@@ -1,0 +1,8 @@
+pytest
+coverage
+ruff
+black
+mypy
+tox
+pip-tools
+pre-commit
