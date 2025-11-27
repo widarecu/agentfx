@@ -1,6 +1,3 @@
-import json
-from datetime import datetime
-
 from fastapi.testclient import TestClient
 
 from agentfx.portal_mock.app import app, RUN_ID, PAIR, STRATEGY_ID
@@ -24,7 +21,9 @@ def test_candles_basic():
 
 def test_runs_listing_and_detail():
     # List runs
-    r = client.get("/api/runs", params={"env": "paper", "pair": PAIR, "strategy": STRATEGY_ID})
+    r = client.get(
+        "/api/runs", params={"env": "paper", "pair": PAIR, "strategy": STRATEGY_ID}
+    )
     assert r.status_code == 200
     items = r.json()["items"]
     assert any(it["run_id"] == RUN_ID for it in items)
@@ -103,7 +102,10 @@ def test_strategies_catalog_and_latest_run():
         assert s["id"] == sid
 
     # Latest run convenience
-    r3 = client.get(f"/api/strategies/{STRATEGY_ID}/latest-run", params={"env": "paper", "pair": PAIR})
+    r3 = client.get(
+        f"/api/strategies/{STRATEGY_ID}/latest-run",
+        params={"env": "paper", "pair": PAIR},
+    )
     assert r3.status_code == 200
     latest = r3.json()
     assert latest["run_id"] == RUN_ID

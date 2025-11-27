@@ -59,11 +59,15 @@ class Registry:
                 """
             )
             # Lightweight migration: ensure params_json exists
-            cols = [r[1] for r in c.execute("PRAGMA table_info(backtest_runs)").fetchall()]
+            cols = [
+                r[1] for r in c.execute("PRAGMA table_info(backtest_runs)").fetchall()
+            ]
             if "params_json" not in cols:
                 c.execute("ALTER TABLE backtest_runs ADD COLUMN params_json TEXT")
 
-    def upsert_dataset(self, instrument: str, granularity: str, start_ts: str, end_ts: str) -> None:
+    def upsert_dataset(
+        self, instrument: str, granularity: str, start_ts: str, end_ts: str
+    ) -> None:
         with self._conn() as c:
             cur = c.execute(
                 "SELECT start_ts, end_ts FROM datasets WHERE instrument=? AND granularity=?",
@@ -87,20 +91,43 @@ class Registry:
         with self._conn() as c:
             cur = c.execute(
                 "INSERT INTO ingestion_runs (instrument, granularity, started_at, status) VALUES (?, ?, ?, ?)",
-                (instrument, granularity, datetime.now(timezone.utc).isoformat(), "running"),
+                (
+                    instrument,
+                    granularity,
+                    datetime.now(timezone.utc).isoformat(),
+                    "running",
+                ),
             )
             return cur.lastrowid
 
-    def finish_run(self, run_id: int, rows_ingested: int, gaps_fixed: int, status: str = "success") -> None:
+    def finish_run(
+        self, run_id: int, rows_ingested: int, gaps_fixed: int, status: str = "success"
+    ) -> None:
         with self._conn() as c:
             c.execute(
                 "UPDATE ingestion_runs SET finished_at=?, rows_ingested=?, gaps_fixed=?, status=? WHERE id=?",
-                (datetime.now(timezone.utc).isoformat(), rows_ingested, gaps_fixed, status, run_id),
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    rows_ingested,
+                    gaps_fixed,
+                    status,
+                    run_id,
+                ),
             )
 
     # --- Backtest persistence ---
-    def record_backtest(self, pair: str, start_ts: str | None, end_ts: str | None, n: int, metrics: dict, policy: dict, params: dict) -> None:
+    def record_backtest(
+        self,
+        pair: str,
+        start_ts: str | None,
+        end_ts: str | None,
+        n: int,
+        metrics: dict,
+        policy: dict,
+        params: dict,
+    ) -> None:
         import json
+
         with self._conn() as c:
             c.execute(
                 "INSERT INTO backtest_runs (pair, start_ts, end_ts, n, metrics_json, policy_json, params_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",

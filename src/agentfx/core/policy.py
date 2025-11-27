@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
 import pandas as pd
 from collections import deque
 
@@ -27,7 +26,7 @@ class PolicyResult:
 def apply_policies(
     signals: pd.Series,
     prices: pd.Series,
-    cfg: Optional[PolicyConfig] = None,
+    cfg: PolicyConfig | None = None,
 ) -> PolicyResult:
     """Apply simple policy rules to an input signal series.
 
@@ -78,7 +77,9 @@ def apply_policies(
         eq = (1.0 + grp).cumprod()
         peak = eq.cummax()
         dd = 1.0 - (eq / peak)
-        if (dd.max() >= cfg.daily_loss_threshold) or ((1.0 - eq.iloc[-1]) >= cfg.daily_loss_threshold):
+        if (dd.max() >= cfg.daily_loss_threshold) or (
+            (1.0 - eq.iloc[-1]) >= cfg.daily_loss_threshold
+        ):
             # Halt from the first time threshold exceeded until end of day
             exceed_idx = dd[dd >= cfg.daily_loss_threshold].index
             if len(exceed_idx) == 0:
@@ -86,9 +87,13 @@ def apply_policies(
                 exceed_point = grp.index[-1]
             else:
                 exceed_point = exceed_idx[0]
-            daily_flag.loc[exceed_point: grp.index[-1]] = True
+            daily_flag.loc[exceed_point : grp.index[-1]] = True
             halted_days += 1
     # Flatten on flagged segments
     s_final = s_blocked.where(~daily_flag, other=0.0)
 
-    return PolicyResult(adjusted_signals=s_final, trades_blocked_rate=trades_blocked, halted_days=halted_days)
+    return PolicyResult(
+        adjusted_signals=s_final,
+        trades_blocked_rate=trades_blocked,
+        halted_days=halted_days,
+    )

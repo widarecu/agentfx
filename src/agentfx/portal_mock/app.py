@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Response, Request
 from pydantic import BaseModel
@@ -13,6 +13,7 @@ PAIR = "AUDUSD"
 RUN_ID = "run_20251117_ma_AUDUSD_paper_01"
 STRATEGY_ID = "ma"
 
+
 class Candle(BaseModel):
     ts: datetime
     o: float
@@ -21,16 +22,24 @@ class Candle(BaseModel):
     c: float
     v: int
 
-CANDLES: List[Candle] = []
+
+CANDLES: list[Candle] = []
 start = NOW - timedelta(days=1)
 for i in range(60 * 24 // 5):  # M5 candles for ~1 day
     ts = start + timedelta(minutes=5 * i)
     base = 0.655 + 0.0001 * (i % 10)
     CANDLES.append(
-        Candle(ts=ts, o=base, h=base + 0.0002, l=base - 0.0002, c=base + 0.00005, v=1000 + i)
+        Candle(
+            ts=ts,
+            o=base,
+            h=base + 0.0002,
+            l=base - 0.0002,
+            c=base + 0.00005,
+            v=1000 + i,
+        )
     )
 
-RUNS: List[Dict[str, Any]] = [
+RUNS: list[dict[str, Any]] = [
     {
         "run_id": RUN_ID,
         "pair": PAIR,
@@ -87,21 +96,23 @@ ORDERS = [
     }
 ]
 
+
 # Build simple moving averages from mock candles to power overlays
-def _sma(values: List[float], window: int) -> List[Optional[float]]:
-    out: List[Optional[float]] = []
+def _sma(values: list[float], window: int) -> list[float | None]:
+    out: list[float | None] = []
     acc = 0.0
-    buf: List[float] = []
+    buf: list[float] = []
     for i, v in enumerate(values):
         buf.append(v)
         acc += v
         if len(buf) > window:
-            acc -= buf[-window-1]
+            acc -= buf[-window - 1]
         if len(buf) >= window:
             out.append(acc / window)
         else:
             out.append(None)
     return out
+
 
 close_vals = [c.c for c in CANDLES]
 fast_ma = _sma(close_vals, 10)
@@ -156,13 +167,16 @@ STRATEGIES = [
     }
 ]
 
+
 # --- Helpers ---
 def iso(dt: datetime) -> str:
     return dt.isoformat().replace("+00:00", "Z")
 
+
 # --- Auth (mock) ---
 SESSION_COOKIE = "session"
 _SESSIONS: dict[str, dict] = {}
+
 
 class LoginPayload(BaseModel):
     email: str
@@ -181,7 +195,9 @@ def login(payload: LoginPayload, response: Response):
     user = {"email": payload.email, "role": "viewer"}
     _SESSIONS[token] = user
     max_age = 60 * 60 * 24 * 7 if payload.remember else None
-    response.set_cookie(key=SESSION_COOKIE, value=token, httponly=True, samesite="lax", max_age=max_age)
+    response.set_cookie(
+        key=SESSION_COOKIE, value=token, httponly=True, samesite="lax", max_age=max_age
+    )
     return {"user": user}
 
 
@@ -201,11 +217,25 @@ def logout(request: Request, response: Response):
     response.delete_cookie(SESSION_COOKIE)
     return {"ok": True}
 
+
 # --- Routes ---
 @app.get("/api/pairs/{pair}/candles")
-def get_candles(pair: str, tf: str = Query("M5"), from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = None, limit: int = 5000):
+def get_candles(
+    pair: str,
+    tf: str = Query("M5"),
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
+    limit: int = 5000,
+):
     if pair != PAIR:
-        return {"tf": tf, "from": from_, "to": to, "items": [], "downsampled": False, "next_cursor": None}
+        return {
+            "tf": tf,
+            "from": from_,
+            "to": to,
+            "items": [],
+            "downsampled": False,
+            "next_cursor": None,
+        }
     # Downsample if needed based on limit
     points = [c.model_dump() for c in CANDLES]
     if limit and limit > 0:
@@ -222,8 +252,16 @@ def get_candles(pair: str, tf: str = Query("M5"), from_: Optional[str] = Query(N
         "next_cursor": None,
     }
 
+
 @app.get("/api/runs")
-def list_runs(env: Optional[str] = None, pair: Optional[str] = None, strategy: Optional[str] = None, status: Optional[str] = None, limit: int = 100, cursor: Optional[str] = None):
+def list_runs(
+    env: str | None = None,
+    pair: str | None = None,
+    strategy: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    cursor: str | None = None,
+):
     items = RUNS
     if env:
         items = [r for r in items if r["env"] == env]
@@ -235,6 +273,7 @@ def list_runs(env: Optional[str] = None, pair: Optional[str] = None, strategy: O
         items = [r for r in items if r["status"] == status]
     return {"items": items[:limit], "next_cursor": None}
 
+
 @app.get("/api/runs/{run_id}")
 def get_run(run_id: str):
     for r in RUNS:
@@ -242,31 +281,52 @@ def get_run(run_id: str):
             return r
     raise HTTPException(status_code=404, detail="run not found")
 
+
 @app.get("/api/runs/{run_id}/trades")
-def get_trades(run_id: str, from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = None, limit: int = 1000, cursor: Optional[str] = None):
+def get_trades(
+    run_id: str,
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
+    limit: int = 1000,
+    cursor: str | None = None,
+):
     if run_id != RUN_ID:
         return {"items": [], "next_cursor": None}
     items, next_cursor = paginate_list(TRADES, cursor, limit)
     return {"items": items, "next_cursor": next_cursor}
 
+
 @app.get("/api/runs/{run_id}/orders")
-def get_orders(run_id: str, from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = None, limit: int = 1000, cursor: Optional[str] = None):
+def get_orders(
+    run_id: str,
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
+    limit: int = 1000,
+    cursor: str | None = None,
+):
     if run_id != RUN_ID:
         return {"items": [], "next_cursor": None}
     items, next_cursor = paginate_list(ORDERS, cursor, limit)
     return {"items": items, "next_cursor": next_cursor}
 
+
 @app.get("/api/runs/{run_id}/signals")
-def get_signals(run_id: str, from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = None, limit: int = 5000, series: Optional[str] = None):
+def get_signals(
+    run_id: str,
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
+    limit: int = 5000,
+    series: str | None = None,
+):
     if run_id != RUN_ID:
         return {"series": [], "downsampled": False}
     if series:
-        series_names = set([s.strip() for s in series.split(",") if s.strip()])
+        series_names = {s.strip() for s in series.split(",") if s.strip()}
         selected = [s for s in SIGNALS["series"] if s["name"] in series_names]
     else:
         selected = SIGNALS["series"]
     downsampled_any = False
-    limited_series: List[Dict[str, Any]] = []
+    limited_series: list[dict[str, Any]] = []
     for s in selected:
         pts = s.get("points", [])
         pts_limited, down = downsample_time_series(pts, limit if limit else len(pts))
@@ -276,23 +336,40 @@ def get_signals(run_id: str, from_: Optional[str] = Query(None, alias="from"), t
         limited_series.append(s_copy)
     return {"series": limited_series, "downsampled": downsampled_any}
 
+
 @app.get("/api/runs/{run_id}/position_bands")
-def get_position_bands(run_id: str, from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = None):
+def get_position_bands(
+    run_id: str,
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
+):
     if run_id != RUN_ID:
         return {"items": []}
     return {
         "items": [
-            {"start": iso(NOW - timedelta(hours=3)), "end": iso(NOW - timedelta(hours=2)), "side": "long"},
+            {
+                "start": iso(NOW - timedelta(hours=3)),
+                "end": iso(NOW - timedelta(hours=2)),
+                "side": "long",
+            },
             {"start": iso(NOW - timedelta(hours=1)), "end": iso(NOW), "side": "short"},
         ]
     }
 
+
 @app.get("/api/strategies")
-def list_strategies(env: Optional[str] = None, status: Optional[str] = None, q: Optional[str] = None, limit: int = 50, cursor: Optional[str] = None):
+def list_strategies(
+    env: str | None = None,
+    status: str | None = None,
+    q: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
+):
     items = STRATEGIES
     if q:
         items = [s for s in items if q.lower() in s["name"].lower()]
     return {"items": items[:limit], "next_cursor": None}
+
 
 @app.get("/api/strategies/{strategy_id}")
 def get_strategy(strategy_id: str):
@@ -301,10 +378,15 @@ def get_strategy(strategy_id: str):
             return s
     raise HTTPException(status_code=404, detail="strategy not found")
 
+
 @app.get("/api/strategies/{strategy_id}/latest-run")
-def get_latest_run(strategy_id: str, env: Optional[str] = None, pair: Optional[str] = None):
+def get_latest_run(strategy_id: str, env: str | None = None, pair: str | None = None):
     for r in RUNS:
-        if r["strategy_id"] == strategy_id and (env is None or r["env"] == env) and (pair is None or r["pair"] == pair):
+        if (
+            r["strategy_id"] == strategy_id
+            and (env is None or r["env"] == env)
+            and (pair is None or r["pair"] == pair)
+        ):
             return {
                 "run_id": r["run_id"],
                 "pair": r["pair"],

@@ -11,10 +11,10 @@ from ..services import user as user_service
 
 router = APIRouter()
 
+
 @router.post("/login", response_model=schemas.Token)
 def login(
-    form_data: OAuth2PasswordRequestForm = Depends(),
-    db: Session = Depends(get_db)
+    form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)
 ) -> Any:
     """
     OAuth2 compatible token login, get an access token for future requests
@@ -28,9 +28,11 @@ def login(
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
-    access_token_expires = timedelta(minutes=config.settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    
+
+    access_token_expires = timedelta(
+        minutes=config.settings.ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+
     return {
         "access_token": security.create_access_token(
             data={"sub": user.email}, expires_delta=access_token_expires
@@ -41,17 +43,17 @@ def login(
 
 
 @router.post("/test-token", response_model=schemas.User)
-def test_token(current_user: models.User = Depends(user_service.get_current_user)) -> Any:
+def test_token(
+    current_user: models.User = Depends(user_service.get_current_user),
+) -> Any:
     """
     Test access token
     """
     return current_user
 
+
 @router.post("/register", response_model=schemas.User)
-def register_user(
-    user_in: schemas.UserCreate,
-    db: Session = Depends(get_db)
-) -> Any:
+def register_user(user_in: schemas.UserCreate, db: Session = Depends(get_db)) -> Any:
     """
     Create new user (registration)
     """
@@ -61,9 +63,10 @@ def register_user(
             status_code=400,
             detail="The user with this email already exists in the system.",
         )
-    
+
     user = user_service.create(db, obj_in=user_in)
     return user
+
 
 @router.get("/me", response_model=schemas.User)
 def read_user_me(

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import List
 
 from agentfx.shared.config import IngestConfig, load_config
 from agentfx.adapters.oanda import OandaClient
@@ -16,13 +15,19 @@ def _calc_start_end(now_utc: datetime, start_days: int) -> tuple[datetime, datet
     return start, end
 
 
-def backfill_pair(cfg: IngestConfig, client: OandaClient, reg: Registry, instrument: str) -> None:
+def backfill_pair(
+    cfg: IngestConfig, client: OandaClient, reg: Registry, instrument: str
+) -> None:
     run_id = reg.start_run(instrument, cfg.granularity)
     rows = 0
     gaps_fixed = 0
     try:
         now = datetime.now(timezone.utc)
-        existing_end = None if cfg.force_start else latest_timestamp(cfg.data_root, instrument, cfg.granularity)
+        existing_end = (
+            None
+            if cfg.force_start
+            else latest_timestamp(cfg.data_root, instrument, cfg.granularity)
+        )
         if existing_end is None:
             start, end = _calc_start_end(now, cfg.start_days)
         else:
@@ -43,7 +48,9 @@ def backfill_pair(cfg: IngestConfig, client: OandaClient, reg: Registry, instrum
             )
             if not candles:
                 break
-            written, chunk_min, chunk_max = write_candles_csv(cfg.data_root, instrument, cfg.granularity, candles)
+            written, chunk_min, chunk_max = write_candles_csv(
+                cfg.data_root, instrument, cfg.granularity, candles
+            )
             rows += written
             if first_written is None and chunk_min is not None:
                 first_written = chunk_min
@@ -61,9 +68,13 @@ def backfill_pair(cfg: IngestConfig, client: OandaClient, reg: Registry, instrum
                 start_ts=first_written.replace(tzinfo=timezone.utc).isoformat(),
                 end_ts=last_written.replace(tzinfo=timezone.utc).isoformat(),
             )
-        reg.finish_run(run_id, rows_ingested=rows, gaps_fixed=gaps_fixed, status="success")
+        reg.finish_run(
+            run_id, rows_ingested=rows, gaps_fixed=gaps_fixed, status="success"
+        )
     except Exception:
-        reg.finish_run(run_id, rows_ingested=rows, gaps_fixed=gaps_fixed, status="error")
+        reg.finish_run(
+            run_id, rows_ingested=rows, gaps_fixed=gaps_fixed, status="error"
+        )
         raise
 
 

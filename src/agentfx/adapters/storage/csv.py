@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
-from typing import List, Dict
 
 import pandas as pd
 
@@ -15,7 +14,9 @@ def _csv_path(root: str, instrument: str, granularity: str, ts: datetime) -> str
     return os.path.join(dir_path, f"{year}-{month}.csv")
 
 
-def write_candles_csv(root: str, instrument: str, granularity: str, candles: List[Dict]) -> tuple[int, datetime, datetime]:
+def write_candles_csv(
+    root: str, instrument: str, granularity: str, candles: list[dict]
+) -> tuple[int, datetime, datetime]:
     if not candles:
         return 0, None, None  # type: ignore
     # Normalize to DataFrame

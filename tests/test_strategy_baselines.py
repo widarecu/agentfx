@@ -7,7 +7,9 @@ from agentfx.core.strategy import RSIMeanReversion, DonchianBreakout
 
 
 def make_df_from_close(values):
-    start = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=len(values))
+    start = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(
+        minutes=len(values)
+    )
     idx = pd.date_range(start=start, periods=len(values), freq="T", tz="UTC")
     df = pd.DataFrame(
         {

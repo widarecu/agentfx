@@ -16,7 +16,16 @@ def test_signals_series_names_and_types():
 def test_runs_metrics_presence():
     assert RUNS
     m = RUNS[0]["metrics"]
-    for k in ["pnl_daily", "pnl_cum", "currency", "sharpe", "mdd", "hit_rate", "turnover", "cagr"]:
+    for k in [
+        "pnl_daily",
+        "pnl_cum",
+        "currency",
+        "sharpe",
+        "mdd",
+        "hit_rate",
+        "turnover",
+        "cagr",
+    ]:
         assert k in m
 
 

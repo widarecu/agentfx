@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Any
 import pandas as pd
 
 
@@ -12,7 +11,9 @@ class Strategy:
     aligned to the input DataFrame index.
     """
 
-    def generate_signals(self, df: pd.DataFrame) -> pd.Series:  # pragma: no cover (interface)
+    def generate_signals(
+        self, df: pd.DataFrame
+    ) -> pd.Series:  # pragma: no cover (interface)
         raise NotImplementedError
 
 

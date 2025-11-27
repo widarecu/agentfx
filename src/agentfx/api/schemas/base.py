@@ -1,26 +1,28 @@
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from pydantic import BaseModel
+from typing import Any
 from datetime import datetime
+
 
 class BaseSchema(BaseModel):
     class Config:
         from_attributes = True
-        json_encoders = {
-            datetime: lambda v: v.isoformat() if v else None
-        }
+        json_encoders = {datetime: lambda v: v.isoformat() if v else None}
+
 
 class PaginatedResponse(BaseSchema):
-    items: List[Any]
+    items: list[Any]
     total: int
     page: int
     size: int
     total_pages: int
+
 
 class ErrorResponse(BaseSchema):
     detail: str
     code: str
     status_code: int
 
+
 class SuccessResponse(BaseSchema):
     success: bool = True
-    message: Optional[str] = None
+    message: str | None = None

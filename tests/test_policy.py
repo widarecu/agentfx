@@ -7,7 +7,9 @@ from agentfx.core.policy import PolicyConfig, apply_policies
 
 
 def make_index(n=120):
-    start = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=n)
+    start = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(
+        minutes=n
+    )
     return pd.date_range(start=start, periods=n, freq="T", tz="UTC")
 
 
@@ -17,7 +19,9 @@ def test_order_rate_throttle_blocks_excess_trades():
     sig = pd.Series([(-1) ** i for i in range(len(idx))], index=idx, dtype=float)
     prices = pd.Series(1.0, index=idx)
 
-    cfg = PolicyConfig(max_abs_position=1, max_trades_per_hour=10, daily_loss_threshold=1.0)
+    cfg = PolicyConfig(
+        max_abs_position=1, max_trades_per_hour=10, daily_loss_threshold=1.0
+    )
     res = apply_policies(sig, prices, cfg)
 
     # With cap of 10 per 60m, we should block many changes
@@ -39,7 +43,9 @@ def test_daily_loss_halts_until_eod():
     prices.loc[:drop_point] = 1.0
     prices.loc[drop_point:] = 0.97
 
-    cfg = PolicyConfig(max_abs_position=1, max_trades_per_hour=1000, daily_loss_threshold=0.02)
+    cfg = PolicyConfig(
+        max_abs_position=1, max_trades_per_hour=1000, daily_loss_threshold=0.02
+    )
     res = apply_policies(sig, prices, cfg)
 
     # Should have at least one halted day

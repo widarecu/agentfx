@@ -17,7 +17,9 @@ def test_candles_endpoint():
 @pytest.mark.integration
 def test_runs_and_detail_endpoints():
     client = TestClient(app)
-    r = client.get("/api/runs", params={"env": "paper", "pair": PAIR, "strategy": STRATEGY_ID})
+    r = client.get(
+        "/api/runs", params={"env": "paper", "pair": PAIR, "strategy": STRATEGY_ID}
+    )
     assert r.status_code == 200
     items = r.json()["items"]
     assert any(it["run_id"] == RUN_ID for it in items)
@@ -38,7 +40,9 @@ def test_run_scoped_trades_orders_signals_position_bands():
     r = client.get(f"/api/runs/{RUN_ID}/orders", params={"limit": 5})
     assert r.status_code == 200
 
-    r = client.get(f"/api/runs/{RUN_ID}/signals", params={"series": "ma_fast,ma_slow,rsi"})
+    r = client.get(
+        f"/api/runs/{RUN_ID}/signals", params={"series": "ma_fast,ma_slow,rsi"}
+    )
     assert r.status_code == 200
 
     r = client.get(f"/api/runs/{RUN_ID}/position_bands")
@@ -55,5 +59,8 @@ def test_strategies_catalog_and_latest_run():
     r = client.get(f"/api/strategies/{STRATEGY_ID}")
     assert r.status_code == 200
 
-    r = client.get(f"/api/strategies/{STRATEGY_ID}/latest-run", params={"env": "paper", "pair": PAIR})
+    r = client.get(
+        f"/api/strategies/{STRATEGY_ID}/latest-run",
+        params={"env": "paper", "pair": PAIR},
+    )
     assert r.status_code == 200

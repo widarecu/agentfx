@@ -3,11 +3,15 @@ from __future__ import annotations
 import glob
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from agentfx.core.strategy import Strategy, MACrossover, RSIMeanReversion, DonchianBreakout
+from agentfx.core.strategy import (
+    Strategy,
+    MACrossover,
+    RSIMeanReversion,
+    DonchianBreakout,
+)
 from agentfx.core.metrics import compute_returns, summarize
 from agentfx.core.policy import PolicyConfig, apply_policies
 from agentfx.adapters.storage.sqlite import Registry
@@ -21,8 +25,8 @@ def load_price_df(
     data_root: str,
     pair: str,
     granularity: str = "M1",
-    start: Optional[datetime] = None,
-    end: Optional[datetime] = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
 ) -> pd.DataFrame:
     base = _data_dir(data_root, pair, granularity)
     if not os.path.isdir(base):
@@ -40,6 +44,7 @@ def load_price_df(
     if not parts:
         raise FileNotFoundError(f"All CSV files empty for {pair}")
     df = pd.concat(parts, ignore_index=True).sort_values("time")
+
     def _to_utc(ts: datetime) -> pd.Timestamp:
         t = pd.Timestamp(ts)
         if t.tzinfo is None:
@@ -61,7 +66,9 @@ def load_price_df(
 def make_strategy(name: str, **kwargs) -> Strategy:
     n = name.lower()
     if n in ("ma", "mac", "ma_crossover", "macrossover"):
-        return MACrossover(fast=int(kwargs.get("fast", 20)), slow=int(kwargs.get("slow", 50)))
+        return MACrossover(
+            fast=int(kwargs.get("fast", 20)), slow=int(kwargs.get("slow", 50))
+        )
     if n in ("rsi", "rsi_mr", "rsi_mean_reversion"):
         # Map generic FAST/SLOW to RSI window if provided
         window = int(kwargs.get("window", kwargs.get("fast", 14)))
@@ -77,17 +84,17 @@ def make_strategy(name: str, **kwargs) -> Strategy:
 def run_backtest(
     data_root: str,
     pair: str,
-    start_days: Optional[int] = None,
+    start_days: int | None = None,
     strategy_name: str = "ma",
-    strategy_params: Optional[Dict] = None,
+    strategy_params: dict | None = None,
     spread_pips: float = 0.5,
     slippage_pips_per_side: float = 0.5,
     max_abs_position: int = 1,
     max_trades_per_hour: int = 60,
     daily_loss_threshold: float = 0.02,
     persist: bool = False,
-    db_path: Optional[str] = None,
-) -> Dict:
+    db_path: str | None = None,
+) -> dict:
     strategy_params = strategy_params or {}
     end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     start = end - timedelta(days=start_days) if start_days else None
@@ -115,7 +122,7 @@ def run_backtest(
         trade_points = signals.diff().fillna(0).ne(0)
         pip_size = pip_size_for_pair(pair)
         # Cost return at trade points
-        cost_ret = (- total_pips * pip_size) / df["close"]
+        cost_ret = (-total_pips * pip_size) / df["close"]
         cost_ret = cost_ret.where(trade_points, other=0.0)
         rets = rets + cost_ret
     metrics = summarize(rets, signals)
@@ -137,7 +144,10 @@ def run_backtest(
         "params": {
             "strategy_name": strategy_name,
             "strategy_params": strategy_params,
-            "costs": {"spread_pips": spread_pips, "slippage_pips_per_side": slippage_pips_per_side},
+            "costs": {
+                "spread_pips": spread_pips,
+                "slippage_pips_per_side": slippage_pips_per_side,
+            },
         },
     }
     if persist and db_path:
@@ -157,18 +167,18 @@ def run_backtest(
 
 def backtest_pairs(
     data_root: str,
-    pairs: List[str],
-    start_days: Optional[int] = None,
+    pairs: list[str],
+    start_days: int | None = None,
     strategy_name: str = "ma",
-    strategy_params: Optional[Dict] = None,
+    strategy_params: dict | None = None,
     spread_pips: float = 0.5,
     slippage_pips_per_side: float = 0.5,
     max_abs_position: int = 1,
     max_trades_per_hour: int = 60,
     daily_loss_threshold: float = 0.02,
     persist: bool = False,
-    db_path: Optional[str] = None,
-) -> List[Dict]:
+    db_path: str | None = None,
+) -> list[dict]:
     out = []
     for p in pairs:
         try:

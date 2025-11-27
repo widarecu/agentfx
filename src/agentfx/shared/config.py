@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from typing import List, Optional
 from pydantic import BaseModel, Field
 
 # Note: Environment settings are read directly via os.environ for simplicity in MVP
@@ -18,7 +17,7 @@ MAJOR_PAIRS = [
 
 
 class IngestConfig(BaseModel):
-    pairs: List[str] = Field(default_factory=lambda: MAJOR_PAIRS.copy())
+    pairs: list[str] = Field(default_factory=lambda: MAJOR_PAIRS.copy())
     granularity: str = "M1"
     start_days: int = 365
     chunk_size: int = 5000  # OANDA max candles per request typically ~5000
@@ -29,12 +28,12 @@ class IngestConfig(BaseModel):
     force_start: bool = False
 
 
-def env_str(name: str, default: Optional[str] = None) -> Optional[str]:
+def env_str(name: str, default: str | None = None) -> str | None:
     val = os.environ.get(name, default)
     return val
 
 
-def env_int(name: str, default: Optional[int] = None) -> Optional[int]:
+def env_int(name: str, default: int | None = None) -> int | None:
     v = os.environ.get(name)
     if v is None:
         return default
@@ -51,7 +50,7 @@ def env_bool(name: str, default: bool = False) -> bool:
     return v.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 
-def env_float(name: str, default: Optional[float] = None) -> Optional[float]:
+def env_float(name: str, default: float | None = None) -> float | None:
     v = os.environ.get(name)
     if v is None:
         return default
@@ -72,7 +71,9 @@ def load_config() -> IngestConfig:
     cfg.force_start = env_bool("INGEST_FORCE_START", False)
     return cfg
 
+
 # Broker environment helpers (used elsewhere)
+
 
 def oanda_env() -> str:
     return env_str("OANDA_ENV", "practice")
@@ -82,15 +83,16 @@ def oanda_api_host() -> str:
     return env_str("OANDA_API_HOST", "api-fxpractice.oanda.com")
 
 
-def oanda_api_key() -> Optional[str]:
+def oanda_api_key() -> str | None:
     return env_str("OANDA_API_KEY")
 
 
-def oanda_account_id() -> Optional[str]:
+def oanda_account_id() -> str | None:
     return env_str("OANDA_ACCOUNT_ID")
 
 
 # Backtest defaults (from env)
+
 
 def backtest_default_spread_pips() -> float:
     return env_float("BACKTEST_SPREAD_PIPS", 0.5) or 0.5

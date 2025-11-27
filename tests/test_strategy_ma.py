@@ -8,7 +8,9 @@ from agentfx.core.strategy import MACrossover
 
 def make_df(values):
     # Build a small OHLCV frame using provided close values
-    start = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=len(values))
+    start = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(
+        minutes=len(values)
+    )
     idx = pd.date_range(start=start, periods=len(values), freq="T", tz="UTC")
     df = pd.DataFrame(
         {
@@ -44,7 +46,9 @@ def test_ma_crossover_basic_no_lookahead():
     raw = (fast_ma > slow_ma).astype(int) - (fast_ma < slow_ma).astype(int)
     expected = raw.shift(1).fillna(0)
 
-    pd.testing.assert_series_equal(sig.astype(float), expected.astype(float), check_names=False)
+    pd.testing.assert_series_equal(
+        sig.astype(float), expected.astype(float), check_names=False
+    )
 
     # No lookahead: current signal equals previous bar's raw crossover
     # i.e., sig[t] == raw[t-1]

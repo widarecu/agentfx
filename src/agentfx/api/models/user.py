@@ -3,10 +3,12 @@ from sqlalchemy.sql import func
 from ..core.database import Base
 import enum
 
+
 class UserRole(str, enum.Enum):
     VIEWER = "viewer"
     TRADER = "trader"
     ADMIN = "admin"
+
 
 class User(Base):
     __tablename__ = "users"
