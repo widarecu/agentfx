@@ -27,4 +27,9 @@ export const router = createBrowserRouter([
       { path: 'runs/:runId', element: <RunDetail /> },
     ],
   },
-])
+], {
+  future: {
+    v7_normalizeFormMethod: true,
+    v7_partialHydration: true,
+  },
+})

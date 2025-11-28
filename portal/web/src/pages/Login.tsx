@@ -13,6 +13,7 @@ export default function Login() {
   const [remember, setRemember] = useState(false)
   const [showPassword, setShowPassword] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [hasUserInteracted, setHasUserInteracted] = useState(false)
 
   // Redirect if already authenticated
   useEffect(() => {
@@ -22,15 +23,16 @@ export default function Login() {
     }
   }, [isAuthenticated, isLoading, navigate, location.state])
 
-  // Clear error when user starts typing
+  // Clear error when user starts typing (after initial interaction)
   useEffect(() => {
-    if (error) {
+    if (hasUserInteracted && error) {
       clearError()
     }
-  }, [email, password, error, clearError])
+  }, [email, password, hasUserInteracted, error, clearError])
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    setHasUserInteracted(true)
     setIsSubmitting(true)
     
     try {
@@ -74,7 +76,10 @@ export default function Login() {
               id="email"
               type="email"
               value={email}
-              onChange={(e) => setEmail(e.target.value)}
+              onChange={(e) => {
+                setEmail(e.target.value)
+                setHasUserInteracted(true)
+              }}
               className="w-full rounded-md border border-slate-300 dark:border-slate-600 px-3 py-2 bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-sky-500"
               placeholder="Enter your email"
               required
@@ -90,7 +95,10 @@ export default function Login() {
                 id="password"
                 type={showPassword ? 'text' : 'password'}
                 value={password}
-                onChange={(e) => setPassword(e.target.value)}
+                onChange={(e) => {
+                  setPassword(e.target.value)
+                  setHasUserInteracted(true)
+                }}
                 className="w-full rounded-md border border-slate-300 dark:border-slate-600 px-3 py-2 pr-10 bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-sky-500"
                 placeholder="Enter your password"
                 required
@@ -122,8 +130,11 @@ export default function Login() {
           </div>
 
           {error && (
-            <div className="text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 p-3 rounded-md">
-              {error}
+            <div className="text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 p-3 rounded-md flex items-center gap-2">
+              <svg className="h-4 w-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <span className="font-medium">{error}</span>
             </div>
           )}
 

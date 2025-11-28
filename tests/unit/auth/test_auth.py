@@ -190,8 +190,9 @@ class TestAuthRouter:
             created_at=datetime.utcnow(),
         )
 
-        # Create a valid token
-        token = create_access_token(data={"sub": str(test_user.id)})
+        # Create a valid token with longer expiration for testing
+        from datetime import timedelta
+        token = create_access_token(data={"sub": str(test_user.id)}, expires_delta=timedelta(hours=1))
 
         # Mock the database query
         db.query.return_value.filter.return_value.first.return_value = test_user
@@ -314,8 +315,9 @@ class TestAuthRouter:
             created_at=datetime.utcnow(),
         )
 
-        # Create a valid token
-        token = create_access_token(data={"sub": str(test_user.id)})
+        # Create a valid token with longer expiration for testing
+        from datetime import timedelta
+        token = create_access_token(data={"sub": str(test_user.id)}, expires_delta=timedelta(hours=1))
 
         # Mock the database query
         db.query.return_value.filter.return_value.first.return_value = test_user

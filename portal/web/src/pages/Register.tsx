@@ -74,6 +74,8 @@ export default function Register() {
     
     try {
       await register(email, password, fullName)
+      // After successful registration, navigate to dashboard
+      navigate('/', { replace: true })
     } catch (error) {
       // Error is automatically handled by AuthContext and stored in state
       console.log('Register page - Caught error:', error)
@@ -210,8 +212,11 @@ export default function Register() {
           </div>
 
           {(error || formError) && (
-            <div className="text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 p-3 rounded-md">
-              {formError || error}
+            <div className="text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 p-3 rounded-md flex items-center gap-2">
+              <svg className="h-4 w-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <span className="font-medium">{formError || error}</span>
             </div>
           )}
 

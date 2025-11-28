@@ -11,14 +11,25 @@ data/
 *.db
 *.sqlite
 *.sqlite3
+
+# Test results and coverage
 .coverage
 .pytest_cache/
+htmlcov/
+test-results/
+test-data/
+test_*.db
+*_test.log
+
+# Build and distribution
 .tox/
 dist/
 build/
 *.egg-info/
 node_modules/
 dist/
+
+# Environment files
 .env.local
 .env.development.local
 .env.test.local

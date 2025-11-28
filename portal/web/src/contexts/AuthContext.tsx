@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useReducer, useEffect, ReactNode } from 'react'
+import { useToast } from './ToastContext'
 
 export interface User {
   id: string
@@ -109,6 +110,7 @@ interface AuthProviderProps {
 
 export function AuthProvider({ children }: AuthProviderProps) {
   const [state, dispatch] = useReducer(authReducer, initialState)
+  const { showToast } = useToast()
 
   // Initialize auth state on mount
   useEffect(() => {
@@ -117,7 +119,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       if (token) {
         try {
           // Verify token with backend
-          const response = await fetch('/api/v1/me', {
+          const response = await fetch('/api/v1/auth/me', {
             headers: {
               'Authorization': `Bearer ${token}`,
               'Content-Type': 'application/json',
@@ -162,8 +164,20 @@ export function AuthProvider({ children }: AuthProviderProps) {
       })
 
       if (!response.ok) {
-        const errorData = await response.json()
-        throw new Error(errorData.detail || 'Login failed')
+        const errorData = await response.json().catch(() => ({}))
+        let errorMessage = 'Login failed'
+        
+        if (errorData.detail) {
+          if (typeof errorData.detail === 'string') {
+            errorMessage = errorData.detail
+          } else if (Array.isArray(errorData.detail)) {
+            errorMessage = errorData.detail.map((err: { msg?: string } | string) => 
+              typeof err === 'string' ? err : err.msg || err
+            ).join(', ')
+          }
+        }
+        
+        throw new Error(errorMessage)
       }
 
       const data = await response.json()
@@ -177,11 +191,13 @@ export function AuthProvider({ children }: AuthProviderProps) {
         type: 'LOGIN_SUCCESS',
         payload: { user: data.user, accessToken: data.access_token, remember }
       })
+      showToast(`Welcome back, ${data.user.full_name || data.user.email}!`, 'success')
     } catch (error) {
       dispatch({
         type: 'LOGIN_FAILURE',
         payload: error instanceof Error ? error.message : 'Login failed'
       })
+      showToast(error instanceof Error ? error.message : 'Login failed', 'error')
     }
   }
 
@@ -202,8 +218,19 @@ export function AuthProvider({ children }: AuthProviderProps) {
       })
 
       if (!response.ok) {
-        const errorData = await response.json()
-        const errorMessage = errorData.detail || 'Registration failed'
+        const errorData = await response.json().catch(() => ({}))
+        let errorMessage = 'Registration failed'
+        
+        if (errorData.detail) {
+          if (typeof errorData.detail === 'string') {
+            errorMessage = errorData.detail
+          } else if (Array.isArray(errorData.detail)) {
+            errorMessage = errorData.detail.map((err: { msg?: string } | string) => 
+              typeof err === 'string' ? err : err.msg || err
+            ).join(', ')
+          }
+        }
+        
         dispatch({
           type: 'REGISTER_FAILURE',
           payload: errorMessage
@@ -213,18 +240,38 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
       const data = await response.json()
       
-      // Store token
-      localStorage.setItem('access_token', data.access_token)
+      // After successful registration, automatically log the user in
+      const loginResponse = await fetch('/api/v1/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({
+          username: email,
+          password: password,
+        }),
+      })
+
+      if (!loginResponse.ok) {
+        throw new Error('Registration successful but automatic login failed')
+      }
+
+      const loginData = await loginResponse.json()
+      
+      // Store token from login
+      localStorage.setItem('access_token', loginData.access_token)
 
       dispatch({
         type: 'REGISTER_SUCCESS',
-        payload: { user: data, accessToken: data.access_token }
+        payload: { user: loginData.user, accessToken: loginData.access_token }
       })
+      showToast(`Account created successfully! Welcome, ${loginData.user.full_name || loginData.user.email}!`, 'success')
     } catch (error) {
       dispatch({
         type: 'REGISTER_FAILURE',
         payload: error instanceof Error ? error.message : 'Registration failed'
       })
+      showToast(error instanceof Error ? error.message : 'Registration failed', 'error')
     }
   }
 

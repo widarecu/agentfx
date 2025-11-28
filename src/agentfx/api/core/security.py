@@ -27,13 +27,20 @@ def get_password_hash(password: str) -> str:
 
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
+    import calendar
+    import time
+    
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
         expire = datetime.utcnow() + timedelta(minutes=15)
-    # Convert to Unix timestamp (seconds since epoch)
-    to_encode.update({"exp": int(expire.timestamp())})
+    
+    # Convert to Unix timestamp using reliable method
+    # Use calendar.timegm with UTC time to avoid timezone issues
+    expire_timestamp = calendar.timegm(expire.utctimetuple())
+    to_encode.update({"exp": expire_timestamp})
+    
     encoded_jwt = jwt.encode(
         to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM
     )
