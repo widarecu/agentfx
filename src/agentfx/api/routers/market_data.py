@@ -1,18 +1,22 @@
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
 from ..core.database import get_db
-from ..services import market_data as market_data_service
+from ..core.rate_limiter import market_data_rate_limit
+from ..core.metrics import market_metrics
+from ..services.market_data import MarketDataService
 from ..services import user as user_service
 
 router = APIRouter(prefix="/market-data", tags=["market-data"])
 
 
 @router.get("/candles", response_model=schemas.CandleList)
-def get_candles(
+@market_data_rate_limit(endpoint_type="candles", per_user=True)
+async def get_candles(
+    request: Request,
     exchange: str = Query(..., description="Exchange identifier (e.g., 'oanda')"),
     instrument: str = Query(..., description="Instrument symbol (e.g., 'AUD_USD')"),
     timeframe: schemas.Timeframe = Query(
@@ -36,32 +40,59 @@ def get_candles(
 
     Returns the most recent candles if no time range is specified.
     """
-    candles, total = market_data_service.get_candles(
-        db=db,
-        exchange=exchange,
-        instrument=instrument,
-        timeframe=timeframe,
-        from_time=from_time,
-        to_time=to_time,
-        limit=limit,
-        run_id=run_id,
-    )
+    try:
+        candles, total = MarketDataService.get_candles(
+            db=db,
+            exchange=exchange,
+            instrument=instrument,
+            timeframe=timeframe,
+            from_time=from_time,
+            to_time=to_time,
+            limit=limit,
+            run_id=run_id,
+        )
 
-    # Determine the actual time range of the returned candles
-    from_ts = min(c.timestamp for c in candles) if candles else None
-    to_ts = max(c.timestamp for c in candles) if candles else None
+        # Determine the actual time range of the returned candles
+        # Use query parameters if provided, otherwise use actual data range
+        if from_time is not None and to_time is not None:
+            # Use query parameters when both are provided
+            response_from_time = from_time
+            response_to_time = to_time
+        elif candles:
+            # Use actual data range when query parameters not provided but data exists
+            response_from_time = min(c.timestamp for c in candles)
+            response_to_time = max(c.timestamp for c in candles)
+        else:
+            # Use reasonable defaults when no query params and no data
+            from datetime import datetime, timezone
 
-    return {
-        "items": candles,
-        "total": total,
-        "from_time": from_ts,
-        "to_time": to_ts,
-        "count": len(candles),
-    }
+            now = datetime.now(timezone.utc)
+            response_from_time = now
+            response_to_time = now
+
+        # Record metrics
+        market_metrics.record_success("candles")
+        market_metrics.record_request_time("candles", 0, str(current_user.id))
+
+        return {
+            "items": candles,
+            "total": total,
+            "from_time": response_from_time,
+            "to_time": response_to_time,
+            "count": len(candles),
+        }
+    except ValueError as e:
+        market_metrics.record_error("candles", "ValueError")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        market_metrics.record_error("candles", type(e).__name__)
+        raise
 
 
 @router.get("/candles/latest", response_model=schemas.CandlePublic)
+@market_data_rate_limit(endpoint_type="candles", per_user=True)
 def get_latest_candle(
+    request: Request,
     exchange: str = Query(..., description="Exchange identifier (e.g., 'oanda')"),
     instrument: str = Query(..., description="Instrument symbol (e.g., 'AUD_USD')"),
     timeframe: schemas.Timeframe = Query(
@@ -72,7 +103,7 @@ def get_latest_candle(
     current_user: models.User = Depends(user_service.get_current_active_user),
 ):
     """Get the most recent candle for the specified instrument and timeframe."""
-    candle = market_data_service.get_latest_candle(
+    candle = MarketDataService.get_latest_candle(
         db=db,
         exchange=exchange,
         instrument=instrument,
@@ -90,7 +121,9 @@ def get_latest_candle(
 
 
 @router.post("/candles", response_model=list[schemas.CandlePublic])
-def create_candles(
+@market_data_rate_limit(endpoint_type="candles", per_user=True)
+async def create_candles(
+    request: Request,
     candle_data: schemas.CandleBulkCreate,
     run_id: str | None = Query(
         None, description="Associate candles with a specific run"
@@ -104,7 +137,7 @@ def create_candles(
 
     This endpoint is typically used by data collection services.
     """
-    candles = market_data_service.create_candles(
+    candles = MarketDataService.create_candles(
         db=db,
         exchange=candle_data.exchange,
         instrument=candle_data.instrument,
@@ -115,7 +148,7 @@ def create_candles(
     )
 
     # Update the market data status
-    market_data_service.update_market_data_status(
+    MarketDataService.update_market_data_status(
         db=db,
         exchange=candle_data.exchange,
         instrument=candle_data.instrument,
@@ -129,7 +162,9 @@ def create_candles(
 
 
 @router.get("/status", response_model=list[schemas.MarketDataUpdatePublic])
-def get_market_data_status(
+@market_data_rate_limit(endpoint_type="status", per_user=True)
+async def get_market_data_status(
+    request: Request,
     exchange: str | None = Query(None, description="Filter by exchange"),
     instrument: str | None = Query(None, description="Filter by instrument"),
     timeframe: schemas.Timeframe | None = Query(
@@ -143,20 +178,18 @@ def get_market_data_status(
 
     Returns all statuses if no filters are provided.
     """
-    query = db.query(models.MarketDataUpdate)
-
-    if exchange:
-        query = query.filter(models.MarketDataUpdate.exchange == exchange)
-    if instrument:
-        query = query.filter(models.MarketDataUpdate.instrument == instrument.upper())
-    if timeframe:
-        query = query.filter(models.MarketDataUpdate.timeframe == timeframe)
-
-    return query.all()
+    return MarketDataService.get_market_data_status(
+        db=db,
+        exchange=exchange,
+        instrument=instrument,
+        timeframe=timeframe,
+    )
 
 
 @router.get("/instruments", response_model=list[schemas.InstrumentInfo])
-def list_instruments(
+@market_data_rate_limit(endpoint_type="instruments", per_user=True)
+async def list_instruments(
+    request: Request,
     exchange: str | None = Query("oanda", description="Filter by exchange"),
     type: str | None = Query(
         None, description="Filter by instrument type (e.g., 'forex', 'crypto')"
@@ -166,38 +199,30 @@ def list_instruments(
 ):
     """
     List available trading instruments.
-
-    This is a simplified implementation that returns a static list of instruments.
-    In a production environment, this would query the exchange API or a configuration store.
     """
-    # TODO: Replace with actual implementation that queries the exchange
-    forex_pairs = [
-        "EUR_USD",
-        "GBP_USD",
-        "USD_JPY",
-        "AUD_USD",
-        "USD_CAD",
-        "NZD_USD",
-        "USD_CHF",
-    ]
+    # Get instruments from service
+    instrument_symbols = MarketDataService.get_instruments(db=db, exchange=exchange)
 
+    # Convert to InstrumentInfo format
     instruments = []
-    for symbol in forex_pairs:
-        if exchange and exchange.lower() != "oanda":
-            continue
+    for symbol in instrument_symbols:
+        symbol_str = str(symbol)  # Ensure it's a string
         if type and type.lower() != "forex":
             continue
 
         instruments.append(
             {
-                "symbol": symbol,
-                "name": f"{symbol[:3]}/{symbol[4:]}",
+                "symbol": symbol_str,
+                "name": f"{symbol_str[:3]}/{symbol_str[4:]}",
                 "type": "forex",
-                "pip_location": 4 if symbol != "USD_JPY" else 2,
-                "display_precision": 5 if symbol != "USD_JPY" else 3,
+                "pip_location": 4 if symbol_str != "USD_JPY" else 2,
+                "display_precision": 5 if symbol_str != "USD_JPY" else 3,
                 "trade_units_precision": 2,
                 "minimum_trade_size": 1.0,
                 "maximum_trade_size": 10000000.0,
+                "margin_rate": None,
+                "maximum_guaranteed_stop_loss_distance": None,
+                "maximum_order_units": None,
             }
         )
 
@@ -205,7 +230,9 @@ def list_instruments(
 
 
 @router.get("/exchanges/{exchange_id}", response_model=schemas.ExchangeInfo)
+@market_data_rate_limit(endpoint_type="instruments", per_user=True)
 def get_exchange_info(
+    request: Request,
     exchange_id: str,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(user_service.get_current_active_user),
@@ -246,5 +273,59 @@ def get_exchange_info(
             "fractional_pips": True,
             "guaranteed_stop_loss": False,
             "trailing_stop": True,
+        },
+    }
+
+
+@router.get("/exchange-info", response_model=dict)
+@market_data_rate_limit(endpoint_type="instruments", per_user=True)
+async def get_exchange_info_query(
+    request: Request,
+    exchange: str = Query(..., description="Exchange identifier"),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+):
+    """
+    Get exchange information using query parameter.
+
+    This endpoint matches the test expectation for /exchange-info?exchange=oanda
+    """
+    return MarketDataService.get_exchange_info(db=db, exchange=exchange)
+
+
+@router.get("/metrics", response_model=dict)
+@market_data_rate_limit(endpoint_type="status", per_user=True)
+async def get_market_data_metrics(
+    request: Request,
+    hours: int = Query(1, ge=1, le=24, description="Time window in hours"),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+):
+    """
+    Get market data system metrics and health information.
+
+    Returns performance, usage, and data quality metrics.
+    """
+    # Clean up old metrics
+    market_metrics.cleanup_old_metrics()
+
+    # Get various metric types
+    endpoint_stats = market_metrics.get_endpoint_stats("candles", hours=hours)
+    usage_stats = market_metrics.get_usage_stats(hours=hours)
+    quality_stats = market_metrics.get_data_quality_stats(hours=hours)
+    health_summary = market_metrics.get_health_summary()
+
+    return {
+        "health": health_summary,
+        "performance": endpoint_stats,
+        "usage": usage_stats,
+        "data_quality": quality_stats,
+        "system": {
+            "active_users": len(
+                [k for k in market_metrics.user_usage.keys() if k.startswith("user:")]
+            ),
+            "total_requests": sum(market_metrics.endpoint_usage.values()),
+            "error_rate": endpoint_stats.get("error_rate", 0),
+            "avg_response_time_ms": endpoint_stats.get("avg_response_time_ms", 0),
         },
     }

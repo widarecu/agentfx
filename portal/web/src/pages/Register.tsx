@@ -27,13 +27,15 @@ export default function Register() {
 
   // Clear errors when user modifies form fields (not on initial load)
   const [hasUserInteracted, setHasUserInteracted] = useState(false)
-  
+
   useEffect(() => {
+    // Only clear errors when form fields change, not when error values change
     if (hasUserInteracted) {
-      if (formError) setFormError(null)
-      if (error) clearError()
+      setFormError(null)
+      clearError()
     }
-  }, [email, password, confirmPassword, fullName, hasUserInteracted, formError, error, clearError])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [email, password, confirmPassword, fullName])
   
   const handleFieldChange = () => {
     setHasUserInteracted(true)

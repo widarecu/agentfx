@@ -2,12 +2,95 @@ from typing import Any
 from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
+import logging
 
 from .. import models
+
+logger = logging.getLogger(__name__)
 
 
 class MarketDataService:
     """Service for handling market data operations."""
+
+    @staticmethod
+    def _validate_candle_data(candle_data: dict[str, Any]) -> bool:
+        """
+        Validate candle data for quality and consistency.
+
+        Returns True if valid, raises ValueError if invalid.
+        """
+        required_fields = {"timestamp", "open", "high", "low", "close"}
+        missing_fields = required_fields - set(candle_data.keys())
+        if missing_fields:
+            raise ValueError(f"Missing required fields: {missing_fields}")
+
+        # Validate price relationships
+        open_price = float(candle_data["open"])
+        high_price = float(candle_data["high"])
+        low_price = float(candle_data["low"])
+        close_price = float(candle_data["close"])
+
+        if high_price < low_price:
+            raise ValueError("High price cannot be lower than low price")
+
+        if high_price < max(open_price, close_price):
+            raise ValueError("High price must be >= both open and close")
+
+        if low_price > min(open_price, close_price):
+            raise ValueError("Low price must be <= both open and close")
+
+        # Validate non-negative values
+        if any(price < 0 for price in [open_price, high_price, low_price, close_price]):
+            raise ValueError("Prices cannot be negative")
+
+        # Validate volume
+        if "volume" in candle_data and float(candle_data["volume"]) < 0:
+            raise ValueError("Volume cannot be negative")
+
+        return True
+
+    @staticmethod
+    def _validate_and_clean_candles(
+        candles_data: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Validate and clean a list of candle data.
+        Returns only valid candles, logs warnings for invalid ones.
+        """
+        valid_candles = []
+        invalid_count = 0
+
+        for i, candle in enumerate(candles_data):
+            try:
+                MarketDataService._validate_candle_data(candle)
+                # Ensure consistent data types
+                cleaned_candle = {
+                    "timestamp": candle["timestamp"],
+                    "open": float(candle["open"]),
+                    "high": float(candle["high"]),
+                    "low": float(candle["low"]),
+                    "close": float(candle["close"]),
+                    "volume": float(candle.get("volume", 0.0)),
+                    "complete": bool(candle.get("complete", True)),
+                }
+
+                # Add optional fields if present
+                if "spread" in candle:
+                    cleaned_candle["spread"] = float(candle["spread"])
+
+                valid_candles.append(cleaned_candle)
+
+            except ValueError as e:
+                invalid_count += 1
+                logger.warning(f"Invalid candle at index {i}: {e}")
+                continue
+
+        if invalid_count > 0:
+            logger.warning(
+                f"Rejected {invalid_count} invalid candles out of {len(candles_data)} total"
+            )
+
+        return valid_candles
 
     @staticmethod
     def get_candles(
@@ -106,9 +189,17 @@ class MarketDataService:
         """
         instrument = instrument.upper()
         timeframe = timeframe.upper()
+
+        # Validate and clean candle data
+        validated_candles = MarketDataService._validate_and_clean_candles(candles_data)
+
+        if not validated_candles:
+            logger.warning("No valid candles to create after validation")
+            return []
+
         result = []
 
-        for candle_data in candles_data:
+        for candle_data in validated_candles:
             # Check if candle already exists
             existing = (
                 db.query(models.Candle)
@@ -141,8 +232,20 @@ class MarketDataService:
                 db.add(db_candle)
                 result.append(db_candle)
 
-        db.commit()
-        return result
+        try:
+            db.commit()
+            logger.info(
+                f"Successfully created/updated {len(result)} candles for {instrument}:{timeframe}"
+            )
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Failed to commit candles: {e}")
+            raise
+
+        # Convert SQLAlchemy objects to Pydantic schemas for proper serialization
+        from src.agentfx.api.schemas.market_data import CandlePublic
+
+        return [CandlePublic.model_validate(candle) for candle in result]
 
     @staticmethod
     def update_market_data_status(
@@ -191,6 +294,102 @@ class MarketDataService:
         db.commit()
         db.refresh(update)
         return update
+
+    @staticmethod
+    def get_market_data_status(
+        db: Session,
+        exchange: str | None = None,
+        instrument: str | None = None,
+        timeframe: str | None = None,
+    ) -> list[models.MarketDataUpdate]:
+        """
+        Get market data status updates with optional filtering.
+
+        Args:
+            db: Database session
+            exchange: Optional exchange filter
+            instrument: Optional instrument filter
+            timeframe: Optional timeframe filter
+
+        Returns:
+            List of market data status updates
+        """
+        query = db.query(models.MarketDataUpdate)
+
+        if exchange:
+            query = query.filter(models.MarketDataUpdate.exchange == exchange)
+        if instrument:
+            query = query.filter(
+                models.MarketDataUpdate.instrument == instrument.upper()
+            )
+        if timeframe:
+            query = query.filter(models.MarketDataUpdate.timeframe == timeframe.upper())
+
+        return query.order_by(models.MarketDataUpdate.last_updated.desc()).all()
+
+    @staticmethod
+    def get_instruments(
+        db: Session,
+        exchange: str | None = None,
+    ) -> list[str]:
+        """
+        Get list of available instruments from the instruments table.
+
+        Args:
+            db: Database session
+            exchange: Optional exchange filter (not used currently, for future extension)
+
+        Returns:
+            List of instrument symbols
+        """
+        # Query the instruments table which is seeded by seed_instruments.py
+        # This ensures instruments are available even before candle data is ingested
+        query = db.query(models.Instrument.symbol).filter(
+            models.Instrument.is_active == True
+        )
+
+        instruments = [row[0] for row in query.all()]
+        return sorted(instruments)
+
+    @staticmethod
+    def get_exchange_info(
+        db: Session,
+        exchange: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Get exchange information and statistics.
+
+        Args:
+            db: Database session
+            exchange: Optional exchange filter
+
+        Returns:
+            Dictionary with exchange information
+        """
+        query = db.query(models.Candle)
+
+        if exchange:
+            query = query.filter(models.Candle.exchange == exchange)
+
+        # Get basic statistics
+        total_candles = query.count()
+        exchanges = db.query(models.Candle.exchange).distinct().all()
+        exchange_list = [e[0] for e in exchanges]
+        instruments = db.query(models.Candle.instrument).distinct().all()
+        instrument_list = [i[0] for i in instruments]
+
+        # Get time range
+        first_candle = query.order_by(models.Candle.timestamp.asc()).first()
+        last_candle = query.order_by(models.Candle.timestamp.desc()).first()
+
+        return {
+            "exchange": exchange or "all",
+            "total_candles": total_candles,
+            "available_exchanges": exchange_list,
+            "available_instruments": sorted(instrument_list),
+            "data_start_time": first_candle.timestamp if first_candle else None,
+            "data_end_time": last_candle.timestamp if last_candle else None,
+        }
 
 
 # Create a singleton instance

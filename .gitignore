@@ -4,13 +4,36 @@ __pycache__/
 *.pyc
 *.pyo
 *.DS_Store
+# Environment files with secrets (NEVER commit these)
 .env
-.env.*
+.env.development
+.env.test
+.env.staging
+.env.production
+.env.local
+.env.*.local
+.env.*.backup
+
+# Keep example files tracked
+!.env.example
+!portal/web/.env.example
 data/
 *.log
+*.log.*
 *.db
 *.sqlite
 *.sqlite3
+
+# Claude Code plans and settings
+.claude/
+
+# Screenshot artifacts from testing (keep only in portal/web/)
+/login-failure.png
+/registration-*.png
+
+# Root package files (Playwright uses these, not for production)
+/package.json
+/package-lock.json
 
 # Test results and coverage
 .coverage
@@ -29,11 +52,7 @@ build/
 node_modules/
 dist/
 
-# Environment files
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+# NPM/Yarn debug logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

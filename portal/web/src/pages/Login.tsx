@@ -25,10 +25,12 @@ export default function Login() {
 
   // Clear error when user starts typing (after initial interaction)
   useEffect(() => {
-    if (hasUserInteracted && error) {
+    // Only clear errors when form fields change, not when error values change
+    if (hasUserInteracted) {
       clearError()
     }
-  }, [email, password, hasUserInteracted, error, clearError])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [email, password])
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault()

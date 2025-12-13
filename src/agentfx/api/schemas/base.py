@@ -1,12 +1,13 @@
-from pydantic import BaseModel
-from typing import Any
+from pydantic import BaseModel, ConfigDict
+from typing import Any, Optional
 from datetime import datetime
 
 
 class BaseSchema(BaseModel):
-    class Config:
-        from_attributes = True
-        json_encoders = {datetime: lambda v: v.isoformat() if v else None}
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_encoders={datetime: lambda v: v.isoformat() if v else None},
+    )
 
 
 class PaginatedResponse(BaseSchema):

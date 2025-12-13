@@ -3,7 +3,7 @@ import App from './App'
 import Login from './pages/Login'
 import Register from './pages/Register'
 import Dashboard from './pages/Dashboard'
-import RunDetail from './pages/RunDetail'
+import MarketData from './pages/MarketData'
 import { ProtectedRoute } from './components/ProtectedRoute'
 
 export const router = createBrowserRouter([
@@ -24,7 +24,7 @@ export const router = createBrowserRouter([
     ),
     children: [
       { index: true, element: <Dashboard /> },
-      { path: 'runs/:runId', element: <RunDetail /> },
+      { path: 'market-data', element: <MarketData /> },
     ],
   },
 ], {

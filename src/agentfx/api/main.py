@@ -1,13 +1,9 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.responses import Response
+from starlette.middleware.base import BaseHTTPMiddleware
 from .core.config import settings
-from .routers import auth, runs, strategies, market_data_ws
-from .core.database import engine, Base
-from .core.websocket import manager
-from .services.market_data_stream import (
-    start_market_data_stream,
-    stop_market_data_stream,
-)
+from .routers import auth, runs, strategies, market_data
 import logging
 import logging.handlers
 import sys
@@ -41,9 +37,8 @@ except Exception as e:
     print(f"Failed to set up file logging: {e}")
 
 # Set log levels for specific loggers
-logging.getLogger("aiohttp").setLevel(logging.DEBUG)
-logging.getLogger("asyncio").setLevel(logging.DEBUG)
-logging.getLogger("websockets").setLevel(logging.DEBUG)
+logging.getLogger("aiohttp").setLevel(logging.INFO)
+logging.getLogger("asyncio").setLevel(logging.INFO)
 
 # Disable noisy loggers
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
@@ -63,21 +58,20 @@ logger.info("Logging configured")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    logger.info("Starting up...")
+    logger.info("Starting up AgentFX API...")
 
-    # Create database tables
-    Base.metadata.create_all(bind=engine)
+    # Start candle ingestion worker
+    from .workers.candle_ingestion import start_ingestion_worker, stop_ingestion_worker
 
-    # Start market data stream if enabled
-    if settings.WEBSOCKET_ENABLED:
-        await start_market_data_stream()
+    await start_ingestion_worker()
+    logger.info("Candle ingestion worker started")
 
     yield  # App runs here
 
     # Shutdown
     logger.info("Shutting down...")
-    if settings.WEBSOCKET_ENABLED:
-        await stop_market_data_stream()
+    await stop_ingestion_worker()
+    logger.info("Candle ingestion worker stopped")
 
 
 app = FastAPI(
@@ -88,27 +82,68 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Set up CORS and WebSocket middleware
+# Parse allowed origins once
+_allowed_origins = (
+    [origin.strip() for origin in settings.BACKEND_CORS_ORIGINS.split(",")]
+    if settings.BACKEND_CORS_ORIGINS
+    else ["*"]
+)
+
+
+class CORSPreflightMiddleware(BaseHTTPMiddleware):
+    """
+    Handle CORS preflight OPTIONS requests before they reach route dependencies.
+
+    This is necessary because FastAPI evaluates route dependencies (like OAuth2PasswordBearer)
+    before CORSMiddleware can short-circuit OPTIONS requests. Since OPTIONS requests don't
+    include Authorization headers (per CORS spec), the auth dependencies fail with 400/401.
+
+    This middleware intercepts OPTIONS requests early and returns proper CORS headers.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        if request.method == "OPTIONS":
+            origin = request.headers.get("origin", "")
+            # Use origin if provided, otherwise use wildcard
+            allow_origin = origin if origin else "*"
+
+            logger.debug(
+                f"CORS preflight: method={request.method}, origin={origin}, path={request.url.path}"
+            )
+
+            # For CORS preflight, we need to respond with appropriate headers
+            return Response(
+                status_code=200,
+                headers={
+                    "Access-Control-Allow-Origin": allow_origin,
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+                    "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, Origin, X-Requested-With",
+                    "Access-Control-Allow-Credentials": "true",
+                    "Access-Control-Max-Age": "600",
+                },
+            )
+
+        return await call_next(request)
+
+
+# Set up CORS middleware (still needed for actual requests with credentials)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=(
-        [str(origin) for origin in settings.BACKEND_CORS_ORIGINS]
-        if settings.BACKEND_CORS_ORIGINS
-        else ["*"]
-    ),
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Add OPTIONS handler AFTER CORSMiddleware so it runs FIRST (LIFO order)
+app.add_middleware(CORSPreflightMiddleware)
+
 # Include routers
 app.include_router(auth.router, prefix=settings.API_V1_STR)
+app.include_router(market_data.router, prefix=settings.API_V1_STR, tags=["market-data"])
 app.include_router(runs.router, prefix=f"{settings.API_V1_STR}/runs", tags=["runs"])
 app.include_router(
     strategies.router, prefix=f"{settings.API_V1_STR}/strategies", tags=["strategies"]
-)
-app.include_router(
-    market_data_ws.router, prefix=settings.API_V1_STR, tags=["market-data-ws"]
 )
 
 
@@ -119,25 +154,5 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {
-        "status": "healthy",
-        "websocket_connections": sum(
-            len(conns) for conns in manager.active_connections.values()
-        ),
-        "active_subscriptions": sum(
-            len(subs) for subs in manager.subscriptions.values()
-        ),
-    }
-
-
-# WebSocket test endpoint (kept for testing)
-@app.websocket("/ws/test")
-async def websocket_test(websocket: WebSocket):
-    """Simple echo WebSocket for testing connectivity."""
-    await websocket.accept()
-    try:
-        while True:
-            data = await websocket.receive_text()
-            await websocket.send_text(f"Echo: {data}")
-    except WebSocketDisconnect:
-        logger.info("WebSocket test connection closed")
+    """Health check endpoint."""
+    return {"status": "healthy"}

@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  postgres-prod:
+    image: postgres:15-alpine
+    container_name: agentfx-postgres-prod
+    environment:
+      POSTGRES_DB: agentfx_production
+      POSTGRES_USER: agentfx_prod
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5435:5432"
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentfx_prod -d agentfx_production"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - prod-network
+    # Production security settings
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql
+
+volumes:
+  postgres_prod_data:
+
+networks:
+  prod-network:
+    driver: bridge

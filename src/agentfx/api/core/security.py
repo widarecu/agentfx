@@ -28,19 +28,18 @@ def get_password_hash(password: str) -> str:
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
     import calendar
-    import time
-    
+
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
         expire = datetime.utcnow() + timedelta(minutes=15)
-    
+
     # Convert to Unix timestamp using reliable method
     # Use calendar.timegm with UTC time to avoid timezone issues
     expire_timestamp = calendar.timegm(expire.utctimetuple())
     to_encode.update({"exp": expire_timestamp})
-    
+
     encoded_jwt = jwt.encode(
         to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM
     )
@@ -126,23 +125,33 @@ async def get_current_user_ws(token: str | None = None) -> User | None:
     """
     Authenticate WebSocket connection using JWT token.
     Returns the user if authenticated, None otherwise.
+
+    This function handles JWT validation including expiration checks,
+    and properly manages database sessions to prevent resource leaks.
     """
     if not token:
         logger.warning("No token provided for WebSocket connection")
         return None
 
+    db = None
     try:
         # Remove 'Bearer ' prefix if present
         if token.lower().startswith("bearer "):
             token = token[7:].strip()
 
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        # Decode with expiration check using settings.ALGORITHM (not hardcoded)
+        payload = jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM],
+            options={"verify_exp": True},  # Explicitly enable expiration check
+        )
         username: str = payload.get("sub")
         if username is None:
             logger.warning("No username in token")
             return None
 
-        # Get database session
+        # Get database session with proper cleanup
         db = next(get_db())
         user = db.query(User).filter(User.email == username).first()
 
@@ -153,9 +162,19 @@ async def get_current_user_ws(token: str | None = None) -> User | None:
         logger.info(f"Authenticated WebSocket user: {username}")
         return user
 
+    except ExpiredSignatureError:
+        logger.warning("WebSocket token has expired")
+        return None
     except JWTError as e:
         logger.warning(f"JWT error in WebSocket auth: {str(e)}")
         return None
     except Exception as e:
         logger.error(f"Error in WebSocket auth: {str(e)}")
         return None
+    finally:
+        # Ensure database session is closed to prevent resource leaks
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass

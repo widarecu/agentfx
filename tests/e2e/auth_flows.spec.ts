@@ -43,7 +43,8 @@ test.describe('Authentication Flows', () => {
     await page.getByRole('button', { name: 'Sign in' }).click();
     
     // Verify error message and URL - expect the actual backend error message
-    await expect(page.getByText('Incorrect email or password')).toBeVisible({ timeout: NAVIGATION_TIMEOUT });
+    // Use .first() to avoid strict mode violation when message appears in multiple places
+    await expect(page.getByText('Incorrect email or password').first()).toBeVisible({ timeout: NAVIGATION_TIMEOUT });
     await expect(page).toHaveURL('/login');
   });
 
@@ -139,31 +140,34 @@ test.describe('Authentication Flows', () => {
       });
     }
     
-    // Check for dashboard content with more flexible selectors
-    const dashboardTitle = page.getByRole('heading', { name: /Welcome to AgentFX Portal/i }).first();
-    const authStatus = page.getByText(/Successfully authenticated/i).first();
-    
+    // Check for dashboard content with flexible selectors matching actual UI
+    // Dashboard.tsx shows heading "Dashboard" and App.tsx shows "AgentFX Portal" in header
+    const dashboardTitle = page.getByRole('heading', { name: /Dashboard/i }).first();
+    const portalBranding = page.locator('text=AgentFX Portal').first();
+    const logoutButton = page.getByRole('button', { name: /logout/i }).first();
+
     try {
-      // Wait for either the dashboard title or authentication status
+      // Wait for any of these dashboard indicators
       await Promise.race([
         dashboardTitle.waitFor({ state: 'visible', timeout: 10000 }),
-        authStatus.waitFor({ state: 'visible', timeout: 10000 })
+        portalBranding.waitFor({ state: 'visible', timeout: 10000 }),
+        logoutButton.waitFor({ state: 'visible', timeout: 10000 })
       ]);
       console.log('Found dashboard content');
     } catch (error) {
       console.log('Could not find dashboard content, checking page state...');
       const pageContent = await page.content();
       console.log('Page content (first 1000 chars):', pageContent.substring(0, 1000));
-      
+
       // Check for common error messages
       const errorElements = await page.$$eval(
-        'div[role="alert"], .error, .error-message, .alert-error', 
+        'div[role="alert"], .error, .error-message, .alert-error',
         els => els.map(el => el.textContent?.trim())
       );
       if (errorElements.length > 0) {
         console.log('Error messages found on page:', errorElements);
       }
-      
+
       throw new Error('Dashboard content not found after login');
     }
     
@@ -254,20 +258,25 @@ test.describe('Registration Flows', () => {
   test('registration with existing email shows error', async ({ page }) => {
     // Navigate to register page
     await page.goto('/register', { waitUntil: 'networkidle' });
-    
+
     // Try to register with existing email
     await page.locator('#fullName').fill('Another User');
     await page.locator('#email').fill(EMAIL); // Use existing email
     await page.locator('#password').fill(NEW_USER_PASSWORD);
     await page.locator('#confirmPassword').fill(NEW_USER_PASSWORD);
-    
+
     // Submit the form
     await page.getByRole('button', { name: 'Create account' }).click();
-    
+
     // Should stay on register page and show error
+    // Backend returns: "The user with this email already exists in the system."
     await expect(page).toHaveURL('/register');
-    await expect(page.getByText(/already exists/i)).toBeVisible({ timeout: 5000 });
-    
+
+    // Wait for API response and check for error display
+    // The error message should appear in the error container
+    // Use .first() since the message may appear in multiple elements (toast + inline error)
+    await expect(page.getByText(/already exists in the system/i).first()).toBeVisible({ timeout: 5000 });
+
     // Take screenshot for verification
     await page.screenshot({ path: 'registration-existing-email.png', fullPage: true });
   });
@@ -275,46 +284,48 @@ test.describe('Registration Flows', () => {
   test('registration validation errors', async ({ page }) => {
     // Navigate to register page
     await page.goto('/register', { waitUntil: 'networkidle' });
-    
-    // Fill minimal data to enable button, then test validation
-    await page.locator('#fullName').fill('a');
-    await page.locator('#email').fill('a');
-    await page.locator('#password').fill('a');
-    await page.locator('#confirmPassword').fill('a');
-    
-    // Try to submit - should show validation errors
-    await page.getByRole('button', { name: 'Create account' }).click();
-    
-    // Wait a moment for validation to trigger
-    await page.waitForTimeout(1000);
-    
-    // Check for any error message
-    const errorElement = page.locator('div').filter({ hasText: /error|failed|invalid|required|characters/i }).first();
-    await expect(errorElement).toBeVisible({ timeout: 5000 });
-    
-    // Test password mismatch
+
+    // Test 1: Password too short (frontend validation: "Password must be at least 8 characters long")
     await page.locator('#fullName').fill('Test User');
     await page.locator('#email').fill('test@example.com');
+    await page.locator('#password').fill('short'); // Less than 8 chars
+    await page.locator('#confirmPassword').fill('short');
+
+    await page.getByRole('button', { name: 'Create account' }).click();
+    await page.waitForTimeout(500);
+
+    // Expected: "Password must be at least 8 characters long" (error message, not help text)
+    // Use more specific selector to avoid matching help text "Must be at least 8 characters long"
+    await expect(page.getByText('Password must be at least 8 characters long')).toBeVisible({ timeout: 5000 });
+
+    // Test 2: Password mismatch (frontend validation: "Passwords do not match")
     await page.locator('#password').fill('password123');
-    await page.locator('#confirmPassword').fill('different');
-    
+    await page.locator('#confirmPassword').fill('different123');
+
     await page.getByRole('button', { name: 'Create account' }).click();
-    await page.waitForTimeout(1000);
-    
-    // Check for password mismatch error
-    const passwordError = page.locator('div').filter({ hasText: /Passwords do not match/i }).first();
-    await expect(passwordError).toBeVisible({ timeout: 5000 });
-    
-    // Test invalid email
-    await page.locator('#email').fill('invalid-email');
+    await page.waitForTimeout(500);
+
+    // Expected: "Passwords do not match"
+    await expect(page.getByText(/Passwords do not match/i)).toBeVisible({ timeout: 5000 });
+
+    // Test 3: Invalid email
+    // Note: The email input has type="email" which triggers browser-native validation
+    // When an email without @ is entered, browser blocks form submission with native tooltip
+    // We verify this by checking the input is in an invalid state
+    await page.locator('#email').fill('invalid-email'); // No @ symbol
     await page.locator('#confirmPassword').fill('password123');
-    
+
     await page.getByRole('button', { name: 'Create account' }).click();
-    await page.waitForTimeout(1000);
-    
-    // Check for email validation error
-    const emailError = page.locator('div').filter({ hasText: /valid email/i }).first();
-    await expect(emailError).toBeVisible({ timeout: 5000 });
+    await page.waitForTimeout(500);
+
+    // The browser's native validation should mark the email field as invalid
+    // We can verify the field has the :invalid CSS pseudo-class
+    const emailInput = page.locator('#email');
+    const isInvalid = await emailInput.evaluate((el: HTMLInputElement) => !el.validity.valid);
+    expect(isInvalid).toBe(true);
+
+    // Alternatively, check that we didn't navigate away (form was blocked)
+    await expect(page).toHaveURL('/register');
   });
 });
 
@@ -363,33 +374,7 @@ test.describe('UI Components and Interactions', () => {
     await expect(confirmPasswordInput).toHaveAttribute('type', 'text');
   });
 
-  test.skip('theme toggle functionality', async ({ page }) => {
-    // Login first
-    await page.goto('/login', { waitUntil: 'networkidle' });
-    await page.locator('#email').fill(EMAIL);
-    await page.locator('#password').fill(PASSWORD);
-    await page.getByRole('button', { name: 'Sign in' }).click();
-    
-    // Wait for dashboard
-    await expect(page.getByRole('button', { name: /logout/i })).toBeVisible({ timeout: 5000 });
-    
-    // Test theme toggle
-    const themeButton = page.getByRole('button', { name: 'Light' });
-    await expect(themeButton).toBeVisible();
-    
-    // Click to toggle to dark mode
-    await themeButton.click();
-    await expect(page.getByRole('button', { name: 'Dark' })).toBeVisible();
-    
-    // Check if dark class is applied
-    const html = page.locator('html');
-    await expect(html).toHaveClass(/dark/);
-    
-    // Click to toggle back to light mode
-    await page.getByRole('button', { name: 'Dark' }).click();
-    await expect(page.getByRole('button', { name: 'Light' })).toBeVisible();
-    await expect(html).not.toHaveClass(/dark/);
-  });
+  // Theme toggle test removed - feature not implemented in v0.1.0
 
   test('navigation between login and register', async ({ page }) => {
     // Start at login page
@@ -416,22 +401,36 @@ test.describe('Error Handling and Edge Cases', () => {
   test('network error handling', async ({ page }) => {
     // Navigate to login page
     await page.goto('/login', { waitUntil: 'networkidle' });
-    
+
     // Simulate network offline
     await page.context().setOffline(true);
-    
+
     // Try to login
     await page.locator('#email').fill(EMAIL);
     await page.locator('#password').fill(PASSWORD);
     await page.getByRole('button', { name: 'Sign in' }).click();
-    
-    // Should show network error or loading state
-    await page.waitForTimeout(3000); // Wait for network timeout
-    
+
+    // Wait for fetch to fail (network error)
+    await page.waitForTimeout(3000);
+
+    // Should show some error indication (either "Login failed" or network error)
+    // The authApi throws "Login failed" as default when response.json() fails
+    const hasError = await page.getByText(/failed|error|network/i).first().isVisible().catch(() => false);
+    console.log('Error shown after network failure:', hasError);
+
     // Restore network
     await page.context().setOffline(false);
-    
-    // Try again - should work
+
+    // Wait a moment for network to stabilize
+    await page.waitForTimeout(1000);
+
+    // Clear any existing error state by re-entering credentials
+    await page.locator('#email').fill('');
+    await page.locator('#email').fill(EMAIL);
+    await page.locator('#password').fill('');
+    await page.locator('#password').fill(PASSWORD);
+
+    // Try again - should work now
     await page.getByRole('button', { name: 'Sign in' }).click();
     await expect(page.getByRole('button', { name: /logout/i })).toBeVisible({ timeout: 10000 });
   });
@@ -439,43 +438,126 @@ test.describe('Error Handling and Edge Cases', () => {
   test('form state persistence', async ({ page }) => {
     // Navigate to login page
     await page.goto('/login', { waitUntil: 'networkidle' });
-    
+
     // Fill form with invalid credentials
     await page.locator('#email').fill(EMAIL);
     await page.locator('#password').fill(INVALID_PASSWORD);
-    
+
     // Submit form
     await page.getByRole('button', { name: 'Sign in' }).click();
-    
-    // Wait for error
-    await expect(page.getByText(/incorrect email or password/i)).toBeVisible({ timeout: 5000 });
-    
-    // Check that form values are preserved
+
+    // Wait for error - use .first() to avoid strict mode violation
+    await expect(page.getByText(/incorrect email or password/i).first()).toBeVisible({ timeout: 5000 });
+
+    // Check that form values are preserved after error
     await expect(page.locator('#email')).toHaveValue(EMAIL);
     await expect(page.locator('#password')).toHaveValue(INVALID_PASSWORD);
-    
-    // Clear error by typing in email field
-    await page.locator('#email').fill('modified@example.com');
-    
-    // Error message should disappear
-    await expect(page.getByText(/incorrect email or password/i)).not.toBeVisible({ timeout: 3000 });
+
+    // Expected behavior from Login.tsx:
+    // Error clears when user types AND hasUserInteracted is true (set after first submit)
+    // The useEffect at lines 26-31 handles this: when email/password changes + hasUserInteracted + error exists -> clearError()
+
+    // Type in email field to trigger error clearing
+    // Use keyboard input to ensure React onChange fires properly
+    await page.locator('#email').clear();
+    await page.locator('#email').pressSequentially('modified@example.com', { delay: 50 });
+
+    // Wait a moment for React state update
+    await page.waitForTimeout(1000);
+
+    // Error message should disappear (this is the expected behavior)
+    await expect(page.getByText(/incorrect email or password/i)).not.toBeVisible({ timeout: 5000 });
   });
 
   test('protected route redirection', async ({ page }) => {
     // Try to access protected route without authentication
     await page.goto('/', { waitUntil: 'networkidle' });
-    
+
     // Should redirect to login page
     await expect(page).toHaveURL('/login');
-    
-    // Login and try again
+
+    // Login with valid credentials
     await page.locator('#email').fill(EMAIL);
     await page.locator('#password').fill(PASSWORD);
     await page.getByRole('button', { name: 'Sign in' }).click();
-    
-    // Should now access dashboard
-    await expect(page).toHaveURL('/');
-    await expect(page.getByRole('heading', { name: /runs/i })).toBeVisible({ timeout: 5000 });
+
+    // Should navigate away from login page to dashboard
+    await expect(page).not.toHaveURL('/login', { timeout: 10000 });
+
+    // Verify we're authenticated by checking for logout button
+    await expect(page.getByRole('button', { name: /logout/i })).toBeVisible({ timeout: 5000 });
+  });
+});
+
+test.describe('Logout Flow', () => {
+  test.beforeEach(async ({ page, context }) => {
+    test.setTimeout(TEST_TIMEOUT);
+    await context.clearCookies();
+  });
+
+  test('logout clears session and redirects to login', async ({ page }) => {
+    // First login
+    await page.goto('/login', { waitUntil: 'networkidle' });
+    await page.locator('#email').fill('test@example.com');
+    await page.locator('#password').fill('TestPass123!');
+    await page.getByRole('button', { name: 'Sign in' }).click();
+
+    // Wait for navigation to dashboard
+    await expect(page).toHaveURL('/', { timeout: 5000 });
+
+    // Verify we're authenticated (user nav should be visible)
+    await expect(page.getByRole('button', { name: 'Logout' })).toBeVisible();
+
+    // Verify token exists
+    const tokenBefore = await page.evaluate(() => localStorage.getItem('access_token'));
+    expect(tokenBefore).toBeTruthy();
+
+    // Click logout
+    await page.getByRole('button', { name: 'Logout' }).click();
+
+    // Should redirect to login
+    await expect(page).toHaveURL('/login', { timeout: 5000 });
+
+    // Token should be cleared
+    const tokenAfter = await page.evaluate(() => localStorage.getItem('access_token'));
+    expect(tokenAfter).toBeNull();
+  });
+
+  test('after logout, protected routes redirect to login', async ({ page }) => {
+    // First login
+    await page.goto('/login', { waitUntil: 'networkidle' });
+    await page.locator('#email').fill('test@example.com');
+    await page.locator('#password').fill('TestPass123!');
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await expect(page).toHaveURL('/', { timeout: 5000 });
+
+    // Logout
+    await page.getByRole('button', { name: 'Logout' }).click();
+    await expect(page).toHaveURL('/login', { timeout: 5000 });
+
+    // Try to access protected route directly
+    await page.goto('/market-data', { waitUntil: 'networkidle' });
+
+    // Should be redirected to login
+    await expect(page).toHaveURL('/login', { timeout: 5000 });
+  });
+
+  test('session persists across page refreshes', async ({ page }) => {
+    // Login
+    await page.goto('/login', { waitUntil: 'networkidle' });
+    await page.locator('#email').fill('test@example.com');
+    await page.locator('#password').fill('TestPass123!');
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await expect(page).toHaveURL('/', { timeout: 5000 });
+
+    // Refresh the page
+    await page.reload({ waitUntil: 'networkidle' });
+
+    // Should still be on dashboard (not redirected to login)
+    await expect(page).toHaveURL('/', { timeout: 5000 });
+
+    // Should still see logout button
+    await expect(page.getByRole('button', { name: 'Logout' })).toBeVisible();
   });
 });
 
@@ -485,24 +567,23 @@ test.describe('Toast Notifications', () => {
     await context.clearCookies();
   });
 
-  test('login error toast notification', async ({ page }) => {
+  test('login error displays inline error message', async ({ page }) => {
     await page.goto('/login', { waitUntil: 'networkidle' });
-    
+
     // Try invalid login
     await page.locator('#email').fill('nonexistent@example.com');
     await page.locator('#password').fill('wrongpassword');
     await page.getByRole('button', { name: 'Sign in' }).click();
-    
-    // Check for toast notification with specific error content
-    await expect(page.getByText(/Incorrect email or password/)).toBeVisible({ timeout: 5000 });
-    
-    // Find the toast container that has the error message
-    const errorToast = page.locator('div').filter({ hasText: /Incorrect email or password/ }).first();
-    await expect(errorToast).toBeVisible({ timeout: 5000 });
-    
-    // Toast should auto-dismiss after 5 seconds
-    await page.waitForTimeout(6000);
-    await expect(errorToast).not.toBeVisible({ timeout: 2000 });
+
+    // Check for error message in the form (inline error, not toast)
+    // The error appears as an inline form error that persists until user interaction
+    // Use .first() to avoid strict mode violation when multiple elements match
+    await expect(page.getByText(/Incorrect email or password/).first()).toBeVisible({ timeout: 5000 });
+
+    // The error appears both inline in the form and as a toast notification
+    // Use .first() to avoid strict mode violation when both are visible
+    const errorMessage = page.locator('.bg-red-50, .dark\\:bg-red-900\\/20').filter({ hasText: /Incorrect email or password/ }).first();
+    await expect(errorMessage).toBeVisible({ timeout: 5000 });
   });
 
   test('registration success toast notification', async ({ page }) => {

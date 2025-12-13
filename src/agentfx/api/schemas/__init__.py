@@ -31,6 +31,23 @@ from .run import (
     RunMetrics,
     RunSignal,
 )
+from .market_data import (
+    Timeframe,
+    CandleBase,
+    CandleCreate,
+    CandleUpdate,
+    CandleInDBBase,
+    CandlePublic,
+    CandleList,
+    CandleBulkCreate,
+    MarketDataUpdateStatus,
+    MarketDataUpdateBase,
+    MarketDataUpdateCreate,
+    MarketDataUpdateInDB,
+    MarketDataUpdatePublic,
+    InstrumentInfo,
+    ExchangeInfo,
+)
 
 # Make schemas available at the package level
 __all__ = [
@@ -64,4 +81,20 @@ __all__ = [
     "RunEnvironment",
     "RunMetrics",
     "RunSignal",
+    # Market data related
+    "Timeframe",
+    "CandleBase",
+    "CandleCreate",
+    "CandleUpdate",
+    "CandleInDBBase",
+    "CandlePublic",
+    "CandleList",
+    "CandleBulkCreate",
+    "MarketDataUpdateStatus",
+    "MarketDataUpdateBase",
+    "MarketDataUpdateCreate",
+    "MarketDataUpdateInDB",
+    "MarketDataUpdatePublic",
+    "InstrumentInfo",
+    "ExchangeInfo",
 ]

@@ -13,7 +13,7 @@ MAXABS?=1
 MAXRATE?=60
 LOSS?=0.02
 
-.PHONY: venv install dev lock update precommit test test-unit test-integration test-e2e lint typecheck format backtest backtest-full portal-mock portal-mock-test portal-web-e2e
+.PHONY: venv install dev lock update precommit test test-unit test-integration test-e2e lint typecheck format backtest backtest-full portal-mock portal-mock-test portal-web-e2e start-backend start-frontend start-all e2e
 
 venv:
 	$(PY) -m venv $(VENV)
@@ -39,18 +39,54 @@ dev: install
 precommit:
 	$(VENV)/bin/pre-commit run --all-files
 
+# ============================================================================
+# TEST TARGETS
+# ============================================================================
+# Test execution requires proper environment configuration:
+# - Unit tests: ENVIRONMENT=test (uses .env.test but mocks database)
+# - Integration tests: ENVIRONMENT=test (uses .env.test with real PostgreSQL)
+# - E2E tests: Requires running backend/frontend servers (use 'make e2e')
+#
+# The ENVIRONMENT variable tells config.py which .env.* file to load.
+# ============================================================================
+
+# Run all tests (unit + integration)
+# Note: For E2E tests, use 'make e2e' which handles server lifecycle
 test:
-	PYTHONPATH=src $(VENV)/bin/pytest -q
+	ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/pytest -q --ignore=tests/e2e
 
-# Run only unit/integration/e2e tests (via markers)
+# Unit tests: Fast, isolated tests with mocked dependencies
+# These should not require a database connection
 test-unit:
-	PYTHONPATH=src $(VENV)/bin/pytest -q -m unit
+	ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/pytest -q -m unit
 
+# Integration tests: Tests with real database (PostgreSQL on port 5432)
+# Requires: PostgreSQL running locally or via 'docker-compose -f docker-compose.test.yml up -d'
 test-integration:
-	PYTHONPATH=src $(VENV)/bin/pytest -q -m integration
+	ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/pytest -q -m integration
 
+# E2E tests via pytest markers (for individual test runs)
+# Note: Prefer 'make e2e' for full E2E suite with server management
 test-e2e:
-	PYTHONPATH=src $(VENV)/bin/pytest -q -m e2e
+	ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/pytest -q -m e2e
+
+# Run tests with verbose output (useful for debugging)
+test-verbose:
+	ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/pytest -v --ignore=tests/e2e
+
+# Run tests without coverage (faster for quick checks)
+test-fast:
+	ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/pytest -q --no-cov --ignore=tests/e2e
+
+# Run a specific test file
+# Usage: make test-file FILE=tests/unit/market_data/test_market_data.py
+test-file:
+	ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/pytest -v $(FILE)
+
+# Run tests matching a pattern
+# Usage: make test-pattern PATTERN="test_auth"
+test-pattern:
+	ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/pytest -v -k "$(PATTERN)" --ignore=tests/e2e
 
 lint:
 	$(VENV)/bin/ruff .
@@ -66,12 +102,13 @@ format:
 .PHONY: dotenv run-backfill smoke
 
 dotenv:
-	@test -f .env || cp .env.example .env
+	@test -f .env.development || cp .env.example .env.development
 
 # Usage: make run-backfill PAIRS="AUDUSD,EURUSD" DAYS=2
 run-backfill: dev dotenv
 	set -a; \
-	source .env; \
+	export ENVIRONMENT=development; \
+	source .env.development; \
 	set +a; \
 	PYTHONPATH=src $(PYBIN) -m agentfx.services.cli backfill --pairs $(PAIRS) --start-days $(DAYS)
 
@@ -83,7 +120,8 @@ smoke:
 # Usage: make backtest PAIRS="AUDUSD,EURUSD" DAYS=2 [PERSIST=1]
 backtest: dev dotenv
 	set -a; \
-	source .env; \
+	export ENVIRONMENT=development; \
+	source .env.development; \
 	set +a; \
 	PYTHONPATH=src $(PYBIN) -m agentfx.services.cli backtest --pairs "$(PAIRS)" --start-days $(DAYS) $(if $(PERSIST),--persist,)
 
@@ -91,13 +129,15 @@ backtest: dev dotenv
 # Usage: make backtest-full PAIRS="AUDUSD,EURUSD" DAYS=2 STRATEGY=ma FAST=20 SLOW=50 SPREAD=0.5 SLIP=0.5 MAXABS=1 MAXRATE=60 LOSS=0.02 [PERSIST=1]
 backtest-full: dev dotenv
 	set -a; \
-	source .env; \
+	export ENVIRONMENT=development; \
+	source .env.development; \
 	set +a; \
 	PYTHONPATH=src $(PYBIN) -m agentfx.services.cli backtest --pairs "$(PAIRS)" --start-days $(DAYS) --strategy $(STRATEGY) --fast $(FAST) --slow $(SLOW) --spread-pips $(SPREAD) --slippage-pips $(SLIP) --max-abs-position $(MAXABS) --max-trades-per-hour $(MAXRATE) --daily-loss-threshold $(LOSS) $(if $(PERSIST),--persist,)
 
 # Run the FastAPI mock API for the portal
 # Usage: make portal-mock [HOST=127.0.0.1 PORT=8000]
 portal-mock: dev
+	export ENVIRONMENT=development; \
 	PYTHONPATH=src $(VENV)/bin/uvicorn agentfx.portal_mock.app:app --host $${HOST-127.0.0.1} --port $${PORT-8000} --reload
 
 # Run only the portal mock API tests
@@ -107,3 +147,26 @@ portal-mock-test: dev
 # Run frontend E2E tests (requires Vite dev server and mock API running)
 portal-web-e2e:
 	cd portal/web && BASE_URL=http://localhost:5173 npx playwright test -c playwright.config.ts
+
+# --- Server Startup ---
+# Start backend server (development mode)
+# Usage: make start-backend [ENV=development]
+ENV?=development
+start-backend:
+	ENVIRONMENT=$(ENV) ./scripts/start-backend.sh
+
+# Start frontend server (development mode)
+# Usage: make start-frontend [ENV=development]
+start-frontend:
+	ENVIRONMENT=$(ENV) ./scripts/start-frontend.sh
+
+# Start both backend and frontend servers
+# Usage: make start-all [ENV=development]
+start-all:
+	ENVIRONMENT=$(ENV) ./scripts/start-all.sh
+
+# --- E2E Testing ---
+# Run full E2E test suite (starts servers, runs tests, cleans up)
+# Usage: make e2e [E2E_HEADED=1] [E2E_DEBUG=1]
+e2e:
+	./scripts/run-e2e-tests.sh $(if $(E2E_HEADED),--headed,) $(if $(E2E_DEBUG),--debug,)

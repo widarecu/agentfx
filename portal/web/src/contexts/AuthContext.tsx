@@ -119,7 +119,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       if (token) {
         try {
           // Verify token with backend
-          const response = await fetch('/api/v1/auth/me', {
+          const response = await fetch('/api/v1/me', {
             headers: {
               'Authorization': `Bearer ${token}`,
               'Content-Type': 'application/json',
@@ -181,11 +181,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
       }
 
       const data = await response.json()
-      
-      // Store token
-      if (remember) {
-        localStorage.setItem('access_token', data.access_token)
-      }
+
+      // Always store token in localStorage for session persistence
+      // The 'remember' flag can be used for longer-term storage (e.g., cookies) in the future
+      localStorage.setItem('access_token', data.access_token)
 
       dispatch({
         type: 'LOGIN_SUCCESS',

@@ -10,20 +10,24 @@ import sys
 # Add the project root to the Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Import your models here so they're registered with SQLAlchemy
+# Import settings and models following architectural principles
+from src.agentfx.api.core.config import settings
 from src.agentfx.api.core.database import Base
+from src.agentfx.api.models import *  # Import all models for autogenerate
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
+
+# Override database URL from settings following architectural principles
+config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# add your model's MetaData object here
-# for 'autogenerate' support
+# Add our model's MetaData object for 'autogenerate' support
 target_metadata = Base.metadata
 
 # other values from the config, defined by the needs of env.py,

@@ -3,6 +3,7 @@ from .user import User, UserRole
 from .run import Run, Trade, Order, RunStatus, RunEnvironment
 from .market_data import Candle, MarketDataUpdate
 from .strategy import Strategy
+from .instrument import Instrument
 
 # Make models available at the package level
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "Strategy",
     "Candle",
     "MarketDataUpdate",
+    "Instrument",
 ]

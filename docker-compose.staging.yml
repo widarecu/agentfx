@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  postgres-staging:
+    image: postgres:15-alpine
+    container_name: agentfx-postgres-staging
+    environment:
+      POSTGRES_DB: agentfx_staging
+      POSTGRES_USER: agentfx_staging
+      POSTGRES_PASSWORD: agentfx_staging
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_staging_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentfx_staging -d agentfx_staging"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - staging-network
+
+volumes:
+  postgres_staging_data:
+
+networks:
+  staging-network:
+    driver: bridge
