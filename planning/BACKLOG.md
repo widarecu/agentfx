@@ -44,43 +44,50 @@ This backlog is organized by version milestone. Each item links to executable us
 
 ---
 
-## v0.2.0 - Parameter Optimizer Agent
+## v0.2.0 - Bayesian Parameter Optimizer Agent
 
-**Theme:** First autonomous capability - optimize strategy parameters
+**Theme:** First autonomous capability - optimize strategy parameters with Bayesian search
 
 ### P0 - Must Have
-- [ ] `TODO` Real-time WebSocket streaming (deferred from v0.1.0)
-  - Req: [US-013](requirements/US-013-websocket-streaming.md)
-  - Files: `src/agentfx/api/routers/websocket.py`, `portal/web/src/services/marketDataWebSocket.ts`
-
-- [ ] `TODO` Optimizer agent - Grid search over strategy params
+- [ ] `TODO` Bayesian Optimizer Agent - Efficient parameter search
   - Req: [US-001](requirements/US-001-optimization-runs.md)
   - Files: `src/agentfx/agents/optimizer.py`
+  - Uses scikit-learn GaussianProcessRegressor with Expected Improvement acquisition
 
-- [ ] `TODO` Experiment persistence - Store runs with lineage
+- [ ] `TODO` Trial persistence - Store runs with lineage and signals
   - Req: [US-001](requirements/US-001-optimization-runs.md)
-  - Files: `src/agentfx/api/models/experiment.py`
+  - Files: `src/agentfx/api/models/optimization.py`
 
-- [ ] `TODO` Optimization API endpoints
+- [ ] `TODO` Optimization API endpoints (`/api/v1/optimization-jobs`)
   - Req: [US-001](requirements/US-001-optimization-runs.md), [US-002](requirements/US-002-view-optimization.md)
-  - Files: `src/agentfx/api/routers/optimize.py`
+  - Files: `src/agentfx/api/routers/optimization.py`, `src/agentfx/api/schemas/optimization.py`
+  - Endpoints: POST (202 Accepted), GET list, GET detail, GET trials, GET signals
 
-- [ ] `TODO` Optimization portal page - View results
+- [ ] `TODO` Optimization portal pages - View jobs and results
   - Req: [US-002](requirements/US-002-view-optimization.md)
-  - Files: `portal/web/src/pages/Optimization.tsx`
+  - Files: `portal/web/src/pages/Optimization.tsx`, `portal/web/src/pages/OptimizationDetail.tsx`
 
-- [ ] `TODO` RunDetail page implementation
-  - Files: `portal/web/src/pages/RunDetail.tsx`
-  - Dependencies: `/api/pairs/`, `/api/runs/{id}/signals` endpoints
+- [ ] `TODO` Strategy visualization - Candlestick chart with signals
+  - Req: [US-015](requirements/US-015-visualization.md)
+  - Files: `portal/web/src/pages/TrialDetail.tsx`, `portal/web/src/components/StrategyChart.tsx`
+  - Features: OHLC candles, entry/exit markers, technical indicator overlays
+
+- [ ] `TODO` Backtest service - Read from PostgreSQL candles table
+  - Req: [US-001](requirements/US-001-optimization-runs.md)
+  - Files: `src/agentfx/services/backtest.py`
+  - Add `load_price_df_from_db()` to read from existing v0.1.0 candles infrastructure
 
 ### P1 - Should Have
-- [ ] `TODO` Bayesian optimization - Smarter param search
-  - Req: [US-001](requirements/US-001-optimization-runs.md) (enhancement)
-  - Files: `src/agentfx/agents/optimizer.py`
+- [ ] `TODO` Configurable backfill days for 5-year historical data
+  - Files: `src/agentfx/api/workers/candle_ingestion.py`, `src/agentfx/api/core/config.py`
+  - Make `INITIAL_BACKFILL_DAYS` configurable (default 7, max 1825)
 
 ### P2 - Could Have
 - [ ] `TODO` Optimization export - CSV/JSON download
-  - Files: `src/agentfx/api/routers/optimize.py`
+  - Files: `src/agentfx/api/routers/optimization.py`
+
+### Deferred Items
+- WebSocket streaming (US-013) - Deferred to TBD (use OANDA directly for real-time feeds)
 
 ---
 

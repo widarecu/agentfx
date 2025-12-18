@@ -4,6 +4,9 @@ import Login from './pages/Login'
 import Register from './pages/Register'
 import Dashboard from './pages/Dashboard'
 import MarketData from './pages/MarketData'
+import Optimization from './pages/Optimization'
+import OptimizationDetail from './pages/OptimizationDetail'
+import TrialDetail from './pages/TrialDetail'
 import { ProtectedRoute } from './components/ProtectedRoute'
 
 export const router = createBrowserRouter([
@@ -25,6 +28,9 @@ export const router = createBrowserRouter([
     children: [
       { index: true, element: <Dashboard /> },
       { path: 'market-data', element: <MarketData /> },
+      { path: 'optimization', element: <Optimization /> },
+      { path: 'optimization/:jobId', element: <OptimizationDetail /> },
+      { path: 'optimization/:jobId/trials/:trialId', element: <TrialDetail /> },
     ],
   },
 ], {
