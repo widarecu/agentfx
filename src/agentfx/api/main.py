@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 from starlette.middleware.base import BaseHTTPMiddleware
 from .core.config import settings
-from .routers import auth, runs, strategies, market_data
+from .routers import auth, runs, strategies, market_data, optimization
 import logging
 import logging.handlers
 import sys
@@ -144,6 +144,9 @@ app.include_router(market_data.router, prefix=settings.API_V1_STR, tags=["market
 app.include_router(runs.router, prefix=f"{settings.API_V1_STR}/runs", tags=["runs"])
 app.include_router(
     strategies.router, prefix=f"{settings.API_V1_STR}/strategies", tags=["strategies"]
+)
+app.include_router(
+    optimization.router, prefix=settings.API_V1_STR, tags=["optimization"]
 )
 
 

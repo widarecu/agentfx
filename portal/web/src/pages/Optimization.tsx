@@ -173,23 +173,29 @@ export default function Optimization() {
     setIsSubmitting(true);
 
     try {
-      // In the future, this will call the API to create a new optimization job
-      // For now, show a success message and close modal
-      console.log('Creating optimization job:', formData);
+      // Call the real API to create a new optimization job
+      const newJob = await optimizationApi.createJob({
+        strategy: formData.strategy,
+        pair: formData.pair,
+        accountBalance: formData.accountBalance,
+        positionSize: formData.positionSize,
+        dataYears: formData.dataYears,
+        paramRanges: formData.paramRanges,
+      });
 
-      // Simulate API call
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      console.log('Created optimization job:', newJob);
 
       // Close modal and refresh list
       setShowNewModal(false);
       setFormData(getDefaultFormData('ma'));
       fetchJobs();
 
-      // Show success message (in production, use toast notification)
-      alert('Optimization job created successfully! (Mock - backend implementation pending)');
+      // Show success message
+      alert(`Optimization job ${newJob.id} created successfully!`);
     } catch (err) {
       console.error('Failed to create optimization job:', err);
-      alert('Failed to create optimization job');
+      const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+      alert(`Failed to create optimization job: ${errorMessage}`);
     } finally {
       setIsSubmitting(false);
     }
@@ -526,11 +532,12 @@ export default function Optimization() {
 
       {/* New Optimization Modal */}
       {showNewModal && (
-        <div className="fixed inset-0 z-50 overflow-y-auto">
+        <div className="fixed inset-0 z-50 overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="modal-title">
           {/* Backdrop */}
           <div
             className="fixed inset-0 bg-black/50 transition-opacity"
             onClick={() => setShowNewModal(false)}
+            aria-hidden="true"
           />
 
           {/* Modal */}
@@ -543,7 +550,7 @@ export default function Optimization() {
                     <BarChart3 className="w-5 h-5 text-blue-600 dark:text-blue-400" />
                   </div>
                   <div>
-                    <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
+                    <h2 id="modal-title" className="text-lg font-semibold text-slate-900 dark:text-slate-100">
                       New Optimization Job
                     </h2>
                     <p className="text-sm text-slate-500 dark:text-slate-400">

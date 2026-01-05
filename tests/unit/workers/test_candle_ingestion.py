@@ -7,7 +7,6 @@ from unittest.mock import MagicMock, patch
 from src.agentfx.api.workers.candle_ingestion import (
     INSTRUMENTS,
     GRANULARITIES,
-    INITIAL_BACKFILL_DAYS,
     MAX_CANDLES_PER_REQUEST,
     _get_backfill_start_time,
     fetch_candles_range,
@@ -15,6 +14,7 @@ from src.agentfx.api.workers.candle_ingestion import (
     backfill_instrument,
     fetch_and_store_recent,
 )
+from src.agentfx.api.core.config import settings
 
 
 @pytest.mark.unit
@@ -37,8 +37,8 @@ class TestIngestionConfiguration:
         assert "H1" in GRANULARITIES
 
     def test_initial_backfill_days(self):
-        """Test that initial backfill is 7 days."""
-        assert INITIAL_BACKFILL_DAYS == 7
+        """Test that default backfill is 7 days (configurable via settings)."""
+        assert settings.BACKFILL_DAYS == 7
 
     def test_max_candles_per_request(self):
         """Test OANDA API pagination limit."""
@@ -50,13 +50,13 @@ class TestGetBackfillStartTime:
     """Test cases for _get_backfill_start_time helper."""
 
     def test_default_backfill_days(self):
-        """Test default 7-day backfill calculation."""
+        """Test default backfill calculation uses settings.BACKFILL_DAYS."""
         before = datetime.now(timezone.utc)
         result = _get_backfill_start_time()
         after = datetime.now(timezone.utc)
 
-        expected_start = before - timedelta(days=INITIAL_BACKFILL_DAYS)
-        expected_end = after - timedelta(days=INITIAL_BACKFILL_DAYS)
+        expected_start = before - timedelta(days=settings.BACKFILL_DAYS)
+        expected_end = after - timedelta(days=settings.BACKFILL_DAYS)
 
         assert expected_start <= result <= expected_end
 

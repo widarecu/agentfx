@@ -5,20 +5,53 @@ Tests require:
 - OANDA_API_KEY: Practice API key
 - OANDA_ACCOUNT_ID: Practice account ID
 - OANDA_API_HOST: api-fxpractice.oanda.com
+- Network access to OANDA API (no SSL interception)
 """
 
 import pytest
 import time
+import requests
 from datetime import datetime, timedelta, timezone
 
 from src.agentfx.adapters.oanda import OandaClient, OandaError, to_oanda_instrument
 from src.agentfx.api.core.config import settings
 
 
-# Skip if OANDA credentials are not configured
+def _oanda_is_reachable() -> tuple[bool, str]:
+    """Check if OANDA API is reachable without SSL issues.
+
+    Returns:
+        Tuple of (is_reachable, reason_if_not)
+    """
+    if not settings.OANDA_API_KEY or settings.OANDA_API_KEY == "your-api-key-here":
+        return False, "OANDA credentials not configured"
+
+    try:
+        # Quick connectivity test with timeout
+        requests.get(
+            f"https://{settings.OANDA_API_HOST}/v3/accounts",
+            headers={"Authorization": f"Bearer {settings.OANDA_API_KEY}"},
+            timeout=5,
+        )
+        # Any response (even 401) means we can reach OANDA
+        return True, ""
+    except requests.exceptions.SSLError as e:
+        return False, f"SSL error connecting to OANDA (likely network proxy): {e}"
+    except requests.exceptions.ConnectionError as e:
+        return False, f"Cannot connect to OANDA API: {e}"
+    except requests.exceptions.Timeout:
+        return False, "Connection to OANDA timed out"
+    except Exception as e:
+        return False, f"Unexpected error testing OANDA connectivity: {e}"
+
+
+# Check OANDA connectivity at module load time
+_oanda_reachable, _oanda_skip_reason = _oanda_is_reachable()
+
+# Skip all tests if OANDA is not reachable
 pytestmark = pytest.mark.skipif(
-    not settings.OANDA_API_KEY or settings.OANDA_API_KEY == "your-api-key-here",
-    reason="OANDA credentials not configured in environment",
+    not _oanda_reachable,
+    reason=_oanda_skip_reason,
 )
 
 

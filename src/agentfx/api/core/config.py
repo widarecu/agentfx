@@ -234,6 +234,12 @@ class Settings(BaseSettings):
         description="Interval in seconds between candle ingestion cycles",
     )
 
+    BACKFILL_DAYS: int = Field(
+        default=7,
+        env="BACKFILL_DAYS",
+        description="Days of historical data to backfill on startup (default 7, set to 1825 for 5 years)",
+    )
+
 
 # Create settings instance
 settings = Settings()

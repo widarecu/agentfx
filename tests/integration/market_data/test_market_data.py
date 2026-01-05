@@ -105,29 +105,42 @@ def db_cursor(real_db_session):
 
 @pytest.fixture(autouse=True)
 def cleanup_test_data(db_cursor):
-    """Clean up test data before and after each test."""
+    """Clean up test data before and after each test.
+
+    NOTE: Candles are EXCLUDED from cleanup. Historical candle data from OANDA
+    should persist across tests for backtesting and optimization tests to work.
+    Only user-created test data (users, runs, strategies, etc.) is cleaned up.
+    """
+    # Tables to clean - EXCLUDES candles (historical market data)
+    # Also excludes instruments (metadata seeded once)
+    tables_to_clean = [
+        "trades",
+        "orders",
+        "signals",
+        "runs",
+        "strategies",
+    ]
+
     # Clean up before test
     try:
-        # Clean up tables in order of dependencies
-        tables = [
-            "trades",
-            "orders",
-            "signals",
-            "candles",
-            "runs",
-            "strategies",
-            "users",
-        ]
-
-        for table in tables:
+        for table in tables_to_clean:
             try:
+                # Only delete test-created records (those with test-like names/emails)
                 db_cursor.execute(
-                    f"DELETE FROM {table} WHERE email LIKE 'test%' OR name LIKE 'test%' OR instrument LIKE 'EUR_%' OR instrument LIKE 'GBP_%' OR instrument LIKE 'USD_%'"
+                    f"DELETE FROM {table} WHERE email LIKE 'test%' OR email LIKE 'integration_%' OR name LIKE 'test%'"
                 )
                 db_cursor.connection.commit()
             except Exception:
                 db_cursor.connection.rollback()
                 pass  # Ignore cleanup errors before test
+
+        # Clean up test users separately (don't delete seeded users)
+        try:
+            db_cursor.execute("DELETE FROM users WHERE email LIKE 'integration_%'")
+            db_cursor.connection.commit()
+        except Exception:
+            db_cursor.connection.rollback()
+            pass
     except Exception:
         pass  # Ignore cleanup errors before test
 
@@ -135,15 +148,23 @@ def cleanup_test_data(db_cursor):
 
     # Clean up after test
     try:
-        for table in tables:
+        for table in tables_to_clean:
             try:
                 db_cursor.execute(
-                    f"DELETE FROM {table} WHERE email LIKE 'test%' OR name LIKE 'test%' OR instrument LIKE 'EUR_%' OR instrument LIKE 'GBP_%' OR instrument LIKE 'USD_%'"
+                    f"DELETE FROM {table} WHERE email LIKE 'test%' OR email LIKE 'integration_%' OR name LIKE 'test%'"
                 )
                 db_cursor.connection.commit()
             except Exception:
                 db_cursor.connection.rollback()
                 pass  # Ignore cleanup errors after test
+
+        # Clean up test users separately
+        try:
+            db_cursor.execute("DELETE FROM users WHERE email LIKE 'integration_%'")
+            db_cursor.connection.commit()
+        except Exception:
+            db_cursor.connection.rollback()
+            pass
     except Exception:
         pass  # Ignore cleanup errors after test
 

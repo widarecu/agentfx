@@ -109,7 +109,14 @@ class TestDatabaseManager:
         return self.connection
 
     def cleanup_test_data(self):
-        """Clean up test data between tests."""
+        """Clean up test data between tests.
+
+        NOTE: Candles and instruments are PRESERVED.
+        - Candles contain historical market data from OANDA needed for backtesting
+        - Instruments contain metadata seeded once at startup
+
+        Only test-created transactional data (orders, trades, runs, etc.) is cleaned.
+        """
         conn = self.get_connection()
 
         # Rollback any aborted transactions first
@@ -122,19 +129,18 @@ class TestDatabaseManager:
 
         try:
             # Delete from tables in dependency order (children first, parents last)
-            # This avoids needing superuser privileges for session_replication_role
+            # EXCLUDES: candles (historical data), instruments (metadata)
             tables_in_order = [
-                "candles",
                 "orders",
                 "trades",
                 "runs",
                 "strategies",
                 "market_data_updates",
-                "instruments",
-                "users",
             ]
 
-            print(f"Cleaning up tables: {tables_in_order}")
+            print(
+                f"Cleaning up tables (preserving candles/instruments): {tables_in_order}"
+            )
 
             for table in tables_in_order:
                 try:
@@ -145,8 +151,16 @@ class TestDatabaseManager:
                     print(f"Skipping {table}: {e}")
                     conn.rollback()
 
+            # Clean up only test-created users (preserve seeded users)
+            try:
+                cursor.execute("DELETE FROM users WHERE email LIKE 'integration_%'")
+                print(f"Deleted integration test users: {cursor.rowcount} rows")
+            except Exception as e:
+                print(f"Skipping user cleanup: {e}")
+                conn.rollback()
+
             conn.commit()
-            print("Database cleanup completed")
+            print("Database cleanup completed (candles/instruments preserved)")
         except Exception as e:
             print(f"Error during cleanup: {e}")
             conn.rollback()
@@ -291,11 +305,11 @@ def seed_test_candles(db_connection, seed_instruments):
 # - Proper dependency injection for testing production code paths
 # =============================================================================
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy.orm import sessionmaker, Session  # noqa: E402
 
 # Import database models and base
-from src.agentfx.api.core.database import Base
+from src.agentfx.api.core.database import Base  # noqa: E402
 
 
 @pytest.fixture(scope="session")

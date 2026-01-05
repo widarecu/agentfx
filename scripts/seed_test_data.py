@@ -24,7 +24,7 @@ def get_database_url():
     """Get database URL from environment or use test default."""
     return os.getenv(
         "DATABASE_URL",
-        "postgresql://test_user:test_password@localhost:5433/agentfx_test",
+        "postgresql://test_user:test_password@localhost:5432/agentfx_test",
     )
 
 

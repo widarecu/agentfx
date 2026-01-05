@@ -184,31 +184,36 @@ def test_strategy_with_feature_flag():
 
 ## Running Tests
 
+> **IMPORTANT:** See `CLAUDE.md` for canonical test execution commands.
+> Always use Makefile targets (`make test-unit`, `make test-integration`, `make e2e`)
+> to ensure proper environment configuration.
+
 ### Development Workflow
 ```bash
 # Fast feedback during development
-pytest tests/unit/ -m "not slow"
+make test-unit
 
 # Full test suite before PR
-pytest tests/unit/ tests/integration/
+make test
 
 # E2E tests before main branch
-cd portal/web && npm run test:e2e
+make e2e
 ```
 
 ### CI/CD Pipeline
 ```bash
 # Pull Request
-pytest tests/unit/ tests/integration/ --maxfail=1
+make test
 
 # Main Branch
-pytest tests/unit/ tests/integration/ --maxfail=1
-npm run test:e2e
+make test
+make e2e
 
 # Release
-pytest tests/unit/ tests/integration/ --maxfail=1
-npm run test:e2e
-pytest tests/performance/ --maxfail=1
+make test
+make e2e
+# Performance tests (manual)
+ENVIRONMENT=test PYTHONPATH=src .venv/bin/pytest tests/performance/ --maxfail=1
 ```
 
 ## Test Data and Results Management

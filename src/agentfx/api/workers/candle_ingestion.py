@@ -15,7 +15,6 @@ This worker handles ALL candle data operations.
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional
 
 from ..core.config import settings
 
@@ -34,7 +33,7 @@ MAX_BACKOFF_SECONDS = 300  # Max 5 minutes between retries
 INITIAL_BACKOFF_SECONDS = 5
 
 # Backfill configuration
-INITIAL_BACKFILL_DAYS = 7  # Days of history on first startup
+# BACKFILL_DAYS is now configurable via settings.BACKFILL_DAYS (default 7, set to 1825 for 5 years)
 MAX_CANDLES_PER_REQUEST = 500  # OANDA API limit
 
 # Granularity to seconds mapping for time-based pagination
@@ -64,9 +63,14 @@ GRANULARITY_SECONDS = {
 }
 
 
-def _get_backfill_start_time(days: int = INITIAL_BACKFILL_DAYS) -> datetime:
-    """Calculate backfill start time based on configured days."""
-    return datetime.now(timezone.utc) - timedelta(days=days)
+def _get_backfill_start_time(days: int | None = None) -> datetime:
+    """Calculate backfill start time based on configured days.
+
+    Args:
+        days: Number of days to backfill. If None, uses settings.BACKFILL_DAYS.
+    """
+    backfill_days = days if days is not None else settings.BACKFILL_DAYS
+    return datetime.now(timezone.utc) - timedelta(days=backfill_days)
 
 
 def fetch_candles_range(
@@ -250,7 +254,7 @@ def backfill_instrument(instrument: str, granularity: str, db=None) -> int:
             from_time = _get_backfill_start_time()
             logger.info(
                 f"No existing data for {instrument}:{granularity}, "
-                f"backfilling {INITIAL_BACKFILL_DAYS} days of history"
+                f"backfilling {settings.BACKFILL_DAYS} days of history"
             )
         else:
             # Gap fill from last candle

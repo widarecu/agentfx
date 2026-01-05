@@ -21,19 +21,15 @@ echo "========================================"
 case $ENVIRONMENT in
     development|dev)
         ENVIRONMENT=development
-        DOCKER_COMPOSE_FILE=docker-compose.development.yml
         ;;
     test|testing)
         ENVIRONMENT=test
-        DOCKER_COMPOSE_FILE=docker-compose.test.yml
         ;;
     staging|stage)
         ENVIRONMENT=staging
-        DOCKER_COMPOSE_FILE=docker-compose.staging.yml
         ;;
     production|prod)
         ENVIRONMENT=production
-        DOCKER_COMPOSE_FILE=docker-compose.production.yml
         ;;
     *)
         echo "Error: Invalid environment: $ENVIRONMENT"
@@ -44,7 +40,6 @@ esac
 
 echo "Environment: $ENVIRONMENT"
 echo "Config file: .env.$ENVIRONMENT"
-echo "Docker Compose: $DOCKER_COMPOSE_FILE"
 echo "========================================"
 
 # Set environment variable - config.py will load .env.{ENVIRONMENT}
@@ -107,40 +102,22 @@ fi
 # Try connecting via psql if available
 if command -v psql > /dev/null 2>&1 || [ -x "/opt/homebrew/opt/postgresql@15/bin/psql" ]; then
     PSQL_BIN="${PSQL_BIN:-$(command -v psql 2>/dev/null || echo '/opt/homebrew/opt/postgresql@15/bin/psql')}"
-    if PGPASSWORD=test_password $PSQL_BIN -h localhost -p $DB_PORT -U $DB_USER -d $DB_NAME -c "SELECT 1" > /dev/null 2>&1; then
+    if PGPASSWORD=$DB_PASSWORD $PSQL_BIN -h localhost -p $DB_PORT -U $DB_USER -d $DB_NAME -c "SELECT 1" > /dev/null 2>&1; then
         echo "Local PostgreSQL is ready on port $DB_PORT!"
         DB_READY=true
     fi
 fi
 
-# Fall back to Docker if local PostgreSQL not available
 if [ "$DB_READY" != "true" ]; then
-    echo "Local PostgreSQL not accessible, trying Docker..."
-    echo "Starting database container..."
-    if docker-compose -f $DOCKER_COMPOSE_FILE up -d 2>/dev/null; then
-        echo "Database container started"
-
-        # Wait for Docker database to be ready
-        echo "Waiting for database..."
-        max_attempts=30
-        attempt=0
-        while [ $attempt -lt $max_attempts ]; do
-            if docker-compose -f $DOCKER_COMPOSE_FILE exec -T $(docker-compose -f $DOCKER_COMPOSE_FILE config --services 2>/dev/null | head -1) pg_isready > /dev/null 2>&1; then
-                echo "Database is ready!"
-                DB_READY=true
-                break
-            fi
-            attempt=$((attempt + 1))
-            sleep 1
-        done
-    else
-        echo "Warning: Could not start database container"
-    fi
-fi
-
-if [ "$DB_READY" != "true" ]; then
-    echo "Warning: Could not verify database readiness"
-    echo "Continuing anyway - database configuration from .env.$ENVIRONMENT will be used"
+    echo "Error: Local PostgreSQL not available on port $DB_PORT"
+    echo "Please start local PostgreSQL: brew services start postgresql@15"
+    echo ""
+    echo "To set up the database for environment '$ENVIRONMENT':"
+    echo "  createdb -U postgres $DB_NAME"
+    echo "  createuser -U postgres $DB_USER"
+    echo "  psql -U postgres -c \"ALTER USER $DB_USER WITH PASSWORD '$DB_PASSWORD';\""
+    echo "  psql -U postgres -c \"GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;\""
+    exit 1
 fi
 
 # Apply database migrations

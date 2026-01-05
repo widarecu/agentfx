@@ -54,10 +54,14 @@ class MarketDataService:
         candles_data: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """
-        Validate and clean a list of candle data.
-        Returns only valid candles, logs warnings for invalid ones.
+        Validate, clean, and deduplicate a list of candle data.
+        Returns only valid, unique candles, logs warnings for invalid/duplicate ones.
+
+        Deduplication: When duplicate timestamps exist, keeps the last occurrence
+        (assuming later data is more up-to-date from API responses).
         """
-        valid_candles = []
+        # Use dict to deduplicate by timestamp - last occurrence wins
+        candles_by_timestamp: dict[str, dict[str, Any]] = {}
         invalid_count = 0
 
         for i, candle in enumerate(candles_data):
@@ -78,7 +82,9 @@ class MarketDataService:
                 if "spread" in candle:
                     cleaned_candle["spread"] = float(candle["spread"])
 
-                valid_candles.append(cleaned_candle)
+                # Store by timestamp, overwriting duplicates
+                ts_key = str(candle["timestamp"])
+                candles_by_timestamp[ts_key] = cleaned_candle
 
             except ValueError as e:
                 invalid_count += 1
@@ -90,7 +96,14 @@ class MarketDataService:
                 f"Rejected {invalid_count} invalid candles out of {len(candles_data)} total"
             )
 
-        return valid_candles
+        # Count duplicates removed
+        duplicates_removed = (
+            len(candles_data) - invalid_count - len(candles_by_timestamp)
+        )
+        if duplicates_removed > 0:
+            logger.debug(f"Removed {duplicates_removed} duplicate candles by timestamp")
+
+        return list(candles_by_timestamp.values())
 
     @staticmethod
     def get_candles(
@@ -198,6 +211,8 @@ class MarketDataService:
             return []
 
         result = []
+        created_count = 0
+        updated_count = 0
 
         for candle_data in validated_candles:
             # Check if candle already exists
@@ -220,6 +235,7 @@ class MarketDataService:
                     existing.run_id = run_id
                 db.add(existing)
                 result.append(existing)
+                updated_count += 1
             elif not existing:
                 # Create new candle
                 db_candle = models.Candle(
@@ -231,12 +247,23 @@ class MarketDataService:
                 )
                 db.add(db_candle)
                 result.append(db_candle)
+                created_count += 1
 
         try:
             db.commit()
-            logger.info(
-                f"Successfully created/updated {len(result)} candles for {instrument}:{timeframe}"
-            )
+            # Log with distinction between created and updated
+            if created_count > 0 and updated_count > 0:
+                logger.info(
+                    f"Successfully created {created_count} new, updated {updated_count} existing candles for {instrument}:{timeframe}"
+                )
+            elif created_count > 0:
+                logger.info(
+                    f"Successfully created {created_count} candles for {instrument}:{timeframe}"
+                )
+            elif updated_count > 0:
+                logger.debug(
+                    f"Updated {updated_count} existing candles for {instrument}:{timeframe} (no new data)"
+                )
         except Exception as e:
             db.rollback()
             logger.error(f"Failed to commit candles: {e}")
@@ -345,7 +372,7 @@ class MarketDataService:
         # Query the instruments table which is seeded by seed_instruments.py
         # This ensures instruments are available even before candle data is ingested
         query = db.query(models.Instrument.symbol).filter(
-            models.Instrument.is_active == True
+            models.Instrument.is_active.is_(True)
         )
 
         instruments = [row[0] for row in query.all()]
