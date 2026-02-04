@@ -57,11 +57,19 @@ class OptimizationJob(Base):
     )  # Format: optjob_{timestamp}_{short_uuid}
 
     # Job configuration
-    strategy = Column(SQLEnum(StrategyType), nullable=False, index=True)
+    strategy = Column(
+        SQLEnum(StrategyType, values_callable=lambda x: [e.value for e in x]),
+        nullable=False,
+        index=True,
+    )
     pair = Column(String(10), nullable=False, index=True)  # EUR_USD, GBP_USD, etc.
 
     # Status and progress
-    status = Column(SQLEnum(JobStatus), default=JobStatus.QUEUED, index=True)
+    status = Column(
+        SQLEnum(JobStatus, values_callable=lambda x: [e.value for e in x]),
+        default=JobStatus.QUEUED,
+        index=True,
+    )
     progress = Column(Integer, default=0)  # 0-100
     estimated_iterations = Column(Integer, nullable=False)
     completed_iterations = Column(Integer, default=0)

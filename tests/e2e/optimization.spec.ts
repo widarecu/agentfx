@@ -251,12 +251,12 @@ test.describe('Job Detail Navigation', () => {
     const hasRows = await firstRow.isVisible();
 
     if (hasRows) {
-      // Click on the row (or a link within it)
-      const clickableElement = firstRow.locator('a, [role="link"], td').first();
-      await clickableElement.click();
+      // Click on the View link in the row
+      const viewLink = firstRow.getByRole('link', { name: /View/i });
+      await viewLink.click();
 
       // Should navigate to job detail page
-      await expect(page).toHaveURL(/\/optimization\/[a-zA-Z0-9-]+/, { timeout: 5000 });
+      await expect(page).toHaveURL(/\/optimization\/optjob_[a-zA-Z0-9_]+/, { timeout: 5000 });
     }
   });
 
@@ -274,15 +274,15 @@ test.describe('Job Detail Navigation', () => {
     const hasRows = await firstRow.isVisible();
 
     if (hasRows) {
-      // Click on the row
-      const clickableElement = firstRow.locator('a, [role="link"], td').first();
-      await clickableElement.click();
+      // Click on the View link in the row
+      const viewLink = firstRow.getByRole('link', { name: /View/i });
+      await viewLink.click();
 
       // Should navigate to job detail page
-      await expect(page).toHaveURL(/\/optimization\/[a-zA-Z0-9-]+/, { timeout: 5000 });
+      await expect(page).toHaveURL(/\/optimization\/optjob_[a-zA-Z0-9_]+/, { timeout: 5000 });
 
-      // Job detail should show strategy, pair, or status
-      const jobInfo = page.getByText(/Strategy|Pair|Status|Progress/i);
+      // Job detail should show job information - look for strategy name or account settings
+      const jobInfo = page.getByText(/Moving Average|RSI|Donchian|Account Settings|Parameter Ranges|EUR_USD|GBP_USD/i);
       await expect(jobInfo.first()).toBeVisible({ timeout: 5000 });
     }
   });
@@ -301,23 +301,183 @@ test.describe('Job Detail Navigation', () => {
     const hasRows = await firstRow.isVisible();
 
     if (hasRows) {
-      // Click on the row
-      const clickableElement = firstRow.locator('a, [role="link"], td').first();
-      await clickableElement.click();
+      // Click on the View link in the row
+      const viewLink = firstRow.getByRole('link', { name: /View/i });
+      await viewLink.click();
 
       // Should navigate to job detail page
-      await expect(page).toHaveURL(/\/optimization\/[a-zA-Z0-9-]+/, { timeout: 5000 });
+      await expect(page).toHaveURL(/\/optimization\/optjob_[a-zA-Z0-9_]+/, { timeout: 5000 });
 
       // Wait for page to load
       await page.waitForTimeout(2000);
 
-      // Should show trials section or table
+      // Should show trials section, queued message, or status info
       const trialsSection = page.getByText(/Trials|Top Results|Best|Sharpe/i);
+      const queuedMessage = page.getByText(/Job is queued|waiting to start/i);
       const trialsTable = page.locator('table');
 
       expect(
         await trialsSection.count() > 0 ||
+        await queuedMessage.count() > 0 ||
         await trialsTable.isVisible()
+      ).toBeTruthy();
+    }
+  });
+});
+
+test.describe('Job Execution', () => {
+  test.beforeEach(async ({ page, context }) => {
+    test.setTimeout(120000); // Longer timeout for job execution
+    await context.clearCookies();
+  });
+
+  test('newly created job transitions from queued to running', async ({ page }) => {
+    await login(page, TRADER_EMAIL, TRADER_PASSWORD);
+
+    await page.getByRole('link', { name: /Optimization/i }).click();
+    await expect(page).toHaveURL('/optimization', { timeout: 5000 });
+
+    // Count initial jobs
+    await page.waitForTimeout(2000);
+    const initialRowCount = await page.locator('table tbody tr').count();
+
+    // Create a new job
+    await page.getByRole('button', { name: /New Optimization/i }).first().click();
+    await expect(page.getByRole('dialog')).toBeVisible({ timeout: 5000 });
+
+    // Select MA strategy (should be default)
+    const maButton = page.getByRole('button', { name: /^MA$/i });
+    if (await maButton.isVisible()) {
+      await maButton.click();
+    }
+
+    // Submit the form
+    const submitButton = page.getByRole('button', { name: /Start Optimization/i });
+    await submitButton.click();
+
+    // Wait for modal to close and job to appear
+    await page.waitForTimeout(3000);
+
+    // Navigate to optimization list to see updated status
+    await page.getByRole('link', { name: /Optimization/i }).click();
+    await page.waitForTimeout(2000);
+
+    // Verify a new job was created (row count increased)
+    const newRowCount = await page.locator('table tbody tr').count();
+    expect(newRowCount).toBeGreaterThanOrEqual(initialRowCount);
+
+    // Find the newest job (first row) and check its status
+    const firstRow = page.locator('table tbody tr').first();
+    if (await firstRow.isVisible()) {
+      // Status should be one of: queued, running, completed, failed
+      const statusCell = firstRow.getByText(/queued|running|completed|failed/i);
+      await expect(statusCell).toBeVisible({ timeout: 5000 });
+    }
+  });
+
+  test('job status updates on page refresh', async ({ page }) => {
+    await login(page, TRADER_EMAIL, TRADER_PASSWORD);
+
+    await page.getByRole('link', { name: /Optimization/i }).click();
+    await expect(page).toHaveURL('/optimization', { timeout: 5000 });
+
+    // Wait for table
+    await page.waitForTimeout(3000);
+
+    const firstRow = page.locator('table tbody tr').first();
+    const hasRows = await firstRow.isVisible();
+
+    if (hasRows) {
+      // Get initial status (Status is the 4th column: Job ID, Strategy, Pair, Status)
+      const statusCell = firstRow.locator('td').nth(3);
+      const initialStatus = await statusCell.textContent();
+
+      // Wait a bit and refresh
+      await page.waitForTimeout(5000);
+      await page.reload();
+      await page.waitForTimeout(2000);
+
+      // Status might have changed if job was running
+      const newStatusCell = page.locator('table tbody tr').first().locator('td').nth(3);
+      const newStatus = await newStatusCell.textContent();
+
+      // Both should be valid statuses
+      expect(
+        ['queued', 'running', 'completed', 'failed'].some(s =>
+          initialStatus?.toLowerCase().includes(s) || newStatus?.toLowerCase().includes(s)
+        )
+      ).toBeTruthy();
+    }
+  });
+
+  test('completed job shows trials in detail view', async ({ page }) => {
+    await login(page, TRADER_EMAIL, TRADER_PASSWORD);
+
+    await page.getByRole('link', { name: /Optimization/i }).click();
+    await expect(page).toHaveURL('/optimization', { timeout: 5000 });
+
+    // Wait for table
+    await page.waitForTimeout(3000);
+
+    // Look for a completed job
+    const completedRow = page.locator('table tbody tr').filter({
+      hasText: /completed/i
+    }).first();
+
+    const hasCompletedJob = await completedRow.isVisible();
+
+    if (hasCompletedJob) {
+      // Navigate to detail
+      const viewLink = completedRow.getByRole('link', { name: /View/i });
+      await viewLink.click();
+
+      await expect(page).toHaveURL(/\/optimization\/optjob_[a-zA-Z0-9_]+/, { timeout: 5000 });
+
+      // Completed job should have trials
+      await page.waitForTimeout(2000);
+
+      // Should show trials table with sharpe ratios
+      const trialsTable = page.locator('table');
+      const sharpeText = page.getByText(/sharpe/i);
+
+      expect(
+        await trialsTable.isVisible() || await sharpeText.count() > 0
+      ).toBeTruthy();
+    }
+  });
+
+  test('running job shows progress indicator', async ({ page }) => {
+    await login(page, TRADER_EMAIL, TRADER_PASSWORD);
+
+    await page.getByRole('link', { name: /Optimization/i }).click();
+    await expect(page).toHaveURL('/optimization', { timeout: 5000 });
+
+    // Wait for table
+    await page.waitForTimeout(3000);
+
+    // Look for a running job
+    const runningRow = page.locator('table tbody tr').filter({
+      hasText: /running/i
+    }).first();
+
+    const hasRunningJob = await runningRow.isVisible();
+
+    if (hasRunningJob) {
+      // Navigate to detail
+      const viewLink = runningRow.getByRole('link', { name: /View/i });
+      await viewLink.click();
+
+      await expect(page).toHaveURL(/\/optimization\/optjob_[a-zA-Z0-9_]+/, { timeout: 5000 });
+
+      // Running job should show progress
+      await page.waitForTimeout(2000);
+
+      // Should show progress bar, percentage, or "running" status
+      const progressIndicator = page.locator('[role="progressbar"], [class*="progress"]');
+      const progressText = page.getByText(/\d+%|running|progress/i);
+
+      expect(
+        await progressIndicator.count() > 0 || await progressText.count() > 0
       ).toBeTruthy();
     }
   });

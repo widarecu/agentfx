@@ -35,16 +35,39 @@ def auth_test_db():
     """Setup test database for auth integration tests.
 
     Uses transaction-based cleanup for test isolation.
+    Cleans up BEFORE and AFTER tests to handle leftover data from previous runs.
     """
     # Ensure tables exist
     Base.metadata.create_all(bind=engine)
 
-    yield
-
-    # Clean up test data (delete users created during tests)
+    # Clean up any leftover test data BEFORE test runs
     db = TestingSessionLocal()
     try:
-        db.query(User).delete()
+        # Only delete test-specific users (not seeded users needed by E2E)
+        test_emails = [
+            "newuser@example.com",
+            "flowtest@example.com",
+        ]
+        for email in test_emails:
+            db.query(User).filter(User.email == email).delete()
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+    yield
+
+    # Clean up test data AFTER test (delete users created during tests)
+    db = TestingSessionLocal()
+    try:
+        # Only delete test-specific users
+        test_emails = [
+            "newuser@example.com",
+            "flowtest@example.com",
+        ]
+        for email in test_emails:
+            db.query(User).filter(User.email == email).delete()
         db.commit()
     except Exception:
         db.rollback()

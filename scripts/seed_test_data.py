@@ -79,14 +79,21 @@ def seed_test_users(db_url: str):
         ]
 
         created_count = 0
-        skipped_count = 0
+        updated_count = 0
 
         for user_data in test_users:
             # Check if user already exists
             existing = db.query(User).filter(User.email == user_data["email"]).first()
             if existing:
-                print(f"  Skipped (exists): {user_data['email']}")
-                skipped_count += 1
+                # Update existing user to ensure correct password and settings
+                existing.hashed_password = get_password_hash(user_data["password"])
+                existing.full_name = user_data["full_name"]
+                existing.role = user_data["role"]
+                existing.is_active = user_data["is_active"]
+                print(
+                    f"  Updated: {user_data['email']} (role: {user_data['role'].value})"
+                )
+                updated_count += 1
                 continue
 
             # Create new user
@@ -102,7 +109,7 @@ def seed_test_users(db_url: str):
             created_count += 1
 
         db.commit()
-        print(f"\nSummary: {created_count} created, {skipped_count} skipped")
+        print(f"\nSummary: {created_count} created, {updated_count} updated")
 
     except Exception as e:
         db.rollback()

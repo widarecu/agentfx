@@ -13,6 +13,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@playwright/test": "^1.57.0",
     "@vueuse/core": "^14.0.0",
     "axios": "^1.13.2",
     "lightweight-charts": "4.2.2",

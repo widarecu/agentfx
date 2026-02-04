@@ -62,9 +62,15 @@ async def lifespan(app: FastAPI):
 
     # Start candle ingestion worker
     from .workers.candle_ingestion import start_ingestion_worker, stop_ingestion_worker
+    from .workers.optimization_runner import recover_queued_jobs
 
     await start_ingestion_worker()
     logger.info("Candle ingestion worker started")
+
+    # Recover any queued optimization jobs from previous runs
+    recovered = await recover_queued_jobs()
+    if recovered > 0:
+        logger.info(f"Scheduled {recovered} optimization jobs for recovery")
 
     yield  # App runs here
 

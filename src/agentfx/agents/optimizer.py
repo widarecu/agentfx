@@ -322,8 +322,8 @@ class BayesianOptimizerAgent(BaseAgent):
             # Round to reasonable precision
             val = p_min + normalized[i] * (p_max - p_min)
             # Round to step if specified
-            if "step" in param_ranges[name]:
-                step = param_ranges[name]["step"]
+            step = param_ranges[name].get("step")
+            if step is not None:
                 val = round(val / step) * step
             params[name] = val
         return params
@@ -379,9 +379,9 @@ class BayesianOptimizerAgent(BaseAgent):
             for name, bounds in param_ranges.items():
                 p_min = bounds["min"]
                 p_max = bounds["max"]
-                if "step" in bounds:
+                step = bounds.get("step")
+                if step is not None:
                     # Discrete parameter
-                    step = bounds["step"]
                     n_steps = int((p_max - p_min) / step) + 1
                     val = p_min + np.random.randint(0, n_steps) * step
                 else:

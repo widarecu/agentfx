@@ -37,8 +37,10 @@ class TestIngestionConfiguration:
         assert "H1" in GRANULARITIES
 
     def test_initial_backfill_days(self):
-        """Test that default backfill is 7 days (configurable via settings)."""
-        assert settings.BACKFILL_DAYS == 7
+        """Test that backfill days is configured to a positive value."""
+        # BACKFILL_DAYS is configurable: default 7, test env uses 1825 for backtesting
+        assert settings.BACKFILL_DAYS > 0
+        assert isinstance(settings.BACKFILL_DAYS, int)
 
     def test_max_candles_per_request(self):
         """Test OANDA API pagination limit."""

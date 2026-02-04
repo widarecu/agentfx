@@ -204,7 +204,8 @@ export function formatPercent(value: number, decimals: number = 1): string {
   return `${(value * 100).toFixed(decimals)}%`;
 }
 
-export function formatSharpe(value: number): string {
+export function formatSharpe(value: number | null | undefined): string {
+  if (value == null) return '-';
   return value.toFixed(2);
 }
 

@@ -14,6 +14,7 @@ from .. import models, schemas
 from ..core.database import get_db
 from ..services import optimization as optimization_service
 from ..services import user as user_service
+from ..workers import run_optimization
 
 router = APIRouter()
 
@@ -84,8 +85,8 @@ def create_optimization_job(
         created_by=current_user.id,
     )
 
-    # TODO: Schedule background optimization task
-    # background_tasks.add_task(run_optimization, db_job.id)
+    # Schedule background optimization task
+    background_tasks.add_task(run_optimization, db_job.id)
 
     return {
         "job_id": db_job.id,
