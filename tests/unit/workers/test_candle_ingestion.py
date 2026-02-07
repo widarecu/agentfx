@@ -5,14 +5,15 @@ from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 
 from src.agentfx.api.workers.candle_ingestion import (
-    INSTRUMENTS,
-    GRANULARITIES,
     MAX_CANDLES_PER_REQUEST,
+    LARGE_GAP_CHUNK_DAYS,
+    LARGE_GAP_THRESHOLD_SECONDS,
     _get_backfill_start_time,
     fetch_candles_range,
     store_candles,
     backfill_instrument,
     fetch_and_store_recent,
+    heal_large_gap,
 )
 from src.agentfx.api.core.config import settings
 
@@ -23,18 +24,18 @@ class TestIngestionConfiguration:
 
     def test_supported_instruments_count(self):
         """Test that we have exactly 6 supported instruments."""
-        assert len(INSTRUMENTS) == 6
+        assert len(settings.instruments_list) == 6
 
     def test_supported_instruments_list(self):
         """Test that all expected instruments are configured."""
         expected = {"EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CHF", "USD_CAD"}
-        assert set(INSTRUMENTS) == expected
+        assert set(settings.instruments_list) == expected
 
     def test_granularities_configured(self):
         """Test that multiple granularities are configured."""
-        assert len(GRANULARITIES) >= 4
-        assert "M1" in GRANULARITIES
-        assert "H1" in GRANULARITIES
+        assert len(settings.granularities_list) >= 4
+        assert "M1" in settings.granularities_list
+        assert "H1" in settings.granularities_list
 
     def test_initial_backfill_days(self):
         """Test that backfill days is configured to a positive value."""
@@ -45,6 +46,15 @@ class TestIngestionConfiguration:
     def test_max_candles_per_request(self):
         """Test OANDA API pagination limit."""
         assert MAX_CANDLES_PER_REQUEST == 500
+
+    def test_large_gap_threshold_is_7_days(self):
+        """Test that large gap threshold is 7 days (604800 seconds)."""
+        assert LARGE_GAP_THRESHOLD_SECONDS == 604800  # 7 days in seconds
+        assert LARGE_GAP_THRESHOLD_SECONDS == 7 * 24 * 60 * 60
+
+    def test_large_gap_chunk_days(self):
+        """Test that large gaps are processed in 7-day chunks."""
+        assert LARGE_GAP_CHUNK_DAYS == 7
 
 
 @pytest.mark.unit
@@ -152,9 +162,10 @@ class TestFetchCandlesRange:
         mock_oanda_client.return_value = mock_client_instance
 
         # First call returns full page, second call returns partial
+        # For M1 candles, generate proper HH:MM timestamps (500 minutes = 8h20m)
         first_batch = [
             {
-                "time": f"2023-01-01T{i:02d}:00:00Z",
+                "time": f"2023-01-01T{i // 60:02d}:{i % 60:02d}:00Z",
                 "open": 1.1,
                 "high": 1.2,
                 "low": 1.0,
@@ -163,11 +174,11 @@ class TestFetchCandlesRange:
             }
             for i in range(MAX_CANDLES_PER_REQUEST)
         ]
-        first_batch[-1]["time"] = "2023-01-01T23:59:00Z"
+        # Last candle at 08:19:00Z (500th minute from 00:00)
 
         second_batch = [
             {
-                "time": "2023-01-02T00:00:00Z",
+                "time": "2023-01-01T08:20:00Z",  # Next minute after first batch
                 "open": 1.15,
                 "high": 1.2,
                 "low": 1.1,
@@ -186,7 +197,9 @@ class TestFetchCandlesRange:
         mock_client_instance.get_candles.side_effect = candle_generator()
 
         from_time = datetime(2023, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        to_time = datetime(2023, 1, 2, 12, 0, 0, tzinfo=timezone.utc)
+        to_time = datetime(
+            2023, 1, 1, 10, 0, 0, tzinfo=timezone.utc
+        )  # 10:00, after 08:20
 
         result = fetch_candles_range("EUR_USD", "M1", from_time, to_time)
 
@@ -437,10 +450,36 @@ class TestIngestionLoop:
             mock.OANDA_API_KEY = "test-key"
             mock.OANDA_API_HOST = "api-fxpractice.oanda.com"
             mock.INGESTION_POLL_INTERVAL = 60
+            mock.CANDLE_HEALTH_CHECK_INTERVAL = 3600
+            mock.BACKFILL_DAYS = 1825
+            mock.instruments_list = [
+                "EUR_USD",
+                "GBP_USD",
+                "USD_JPY",
+                "AUD_USD",
+                "USD_CHF",
+                "USD_CAD",
+            ]
+            mock.granularities_list = [
+                "M1",
+                "M5",
+                "M10",
+                "M30",
+                "H1",
+                "H4",
+                "H12",
+                "D",
+                "W",
+                "M",
+            ]
             yield mock
 
     async def test_startup_backfill_runs_for_all_instruments(self, mock_settings):
         """Test that startup_backfill processes all instruments."""
+        # Mock the settings to have predictable values
+        mock_settings.instruments_list = ["EUR_USD", "GBP_USD"]
+        mock_settings.granularities_list = ["M1", "H1"]
+
         with patch(
             "src.agentfx.api.workers.candle_ingestion.backfill_instrument"
         ) as mock_backfill, patch(
@@ -453,7 +492,9 @@ class TestIngestionLoop:
             result = await startup_backfill()
 
             # Should call backfill for each instrument/granularity combo
-            expected_calls = len(INSTRUMENTS) * len(GRANULARITIES)
+            expected_calls = len(mock_settings.instruments_list) * len(
+                mock_settings.granularities_list
+            )
             assert mock_backfill.call_count == expected_calls
             assert result == 10 * expected_calls
 
@@ -519,3 +560,199 @@ class TestExponentialBackoff:
 
         assert backoff == MAX_BACKOFF_SECONDS
         assert backoff == 300  # 5 minutes max
+
+
+@pytest.mark.unit
+class TestHealLargeGap:
+    """Test cases for heal_large_gap function."""
+
+    @pytest.fixture
+    def mock_fetch_and_store(self):
+        """Mock fetch_candles_range and store_candles."""
+        with patch(
+            "src.agentfx.api.workers.candle_ingestion.fetch_candles_range"
+        ) as mock_fetch, patch(
+            "src.agentfx.api.workers.candle_ingestion.store_candles"
+        ) as mock_store:
+            yield {"fetch": mock_fetch, "store": mock_store}
+
+    def test_heal_large_gap_processes_in_chunks(self, mock_fetch_and_store):
+        """Test that large gaps are processed in 7-day chunks."""
+        # 21-day gap should result in 3 chunks
+        mock_fetch_and_store["fetch"].return_value = [{"time": "2023-01-01T12:00:00Z"}]
+        mock_fetch_and_store["store"].return_value = 100
+
+        gap_start = datetime(2023, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        gap_end = datetime(2023, 1, 22, 0, 0, 0, tzinfo=timezone.utc)  # 21 days later
+
+        with patch("src.agentfx.api.workers.candle_ingestion.time.sleep"):
+            result = heal_large_gap("EUR_USD", "M1", gap_start, gap_end)
+
+        # Should have 3 chunks (7 + 7 + 7 days)
+        assert mock_fetch_and_store["fetch"].call_count == 3
+        assert result == 300  # 100 candles per chunk * 3 chunks
+
+    def test_heal_large_gap_handles_empty_chunks(self, mock_fetch_and_store):
+        """Test that empty chunks (market closures) are handled gracefully."""
+        # First chunk returns data, second is empty (weekend), third returns data
+        mock_fetch_and_store["fetch"].side_effect = [
+            [{"time": "2023-01-01T12:00:00Z"}],
+            [],  # Empty chunk
+            [{"time": "2023-01-15T12:00:00Z"}],
+        ]
+        mock_fetch_and_store["store"].return_value = 50
+
+        gap_start = datetime(2023, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        gap_end = datetime(2023, 1, 22, 0, 0, 0, tzinfo=timezone.utc)
+
+        with patch("src.agentfx.api.workers.candle_ingestion.time.sleep"):
+            result = heal_large_gap("EUR_USD", "M1", gap_start, gap_end)
+
+        # Only 2 chunks had data
+        assert mock_fetch_and_store["store"].call_count == 2
+        assert result == 100
+
+    def test_heal_large_gap_retries_on_504_error(self, mock_fetch_and_store):
+        """Test that 504 errors trigger retry with exponential backoff."""
+        from agentfx.adapters.oanda import OandaError
+
+        # First call fails with 504, second succeeds
+        mock_fetch_and_store["fetch"].side_effect = [
+            OandaError("504 Gateway Timeout"),
+            [{"time": "2023-01-01T12:00:00Z"}],
+        ]
+        mock_fetch_and_store["store"].return_value = 50
+
+        gap_start = datetime(2023, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        gap_end = datetime(2023, 1, 8, 0, 0, 0, tzinfo=timezone.utc)  # 7 days
+
+        with patch("src.agentfx.api.workers.candle_ingestion.time.sleep") as mock_sleep:
+            result = heal_large_gap("EUR_USD", "M1", gap_start, gap_end)
+
+        # Should have retried
+        assert mock_fetch_and_store["fetch"].call_count == 2
+        assert result == 50
+        # Should have called sleep for backoff
+        assert mock_sleep.call_count >= 1
+
+    def test_heal_large_gap_retries_on_429_error(self, mock_fetch_and_store):
+        """Test that 429 rate limit errors trigger retry."""
+        from agentfx.adapters.oanda import OandaError
+
+        # First call fails with 429, second succeeds
+        mock_fetch_and_store["fetch"].side_effect = [
+            OandaError("429 Too Many Requests"),
+            [{"time": "2023-01-01T12:00:00Z"}],
+        ]
+        mock_fetch_and_store["store"].return_value = 50
+
+        gap_start = datetime(2023, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        gap_end = datetime(2023, 1, 8, 0, 0, 0, tzinfo=timezone.utc)
+
+        with patch("src.agentfx.api.workers.candle_ingestion.time.sleep"):
+            result = heal_large_gap("EUR_USD", "M1", gap_start, gap_end)
+
+        assert mock_fetch_and_store["fetch"].call_count == 2
+        assert result == 50
+
+
+@pytest.mark.unit
+class TestFetchCandlesRangeRetry:
+    """Test cases for fetch_candles_range retry logic."""
+
+    @pytest.fixture
+    def mock_oanda_client(self):
+        """Create a mock OANDA client."""
+        with patch("agentfx.adapters.oanda.OandaClient") as mock:
+            yield mock
+
+    def test_fetch_retries_on_504_error(self, mock_oanda_client):
+        """Test that 504 errors trigger retry."""
+        from agentfx.adapters.oanda import OandaError
+
+        mock_client = MagicMock()
+        mock_oanda_client.return_value = mock_client
+
+        # Generator that yields: error, success, then empty (to end pagination)
+        def candle_generator():
+            yield OandaError("504 Gateway Timeout")  # First call fails
+            yield [
+                {
+                    "time": "2023-01-01T12:04:00Z",
+                    "open": 1.1,
+                    "high": 1.2,
+                    "low": 1.0,
+                    "close": 1.15,
+                    "volume": 100,
+                }
+            ]
+            while True:
+                yield []  # Pagination ends
+
+        gen = candle_generator()
+
+        def side_effect_fn(*args, **kwargs):
+            result = next(gen)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        mock_client.get_candles.side_effect = side_effect_fn
+
+        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        to_time = datetime(2023, 1, 1, 12, 5, 0, tzinfo=timezone.utc)
+
+        with patch("src.agentfx.api.workers.candle_ingestion.time.sleep"):
+            result = fetch_candles_range(
+                "EUR_USD", "M1", from_time, to_time, max_retries=3
+            )
+
+        assert len(result) == 1
+        assert (
+            mock_client.get_candles.call_count >= 2
+        )  # At least 2 calls (error + success)
+
+    def test_fetch_returns_partial_on_max_retries(self, mock_oanda_client):
+        """Test that max retries exceeded returns partial results."""
+        from agentfx.adapters.oanda import OandaError
+
+        mock_client = MagicMock()
+        mock_oanda_client.return_value = mock_client
+
+        # All calls fail with 504
+        mock_client.get_candles.side_effect = OandaError("504 Gateway Timeout")
+
+        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        to_time = datetime(2023, 1, 1, 12, 5, 0, tzinfo=timezone.utc)
+
+        with patch("src.agentfx.api.workers.candle_ingestion.time.sleep"):
+            result = fetch_candles_range(
+                "EUR_USD", "M1", from_time, to_time, max_retries=2
+            )
+
+        # Should return empty after all retries failed
+        assert result == []
+        assert mock_client.get_candles.call_count == 2
+
+    def test_fetch_no_retry_on_non_retryable_error(self, mock_oanda_client):
+        """Test that non-retryable errors don't trigger retry."""
+        from agentfx.adapters.oanda import OandaError
+
+        mock_client = MagicMock()
+        mock_oanda_client.return_value = mock_client
+
+        # Error that shouldn't trigger retry
+        mock_client.get_candles.side_effect = OandaError("400 Bad Request")
+
+        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        to_time = datetime(2023, 1, 1, 12, 5, 0, tzinfo=timezone.utc)
+
+        result = fetch_candles_range("EUR_USD", "M1", from_time, to_time, max_retries=3)
+
+        # Should not retry for 400 errors
+        assert result == []
+        assert mock_client.get_candles.call_count == 1
+
+
+# NOTE: Market closure tests have been moved to test_market_calendar.py
+# The is_market_closure function is now in src.agentfx.api.workers.market_calendar

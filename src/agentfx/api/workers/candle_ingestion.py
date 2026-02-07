@@ -14,19 +14,18 @@ This worker handles ALL candle data operations.
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 
 from ..core.config import settings
+from .market_calendar import is_market_closure
 
 logger = logging.getLogger(__name__)
 
 # Worker state
 _worker_task: asyncio.Task | None = None
 _shutdown_event: asyncio.Event | None = None
-
-# Configuration - instruments and timeframes to ingest
-INSTRUMENTS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CHF", "USD_CAD"]
-GRANULARITIES = ["M1", "M5", "M15", "H1"]
+_last_health_check: datetime | None = None
 
 # Retry configuration
 MAX_BACKOFF_SECONDS = 300  # Max 5 minutes between retries
@@ -35,6 +34,12 @@ INITIAL_BACKOFF_SECONDS = 5
 # Backfill configuration
 # BACKFILL_DAYS is now configurable via settings.BACKFILL_DAYS (default 7, set to 1825 for 5 years)
 MAX_CANDLES_PER_REQUEST = 500  # OANDA API limit
+
+# Large gap healing configuration
+LARGE_GAP_CHUNK_DAYS = 7  # Process large gaps in 7-day chunks
+LARGE_GAP_THRESHOLD_SECONDS = (
+    7 * 86400
+)  # 7 days - gaps larger than this use chunked healing
 
 # Granularity to seconds mapping for time-based pagination
 # OANDA API doesn't allow count + from/to together, so we paginate by time windows
@@ -78,16 +83,19 @@ def fetch_candles_range(
     granularity: str,
     from_time: datetime,
     to_time: datetime | None = None,
+    max_retries: int = 3,
 ) -> list[dict]:
     """Fetch candles for a time range from OANDA.
 
-    Handles pagination for large ranges automatically.
+    Handles pagination for large ranges automatically. Includes retry logic
+    for transient OANDA API errors (504 gateway timeout, 429 rate limit).
 
     Args:
         instrument: The instrument symbol (e.g., EUR_USD)
         granularity: The candle granularity (e.g., M1, H1)
         from_time: Start of the time range
         to_time: End of the time range (defaults to now)
+        max_retries: Maximum number of retry attempts for transient errors
 
     Returns:
         List of candle dictionaries
@@ -114,47 +122,90 @@ def fetch_candles_range(
     last_seen_time = None  # Track last candle time to detect duplicates
 
     while current_from < to_time:
-        try:
-            # Calculate chunk end time (don't exceed to_time)
-            chunk_end = min(current_from + chunk_duration, to_time)
+        # Calculate chunk end time (don't exceed to_time)
+        chunk_end = min(current_from + chunk_duration, to_time)
 
-            candles = client.get_candles(
-                instrument=instrument,
-                granularity=granularity,
-                from_ts=current_from,
-                to_ts=chunk_end,
-                # NO count parameter - use time range only (OANDA API constraint)
-                include_first=True,
-            )
+        # Fetch with retry logic for transient errors
+        candles = None
+        for attempt in range(max_retries):
+            try:
+                candles = client.get_candles(
+                    instrument=instrument,
+                    granularity=granularity,
+                    from_ts=current_from,
+                    to_ts=chunk_end,
+                    # NO count parameter - use time range only (OANDA API constraint)
+                    include_first=True,
+                )
+                break  # Success
 
-            if not candles:
-                # No data in this chunk - move to next
-                current_from = chunk_end + timedelta(seconds=1)
-                continue
+            except OandaError as e:
+                error_str = str(e)
+                is_retryable = "504" in error_str or "429" in error_str
 
-            # Parse last candle time
-            last_time_str = candles[-1]["time"]
-            if last_time_str.endswith("Z"):
-                last_time_str = last_time_str[:-1] + "+00:00"
-            last_time = datetime.fromisoformat(last_time_str)
+                if is_retryable and attempt < max_retries - 1:
+                    backoff = INITIAL_BACKOFF_SECONDS * (2**attempt)
+                    logger.warning(
+                        f"OANDA API error (attempt {attempt + 1}/{max_retries}): {e}. "
+                        f"Retrying in {backoff}s..."
+                    )
+                    time.sleep(backoff)
+                else:
+                    # Non-retryable error or max retries exceeded
+                    logger.warning(f"OANDA API error during backfill: {e}")
+                    return all_candles  # Return what we have so far
 
-            # If we're receiving candles we've already seen, we're done
-            # This handles both real API pagination and mocked tests
-            if last_seen_time is not None and last_time <= last_seen_time:
-                break
+        if candles is None:
+            # All retries failed
+            return all_candles
 
-            all_candles.extend(candles)
-            last_seen_time = last_time
+        if not candles:
+            # No data in this chunk - move to next
+            current_from = chunk_end + timedelta(seconds=1)
+            continue
 
-            # Move past the last candle we received
-            current_from = last_time + timedelta(seconds=1)
+        # Filter out candles that are before the requested start time
+        # OANDA with include_first=True may return the last candle BEFORE the range
+        # which causes pagination to get stuck in a loop
+        current_from_utc = (
+            current_from.astimezone(timezone.utc)
+            if current_from.tzinfo
+            else current_from.replace(tzinfo=timezone.utc)
+        )
+        valid_candles = []
+        for c in candles:
+            c_time_str = c["time"]
+            if c_time_str.endswith("Z"):
+                c_time_str = c_time_str[:-1] + "+00:00"
+            c_time = datetime.fromisoformat(c_time_str)
+            if c_time >= current_from_utc:
+                valid_candles.append(c)
 
-            # If we've passed the target time, we're done
-            if current_from >= to_time:
-                break
+        if not valid_candles:
+            # All returned candles were before the requested start
+            # This happens when hitting market closures - move to next chunk
+            current_from = chunk_end + timedelta(seconds=1)
+            continue
 
-        except OandaError as e:
-            logger.warning(f"OANDA API error during backfill: {e}")
+        # Parse last valid candle time
+        last_time_str = valid_candles[-1]["time"]
+        if last_time_str.endswith("Z"):
+            last_time_str = last_time_str[:-1] + "+00:00"
+        last_time = datetime.fromisoformat(last_time_str)
+
+        # If we're receiving candles we've already seen, we're done
+        # This handles both real API pagination and mocked tests
+        if last_seen_time is not None and last_time <= last_seen_time:
+            break
+
+        all_candles.extend(valid_candles)
+        last_seen_time = last_time
+
+        # Move past the last candle we received
+        current_from = last_time + timedelta(seconds=1)
+
+        # If we've passed the target time, we're done
+        if current_from >= to_time:
             break
 
     return all_candles
@@ -214,6 +265,111 @@ def store_candles(
     finally:
         if should_close:
             db.close()
+
+
+def heal_large_gap(
+    instrument: str,
+    granularity: str,
+    gap_start: datetime,
+    gap_end: datetime,
+    db=None,
+) -> int:
+    """
+    Heal a large gap by processing in chunks with retry logic.
+
+    Handles OANDA API errors (504 gateway timeout, 429 rate limit) with
+    exponential backoff. Processes gaps in LARGE_GAP_CHUNK_DAYS segments
+    to avoid API timeouts on large date ranges.
+
+    Args:
+        instrument: The instrument symbol (e.g., EUR_USD)
+        granularity: The candle granularity (e.g., M1, H1)
+        gap_start: Start of the gap (last candle before gap)
+        gap_end: End of the gap (first candle after gap)
+        db: Optional database session for testing
+
+    Returns:
+        Number of candles stored
+    """
+    from agentfx.adapters.oanda import OandaError
+
+    MAX_RETRIES = 5
+    BASE_BACKOFF = 5  # seconds
+    RATE_LIMIT_DELAY = 0.5  # seconds between chunks
+
+    total_stored = 0
+    current = gap_start + timedelta(seconds=1)
+    chunk_count = 0
+
+    gap_days = (gap_end - gap_start).total_seconds() / 86400
+    logger.info(
+        f"Healing large gap ({gap_days:.1f} days) for {instrument}:{granularity} "
+        f"in {LARGE_GAP_CHUNK_DAYS}-day chunks..."
+    )
+
+    while current < gap_end:
+        chunk_end = min(current + timedelta(days=LARGE_GAP_CHUNK_DAYS), gap_end)
+        chunk_count += 1
+
+        # Fetch with retry logic for transient errors
+        for attempt in range(MAX_RETRIES):
+            try:
+                candles = fetch_candles_range(
+                    instrument, granularity, current, chunk_end
+                )
+                if candles:
+                    stored = store_candles(instrument, granularity, candles, db)
+                    total_stored += stored
+                    if stored > 0:
+                        logger.info(
+                            f"  Chunk {chunk_count}: {current.date()} to {chunk_end.date()} - "
+                            f"{stored} candles"
+                        )
+                    else:
+                        logger.info(
+                            f"  Chunk {chunk_count}: {current.date()} to {chunk_end.date()} - "
+                            f"data already exists"
+                        )
+                else:
+                    logger.info(
+                        f"  Chunk {chunk_count}: {current.date()} to {chunk_end.date()} - "
+                        f"no data (market closure)"
+                    )
+                break  # Success - exit retry loop
+
+            except OandaError as e:
+                error_str = str(e)
+                is_retryable = "504" in error_str or "429" in error_str
+
+                if is_retryable and attempt < MAX_RETRIES - 1:
+                    backoff = BASE_BACKOFF * (2**attempt)
+                    logger.warning(
+                        f"OANDA API error on chunk {chunk_count} (attempt {attempt + 1}/{MAX_RETRIES}): {e}. "
+                        f"Retrying in {backoff}s..."
+                    )
+                    time.sleep(backoff)
+                else:
+                    # Non-retryable error or max retries exceeded
+                    logger.error(
+                        f"Failed to heal chunk {current.date()} to {chunk_end.date()} "
+                        f"after {attempt + 1} attempts: {e}"
+                    )
+                    # Continue to next chunk rather than failing entirely
+                    break
+
+            except Exception as e:
+                logger.error(f"Unexpected error healing chunk: {e}")
+                break
+
+        current = chunk_end
+        # Rate limiting between chunks to avoid overwhelming the API
+        time.sleep(RATE_LIMIT_DELAY)
+
+    logger.info(
+        f"Finished healing gap for {instrument}:{granularity}: "
+        f"{total_stored} candles across {chunk_count} chunks"
+    )
+    return total_stored
 
 
 def backfill_instrument(instrument: str, granularity: str, db=None) -> int:
@@ -287,6 +443,240 @@ def backfill_instrument(instrument: str, granularity: str, db=None) -> int:
     return stored
 
 
+def validate_backfill_completeness(instrument: str, granularity: str, db=None) -> bool:
+    """
+    Check if backfill is complete by verifying data starts from expected date.
+
+    Args:
+        instrument: The instrument symbol
+        granularity: The candle granularity
+        db: Optional database session
+
+    Returns:
+        True if data starts from expected date, False otherwise
+    """
+    from ..services.market_data import MarketDataService
+    from ..core.database import SessionLocal
+
+    expected_start = _get_backfill_start_time()
+
+    should_close = db is None
+    if db is None:
+        db = SessionLocal()
+
+    try:
+        earliest = MarketDataService.get_earliest_candle(
+            db, "oanda", instrument, granularity
+        )
+
+        if earliest is None:
+            logger.warning(f"No data for {instrument}:{granularity}")
+            return False
+
+        # Allow 7 days tolerance for weekends/holidays
+        if earliest.timestamp > expected_start + timedelta(days=7):
+            logger.warning(
+                f"Incomplete backfill for {instrument}:{granularity}: "
+                f"data starts {earliest.timestamp.date()}, expected ~{expected_start.date()}"
+            )
+            return False
+
+        return True
+    finally:
+        if should_close:
+            db.close()
+
+
+def detect_and_heal_gaps(instrument: str, granularity: str, db=None) -> int:
+    """
+    Scan candle data for gaps and heal them by fetching missing data.
+
+    Skips normal forex weekend closures (Friday 5 PM to Sunday 5 PM EST).
+    Only heals gaps that occur during trading hours.
+
+    Args:
+        instrument: The instrument symbol
+        granularity: The candle granularity
+        db: Optional database session
+
+    Returns:
+        Number of candles backfilled to heal gaps
+    """
+    from ..services.market_data import MarketDataService
+    from ..core.database import SessionLocal
+
+    granularity_seconds = GRANULARITY_SECONDS.get(granularity, 60)
+    # Minimum gap threshold: at least granularity * 3 or 2 hours, whichever is larger
+    # This gives more tolerance before flagging as a gap
+    max_gap_seconds = max(granularity_seconds * 3, 7200)
+
+    should_close = db is None
+    if db is None:
+        db = SessionLocal()
+
+    try:
+        timestamps = MarketDataService.get_candle_timestamps(
+            db, "oanda", instrument, granularity
+        )
+
+        if len(timestamps) < 2:
+            return 0
+
+        small_gaps = []
+        large_gaps = []
+        market_closures_skipped = 0
+
+        for i in range(1, len(timestamps)):
+            delta = (timestamps[i] - timestamps[i - 1]).total_seconds()
+            if delta > max_gap_seconds:
+                gap_start = timestamps[i - 1]
+                gap_end = timestamps[i]
+
+                # Skip market closures - weekends, holidays, low-liquidity
+                is_closure, closure_reason = is_market_closure(gap_start, gap_end)
+                if is_closure:
+                    logger.debug(
+                        f"Skipping gap {gap_start} to {gap_end}: {closure_reason}"
+                    )
+                    market_closures_skipped += 1
+                    continue
+
+                gap_info = {
+                    "from": gap_start,
+                    "to": gap_end,
+                    "duration_hours": delta / 3600,
+                    "duration_seconds": delta,
+                }
+
+                # Categorize gaps by size
+                if delta > LARGE_GAP_THRESHOLD_SECONDS:
+                    large_gaps.append(gap_info)
+                else:
+                    small_gaps.append(gap_info)
+
+        if market_closures_skipped > 0:
+            logger.debug(
+                f"Skipped {market_closures_skipped} market closure gaps for {instrument}:{granularity}"
+            )
+
+        total_gaps = len(small_gaps) + len(large_gaps)
+        if total_gaps == 0:
+            logger.debug(f"No healable gaps found for {instrument}:{granularity}")
+            return 0
+
+        if large_gaps:
+            logger.info(
+                f"Found {len(large_gaps)} large gaps and {len(small_gaps)} small gaps "
+                f"in {instrument}:{granularity}"
+            )
+        elif small_gaps:
+            logger.warning(
+                f"Found {len(small_gaps)} gaps in {instrument}:{granularity}, healing..."
+            )
+
+        total_healed = 0
+
+        # Process large gaps first using chunked healing
+        for gap in large_gaps:
+            healed = heal_large_gap(instrument, granularity, gap["from"], gap["to"], db)
+            total_healed += healed
+
+        # Process small gaps with direct fetch
+        for gap in small_gaps:
+            candles = fetch_candles_range(
+                instrument,
+                granularity,
+                from_time=gap["from"] + timedelta(seconds=1),
+                to_time=gap["to"],
+            )
+            if candles:
+                stored = store_candles(instrument, granularity, candles, db)
+                total_healed += stored
+                if stored > 0:
+                    logger.info(
+                        f"Healed gap {gap['from']} to {gap['to']}: {stored} candles"
+                    )
+                else:
+                    # Data returned but all candles already exist
+                    logger.info(
+                        f"Gap {gap['from']} to {gap['to']}: data already exists"
+                    )
+            else:
+                # No candles returned - this is expected for low-liquidity periods
+                # or undetected closures.
+                logger.info(
+                    f"No data for gap {gap['from']} to {gap['to']} (low-liquidity)"
+                )
+
+        return total_healed
+    finally:
+        if should_close:
+            db.close()
+
+
+async def run_health_check() -> int:
+    """
+    Run comprehensive health check: validate completeness and heal gaps.
+
+    This is called periodically during the poll loop based on
+    CANDLE_HEALTH_CHECK_INTERVAL setting.
+
+    Returns:
+        Total candles healed across all instruments
+    """
+    import concurrent.futures
+    from ..services.market_data import MarketDataService
+    from ..core.database import SessionLocal
+
+    logger.info("Running candle data health check...")
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    loop = asyncio.get_event_loop()
+    total_healed = 0
+
+    db = SessionLocal()
+    try:
+        for instrument in settings.instruments_list:
+            if _shutdown_event and _shutdown_event.is_set():
+                break
+
+            for granularity in settings.granularities_list:
+                if _shutdown_event and _shutdown_event.is_set():
+                    break
+
+                try:
+                    # Step 1: Validate backfill completeness
+                    if not validate_backfill_completeness(instrument, granularity, db):
+                        # Delete incomplete data and trigger full backfill
+                        logger.info(
+                            f"Triggering full re-backfill for {instrument}:{granularity}"
+                        )
+                        MarketDataService.delete_candles(
+                            db, "oanda", instrument, granularity
+                        )
+                        stored = await loop.run_in_executor(
+                            executor, backfill_instrument, instrument, granularity
+                        )
+                        total_healed += stored
+                        continue
+
+                    # Step 2: Detect and heal gaps in the middle
+                    healed = await loop.run_in_executor(
+                        executor, detect_and_heal_gaps, instrument, granularity, db
+                    )
+                    total_healed += healed
+
+                except Exception as e:
+                    logger.error(
+                        f"Health check failed for {instrument}:{granularity}: {e}"
+                    )
+    finally:
+        db.close()
+
+    logger.info(f"Health check complete: {total_healed} candles healed")
+    return total_healed
+
+
 async def startup_backfill() -> int:
     """Run initial backfill for all instruments at startup.
 
@@ -300,18 +690,21 @@ async def startup_backfill() -> int:
     import concurrent.futures
 
     logger.info("Starting candle backfill...")
-    logger.info(f"Instruments: {INSTRUMENTS}, Granularities: {GRANULARITIES}")
+    logger.info(
+        f"Instruments: {settings.instruments_list}, "
+        f"Granularities: {settings.granularities_list}"
+    )
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     loop = asyncio.get_event_loop()
 
     total_stored = 0
 
-    for instrument in INSTRUMENTS:
+    for instrument in settings.instruments_list:
         if _shutdown_event and _shutdown_event.is_set():
             break
 
-        for granularity in GRANULARITIES:
+        for granularity in settings.granularities_list:
             if _shutdown_event and _shutdown_event.is_set():
                 break
 
@@ -362,21 +755,30 @@ def fetch_and_store_recent(instrument: str, granularity: str, count: int = 10) -
 
 
 async def ingestion_loop():
-    """Main ingestion loop with resilient retry logic.
+    """Main ingestion loop with resilient retry logic and periodic health checks.
 
     Flow:
     1. Run startup_backfill() to fill any gaps
-    2. Enter continuous polling mode
-    3. Fetch recent candles at INGESTION_POLL_INTERVAL
+    2. Run initial health check (validate completeness + heal gaps)
+    3. Enter continuous polling mode
+    4. Fetch recent candles at INGESTION_POLL_INTERVAL
+    5. Run health check every CANDLE_HEALTH_CHECK_INTERVAL seconds
     """
     import concurrent.futures
+
+    global _last_health_check
 
     # Run initial backfill first
     await startup_backfill()
 
+    # Run initial health check
+    await run_health_check()
+    _last_health_check = datetime.now(timezone.utc)
+
     logger.info(
         f"Entering continuous polling mode "
-        f"(interval: {settings.INGESTION_POLL_INTERVAL}s)"
+        f"(poll: {settings.INGESTION_POLL_INTERVAL}s, "
+        f"health check: {settings.CANDLE_HEALTH_CHECK_INTERVAL}s)"
     )
 
     consecutive_failures = 0
@@ -387,13 +789,21 @@ async def ingestion_loop():
     while not _shutdown_event.is_set():
         try:
             cycle_start = datetime.now(timezone.utc)
+
+            # Check if health check is due
+            if settings.CANDLE_HEALTH_CHECK_INTERVAL > 0 and _last_health_check:
+                time_since_check = (cycle_start - _last_health_check).total_seconds()
+                if time_since_check >= settings.CANDLE_HEALTH_CHECK_INTERVAL:
+                    await run_health_check()
+                    _last_health_check = datetime.now(timezone.utc)
+
             total_stored = 0
 
-            for instrument in INSTRUMENTS:
+            for instrument in settings.instruments_list:
                 if _shutdown_event.is_set():
                     break
 
-                for granularity in GRANULARITIES:
+                for granularity in settings.granularities_list:
                     if _shutdown_event.is_set():
                         break
 
@@ -486,8 +896,10 @@ async def start_ingestion_worker() -> None:
 
     logger.info(
         f"Candle ingestion worker started: "
-        f"{len(INSTRUMENTS)} instruments, {len(GRANULARITIES)} granularities, "
-        f"polling every {settings.INGESTION_POLL_INTERVAL}s"
+        f"{len(settings.instruments_list)} instruments, "
+        f"{len(settings.granularities_list)} granularities, "
+        f"polling every {settings.INGESTION_POLL_INTERVAL}s, "
+        f"health check every {settings.CANDLE_HEALTH_CHECK_INTERVAL}s"
     )
 
 
