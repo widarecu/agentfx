@@ -14,9 +14,10 @@ Prerequisites:
 Run with: ENVIRONMENT=test pytest tests/integration/optimization/test_optimization_integration.py -v
 """
 
-import pytest
-from uuid import uuid4
 import time
+from uuid import uuid4
+
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
@@ -43,8 +44,8 @@ def generate_trial_id() -> str:
 @pytest.fixture
 def test_users(db_session: Session):
     """Ensure test users exist in the database."""
-    from src.agentfx.api.models.user import User
     from src.agentfx.api.core.security import get_password_hash
+    from src.agentfx.api.models.user import User
 
     users = {
         "viewer": {

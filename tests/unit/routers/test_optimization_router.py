@@ -5,14 +5,14 @@ Tests REST endpoints for optimization jobs, trials, signals, and trades.
 Uses FastAPI TestClient with mocked dependencies.
 """
 
-import pytest
+from datetime import UTC, datetime
 from unittest.mock import Mock, patch
-from datetime import datetime, timezone
+
+import pytest
 from fastapi import HTTPException
 
-from agentfx.api.routers import optimization as optimization_router
 from agentfx.api import models, schemas
-
+from agentfx.api.routers import optimization as optimization_router
 
 # Fixtures for mocking
 
@@ -73,9 +73,9 @@ def sample_job():
     job.data_range_start = None
     job.data_range_end = None
     job.error_message = None
-    job.created_at = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
-    job.started_at = datetime(2024, 1, 15, 10, 0, 1, tzinfo=timezone.utc)
-    job.completed_at = datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc)
+    job.created_at = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+    job.started_at = datetime(2024, 1, 15, 10, 0, 1, tzinfo=UTC)
+    job.completed_at = datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC)
     job.created_by = "user_123"
     return job
 
@@ -103,7 +103,7 @@ def sample_trial():
     trial.net_pnl_dollars = 480.0
     trial.passes_gate_b = True
     trial.gate_b_failures = None
-    trial.created_at = datetime(2024, 1, 15, 10, 5, 0, tzinfo=timezone.utc)
+    trial.created_at = datetime(2024, 1, 15, 10, 5, 0, tzinfo=UTC)
     return trial
 
 
@@ -114,13 +114,15 @@ class TestListOptimizationJobs:
         self, mock_db, mock_current_user, sample_job
     ):
         """Test that list endpoint returns paginated results."""
-        with patch(
-            "agentfx.api.routers.optimization.optimization_service"
-        ) as mock_service, patch(
-            "agentfx.api.routers.optimization.get_db", return_value=mock_db
-        ), patch(
-            "agentfx.api.routers.optimization.user_service.get_current_active_user",
-            return_value=mock_current_user,
+        with (
+            patch(
+                "agentfx.api.routers.optimization.optimization_service"
+            ) as mock_service,
+            patch("agentfx.api.routers.optimization.get_db", return_value=mock_db),
+            patch(
+                "agentfx.api.routers.optimization.user_service.get_current_active_user",
+                return_value=mock_current_user,
+            ),
         ):
             mock_service.get_jobs.return_value = ([sample_job], 1)
 
@@ -175,7 +177,7 @@ class TestCreateOptimizationJob:
             mock_job.id = "optjob_new_123"
             mock_job.status = models.JobStatus.QUEUED
             mock_job.estimated_iterations = 40
-            mock_job.created_at = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+            mock_job.created_at = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
             mock_service.create_job.return_value = mock_job
 
             job_in = schemas.OptimizationJobCreate(
@@ -226,7 +228,7 @@ class TestCreateOptimizationJob:
             mock_job.id = "optjob_admin_123"
             mock_job.status = models.JobStatus.QUEUED
             mock_job.estimated_iterations = 25
-            mock_job.created_at = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+            mock_job.created_at = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
             mock_service.create_job.return_value = mock_job
 
             job_in = schemas.OptimizationJobCreate(

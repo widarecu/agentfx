@@ -14,18 +14,18 @@ Prerequisites:
 Run with: make test-file FILE=tests/integration/workers/test_optimization_runner.py
 """
 
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from src.agentfx.api.core.config import settings
-from src.agentfx.api.models.optimization import OptimizationJob, JobStatus, StrategyType
+from src.agentfx.api.models.optimization import JobStatus, OptimizationJob, StrategyType
 from src.agentfx.api.services import optimization as optimization_service
 from src.agentfx.api.workers.optimization_runner import (
-    run_optimization,
-    recover_queued_jobs,
     _running_jobs,
+    recover_queued_jobs,
+    run_optimization,
 )
 
 pytestmark = pytest.mark.integration

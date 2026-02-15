@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import timezone, datetime
+from datetime import UTC, datetime
 
 
 @dataclass
@@ -94,7 +94,7 @@ class Registry:
                 (
                     instrument,
                     granularity,
-                    datetime.now(timezone.utc).isoformat(),
+                    datetime.now(UTC).isoformat(),
                     "running",
                 ),
             )
@@ -107,7 +107,7 @@ class Registry:
             c.execute(
                 "UPDATE ingestion_runs SET finished_at=?, rows_ingested=?, gaps_fixed=?, status=? WHERE id=?",
                 (
-                    datetime.now(timezone.utc).isoformat(),
+                    datetime.now(UTC).isoformat(),
                     rows_ingested,
                     gaps_fixed,
                     status,
@@ -139,6 +139,6 @@ class Registry:
                     json.dumps(metrics),
                     json.dumps(policy),
                     json.dumps(params),
-                    datetime.now(timezone.utc).isoformat(),
+                    datetime.now(UTC).isoformat(),
                 ),
             )

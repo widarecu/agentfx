@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from agentfx.portal_mock.app import app, RUN_ID, PAIR, STRATEGY_ID
+from agentfx.portal_mock.app import PAIR, RUN_ID, STRATEGY_ID, app
 
 
 @pytest.mark.integration

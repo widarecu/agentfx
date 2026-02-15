@@ -1,14 +1,15 @@
 from sqlalchemy import (
-    Column,
-    String,
-    Float,
-    DateTime,
-    Integer,
     Boolean,
+    Column,
+    DateTime,
+    Float,
     ForeignKey,
     Index,
+    Integer,
+    String,
 )
 from sqlalchemy.sql import func
+
 from ..core.database import Base
 
 

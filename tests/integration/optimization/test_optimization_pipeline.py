@@ -18,15 +18,16 @@ Prerequisites:
 Run with: ENVIRONMENT=test pytest tests/integration/optimization/test_optimization_pipeline.py -v
 """
 
-import pytest
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from urllib.parse import urlparse
-import subprocess
-import time
-import requests
 import os
 import signal
+import subprocess
+import time
+from urllib.parse import urlparse
+
+import psycopg2
+import pytest
+import requests
+from psycopg2.extras import RealDictCursor
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
@@ -253,8 +254,8 @@ class TestOptimizerPipelineBasics:
 
     def test_parameter_normalization(self):
         """Test parameter normalization and denormalization."""
-        from src.agentfx.agents.optimizer import BayesianOptimizerAgent
         import numpy as np
+        from src.agentfx.agents.optimizer import BayesianOptimizerAgent
 
         agent = BayesianOptimizerAgent()
         param_ranges = {
@@ -363,7 +364,8 @@ class TestOptimizerWithData:
                 assert isinstance(metrics["sharpe"], (int, float))
 
             if "max_drawdown" in metrics:
-                assert 0 <= metrics["max_drawdown"] <= 1.0
+                # max_drawdown returns negative values (e.g., -0.10 = 10% drawdown)
+                assert -1.0 <= metrics["max_drawdown"] <= 0
 
             if "hit_rate" in metrics:
                 assert 0 <= metrics["hit_rate"] <= 1.0
@@ -375,8 +377,8 @@ class TestOptimizerWithData:
     def test_optimizer_gate_b_applied_correctly(self, wait_for_candles):
         """Test that Gate B evaluation is applied to each trial."""
         from src.agentfx.agents.optimizer import (
-            BayesianOptimizerAgent,
             GATE_B_THRESHOLDS,
+            BayesianOptimizerAgent,
         )
 
         agent = BayesianOptimizerAgent()
@@ -453,7 +455,7 @@ class TestOptimizerWithData:
             next_sharpe = top_results[i + 1]["metrics"].get("sharpe", float("-inf"))
             assert current_sharpe >= next_sharpe, (
                 f"Top results not sorted: position {i} has sharpe {current_sharpe}, "
-                f"position {i+1} has sharpe {next_sharpe}"
+                f"position {i + 1} has sharpe {next_sharpe}"
             )
 
     def test_optimizer_progress_callback(self, wait_for_candles):

@@ -105,13 +105,46 @@ early_closes:
     - "12-24"   # Christmas Eve
     - "12-31"   # New Year's Eve
 
+# Extended closure periods (multi-day closures spanning holidays + weekends)
+# These handle gaps like Christmas week and New Year week where the market
+# is effectively closed for several consecutive days. The single-day holiday
+# check cannot match these because the gap boundaries are too far from any
+# individual holiday date.
+# Format: list of {start: "MM-DD", end: "MM-DD"} date ranges
+extended_closures:
+  2020:
+    - {start: "12-24", end: "12-28"}  # Christmas Eve Thu → Mon after Christmas
+
+  2021:
+    - {start: "12-23", end: "12-27"}  # Thu before → Mon after observed Christmas (Fri Dec 24)
+
+  2022:
+    - {start: "12-23", end: "12-27"}  # Fri early close → Tue after observed Christmas (Mon Dec 26)
+
+  2023:
+    - {start: "12-22", end: "12-26"}  # Fri early close → Tue after Christmas (Mon Dec 25)
+    - {start: "12-29", end: "01-03"}  # Fri NYE → Tue after observed New Year (Mon Jan 2)
+
+  2024:
+    - {start: "12-24", end: "12-27"}  # Tue Christmas Eve → Fri after Christmas (Wed Dec 25)
+    - {start: "12-31", end: "01-02"}  # Tue NYE → Thu after New Year (Wed Jan 1)
+
+  2025:
+    - {start: "12-24", end: "12-28"}  # Wed Christmas Eve → Sun after Christmas (Thu Dec 25)
+    - {start: "12-31", end: "01-02"}  # Wed NYE → Fri after New Year (Thu Jan 1)
+
+  2026:
+    - {start: "12-24", end: "12-28"}  # Thu Christmas Eve → Mon after Christmas (Fri Dec 25)
+    - {start: "12-31", end: "01-02"}  # Thu NYE → Fri after New Year (Thu Jan 1)
+
 # Low-liquidity hours (OANDA returns sparse data during these hours)
 # Source: https://mechanicalforex.com/2015/12/oandas-not-so-good-1m-data-can-you-trust-your-own-brokers-historical-data.html
 # 10-14% of M1 bars are missing during 22:00-07:00 GMT - this is expected behavior
-low_liquidity_hours_utc:
-  start: 22  # 10 PM UTC
-  end: 7     # 7 AM UTC
-
-# Maximum gap duration (hours) that qualifies as low-liquidity
-# Gaps longer than this are NOT automatically attributed to low liquidity
-low_liquidity_max_gap_hours: 12
+# TEMPORARILY DISABLED to validate whether OANDA actually has data during these hours
+# low_liquidity_hours_utc:
+#   start: 22  # 10 PM UTC
+#   end: 7     # 7 AM UTC
+#
+# # Maximum gap duration (hours) that qualifies as low-liquidity
+# # Gaps longer than this are NOT automatically attributed to low liquidity
+# low_liquidity_max_gap_hours: 12

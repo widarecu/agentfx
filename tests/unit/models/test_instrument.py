@@ -1,9 +1,9 @@
 """Unit tests for the Instrument model."""
 
-import pytest
 from unittest.mock import MagicMock
-from sqlalchemy.orm import Session
 
+import pytest
+from sqlalchemy.orm import Session
 from src.agentfx.api.models.instrument import Instrument
 
 

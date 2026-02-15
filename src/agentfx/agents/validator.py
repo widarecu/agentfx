@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from agentfx.agents.base import BaseAgent, AgentResult
+from agentfx.agents.base import AgentResult, BaseAgent
 
 
 @dataclass

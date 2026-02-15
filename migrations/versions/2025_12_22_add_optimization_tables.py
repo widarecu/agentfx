@@ -11,8 +11,8 @@ Creates tables for Bayesian parameter optimization:
 - optimization_trades: Individual trades with financing breakdown
 """
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.

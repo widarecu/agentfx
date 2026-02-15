@@ -1,14 +1,14 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
 from ..core.database import get_db
-from ..core.rate_limiter import market_data_rate_limit
 from ..core.metrics import market_metrics
-from ..services.market_data import MarketDataService
+from ..core.rate_limiter import market_data_rate_limit
 from ..services import user as user_service
+from ..services.market_data import MarketDataService
 
 router = APIRouter(prefix="/market-data", tags=["market-data"])
 
@@ -31,6 +31,9 @@ async def get_candles(
     limit: int = Query(
         1000, le=10000, description="Maximum number of candles to return"
     ),
+    offset: int = Query(
+        0, ge=0, description="Number of candles to skip (for pagination)"
+    ),
     run_id: str | None = Query(None, description="Filter by run ID"),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(user_service.get_current_active_user),
@@ -49,6 +52,7 @@ async def get_candles(
             from_time=from_time,
             to_time=to_time,
             limit=limit,
+            offset=offset,
             run_id=run_id,
         )
 
@@ -64,9 +68,9 @@ async def get_candles(
             response_to_time = max(c.timestamp for c in candles)
         else:
             # Use reasonable defaults when no query params and no data
-            from datetime import datetime, timezone
+            from datetime import datetime
 
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             response_from_time = now
             response_to_time = now
 
@@ -229,6 +233,21 @@ async def list_instruments(
     return instruments
 
 
+@router.get("/timeframes", response_model=list[schemas.TimeframeInfo])
+@market_data_rate_limit(endpoint_type="instruments", per_user=True)
+async def list_timeframes(
+    request: Request,
+    exchange: str | None = Query("oanda", description="Filter by exchange"),
+    instrument: str | None = Query(None, description="Filter by instrument"),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+):
+    """List available timeframes from ingested candle data."""
+    return MarketDataService.get_timeframes(
+        db=db, exchange=exchange, instrument=instrument
+    )
+
+
 @router.get("/exchanges/{exchange_id}", response_model=schemas.ExchangeInfo)
 @market_data_rate_limit(endpoint_type="instruments", per_user=True)
 def get_exchange_info(
@@ -248,23 +267,31 @@ def get_exchange_info(
             status_code=404, detail=f"Exchange '{exchange_id}' not found"
         )
 
+    # Get timeframes dynamically from DB
+    db_timeframes = MarketDataService.get_timeframes(db=db, exchange=exchange_id)
+    supported_tfs = (
+        [tf["code"] for tf in db_timeframes]
+        if db_timeframes
+        else [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D",
+            "W",
+            "M",
+        ]
+    )
+
     return {
         "id": "oanda",
         "name": "OANDA",
         "status": "online",
         "timezone": "UTC",
         "server_time": datetime.utcnow(),
-        "supported_timeframes": [
-            schemas.Timeframe.M1,
-            schemas.Timeframe.M5,
-            schemas.Timeframe.M15,
-            schemas.Timeframe.M30,
-            schemas.Timeframe.H1,
-            schemas.Timeframe.H4,
-            schemas.Timeframe.D1,
-            schemas.Timeframe.W1,
-            schemas.Timeframe.MN1,
-        ],
+        "supported_timeframes": supported_tfs,
         "rate_limit_requests_per_second": 100,
         "is_authenticated": True,
         "features": {

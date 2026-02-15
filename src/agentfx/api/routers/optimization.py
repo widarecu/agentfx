@@ -7,7 +7,7 @@ Endpoints follow REST conventions per STANDARDS.md:
 - 202 Accepted for async job creation
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from .. import models, schemas

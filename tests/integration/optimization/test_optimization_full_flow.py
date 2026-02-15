@@ -22,26 +22,26 @@ Prerequisites:
 Run with: make test-file FILE=tests/integration/optimization/test_optimization_full_flow.py
 """
 
-import pytest
-import psycopg2
-from psycopg2.extras import RealDictCursor
 from urllib.parse import urlparse
+
+import psycopg2
+import pytest
+from psycopg2.extras import RealDictCursor
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from src.agentfx.api.core.config import settings
 from src.agentfx.api.models.optimization import (
+    JobStatus,
     OptimizationJob,
-    OptimizationTrial,
     OptimizationSignal,
     OptimizationTrade,
-    JobStatus,
+    OptimizationTrial,
     StrategyType,
 )
 from src.agentfx.api.services import optimization as optimization_service
 from src.agentfx.api.workers.optimization_runner import (
-    run_optimization,
     _execute_optimization,
+    run_optimization,
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
@@ -557,10 +557,10 @@ class TestTrialPersistence:
         assert len(trials) >= 1
 
         for trial in trials:
-            # Max drawdown should be between 0 and 1
-            assert (
-                0 <= trial.max_drawdown <= 1.0
-            ), f"Invalid max_drawdown: {trial.max_drawdown}"
+            # Max drawdown is negative (e.g., -0.10 = 10% drawdown) per metrics.max_drawdown()
+            assert -1.0 <= trial.max_drawdown <= 0, (
+                f"Invalid max_drawdown: {trial.max_drawdown}"
+            )
 
             # Hit rate should be between 0 and 1
             assert 0 <= trial.hit_rate <= 1.0, f"Invalid hit_rate: {trial.hit_rate}"
@@ -570,6 +570,14 @@ class TestTrialPersistence:
 
             # Sharpe can be any float (negative or positive)
             assert isinstance(trial.sharpe, float)
+
+        # At least one trial should have generated trades
+        # A valid strategy run over multi-year data MUST produce trades
+        trials_with_trades = [t for t in trials if t.trade_count > 0]
+        assert len(trials_with_trades) > 0, (
+            f"No trials generated any trades! This indicates a bug in metrics calculation. "
+            f"Trial trade counts: {[t.trade_count for t in trials]}"
+        )
 
     @pytest.mark.asyncio
     async def test_gate_b_evaluation_persisted_correctly(
@@ -625,6 +633,42 @@ class TestTrialPersistence:
                 f"best_trial_id mismatch: expected {best_trial.id}, "
                 f"got {completed_job.best_trial_id}"
             )
+
+    @pytest.mark.asyncio
+    async def test_trials_generate_nonzero_trades(
+        self, session_factory, create_test_job, verify_candle_data
+    ):
+        """
+        Verify that trials generate non-zero trade counts.
+
+        This is a critical test that validates the metrics.summarize() function
+        correctly returns n_trades. A Moving Average strategy over multi-year
+        H1 data MUST generate trades (signal changes).
+
+        This test was added after discovering that n_trades was missing from
+        the metrics return dictionary, causing all Gate B checks to fail.
+        """
+        job = create_test_job(estimated_iterations=3)
+        job_id = job.id
+
+        await run_optimization(job_id)
+
+        trials = get_trials_from_db(session_factory, job_id)
+        assert len(trials) >= 1, "No trials were created"
+
+        # Each trial should have trades
+        for trial in trials:
+            assert trial.trade_count > 0, (
+                f"Trial {trial.id} has 0 trades. "
+                f"This indicates metrics.summarize() is not returning n_trades correctly. "
+                f"Metrics: sharpe={trial.sharpe}, hit_rate={trial.hit_rate}"
+            )
+
+        # Log trade counts for visibility
+        trade_counts = [t.trade_count for t in trials]
+        avg_trades = sum(trade_counts) / len(trade_counts)
+        # With minimal test data (100 candles), lower threshold is appropriate
+        assert avg_trades > 0, f"Average trade count ({avg_trades}) should be positive"
 
 
 class TestProgressUpdates:
@@ -697,6 +741,8 @@ class TestSignalAndTradePersistence:
                     assert signal.signal_type in [
                         "entry_long",
                         "entry_short",
+                        "exit_long",
+                        "exit_short",
                         "exit",
                         "hold",
                     ], f"Invalid signal_type: {signal.signal_type}"

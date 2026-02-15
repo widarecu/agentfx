@@ -42,9 +42,11 @@ def summarize(returns: pd.Series, signals: pd.Series) -> dict[str, float]:
     # Approximate trades when signal changes (position change)
     trade_mask = signals.diff().fillna(0).ne(0)
     trade_rets = returns.where(trade_mask).dropna()
+    mdd_value = max_drawdown(eq)
     return {
         "sharpe": sharpe(returns),
-        "mdd": max_drawdown(eq),
+        "mdd": mdd_value,
+        "max_drawdown": mdd_value,  # Alias for Gate B compatibility
         "hit_rate": hit_rate(trade_rets),
         "turnover": turnover(signals),
         "cagr": (
@@ -52,4 +54,5 @@ def summarize(returns: pd.Series, signals: pd.Series) -> dict[str, float]:
             if len(eq) > 1
             else 0.0
         ),
+        "n_trades": int(trade_mask.sum()),  # Count of position changes (trades)
     }

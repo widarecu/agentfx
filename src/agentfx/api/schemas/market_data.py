@@ -1,19 +1,33 @@
-from pydantic import BaseModel, Field, validator
 from datetime import datetime
-from typing import Any
 from enum import Enum
+from typing import Any
+
+from pydantic import BaseModel, Field, validator
+
 from .base import BaseSchema
 
 
 class Timeframe(str, Enum):
-    """Supported timeframes for market data."""
+    """Supported timeframes for market data.
 
+    Uses OANDA granularity naming convention.
+    """
+
+    # Minutes
     M1 = "M1"
     M5 = "M5"
+    M10 = "M10"
     M15 = "M15"
     M30 = "M30"
+    # Hours
     H1 = "H1"
     H4 = "H4"
+    H12 = "H12"
+    # Daily/Weekly/Monthly (OANDA format)
+    D = "D"
+    W = "W"
+    M = "M"
+    # Legacy aliases (for backward compatibility)
     D1 = "D1"
     W1 = "W1"
     MN1 = "MN1"
@@ -152,6 +166,13 @@ class InstrumentInfo(BaseModel):
     maximum_position_size: float | None = None
     maximum_order_units: float | None = None
     tags: list[str] = []
+
+
+class TimeframeInfo(BaseModel):
+    """Information about a trading timeframe."""
+
+    code: str
+    display_name: str
 
 
 class ExchangeInfo(BaseModel):

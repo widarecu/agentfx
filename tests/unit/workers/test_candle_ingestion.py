@@ -1,21 +1,27 @@
 """Unit tests for the candle ingestion worker."""
 
-import pytest
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
+import pytest
+from src.agentfx.api.core.config import settings
 from src.agentfx.api.workers.candle_ingestion import (
-    MAX_CANDLES_PER_REQUEST,
+    GAP_DETECTION_MULTIPLIER,
+    GRANULARITY_SECONDS,
     LARGE_GAP_CHUNK_DAYS,
     LARGE_GAP_THRESHOLD_SECONDS,
+    MAX_CANDLES_PER_REQUEST,
+    MAX_GAPS_PER_HEALTH_CHECK,
     _get_backfill_start_time,
-    fetch_candles_range,
-    store_candles,
+    _merge_nearby_gaps,
     backfill_instrument,
+    detect_and_heal_gaps,
     fetch_and_store_recent,
+    fetch_candles_range,
     heal_large_gap,
+    repair_candle_data,
+    store_candles,
 )
-from src.agentfx.api.core.config import settings
 
 
 @pytest.mark.unit
@@ -63,9 +69,9 @@ class TestGetBackfillStartTime:
 
     def test_default_backfill_days(self):
         """Test default backfill calculation uses settings.BACKFILL_DAYS."""
-        before = datetime.now(timezone.utc)
+        before = datetime.now(UTC)
         result = _get_backfill_start_time()
-        after = datetime.now(timezone.utc)
+        after = datetime.now(UTC)
 
         expected_start = before - timedelta(days=settings.BACKFILL_DAYS)
         expected_end = after - timedelta(days=settings.BACKFILL_DAYS)
@@ -74,9 +80,9 @@ class TestGetBackfillStartTime:
 
     def test_custom_backfill_days(self):
         """Test custom backfill days calculation."""
-        before = datetime.now(timezone.utc)
+        before = datetime.now(UTC)
         result = _get_backfill_start_time(days=30)
-        after = datetime.now(timezone.utc)
+        after = datetime.now(UTC)
 
         expected_start = before - timedelta(days=30)
         expected_end = after - timedelta(days=30)
@@ -86,7 +92,7 @@ class TestGetBackfillStartTime:
     def test_backfill_returns_utc_datetime(self):
         """Test that backfill time has UTC timezone."""
         result = _get_backfill_start_time()
-        assert result.tzinfo == timezone.utc
+        assert result.tzinfo == UTC
 
 
 @pytest.mark.unit
@@ -132,8 +138,8 @@ class TestFetchCandlesRange:
         mock_oanda_client.return_value = mock_client_instance
         mock_client_instance.get_candles.return_value = sample_candles
 
-        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        to_time = datetime(2023, 1, 1, 12, 5, 0, tzinfo=timezone.utc)
+        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC)
+        to_time = datetime(2023, 1, 1, 12, 5, 0, tzinfo=UTC)
 
         result = fetch_candles_range("EUR_USD", "M1", from_time, to_time)
 
@@ -147,7 +153,7 @@ class TestFetchCandlesRange:
         mock_oanda_client.return_value = mock_client_instance
         mock_client_instance.get_candles.return_value = []
 
-        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC)
         result = fetch_candles_range("EUR_USD", "M1", from_time)
 
         assert result == []
@@ -196,10 +202,8 @@ class TestFetchCandlesRange:
 
         mock_client_instance.get_candles.side_effect = candle_generator()
 
-        from_time = datetime(2023, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        to_time = datetime(
-            2023, 1, 1, 10, 0, 0, tzinfo=timezone.utc
-        )  # 10:00, after 08:20
+        from_time = datetime(2023, 1, 1, 0, 0, 0, tzinfo=UTC)
+        to_time = datetime(2023, 1, 1, 10, 0, 0, tzinfo=UTC)  # 10:00, after 08:20
 
         result = fetch_candles_range("EUR_USD", "M1", from_time, to_time)
 
@@ -215,7 +219,7 @@ class TestFetchCandlesRange:
         mock_oanda_client.return_value = mock_client_instance
         mock_client_instance.get_candles.side_effect = OandaError("API Error")
 
-        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC)
         result = fetch_candles_range("EUR_USD", "M1", from_time)
 
         # Should return empty list on error, not raise
@@ -319,15 +323,18 @@ class TestBackfillInstrument:
 
         Note: Functions and classes are imported inside the function using relative imports.
         """
-        with patch(
-            "src.agentfx.api.services.market_data.MarketDataService"
-        ) as mock_service, patch(
-            "src.agentfx.api.core.database.SessionLocal"
-        ) as mock_session, patch(
-            "src.agentfx.api.workers.candle_ingestion.fetch_candles_range"
-        ) as mock_fetch, patch(
-            "src.agentfx.api.workers.candle_ingestion.store_candles"
-        ) as mock_store:
+        with (
+            patch(
+                "src.agentfx.api.services.market_data.MarketDataService"
+            ) as mock_service,
+            patch("src.agentfx.api.core.database.SessionLocal") as mock_session,
+            patch(
+                "src.agentfx.api.workers.candle_ingestion.fetch_candles_range"
+            ) as mock_fetch,
+            patch(
+                "src.agentfx.api.workers.candle_ingestion.store_candles"
+            ) as mock_store,
+        ):
             mock_db = MagicMock()
             mock_session.return_value = mock_db
             yield {
@@ -355,7 +362,7 @@ class TestBackfillInstrument:
         """Test backfill when there's a gap (data exists but outdated)."""
         # Latest candle is 2 hours ago
         latest_candle = MagicMock()
-        latest_candle.timestamp = datetime.now(timezone.utc) - timedelta(hours=2)
+        latest_candle.timestamp = datetime.now(UTC) - timedelta(hours=2)
 
         mock_dependencies["service"].get_latest_candle.return_value = latest_candle
         mock_dependencies["fetch"].return_value = [{"time": "2023-01-01T12:00:00Z"}]
@@ -370,7 +377,7 @@ class TestBackfillInstrument:
         """Test backfill when gap is negligible (<1 minute)."""
         # Latest candle is 30 seconds ago
         latest_candle = MagicMock()
-        latest_candle.timestamp = datetime.now(timezone.utc) - timedelta(seconds=30)
+        latest_candle.timestamp = datetime.now(UTC) - timedelta(seconds=30)
 
         mock_dependencies["service"].get_latest_candle.return_value = latest_candle
 
@@ -480,10 +487,11 @@ class TestIngestionLoop:
         mock_settings.instruments_list = ["EUR_USD", "GBP_USD"]
         mock_settings.granularities_list = ["M1", "H1"]
 
-        with patch(
-            "src.agentfx.api.workers.candle_ingestion.backfill_instrument"
-        ) as mock_backfill, patch(
-            "src.agentfx.api.workers.candle_ingestion._shutdown_event", None
+        with (
+            patch(
+                "src.agentfx.api.workers.candle_ingestion.backfill_instrument"
+            ) as mock_backfill,
+            patch("src.agentfx.api.workers.candle_ingestion._shutdown_event", None),
         ):
             mock_backfill.return_value = 10
 
@@ -569,11 +577,14 @@ class TestHealLargeGap:
     @pytest.fixture
     def mock_fetch_and_store(self):
         """Mock fetch_candles_range and store_candles."""
-        with patch(
-            "src.agentfx.api.workers.candle_ingestion.fetch_candles_range"
-        ) as mock_fetch, patch(
-            "src.agentfx.api.workers.candle_ingestion.store_candles"
-        ) as mock_store:
+        with (
+            patch(
+                "src.agentfx.api.workers.candle_ingestion.fetch_candles_range"
+            ) as mock_fetch,
+            patch(
+                "src.agentfx.api.workers.candle_ingestion.store_candles"
+            ) as mock_store,
+        ):
             yield {"fetch": mock_fetch, "store": mock_store}
 
     def test_heal_large_gap_processes_in_chunks(self, mock_fetch_and_store):
@@ -582,8 +593,8 @@ class TestHealLargeGap:
         mock_fetch_and_store["fetch"].return_value = [{"time": "2023-01-01T12:00:00Z"}]
         mock_fetch_and_store["store"].return_value = 100
 
-        gap_start = datetime(2023, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        gap_end = datetime(2023, 1, 22, 0, 0, 0, tzinfo=timezone.utc)  # 21 days later
+        gap_start = datetime(2023, 1, 1, 0, 0, 0, tzinfo=UTC)
+        gap_end = datetime(2023, 1, 22, 0, 0, 0, tzinfo=UTC)  # 21 days later
 
         with patch("src.agentfx.api.workers.candle_ingestion.time.sleep"):
             result = heal_large_gap("EUR_USD", "M1", gap_start, gap_end)
@@ -602,8 +613,8 @@ class TestHealLargeGap:
         ]
         mock_fetch_and_store["store"].return_value = 50
 
-        gap_start = datetime(2023, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        gap_end = datetime(2023, 1, 22, 0, 0, 0, tzinfo=timezone.utc)
+        gap_start = datetime(2023, 1, 1, 0, 0, 0, tzinfo=UTC)
+        gap_end = datetime(2023, 1, 22, 0, 0, 0, tzinfo=UTC)
 
         with patch("src.agentfx.api.workers.candle_ingestion.time.sleep"):
             result = heal_large_gap("EUR_USD", "M1", gap_start, gap_end)
@@ -623,8 +634,8 @@ class TestHealLargeGap:
         ]
         mock_fetch_and_store["store"].return_value = 50
 
-        gap_start = datetime(2023, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        gap_end = datetime(2023, 1, 8, 0, 0, 0, tzinfo=timezone.utc)  # 7 days
+        gap_start = datetime(2023, 1, 1, 0, 0, 0, tzinfo=UTC)
+        gap_end = datetime(2023, 1, 8, 0, 0, 0, tzinfo=UTC)  # 7 days
 
         with patch("src.agentfx.api.workers.candle_ingestion.time.sleep") as mock_sleep:
             result = heal_large_gap("EUR_USD", "M1", gap_start, gap_end)
@@ -646,8 +657,8 @@ class TestHealLargeGap:
         ]
         mock_fetch_and_store["store"].return_value = 50
 
-        gap_start = datetime(2023, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        gap_end = datetime(2023, 1, 8, 0, 0, 0, tzinfo=timezone.utc)
+        gap_start = datetime(2023, 1, 1, 0, 0, 0, tzinfo=UTC)
+        gap_end = datetime(2023, 1, 8, 0, 0, 0, tzinfo=UTC)
 
         with patch("src.agentfx.api.workers.candle_ingestion.time.sleep"):
             result = heal_large_gap("EUR_USD", "M1", gap_start, gap_end)
@@ -699,8 +710,8 @@ class TestFetchCandlesRangeRetry:
 
         mock_client.get_candles.side_effect = side_effect_fn
 
-        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        to_time = datetime(2023, 1, 1, 12, 5, 0, tzinfo=timezone.utc)
+        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC)
+        to_time = datetime(2023, 1, 1, 12, 5, 0, tzinfo=UTC)
 
         with patch("src.agentfx.api.workers.candle_ingestion.time.sleep"):
             result = fetch_candles_range(
@@ -722,8 +733,8 @@ class TestFetchCandlesRangeRetry:
         # All calls fail with 504
         mock_client.get_candles.side_effect = OandaError("504 Gateway Timeout")
 
-        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        to_time = datetime(2023, 1, 1, 12, 5, 0, tzinfo=timezone.utc)
+        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC)
+        to_time = datetime(2023, 1, 1, 12, 5, 0, tzinfo=UTC)
 
         with patch("src.agentfx.api.workers.candle_ingestion.time.sleep"):
             result = fetch_candles_range(
@@ -744,14 +755,467 @@ class TestFetchCandlesRangeRetry:
         # Error that shouldn't trigger retry
         mock_client.get_candles.side_effect = OandaError("400 Bad Request")
 
-        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        to_time = datetime(2023, 1, 1, 12, 5, 0, tzinfo=timezone.utc)
+        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC)
+        to_time = datetime(2023, 1, 1, 12, 5, 0, tzinfo=UTC)
 
         result = fetch_candles_range("EUR_USD", "M1", from_time, to_time, max_retries=3)
 
         # Should not retry for 400 errors
         assert result == []
         assert mock_client.get_candles.call_count == 1
+
+
+@pytest.mark.unit
+class TestGapDetectionMultiplier:
+    """Test cases for the gap detection sensitivity constant."""
+
+    def test_gap_detection_multiplier_value(self):
+        """Test that the multiplier is 5."""
+        assert GAP_DETECTION_MULTIPLIER == 5
+
+    def test_m1_threshold_is_5_minutes(self):
+        """Test that M1 gap threshold is 300 seconds (5 min), not 7200."""
+        threshold = GRANULARITY_SECONDS["M1"] * GAP_DETECTION_MULTIPLIER
+        assert threshold == 300
+
+    def test_m5_threshold_is_25_minutes(self):
+        """Test that M5 gap threshold is 1500 seconds (25 min)."""
+        threshold = GRANULARITY_SECONDS["M5"] * GAP_DETECTION_MULTIPLIER
+        assert threshold == 1500
+
+    def test_h1_threshold_is_5_hours(self):
+        """Test that H1 gap threshold is 18000 seconds (5 hours)."""
+        threshold = GRANULARITY_SECONDS["H1"] * GAP_DETECTION_MULTIPLIER
+        assert threshold == 18000
+
+    def test_d_threshold_is_5_days(self):
+        """Test that D gap threshold is 432000 seconds (5 days)."""
+        threshold = GRANULARITY_SECONDS["D"] * GAP_DETECTION_MULTIPLIER
+        assert threshold == 432000
+
+
+@pytest.mark.unit
+class TestMergeNearbyGaps:
+    """Test cases for _merge_nearby_gaps function."""
+
+    def test_empty_gaps_returns_empty(self):
+        """Test that empty input returns empty output."""
+        assert _merge_nearby_gaps([], 60) == []
+
+    def test_single_gap_unchanged(self):
+        """Test that a single gap is returned unchanged."""
+        gap = {
+            "from": datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
+            "to": datetime(2024, 1, 15, 10, 30, tzinfo=UTC),
+            "duration_seconds": 1800,
+            "duration_hours": 0.5,
+        }
+        result = _merge_nearby_gaps([gap], 60)
+        assert len(result) == 1
+        assert result[0]["from"] == gap["from"]
+        assert result[0]["to"] == gap["to"]
+
+    def test_adjacent_gaps_merged(self):
+        """Test that gaps separated by less than merge_threshold are merged."""
+        gap1 = {
+            "from": datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
+            "to": datetime(2024, 1, 15, 10, 5, tzinfo=UTC),
+            "duration_seconds": 300,
+            "duration_hours": 300 / 3600,
+        }
+        gap2 = {
+            "from": datetime(2024, 1, 15, 10, 8, tzinfo=UTC),
+            "to": datetime(2024, 1, 15, 10, 15, tzinfo=UTC),
+            "duration_seconds": 420,
+            "duration_hours": 420 / 3600,
+        }
+        # 3 minutes apart, merge_threshold = 10 * 60 = 600s
+        result = _merge_nearby_gaps([gap1, gap2], 60)
+        assert len(result) == 1
+        assert result[0]["from"] == gap1["from"]
+        assert result[0]["to"] == gap2["to"]
+
+    def test_distant_gaps_not_merged(self):
+        """Test that gaps separated by more than merge_threshold stay separate."""
+        gap1 = {
+            "from": datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
+            "to": datetime(2024, 1, 15, 10, 5, tzinfo=UTC),
+            "duration_seconds": 300,
+            "duration_hours": 300 / 3600,
+        }
+        gap2 = {
+            "from": datetime(2024, 1, 15, 12, 0, tzinfo=UTC),
+            "to": datetime(2024, 1, 15, 12, 10, tzinfo=UTC),
+            "duration_seconds": 600,
+            "duration_hours": 600 / 3600,
+        }
+        # 2 hours apart, merge_threshold = 600s
+        result = _merge_nearby_gaps([gap1, gap2], 60)
+        assert len(result) == 2
+
+    def test_three_gaps_merge_into_one(self):
+        """Test that three adjacent gaps merge into one."""
+        base = datetime(2024, 1, 15, 10, 0, tzinfo=UTC)
+        gaps = [
+            {
+                "from": base,
+                "to": base + timedelta(minutes=3),
+                "duration_seconds": 180,
+                "duration_hours": 0.05,
+            },
+            {
+                "from": base + timedelta(minutes=5),
+                "to": base + timedelta(minutes=8),
+                "duration_seconds": 180,
+                "duration_hours": 0.05,
+            },
+            {
+                "from": base + timedelta(minutes=9),
+                "to": base + timedelta(minutes=12),
+                "duration_seconds": 180,
+                "duration_hours": 0.05,
+            },
+        ]
+        result = _merge_nearby_gaps(gaps, 60)
+        assert len(result) == 1
+        assert result[0]["from"] == base
+        assert result[0]["to"] == base + timedelta(minutes=12)
+
+    def test_custom_merge_threshold(self):
+        """Test that custom merge_threshold_seconds is respected."""
+        gap1 = {
+            "from": datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
+            "to": datetime(2024, 1, 15, 10, 5, tzinfo=UTC),
+            "duration_seconds": 300,
+            "duration_hours": 300 / 3600,
+        }
+        gap2 = {
+            "from": datetime(2024, 1, 15, 10, 8, tzinfo=UTC),
+            "to": datetime(2024, 1, 15, 10, 15, tzinfo=UTC),
+            "duration_seconds": 420,
+            "duration_hours": 420 / 3600,
+        }
+        # 3 minutes apart, but custom threshold is 60s (should NOT merge)
+        result = _merge_nearby_gaps([gap1, gap2], 60, merge_threshold_seconds=60)
+        assert len(result) == 2
+
+    def test_unsorted_gaps_handled(self):
+        """Test that out-of-order gaps are sorted before merging."""
+        gap_late = {
+            "from": datetime(2024, 1, 15, 10, 8, tzinfo=UTC),
+            "to": datetime(2024, 1, 15, 10, 15, tzinfo=UTC),
+            "duration_seconds": 420,
+            "duration_hours": 420 / 3600,
+        }
+        gap_early = {
+            "from": datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
+            "to": datetime(2024, 1, 15, 10, 5, tzinfo=UTC),
+            "duration_seconds": 300,
+            "duration_hours": 300 / 3600,
+        }
+        result = _merge_nearby_gaps([gap_late, gap_early], 60)
+        assert len(result) == 1
+        assert result[0]["from"] == gap_early["from"]
+        assert result[0]["to"] == gap_late["to"]
+
+
+@pytest.mark.unit
+class TestRepairCandleData:
+    """Test cases for repair_candle_data function."""
+
+    @pytest.fixture
+    def mock_dependencies(self):
+        """Mock all dependencies for repair_candle_data."""
+        with (
+            patch(
+                "src.agentfx.api.workers.candle_ingestion.detect_and_heal_gaps"
+            ) as mock_heal,
+            patch("src.agentfx.api.core.database.SessionLocal") as mock_session,
+            patch("src.agentfx.api.workers.candle_ingestion.settings") as mock_settings,
+        ):
+            mock_db = MagicMock()
+            mock_session.return_value = mock_db
+            mock_settings.instruments_list = ["EUR_USD", "GBP_USD"]
+            mock_settings.granularities_list = ["M1", "H1"]
+            yield {
+                "heal": mock_heal,
+                "session": mock_session,
+                "db": mock_db,
+                "settings": mock_settings,
+            }
+
+    def test_repair_processes_all_combinations(self, mock_dependencies):
+        """Test repair processes all instrument/granularity combinations."""
+        mock_dependencies["heal"].return_value = 10
+
+        stats = repair_candle_data()
+
+        # 2 instruments * 2 granularities = 4 calls
+        assert mock_dependencies["heal"].call_count == 4
+        assert stats["total_healed"] == 40
+
+    def test_repair_with_specific_instruments(self, mock_dependencies):
+        """Test repair with specific instruments only."""
+        mock_dependencies["heal"].return_value = 5
+
+        stats = repair_candle_data(instruments=["EUR_USD"])
+
+        # 1 instrument * 2 granularities = 2 calls
+        assert mock_dependencies["heal"].call_count == 2
+        assert stats["total_healed"] == 10
+
+    def test_repair_with_specific_granularities(self, mock_dependencies):
+        """Test repair with specific granularities only."""
+        mock_dependencies["heal"].return_value = 5
+
+        stats = repair_candle_data(granularities=["M1"])
+
+        # 2 instruments * 1 granularity = 2 calls
+        assert mock_dependencies["heal"].call_count == 2
+        assert stats["total_healed"] == 10
+
+    def test_repair_handles_errors_gracefully(self, mock_dependencies):
+        """Test that repair continues when one combination fails."""
+        mock_dependencies["heal"].side_effect = [
+            Exception("API error"),
+            10,
+            5,
+            20,
+        ]
+
+        stats = repair_candle_data()
+
+        assert mock_dependencies["heal"].call_count == 4
+        assert stats["total_healed"] == 35
+        assert stats["by_instrument"]["EUR_USD"]["M1"] == -1
+
+    def test_repair_returns_per_instrument_stats(self, mock_dependencies):
+        """Test that repair returns stats broken down by instrument/granularity."""
+        mock_dependencies["heal"].side_effect = [10, 20, 30, 40]
+
+        stats = repair_candle_data()
+
+        assert stats["by_instrument"]["EUR_USD"]["M1"] == 10
+        assert stats["by_instrument"]["EUR_USD"]["H1"] == 20
+        assert stats["by_instrument"]["GBP_USD"]["M1"] == 30
+        assert stats["by_instrument"]["GBP_USD"]["H1"] == 40
+
+
+@pytest.mark.unit
+class TestFetchCandlesRange502Retry:
+    """Test that 502 Bad Gateway errors trigger retries."""
+
+    @pytest.fixture
+    def mock_oanda_client(self):
+        """Create a mock OANDA client."""
+        with patch("agentfx.adapters.oanda.OandaClient") as mock:
+            yield mock
+
+    def test_fetch_retries_on_502_error(self, mock_oanda_client):
+        """Test that 502 errors trigger retry (previously silently failed)."""
+        from agentfx.adapters.oanda import OandaError
+
+        mock_client = MagicMock()
+        mock_oanda_client.return_value = mock_client
+
+        def candle_generator():
+            yield OandaError("502 Bad Gateway")  # First call fails
+            yield [
+                {
+                    "time": "2023-01-01T12:04:00Z",
+                    "open": 1.1,
+                    "high": 1.2,
+                    "low": 1.0,
+                    "close": 1.15,
+                    "volume": 100,
+                }
+            ]
+            while True:
+                yield []
+
+        gen = candle_generator()
+
+        def side_effect_fn(*args, **kwargs):
+            result = next(gen)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        mock_client.get_candles.side_effect = side_effect_fn
+
+        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC)
+        to_time = datetime(2023, 1, 1, 12, 5, 0, tzinfo=UTC)
+
+        with patch("src.agentfx.api.workers.candle_ingestion.time.sleep"):
+            result = fetch_candles_range(
+                "EUR_USD", "M1", from_time, to_time, max_retries=3
+            )
+
+        assert len(result) == 1
+        assert mock_client.get_candles.call_count >= 2
+
+    def test_fetch_retries_on_connection_error(self, mock_oanda_client):
+        """Test that connection_error from OandaClient triggers retry."""
+        from agentfx.adapters.oanda import OandaError
+
+        mock_client = MagicMock()
+        mock_oanda_client.return_value = mock_client
+
+        def candle_generator():
+            yield OandaError("connection_error: Read timed out")
+            yield [
+                {
+                    "time": "2023-01-01T12:04:00Z",
+                    "open": 1.1,
+                    "high": 1.2,
+                    "low": 1.0,
+                    "close": 1.15,
+                    "volume": 100,
+                }
+            ]
+            while True:
+                yield []
+
+        gen = candle_generator()
+
+        def side_effect_fn(*args, **kwargs):
+            result = next(gen)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        mock_client.get_candles.side_effect = side_effect_fn
+
+        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC)
+        to_time = datetime(2023, 1, 1, 12, 5, 0, tzinfo=UTC)
+
+        with patch("src.agentfx.api.workers.candle_ingestion.time.sleep"):
+            result = fetch_candles_range(
+                "EUR_USD", "M1", from_time, to_time, max_retries=3
+            )
+
+        assert len(result) == 1
+        assert mock_client.get_candles.call_count >= 2
+
+
+@pytest.mark.unit
+class TestGapPrioritization:
+    """Test that gaps are processed newest-first with a configurable limit."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        """Mock all dependencies for detect_and_heal_gaps."""
+        with (
+            patch("src.agentfx.api.services.market_data.MarketDataService") as mock_mds,
+            patch("src.agentfx.api.core.database.SessionLocal") as mock_session,
+            patch(
+                "src.agentfx.api.workers.candle_ingestion.is_market_closure",
+                return_value=(False, ""),
+            ),
+            patch(
+                "src.agentfx.api.workers.candle_ingestion.fetch_candles_range"
+            ) as mock_fetch,
+            patch(
+                "src.agentfx.api.workers.candle_ingestion.store_candles",
+                return_value=1,
+            ) as mock_store,
+        ):
+            mock_db = MagicMock()
+            mock_session.return_value = mock_db
+            yield {
+                "mds": mock_mds,
+                "db": mock_db,
+                "fetch": mock_fetch,
+                "store": mock_store,
+            }
+
+    def test_gaps_processed_newest_first(self, mock_deps):
+        """Test that the most recent gap is healed before older gaps."""
+        # Create timestamps with 3 gaps, each separated by >10 candles (>600s)
+        # to prevent _merge_nearby_gaps from merging them (merge threshold = 10 * 60s = 600s)
+        base = datetime(2023, 1, 1, 0, 0, 0, tzinfo=UTC)
+        timestamps = [
+            base,  # 0: 00:00
+            base + timedelta(minutes=1),  # 1: 00:01
+            # GAP 1: 10 min gap
+            base + timedelta(minutes=11),  # 2: 00:11
+            # 15 normal candles to separate gaps (> merge threshold)
+            *[base + timedelta(minutes=11 + i) for i in range(1, 16)],
+            # GAP 2: 10 min gap at minute 26
+            base + timedelta(minutes=36),  # ~: 00:36
+            # 15 normal candles to separate gaps
+            *[base + timedelta(minutes=36 + i) for i in range(1, 16)],
+            # GAP 3: 10 min gap at minute 51
+            base + timedelta(minutes=61),  # ~: 01:01
+        ]
+        mock_deps["mds"].get_candle_timestamps.return_value = timestamps
+
+        # Track the order gaps are fetched
+        fetch_order = []
+
+        def track_fetch(instrument, granularity, from_time, to_time):
+            fetch_order.append(from_time)
+            return [
+                {
+                    "time": "2023-01-01T00:05:00Z",
+                    "open": 1.1,
+                    "high": 1.2,
+                    "low": 1.0,
+                    "close": 1.15,
+                    "volume": 100,
+                }
+            ]
+
+        mock_deps["fetch"].side_effect = track_fetch
+
+        detect_and_heal_gaps("EUR_USD", "M1", mock_deps["db"])
+
+        # Should process 3 gaps, newest first
+        assert len(fetch_order) == 3
+        # Most recent gap first, then middle, then oldest
+        assert fetch_order[0] > fetch_order[1] > fetch_order[2]
+
+    def test_max_gaps_limit_respected(self, mock_deps):
+        """Test that processing stops after MAX_GAPS_PER_HEALTH_CHECK gaps."""
+        # Create timestamps with 60 gaps, each separated by >10 candles
+        # to prevent merging (merge threshold = 10 * 60s = 600s for M1)
+        base = datetime(2023, 1, 1, 0, 0, 0, tzinfo=UTC)
+        timestamps = []
+        offset = 0
+        for i in range(61):
+            # Add a normal candle
+            timestamps.append(base + timedelta(minutes=offset))
+            offset += 1
+            # Add a 10 min gap (> 5 min threshold)
+            offset += 10
+            # Add candle after gap
+            timestamps.append(base + timedelta(minutes=offset))
+            offset += 1
+            # Add 15 normal candles to separate from next gap (> merge threshold)
+            for j in range(15):
+                timestamps.append(base + timedelta(minutes=offset))
+                offset += 1
+
+        mock_deps["mds"].get_candle_timestamps.return_value = timestamps
+        mock_deps["fetch"].return_value = [
+            {
+                "time": "2023-01-01T00:05:00Z",
+                "open": 1.1,
+                "high": 1.2,
+                "low": 1.0,
+                "close": 1.15,
+                "volume": 100,
+            }
+        ]
+
+        detect_and_heal_gaps("EUR_USD", "M1", mock_deps["db"])
+
+        # Should stop at MAX_GAPS_PER_HEALTH_CHECK
+        assert mock_deps["fetch"].call_count == MAX_GAPS_PER_HEALTH_CHECK
+
+    def test_max_gaps_per_health_check_constant(self):
+        """Test that MAX_GAPS_PER_HEALTH_CHECK is set to 50."""
+        assert MAX_GAPS_PER_HEALTH_CHECK == 50
 
 
 # NOTE: Market closure tests have been moved to test_market_calendar.py

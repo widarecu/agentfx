@@ -9,10 +9,10 @@ Mark with @pytest.mark.oanda_real to require real OANDA connection.
 Mark with @pytest.mark.slow for long-running tests.
 """
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 import requests
-from datetime import datetime, timezone, timedelta
-
 from src.agentfx.api.core.config import settings
 
 
@@ -133,7 +133,7 @@ class TestCandleStorage:
     @pytest.fixture
     def sample_candles(self):
         """Sample candle data for testing."""
-        base_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        base_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC)
         return [
             {
                 "timestamp": base_time,
@@ -259,7 +259,7 @@ class TestCandleStorage:
         Uses TEST_EUR instrument to avoid conflicting with real OANDA data.
         """
         cursor = db_connection.cursor()
-        timestamp = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        timestamp = datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC)
 
         # Clean up any previous test data
         cursor.execute("DELETE FROM candles WHERE instrument = 'TEST_EUR'")
@@ -333,7 +333,7 @@ class TestOandaIntegration:
         """Test fetching real candles from OANDA API."""
         from src.agentfx.api.workers.candle_ingestion import fetch_candles_range
 
-        from_time = datetime.now(timezone.utc) - timedelta(hours=1)
+        from_time = datetime.now(UTC) - timedelta(hours=1)
         candles = fetch_candles_range("EUR_USD", "M1", from_time)
 
         # Should get some candles (markets may be closed on weekends)
@@ -348,8 +348,8 @@ class TestOandaIntegration:
 
         Note: This test requires OANDA credentials to be configured.
         """
-        from src.agentfx.api.workers.candle_ingestion import backfill_instrument
         from src.agentfx.api.models.instrument import Instrument
+        from src.agentfx.api.workers.candle_ingestion import backfill_instrument
 
         # Seed instruments using SQLAlchemy (not psycopg2)
         instruments_data = [
@@ -402,7 +402,7 @@ class TestGapDetection:
         )
 
         # Create candles from 2 hours ago to 1.5 hours ago (leaving 1.5 hour gap)
-        base_time = datetime.now(timezone.utc) - timedelta(hours=2)
+        base_time = datetime.now(UTC) - timedelta(hours=2)
 
         for i in range(30):  # 30 minutes of data
             timestamp = base_time + timedelta(minutes=i)
@@ -441,9 +441,9 @@ class TestGapDetection:
         if result:
             latest_time = result["timestamp"]
             if latest_time.tzinfo is None:
-                latest_time = latest_time.replace(tzinfo=timezone.utc)
+                latest_time = latest_time.replace(tzinfo=UTC)
 
-            gap = datetime.now(timezone.utc) - latest_time
+            gap = datetime.now(UTC) - latest_time
             gap_minutes = gap.total_seconds() / 60
 
             # Should have at least 30 minutes gap (we created data ending 1h30m ago)
@@ -455,7 +455,7 @@ class TestGapDetection:
 
         # Gap fill should start from last candle + 1 second
         gap_fill_start = last_candle_time + timedelta(seconds=1)
-        gap_fill_end = datetime.now(timezone.utc)
+        gap_fill_end = datetime.now(UTC)
 
         # Calculate expected candles in gap
         gap_duration = gap_fill_end - gap_fill_start

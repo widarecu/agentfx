@@ -5,12 +5,13 @@ Defines request/response models for optimization API endpoints.
 Follows the *Base/*Create/*Public pattern from existing schemas.
 """
 
-from pydantic import BaseModel, Field
-from typing import Any
 from datetime import datetime
+from typing import Any
+
+from pydantic import BaseModel, Field
+
 from ..models.optimization import JobStatus, StrategyType
 from .base import BaseSchema
-
 
 # =============================================================================
 # Parameter Range

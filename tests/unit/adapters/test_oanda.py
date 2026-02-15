@@ -1,10 +1,10 @@
 """Unit tests for OANDA adapter."""
 
-import pytest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
-import requests
 
+import pytest
+import requests
 from src.agentfx.adapters.oanda import (
     OandaClient,
     OandaError,
@@ -238,8 +238,8 @@ class TestOandaAdapter:
 
     def test_get_candles_with_all_parameters(self, oanda_client):
         """Test candle retrieval with all optional parameters."""
-        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        to_time = datetime(2023, 1, 1, 13, 0, 0, tzinfo=timezone.utc)
+        from_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC)
+        to_time = datetime(2023, 1, 1, 13, 0, 0, tzinfo=UTC)
 
         mock_response = {"candles": []}
         oanda_client._request = MagicMock(return_value=mock_response)
@@ -371,19 +371,47 @@ class TestOandaAdapter:
         assert result == []
 
     def test_timeout_handling(self, oanda_client):
-        """Test timeout handling in API requests."""
+        """Test timeout is caught and converted to OandaError after retries."""
         oanda_client.session.request = MagicMock(
-            side_effect=requests.exceptions.Timeout()
+            side_effect=requests.exceptions.Timeout("Read timed out")
         )
 
-        with pytest.raises(requests.exceptions.Timeout):
-            oanda_client._request("GET", "/test", {})
+        with patch("time.sleep"):
+            with pytest.raises(OandaError, match="connection_error"):
+                oanda_client._request("GET", "/test", {})
+
+        # Should retry 5 times before raising
+        assert oanda_client.session.request.call_count == 5
 
     def test_connection_error_handling(self, oanda_client):
-        """Test connection error handling in API requests."""
+        """Test connection error is caught and converted to OandaError after retries."""
         oanda_client.session.request = MagicMock(
-            side_effect=requests.exceptions.ConnectionError()
+            side_effect=requests.exceptions.ConnectionError("Connection refused")
         )
 
-        with pytest.raises(requests.exceptions.ConnectionError):
-            oanda_client._request("GET", "/test", {})
+        with patch("time.sleep"):
+            with pytest.raises(OandaError, match="connection_error"):
+                oanda_client._request("GET", "/test", {})
+
+        # Should retry 5 times before raising
+        assert oanda_client.session.request.call_count == 5
+
+    def test_timeout_retries_then_succeeds(self, oanda_client):
+        """Test timeout retries and succeeds on later attempt."""
+        success_response = MagicMock()
+        success_response.status_code = 200
+        success_response.json.return_value = {"data": "success"}
+
+        oanda_client.session.request = MagicMock(
+            side_effect=[
+                requests.exceptions.Timeout("Read timed out"),
+                requests.exceptions.Timeout("Read timed out"),
+                success_response,
+            ]
+        )
+
+        with patch("time.sleep"):
+            result = oanda_client._request("GET", "/test", {})
+
+        assert result == {"data": "success"}
+        assert oanda_client.session.request.call_count == 3

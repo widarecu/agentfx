@@ -11,11 +11,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 from sqlalchemy.orm import Session
 
+from agentfx.agents.optimizer import BayesianOptimizerAgent
+
 from ..core.database import SessionLocal
 from ..models.optimization import JobStatus
-from ..services import optimization as optimization_service
 from ..schemas.optimization import TrialMetrics, TrialMetricsExtended
-from agentfx.agents.optimizer import BayesianOptimizerAgent
+from ..services import optimization as optimization_service
 
 logger = logging.getLogger(__name__)
 

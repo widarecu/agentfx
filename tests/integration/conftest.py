@@ -19,11 +19,13 @@ os.environ.setdefault("TESTING", "true")
 if os.path.join(os.path.dirname(__file__), "..", "..", "src") not in sys.path:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
-import pytest
 from collections.abc import Generator
+from datetime import UTC
 from urllib.parse import urlparse
+
+import psycopg2
+import pytest
+from psycopg2.extras import RealDictCursor
 
 # Import settings AFTER environment is set
 from src.agentfx.api.core.config import settings
@@ -264,12 +266,12 @@ def seed_test_candles(db_connection, seed_instruments):
 
     This creates sample candle data for testing without requiring real OANDA API.
     """
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta
 
     cursor = db_connection.cursor()
 
     # Create 100 candles for EUR_USD M1
-    base_time = datetime.now(timezone.utc) - timedelta(hours=2)
+    base_time = datetime.now(UTC) - timedelta(hours=2)
 
     for i in range(100):
         timestamp = base_time + timedelta(minutes=i)
@@ -306,7 +308,7 @@ def seed_test_candles(db_connection, seed_instruments):
 # =============================================================================
 
 from sqlalchemy import create_engine  # noqa: E402
-from sqlalchemy.orm import sessionmaker, Session  # noqa: E402
+from sqlalchemy.orm import Session, sessionmaker  # noqa: E402
 
 # Import database models and base
 from src.agentfx.api.core.database import Base  # noqa: E402
@@ -355,8 +357,8 @@ def test_client_with_db(db_session):
     database isolation.
     """
     from fastapi.testclient import TestClient
-    from src.agentfx.api.main import app
     from src.agentfx.api.core.database import get_db
+    from src.agentfx.api.main import app
 
     def override_get_db():
         yield db_session

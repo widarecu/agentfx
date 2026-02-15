@@ -1,5 +1,7 @@
-from pydantic import BaseModel, EmailStr, Field, validator
 from datetime import datetime
+
+from pydantic import BaseModel, EmailStr, Field, validator
+
 from ..models.user import UserRole
 
 

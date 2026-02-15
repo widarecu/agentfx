@@ -1,14 +1,15 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, Response, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel
-from agentfx.portal_mock.utils import paginate_list, downsample_time_series
+
+from agentfx.portal_mock.utils import downsample_time_series, paginate_list
 
 app = FastAPI(title="AgentFX Portal Mock API", version="0.1")
 
 # --- In-memory fixtures ---
-NOW = datetime(2025, 11, 18, 1, 2, 3, tzinfo=timezone.utc)
+NOW = datetime(2025, 11, 18, 1, 2, 3, tzinfo=UTC)
 PAIR = "AUDUSD"
 RUN_ID = "run_20251117_ma_AUDUSD_paper_01"
 STRATEGY_ID = "ma"
@@ -120,12 +121,12 @@ slow_ma = _sma(close_vals, 20)
 
 ma_fast_points = [
     {"ts": c.ts.isoformat().replace("+00:00", "Z"), "value": v}
-    for c, v in zip(CANDLES, fast_ma)
+    for c, v in zip(CANDLES, fast_ma, strict=False)
     if v is not None
 ]
 ma_slow_points = [
     {"ts": c.ts.isoformat().replace("+00:00", "Z"), "value": v}
-    for c, v in zip(CANDLES, slow_ma)
+    for c, v in zip(CANDLES, slow_ma, strict=False)
     if v is not None
 ]
 

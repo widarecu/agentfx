@@ -15,7 +15,7 @@ This worker handles ALL candle data operations.
 import asyncio
 import logging
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
 
 from ..core.config import settings
 from .market_calendar import is_market_closure
@@ -40,6 +40,16 @@ LARGE_GAP_CHUNK_DAYS = 7  # Process large gaps in 7-day chunks
 LARGE_GAP_THRESHOLD_SECONDS = (
     7 * 86400
 )  # 7 days - gaps larger than this use chunked healing
+
+# Gap detection sensitivity: flag gaps exceeding this many candle intervals.
+# For M1 (60s): gaps > 300s (5 min). For H1 (3600s): gaps > 18000s (5 hours).
+# The market_calendar then filters out weekends/holidays/early closes.
+GAP_DETECTION_MULTIPLIER = 5
+
+# Maximum gaps to process per instrument:granularity per health check.
+# Prevents a single pair with many historical gaps from consuming the entire
+# health check window. Gaps are processed newest-first so recent data is prioritized.
+MAX_GAPS_PER_HEALTH_CHECK = 50
 
 # Granularity to seconds mapping for time-based pagination
 # OANDA API doesn't allow count + from/to together, so we paginate by time windows
@@ -75,7 +85,7 @@ def _get_backfill_start_time(days: int | None = None) -> datetime:
         days: Number of days to backfill. If None, uses settings.BACKFILL_DAYS.
     """
     backfill_days = days if days is not None else settings.BACKFILL_DAYS
-    return datetime.now(timezone.utc) - timedelta(days=backfill_days)
+    return datetime.now(UTC) - timedelta(days=backfill_days)
 
 
 def fetch_candles_range(
@@ -109,7 +119,7 @@ def fetch_candles_range(
 
     all_candles = []
     current_from = from_time
-    to_time = to_time or datetime.now(timezone.utc)
+    to_time = to_time or datetime.now(UTC)
 
     # Calculate chunk duration based on granularity
     # OANDA API doesn't allow count + from/to together, so we paginate by time windows
@@ -141,7 +151,10 @@ def fetch_candles_range(
 
             except OandaError as e:
                 error_str = str(e)
-                is_retryable = "504" in error_str or "429" in error_str
+                is_retryable = any(
+                    code in error_str
+                    for code in ("502", "504", "429", "connection_error")
+                )
 
                 if is_retryable and attempt < max_retries - 1:
                     backoff = INITIAL_BACKOFF_SECONDS * (2**attempt)
@@ -168,9 +181,9 @@ def fetch_candles_range(
         # OANDA with include_first=True may return the last candle BEFORE the range
         # which causes pagination to get stuck in a loop
         current_from_utc = (
-            current_from.astimezone(timezone.utc)
+            current_from.astimezone(UTC)
             if current_from.tzinfo
-            else current_from.replace(tzinfo=timezone.utc)
+            else current_from.replace(tzinfo=UTC)
         )
         valid_candles = []
         for c in candles:
@@ -228,8 +241,8 @@ def store_candles(
     Returns:
         Number of candles stored
     """
-    from ..services.market_data import MarketDataService
     from ..core.database import SessionLocal
+    from ..services.market_data import MarketDataService
 
     if not candles:
         return 0
@@ -339,7 +352,10 @@ def heal_large_gap(
 
             except OandaError as e:
                 error_str = str(e)
-                is_retryable = "504" in error_str or "429" in error_str
+                is_retryable = any(
+                    code in error_str
+                    for code in ("502", "504", "429", "connection_error")
+                )
 
                 if is_retryable and attempt < MAX_RETRIES - 1:
                     backoff = BASE_BACKOFF * (2**attempt)
@@ -389,8 +405,8 @@ def backfill_instrument(instrument: str, granularity: str, db=None) -> int:
     Returns:
         Number of candles stored
     """
-    from ..services.market_data import MarketDataService
     from ..core.database import SessionLocal
+    from ..services.market_data import MarketDataService
 
     # Support session injection for testing
     should_close = db is None
@@ -415,7 +431,7 @@ def backfill_instrument(instrument: str, granularity: str, db=None) -> int:
         else:
             # Gap fill from last candle
             from_time = latest.timestamp + timedelta(seconds=1)
-            gap_duration = datetime.now(timezone.utc) - from_time
+            gap_duration = datetime.now(UTC) - from_time
 
             # Skip if gap is negligible (< 1 minute)
             if gap_duration.total_seconds() < 60:
@@ -455,8 +471,8 @@ def validate_backfill_completeness(instrument: str, granularity: str, db=None) -
     Returns:
         True if data starts from expected date, False otherwise
     """
-    from ..services.market_data import MarketDataService
     from ..core.database import SessionLocal
+    from ..services.market_data import MarketDataService
 
     expected_start = _get_backfill_start_time()
 
@@ -487,6 +503,49 @@ def validate_backfill_completeness(instrument: str, granularity: str, db=None) -
             db.close()
 
 
+def _merge_nearby_gaps(
+    gaps: list[dict],
+    granularity_seconds: int,
+    merge_threshold_seconds: int | None = None,
+) -> list[dict]:
+    """Merge gaps that are close together into larger fetch ranges.
+
+    When gap detection uses a tight threshold, many small gaps may be
+    adjacent or separated by only a few candles. Merging them into
+    contiguous ranges dramatically reduces the number of OANDA API calls.
+
+    Args:
+        gaps: List of gap dicts with 'from', 'to', 'duration_seconds' keys.
+        granularity_seconds: Candle interval in seconds.
+        merge_threshold_seconds: Gaps separated by less than this are merged.
+            Defaults to 10 * granularity_seconds.
+
+    Returns:
+        List of merged gap dicts.
+    """
+    if not gaps:
+        return []
+
+    if merge_threshold_seconds is None:
+        merge_threshold_seconds = granularity_seconds * 10
+
+    sorted_gaps = sorted(gaps, key=lambda g: g["from"])
+
+    merged = [sorted_gaps[0].copy()]
+
+    for gap in sorted_gaps[1:]:
+        last = merged[-1]
+        separation = (gap["from"] - last["to"]).total_seconds()
+        if separation <= merge_threshold_seconds:
+            last["to"] = gap["to"]
+            last["duration_seconds"] = (last["to"] - last["from"]).total_seconds()
+            last["duration_hours"] = last["duration_seconds"] / 3600
+        else:
+            merged.append(gap.copy())
+
+    return merged
+
+
 def detect_and_heal_gaps(instrument: str, granularity: str, db=None) -> int:
     """
     Scan candle data for gaps and heal them by fetching missing data.
@@ -502,13 +561,11 @@ def detect_and_heal_gaps(instrument: str, granularity: str, db=None) -> int:
     Returns:
         Number of candles backfilled to heal gaps
     """
-    from ..services.market_data import MarketDataService
     from ..core.database import SessionLocal
+    from ..services.market_data import MarketDataService
 
     granularity_seconds = GRANULARITY_SECONDS.get(granularity, 60)
-    # Minimum gap threshold: at least granularity * 3 or 2 hours, whichever is larger
-    # This gives more tolerance before flagging as a gap
-    max_gap_seconds = max(granularity_seconds * 3, 7200)
+    max_gap_seconds = granularity_seconds * GAP_DETECTION_MULTIPLIER
 
     should_close = db is None
     if db is None:
@@ -536,7 +593,8 @@ def detect_and_heal_gaps(instrument: str, granularity: str, db=None) -> int:
                 is_closure, closure_reason = is_market_closure(gap_start, gap_end)
                 if is_closure:
                     logger.debug(
-                        f"Skipping gap {gap_start} to {gap_end}: {closure_reason}"
+                        f"Skipping gap {gap_start} to {gap_end} "
+                        f"({delta / 3600:.1f}h): {closure_reason}"
                     )
                     market_closures_skipped += 1
                     continue
@@ -559,6 +617,20 @@ def detect_and_heal_gaps(instrument: str, granularity: str, db=None) -> int:
                 f"Skipped {market_closures_skipped} market closure gaps for {instrument}:{granularity}"
             )
 
+        # Merge nearby small gaps to reduce OANDA API calls
+        if small_gaps:
+            original_count = len(small_gaps)
+            small_gaps = _merge_nearby_gaps(small_gaps, granularity_seconds)
+            if len(small_gaps) < original_count:
+                logger.info(
+                    f"Merged {original_count} small gaps into {len(small_gaps)} "
+                    f"fetch ranges for {instrument}:{granularity}"
+                )
+
+        # Sort gaps newest-first so recent (most likely healable) gaps are prioritized
+        small_gaps.sort(key=lambda g: g["from"], reverse=True)
+        large_gaps.sort(key=lambda g: g["from"], reverse=True)
+
         total_gaps = len(small_gaps) + len(large_gaps)
         if total_gaps == 0:
             logger.debug(f"No healable gaps found for {instrument}:{granularity}")
@@ -575,14 +647,28 @@ def detect_and_heal_gaps(instrument: str, granularity: str, db=None) -> int:
             )
 
         total_healed = 0
+        gaps_processed = 0
 
         # Process large gaps first using chunked healing
         for gap in large_gaps:
+            if gaps_processed >= MAX_GAPS_PER_HEALTH_CHECK:
+                logger.info(
+                    f"Reached max gaps limit ({MAX_GAPS_PER_HEALTH_CHECK}) "
+                    f"for {instrument}:{granularity}, deferring remaining gaps"
+                )
+                break
             healed = heal_large_gap(instrument, granularity, gap["from"], gap["to"], db)
             total_healed += healed
+            gaps_processed += 1
 
         # Process small gaps with direct fetch
         for gap in small_gaps:
+            if gaps_processed >= MAX_GAPS_PER_HEALTH_CHECK:
+                logger.info(
+                    f"Reached max gaps limit ({MAX_GAPS_PER_HEALTH_CHECK}) "
+                    f"for {instrument}:{granularity}, deferring remaining gaps"
+                )
+                break
             candles = fetch_candles_range(
                 instrument,
                 granularity,
@@ -602,13 +688,75 @@ def detect_and_heal_gaps(instrument: str, granularity: str, db=None) -> int:
                         f"Gap {gap['from']} to {gap['to']}: data already exists"
                     )
             else:
-                # No candles returned - this is expected for low-liquidity periods
-                # or undetected closures.
-                logger.info(
-                    f"No data for gap {gap['from']} to {gap['to']} (low-liquidity)"
-                )
+                logger.info(f"No data for gap {gap['from']} to {gap['to']}")
+            gaps_processed += 1
 
         return total_healed
+    finally:
+        if should_close:
+            db.close()
+
+
+def repair_candle_data(
+    instruments: list[str] | None = None,
+    granularities: list[str] | None = None,
+    db=None,
+) -> dict:
+    """Comprehensive repair sweep of all candle data.
+
+    Scans every instrument/granularity combination for gaps using the tight
+    detection threshold, merges nearby gaps, and heals them by fetching
+    from OANDA.
+
+    Args:
+        instruments: List of instruments to repair. Defaults to all configured.
+        granularities: List of granularities to repair. Defaults to all configured.
+        db: Optional database session (for testing).
+
+    Returns:
+        Dict with repair statistics.
+    """
+    from ..core.database import SessionLocal
+
+    instruments = instruments or settings.instruments_list
+    granularities = granularities or settings.granularities_list
+
+    should_close = db is None
+    if db is None:
+        db = SessionLocal()
+
+    stats = {
+        "total_healed": 0,
+        "by_instrument": {},
+    }
+
+    try:
+        total_combos = len(instruments) * len(granularities)
+        combo_count = 0
+
+        for instrument in instruments:
+            stats["by_instrument"][instrument] = {}
+
+            for granularity in granularities:
+                combo_count += 1
+                logger.info(
+                    f"[{combo_count}/{total_combos}] Repairing "
+                    f"{instrument}:{granularity}..."
+                )
+
+                try:
+                    healed = detect_and_heal_gaps(instrument, granularity, db)
+                    stats["by_instrument"][instrument][granularity] = healed
+                    stats["total_healed"] += healed
+                except Exception as e:
+                    logger.error(f"Repair failed for {instrument}:{granularity}: {e}")
+                    stats["by_instrument"][instrument][granularity] = -1
+
+        logger.info(
+            f"Repair complete: {stats['total_healed']} candles healed "
+            f"across {total_combos} combinations"
+        )
+        return stats
     finally:
         if should_close:
             db.close()
@@ -625,8 +773,9 @@ async def run_health_check() -> int:
         Total candles healed across all instruments
     """
     import concurrent.futures
-    from ..services.market_data import MarketDataService
+
     from ..core.database import SessionLocal
+    from ..services.market_data import MarketDataService
 
     logger.info("Running candle data health check...")
 
@@ -773,7 +922,7 @@ async def ingestion_loop():
 
     # Run initial health check
     await run_health_check()
-    _last_health_check = datetime.now(timezone.utc)
+    _last_health_check = datetime.now(UTC)
 
     logger.info(
         f"Entering continuous polling mode "
@@ -788,14 +937,14 @@ async def ingestion_loop():
 
     while not _shutdown_event.is_set():
         try:
-            cycle_start = datetime.now(timezone.utc)
+            cycle_start = datetime.now(UTC)
 
             # Check if health check is due
             if settings.CANDLE_HEALTH_CHECK_INTERVAL > 0 and _last_health_check:
                 time_since_check = (cycle_start - _last_health_check).total_seconds()
                 if time_since_check >= settings.CANDLE_HEALTH_CHECK_INTERVAL:
                     await run_health_check()
-                    _last_health_check = datetime.now(timezone.utc)
+                    _last_health_check = datetime.now(UTC)
 
             total_stored = 0
 
@@ -813,7 +962,7 @@ async def ingestion_loop():
                             fetch_and_store_recent,
                             instrument,
                             granularity,
-                            10,  # Fetch last 10 candles
+                            30,  # Fetch last 30 candles to recover from missed polls
                         )
                         total_stored += stored
                     except Exception as e:
@@ -821,7 +970,7 @@ async def ingestion_loop():
                             f"Failed to ingest {instrument}/{granularity}: {e}"
                         )
 
-            cycle_duration = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+            cycle_duration = (datetime.now(UTC) - cycle_start).total_seconds()
             logger.debug(
                 f"Ingestion cycle completed: {total_stored} candles in {cycle_duration:.1f}s"
             )

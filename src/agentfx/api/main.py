@@ -1,13 +1,15 @@
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import Response
-from starlette.middleware.base import BaseHTTPMiddleware
-from .core.config import settings
-from .routers import auth, runs, strategies, market_data, optimization
 import logging
 import logging.handlers
 import sys
 from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
+
+from .core.config import settings
+from .routers import auth, market_data, optimization, runs, strategies
 
 # Configure root logger
 logging.basicConfig(

@@ -1,14 +1,14 @@
 """Unit tests for the market data router."""
 
-import pytest
 from datetime import datetime
-from fastapi.testclient import TestClient
-from fastapi import status
 from unittest.mock import MagicMock, patch
 
-from src.agentfx.api.main import app
+import pytest
+from fastapi import status
+from fastapi.testclient import TestClient
 from src.agentfx.api import models
 from src.agentfx.api.core.database import get_db
+from src.agentfx.api.main import app
 from src.agentfx.api.models.user import UserRole
 from src.agentfx.api.services.user import get_current_active_user
 
@@ -297,6 +297,66 @@ class TestMarketDataRouter:
         assert "data_quality" in data
         assert "health" in data
         assert data["health"]["status"] == "healthy"
+
+    @patch("src.agentfx.api.services.market_data.MarketDataService.get_candles")
+    def test_get_candles_with_custom_limit(
+        self, mock_get_candles, client, mock_current_user
+    ):
+        """Test candle retrieval with custom limit returns correct total count."""
+        # Create mock candle objects to simulate 500 of 1500 total
+        mock_candles = []
+        for i in range(3):
+            mock_candle = MagicMock()
+            mock_candle.id = i + 1
+            mock_candle.timestamp = datetime(2023, 1, 1, 12, i, 0)
+            mock_candle.open = 1.1000 + i * 0.0001
+            mock_candle.high = 1.1005 + i * 0.0001
+            mock_candle.low = 1.0995 + i * 0.0001
+            mock_candle.close = 1.1002 + i * 0.0001
+            mock_candle.volume = 1000 + i
+            mock_candle.exchange = "oanda"
+            mock_candle.instrument = "EUR_USD"
+            mock_candle.timeframe = "M1"
+            mock_candle.created_at = datetime(2023, 1, 1, 12, i, 0)
+            mock_candles.append(mock_candle)
+
+        # Return 3 candles but total of 1500 (simulating limit < total)
+        mock_get_candles.return_value = (mock_candles, 1500)
+
+        response = client.get(
+            "/api/v1/market-data/candles?exchange=oanda&instrument=EUR_USD&timeframe=M1&limit=500",
+            headers={"Authorization": "Bearer test-token"},
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert "items" in data
+        assert "total" in data
+        assert data["total"] == 1500
+        assert len(data["items"]) == 3
+
+    @patch("src.agentfx.api.services.market_data.MarketDataService.get_timeframes")
+    def test_list_timeframes(self, mock_get_timeframes, client, mock_current_user):
+        """Test timeframes listing endpoint returns dynamic DB values."""
+        mock_get_timeframes.return_value = [
+            {"code": "M1", "display_name": "1 Min"},
+            {"code": "H1", "display_name": "1 Hour"},
+            {"code": "D", "display_name": "Daily"},
+        ]
+
+        response = client.get(
+            "/api/v1/market-data/timeframes?exchange=oanda",
+            headers={"Authorization": "Bearer test-token"},
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert len(data) == 3
+        assert data[0]["code"] == "M1"
+        assert data[0]["display_name"] == "1 Min"
+        assert data[1]["code"] == "H1"
+        assert data[2]["code"] == "D"
+        assert data[2]["display_name"] == "Daily"
 
     def test_unauthorized_access(self, client):
         """Test that unauthorized requests are rejected."""

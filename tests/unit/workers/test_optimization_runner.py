@@ -15,9 +15,10 @@ These are UNIT tests - all database operations are mocked.
 Run with: make test-file FILE=tests/unit/workers/test_optimization_runner.py
 """
 
-import pytest
-from unittest.mock import MagicMock, patch, AsyncMock
 from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 pytestmark = pytest.mark.unit
 
@@ -332,8 +333,8 @@ class TestRunOptimization:
     async def test_prevents_duplicate_execution(self):
         """Test that duplicate job execution is prevented."""
         from src.agentfx.api.workers.optimization_runner import (
-            run_optimization,
             _running_jobs,
+            run_optimization,
         )
 
         job_id = "test_job_duplicate"
@@ -354,8 +355,8 @@ class TestRunOptimization:
     async def test_adds_and_removes_from_running_jobs(self):
         """Test that job is tracked in _running_jobs during execution."""
         from src.agentfx.api.workers.optimization_runner import (
-            run_optimization,
             _running_jobs,
+            run_optimization,
         )
 
         job_id = "test_job_tracking"
@@ -380,8 +381,8 @@ class TestRunOptimization:
     async def test_removes_from_running_jobs_on_completion(self):
         """Test that job is removed from _running_jobs after execution completes."""
         from src.agentfx.api.workers.optimization_runner import (
-            run_optimization,
             _running_jobs,
+            run_optimization,
         )
 
         job_id = "test_job_completion"

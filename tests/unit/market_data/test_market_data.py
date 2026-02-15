@@ -1,14 +1,14 @@
 """Unit tests for the market data router."""
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 from fastapi import status
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
-from unittest.mock import MagicMock, patch
-
-from src.agentfx.api.main import app
 from src.agentfx.api import models
 from src.agentfx.api.core.database import get_db
+from src.agentfx.api.main import app
 from src.agentfx.api.models.user import UserRole
 from src.agentfx.api.services.user import get_current_active_user
 

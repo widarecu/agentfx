@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pandas as pd
-from datetime import datetime, timedelta, timezone
 
 from agentfx.core.policy import PolicyConfig, apply_policies
 
 
 def make_index(n=120, start_time=None):
     if start_time is None:
-        start = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(
+        start = datetime.now(UTC).replace(second=0, microsecond=0) - timedelta(
             minutes=n
         )
     else:
@@ -37,7 +38,7 @@ def test_order_rate_throttle_blocks_excess_trades():
 
 def test_daily_loss_halts_until_eod():
     # Use a fixed date at 10 AM UTC to avoid crossing midnight
-    start_time = datetime(2023, 6, 15, 10, 0, 0, tzinfo=timezone.utc)
+    start_time = datetime(2023, 6, 15, 10, 0, 0, tzinfo=UTC)
     idx = make_index(300, start_time=start_time)  # 5 hours: 10 AM to 3 PM
     # Flat signals
     sig = pd.Series(1.0, index=idx)

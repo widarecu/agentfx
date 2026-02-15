@@ -5,11 +5,11 @@ Tests CRUD operations for optimization jobs, trials, signals, and trades.
 Uses mocked database sessions to test service layer logic.
 """
 
+from datetime import UTC, datetime
 from unittest.mock import Mock, patch
-from datetime import datetime, timezone
 
-from agentfx.api.services import optimization as optimization_service
 from agentfx.api import schemas
+from agentfx.api.services import optimization as optimization_service
 
 
 class TestJobIdGeneration:
@@ -82,9 +82,7 @@ class TestGetJobs:
         mock_jobs = [Mock(), Mock()]
         mock_query = Mock()
         mock_query.count.return_value = 10
-        mock_query.order_by.return_value.offset.return_value.limit.return_value.all.return_value = (
-            mock_jobs
-        )
+        mock_query.order_by.return_value.offset.return_value.limit.return_value.all.return_value = mock_jobs
         mock_db.query.return_value = mock_query
 
         items, total = optimization_service.get_jobs(mock_db)
@@ -98,9 +96,7 @@ class TestGetJobs:
         mock_query = Mock()
         mock_query.filter.return_value = mock_query
         mock_query.count.return_value = 5
-        mock_query.order_by.return_value.offset.return_value.limit.return_value.all.return_value = (
-            []
-        )
+        mock_query.order_by.return_value.offset.return_value.limit.return_value.all.return_value = []
         mock_db.query.return_value = mock_query
 
         optimization_service.get_jobs(
@@ -119,9 +115,7 @@ class TestGetJobs:
         mock_db = Mock()
         mock_query = Mock()
         mock_query.count.return_value = 100
-        mock_query.order_by.return_value.offset.return_value.limit.return_value.all.return_value = (
-            []
-        )
+        mock_query.order_by.return_value.offset.return_value.limit.return_value.all.return_value = []
         mock_db.query.return_value = mock_query
 
         optimization_service.get_jobs(mock_db, skip=20, limit=10)
@@ -336,9 +330,7 @@ class TestTrialOperations:
         mock_query = Mock()
         mock_query.filter.return_value = mock_query
         mock_query.count.return_value = 50
-        mock_query.order_by.return_value.offset.return_value.limit.return_value.all.return_value = (
-            mock_trials
-        )
+        mock_query.order_by.return_value.offset.return_value.limit.return_value.all.return_value = mock_trials
         mock_db.query.return_value = mock_query
 
         items, total = optimization_service.get_trials(mock_db, "optjob_123")
@@ -352,9 +344,7 @@ class TestTrialOperations:
         mock_query = Mock()
         mock_query.filter.return_value = mock_query
         mock_query.count.return_value = 10
-        mock_query.order_by.return_value.offset.return_value.limit.return_value.all.return_value = (
-            []
-        )
+        mock_query.order_by.return_value.offset.return_value.limit.return_value.all.return_value = []
         mock_db.query.return_value = mock_query
 
         optimization_service.get_trials(mock_db, "optjob_123", passes_gate_b=True)
@@ -462,9 +452,7 @@ class TestSignalOperations:
         mock_query = Mock()
         mock_query.filter.return_value = mock_query
         mock_query.count.return_value = 100
-        mock_query.order_by.return_value.offset.return_value.limit.return_value.all.return_value = (
-            mock_signals
-        )
+        mock_query.order_by.return_value.offset.return_value.limit.return_value.all.return_value = mock_signals
         mock_db.query.return_value = mock_query
 
         items, total = optimization_service.get_signals(mock_db, "trial_123")
@@ -478,13 +466,13 @@ class TestSignalOperations:
         mock_db = Mock()
         signals = [
             {
-                "timestamp": datetime.now(timezone.utc),
+                "timestamp": datetime.now(UTC),
                 "signal": 1,
                 "signal_type": "entry_long",
                 "price": 1.1000,
             },
             {
-                "timestamp": datetime.now(timezone.utc),
+                "timestamp": datetime.now(UTC),
                 "signal": -1,
                 "signal_type": "exit_long",
                 "price": 1.1050,
@@ -508,9 +496,7 @@ class TestTradeOperations:
         mock_query = Mock()
         mock_query.filter.return_value = mock_query
         mock_query.count.return_value = 50
-        mock_query.order_by.return_value.offset.return_value.limit.return_value.all.return_value = (
-            mock_trades
-        )
+        mock_query.order_by.return_value.offset.return_value.limit.return_value.all.return_value = mock_trades
         mock_db.query.return_value = mock_query
 
         items, total = optimization_service.get_trades(mock_db, "trial_123")
@@ -525,8 +511,8 @@ class TestTradeOperations:
         trades = [
             {
                 "direction": "long",
-                "entry_timestamp": datetime.now(timezone.utc),
-                "exit_timestamp": datetime.now(timezone.utc),
+                "entry_timestamp": datetime.now(UTC),
+                "exit_timestamp": datetime.now(UTC),
                 "entry_price": 1.1000,
                 "exit_price": 1.1050,
                 "pips": 50,
@@ -547,3 +533,45 @@ class TestTradeOperations:
         assert result == 1
         mock_db.bulk_save_objects.assert_called_once()
         mock_db.commit.assert_called_once()
+
+    @patch("agentfx.api.services.optimization.models")
+    def test_bulk_create_trades_ignores_id_field(self, mock_models):
+        """Test that bulk_create_trades ignores 'id' field from trade dict.
+
+        Regression test: The backtest service includes an 'id' field in trade
+        dictionaries, but bulk_create_trades generates its own ID. This test
+        ensures the input 'id' is stripped to avoid 'got multiple values for
+        keyword argument' errors.
+        """
+        mock_db = Mock()
+        trades = [
+            {
+                "id": "trade_should_be_ignored",  # This field should be ignored
+                "direction": "long",
+                "entry_timestamp": datetime.now(UTC),
+                "exit_timestamp": datetime.now(UTC),
+                "entry_price": 1.1000,
+                "exit_price": 1.1050,
+                "pips": 50,
+                "spread_cost_pips": 2,
+                "swap_cost_pips": 0.5,
+                "net_pips": 47.5,
+                "gross_pnl_dollars": 50.0,
+                "spread_cost_dollars": 2.0,
+                "swap_cost_dollars": 0.5,
+                "net_pnl_dollars": 47.5,
+                "duration_minutes": 120,
+                "position_size": 10000,
+            },
+        ]
+
+        # Should not raise "got multiple values for keyword argument 'id'"
+        result = optimization_service.bulk_create_trades(mock_db, "trial_123", trades)
+
+        assert result == 1
+        mock_db.bulk_save_objects.assert_called_once()
+        mock_db.commit.assert_called_once()
+
+        # Verify the model was called with generated ID, not the input 'id'
+        call_args = mock_models.OptimizationTrade.call_args
+        assert call_args.kwargs["id"].startswith("trade_trial_123_")

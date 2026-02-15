@@ -4,17 +4,17 @@ NOTE: This test file has been migrated from SQLite to PostgreSQL.
 It now uses the settings.TEST_DATABASE_URL from config.py as the single source of truth.
 """
 
-import pytest
 import time
+
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
-from src.agentfx.api.main import app
-from src.agentfx.api.core.database import get_db, Base
 from src.agentfx.api.core.config import settings
-from src.agentfx.api.models.user import User, UserRole
+from src.agentfx.api.core.database import Base, get_db
 from src.agentfx.api.core.security import get_password_hash
+from src.agentfx.api.main import app
+from src.agentfx.api.models.user import User, UserRole
 
 # Use PostgreSQL for auth integration tests (from settings.TEST_DATABASE_URL)
 # This is the SINGLE SOURCE OF TRUTH for test database configuration

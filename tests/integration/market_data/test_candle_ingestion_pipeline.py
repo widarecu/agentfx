@@ -20,11 +20,12 @@ Prerequisites:
 Run with: ENVIRONMENT=test pytest tests/integration/market_data/test_candle_ingestion_pipeline.py -v
 """
 
-import pytest
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urlparse
+
+import psycopg2
+import pytest
+from psycopg2.extras import RealDictCursor
 
 # Core FX pairs that must have data
 CORE_PAIRS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CHF", "USD_CAD"]
@@ -334,9 +335,9 @@ class TestCandleDataQuality:
         result = cursor.fetchone()
         cursor.close()
 
-        assert (
-            result["count"] == 0
-        ), f"{result['count']} candles have timestamps more than 2 hours in the future"
+        assert result["count"] == 0, (
+            f"{result['count']} candles have timestamps more than 2 hours in the future"
+        )
 
     def test_candle_prices_reasonable(self, pipeline_db):
         """Validate that candle prices are within reasonable FX ranges."""
@@ -353,9 +354,9 @@ class TestCandleDataQuality:
         result = cursor.fetchone()
         cursor.close()
 
-        assert (
-            result["count"] == 0
-        ), f"{result['count']} candles have prices outside reasonable FX range (0.5-200)"
+        assert result["count"] == 0, (
+            f"{result['count']} candles have prices outside reasonable FX range (0.5-200)"
+        )
 
 
 class TestCandleDataContinuity:
@@ -419,9 +420,9 @@ class TestCandleDataContinuity:
             if result and result["latest"]:
                 latest = result["latest"]
                 if latest.tzinfo is None:
-                    latest = latest.replace(tzinfo=timezone.utc)
+                    latest = latest.replace(tzinfo=UTC)
 
-                age_hours = (datetime.now(timezone.utc) - latest).total_seconds() / 3600
+                age_hours = (datetime.now(UTC) - latest).total_seconds() / 3600
 
                 # If data is older than 24 hours, flag it (could be weekend)
                 # For a stricter check on trading days, use 2 hours
@@ -437,9 +438,9 @@ class TestCandleDataContinuity:
             print(f"\nWarning: Potentially stale data: {stale_pairs}")
 
         # Don't fail on weekends - just ensure data exists
-        assert all(
-            age != "no data" for _, age in stale_pairs
-        ), f"Some pairs have no M1 data at all: {[p for p, a in stale_pairs if a == 'no data']}"
+        assert all(age != "no data" for _, age in stale_pairs), (
+            f"Some pairs have no M1 data at all: {[p for p, a in stale_pairs if a == 'no data']}"
+        )
 
 
 class TestCandleIngestionWorker:
@@ -448,8 +449,8 @@ class TestCandleIngestionWorker:
     @pytest.mark.oanda_real
     def test_worker_can_fetch_new_candles(self, db_session):
         """Test that the worker can fetch and store new candles from OANDA."""
-        from src.agentfx.api.workers.candle_ingestion import backfill_instrument
         from src.agentfx.api.models.instrument import Instrument
+        from src.agentfx.api.workers.candle_ingestion import backfill_instrument
 
         # Ensure EUR_USD instrument exists
         instrument = db_session.query(Instrument).filter_by(symbol="EUR_USD").first()

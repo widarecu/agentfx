@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import glob
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pandas as pd
 
-from agentfx.core.strategy import (
-    Strategy,
-    MACrossover,
-    RSIMeanReversion,
-    DonchianBreakout,
-)
+from agentfx.adapters.storage.sqlite import Registry
 from agentfx.core.metrics import compute_returns, summarize
 from agentfx.core.policy import PolicyConfig, apply_policies
-from agentfx.adapters.storage.sqlite import Registry
+from agentfx.core.strategy import (
+    DonchianBreakout,
+    MACrossover,
+    RSIMeanReversion,
+    Strategy,
+)
 
 
 def _data_dir(root: str, pair: str, granularity: str = "M1") -> str:
@@ -443,7 +443,7 @@ def run_backtest(
     db_path: str | None = None,
 ) -> dict:
     strategy_params = strategy_params or {}
-    end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    end = datetime.now(UTC).replace(second=0, microsecond=0)
     start = end - timedelta(days=start_days) if start_days else None
     df = load_price_df(data_root, pair, start=start, end=end)
     strat = make_strategy(strategy_name, **strategy_params)

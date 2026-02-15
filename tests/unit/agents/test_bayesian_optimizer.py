@@ -10,8 +10,9 @@ Tests the Bayesian optimization logic including:
 - Iteration estimation
 """
 
-import numpy as np
 from unittest.mock import patch
+
+import numpy as np
 
 from agentfx.agents.optimizer import (
     BayesianOptimizerAgent,

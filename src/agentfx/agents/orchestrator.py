@@ -10,7 +10,7 @@ See: planning/requirements/US-007 (to be created)
 from datetime import datetime
 from uuid import uuid4
 
-from agentfx.agents.base import BaseAgent, AgentResult
+from agentfx.agents.base import AgentResult, BaseAgent
 from agentfx.agents.discovery import DiscoveryAgent
 from agentfx.agents.optimizer import OptimizerAgent
 

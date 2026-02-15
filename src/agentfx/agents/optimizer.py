@@ -8,14 +8,15 @@ to efficiently search the parameter space.
 See: planning/requirements/US-001-optimization-runs.md
 """
 
-from datetime import datetime, timezone, timedelta
+import logging
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from itertools import product
 from typing import Any
-from collections.abc import Callable
-import logging
+
 import numpy as np
 
-from agentfx.agents.base import BaseAgent, AgentResult
+from agentfx.agents.base import AgentResult, BaseAgent
 from agentfx.services.backtest import run_backtest, run_backtest_from_db
 
 logger = logging.getLogger(__name__)
@@ -47,13 +48,13 @@ def evaluate_gate_b(metrics: dict) -> tuple[bool, list[str]]:
     max_dd = metrics.get("max_drawdown", 1.0)
     if max_dd > GATE_B_THRESHOLDS["max_drawdown"]:
         failures.append(
-            f"Max DD {max_dd*100:.1f}% > {GATE_B_THRESHOLDS['max_drawdown']*100}%"
+            f"Max DD {max_dd * 100:.1f}% > {GATE_B_THRESHOLDS['max_drawdown'] * 100}%"
         )
 
     hit_rate = metrics.get("hit_rate", 0)
     if hit_rate < GATE_B_THRESHOLDS["hit_rate_min"]:
         failures.append(
-            f"Hit Rate {hit_rate*100:.1f}% < {GATE_B_THRESHOLDS['hit_rate_min']*100}%"
+            f"Hit Rate {hit_rate * 100:.1f}% < {GATE_B_THRESHOLDS['hit_rate_min'] * 100}%"
         )
 
     trade_count = metrics.get("n_trades", 0)
@@ -116,7 +117,7 @@ class OptimizerAgent(BaseAgent):
 
         combinations = []
         for combo in product(*param_values):
-            combinations.append(dict(zip(param_names, combo)))
+            combinations.append(dict(zip(param_names, combo, strict=False)))
 
         return combinations
 
@@ -434,7 +435,7 @@ class BayesianOptimizerAgent(BaseAgent):
         from sklearn.gaussian_process import GaussianProcessRegressor
         from sklearn.gaussian_process.kernels import Matern
 
-        self.started_at = datetime.now(timezone.utc)
+        self.started_at = datetime.now(UTC)
 
         # Validate inputs
         is_valid, errors = self.validate_inputs(
@@ -446,7 +447,7 @@ class BayesianOptimizerAgent(BaseAgent):
             return self._create_result("failed", {}, errors)
 
         # Calculate date range
-        end_time = datetime.now(timezone.utc)
+        end_time = datetime.now(UTC)
         start_time = end_time - timedelta(days=data_years * 365)
 
         # Estimate iterations if not specified
@@ -618,7 +619,7 @@ class BayesianOptimizerAgent(BaseAgent):
             trial["rank"] = i + 1
 
         # Calculate optimization stats
-        duration = (datetime.now(timezone.utc) - self.started_at).total_seconds()
+        duration = (datetime.now(UTC) - self.started_at).total_seconds()
         gate_b_passes = sum(1 for t in all_trials if t["passes_gate_b"])
 
         optimization_stats = {

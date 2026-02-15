@@ -8,20 +8,24 @@ Defines database tables for:
 """
 
 from enum import Enum
+
 from sqlalchemy import (
-    Column,
-    String,
-    Float,
-    Integer,
-    Boolean,
-    DateTime,
-    ForeignKey,
     JSON,
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
     Text,
+)
+from sqlalchemy import (
     Enum as SQLEnum,
 )
-from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+
 from ..core.database import Base
 
 

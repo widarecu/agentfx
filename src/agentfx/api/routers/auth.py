@@ -1,11 +1,12 @@
 from datetime import timedelta
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
-from typing import Any
 
 from .. import models, schemas
-from ..core import security, config
+from ..core import config, security
 from ..core.database import get_db
 from ..services import user as user_service
 

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import time
-import requests
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+
+import requests  # type: ignore[import-untyped]
 
 from agentfx.shared.config import oanda_api_host, oanda_api_key
 
@@ -44,9 +45,18 @@ class OandaClient:
     def _request(self, method: str, path: str, params: dict[str, str]) -> dict:
         url = f"{self.base_url}{path}"
         for attempt in range(5):
-            resp = self.session.request(
-                method, url, params=params, timeout=self.timeout
-            )
+            try:
+                resp = self.session.request(
+                    method, url, params=params, timeout=self.timeout
+                )
+            except (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+            ) as e:
+                if attempt < 4:
+                    time.sleep(1 + attempt)
+                    continue
+                raise OandaError(f"connection_error: {e}") from e
             if resp.status_code == 429:
                 time.sleep(1 + attempt)
                 continue
@@ -73,13 +83,9 @@ class OandaClient:
         if count is not None:
             params["count"] = str(count)
         if from_ts is not None:
-            params["from"] = (
-                from_ts.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-            )
+            params["from"] = from_ts.astimezone(UTC).isoformat().replace("+00:00", "Z")
         if to_ts is not None:
-            params["to"] = (
-                to_ts.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-            )
+            params["to"] = to_ts.astimezone(UTC).isoformat().replace("+00:00", "Z")
         if include_first:
             params["includeFirst"] = "true"
         data = self._request("GET", f"/instruments/{instrument}/candles", params)
@@ -92,12 +98,12 @@ class OandaClient:
             if price.upper() == "M" and "mid" in c:
                 o = c["mid"]["o"]
                 h = c["mid"]["h"]
-                l = c["mid"]["l"]
+                lo = c["mid"]["l"]
                 cl = c["mid"]["c"]
             elif "bid" in c and "ask" in c:
                 o = (float(c["bid"]["o"]) + float(c["ask"]["o"])) / 2
                 h = (float(c["bid"]["h"]) + float(c["ask"]["h"])) / 2
-                l = (float(c["bid"]["l"]) + float(c["ask"]["l"])) / 2
+                lo = (float(c["bid"]["l"]) + float(c["ask"]["l"])) / 2
                 cl = (float(c["bid"]["c"]) + float(c["ask"]["c"])) / 2
             else:
                 # Skip malformed candle
@@ -107,7 +113,7 @@ class OandaClient:
                     "time": t,
                     "open": float(o),
                     "high": float(h),
-                    "low": float(l),
+                    "low": float(lo),
                     "close": float(cl),
                     "volume": int(vol),
                     "complete": bool(complete),

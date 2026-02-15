@@ -1,20 +1,20 @@
 """Unit tests for security module functions."""
 
-import pytest
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
-from jose import jwt
 
+import pytest
+from jose import jwt
+from src.agentfx.api.core.config import settings
 from src.agentfx.api.core.security import (
-    verify_password,
-    get_password_hash,
     create_access_token,
     decode_token,
-    get_current_user,
     get_current_active_user,
+    get_current_user,
     get_current_user_ws,
+    get_password_hash,
+    verify_password,
 )
-from src.agentfx.api.core.config import settings
 from src.agentfx.api.models.user import User, UserRole
 
 

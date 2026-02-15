@@ -7,8 +7,9 @@ Provides CRUD operations for optimization jobs, trials, signals, and trades.
 import uuid
 from datetime import datetime
 from typing import Any
-from sqlalchemy.orm import Session
+
 from sqlalchemy import desc
+from sqlalchemy.orm import Session
 
 from .. import models, schemas
 
@@ -446,14 +447,18 @@ def bulk_create_trades(
     trades: list[dict[str, Any]],
 ) -> int:
     """Bulk create trades. Returns count created."""
-    db_trades = [
-        models.OptimizationTrade(
-            id=generate_trade_id(trial_id, i),
-            trial_id=trial_id,
-            **trade,
+    db_trades = []
+    for i, trade in enumerate(trades):
+        # Remove 'id' if present to avoid conflict with generated ID
+        # The backtest service includes an 'id' field that would conflict
+        trade_data = {k: v for k, v in trade.items() if k != "id"}
+        db_trades.append(
+            models.OptimizationTrade(
+                id=generate_trade_id(trial_id, i),
+                trial_id=trial_id,
+                **trade_data,
+            )
         )
-        for i, trade in enumerate(trades)
-    ]
     db.bulk_save_objects(db_trades)
     db.commit()
     return len(db_trades)

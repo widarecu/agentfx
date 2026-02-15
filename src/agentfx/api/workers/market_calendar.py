@@ -10,7 +10,7 @@ Source: SIFMA Holiday Schedule (https://www.sifma.org/resources/guides-playbooks
 """
 
 import logging
-from datetime import datetime, date, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -116,9 +116,9 @@ def _spans_weekend(gap_start: datetime, gap_end: datetime) -> bool:
     """
     # Ensure timezone awareness
     if gap_start.tzinfo is None:
-        gap_start = gap_start.replace(tzinfo=timezone.utc)
+        gap_start = gap_start.replace(tzinfo=UTC)
     if gap_end.tzinfo is None:
-        gap_end = gap_end.replace(tzinfo=timezone.utc)
+        gap_end = gap_end.replace(tzinfo=UTC)
 
     gap_hours = (gap_end - gap_start).total_seconds() / 3600
 
@@ -135,6 +135,85 @@ def _spans_weekend(gap_start: datetime, gap_end: datetime) -> bool:
     # Gap should end around Sunday (6), Monday (0), or Tuesday (1)
     # Include Tuesday for gaps that end later due to timezone
     return start_weekday in (3, 4, 5) and end_weekday in (6, 0, 1)
+
+
+def _spans_extended_closure(gap_start: datetime, gap_end: datetime) -> tuple[bool, str]:
+    """
+    Check if a gap spans a known extended market closure period.
+
+    Extended closures are multi-day periods around holidays (e.g., Christmas week,
+    New Year week) where the market is effectively closed for longer than a
+    single holiday. Defined in forex_calendar.yaml 'extended_closures' section.
+
+    Args:
+        gap_start: Start of the gap (last candle before gap).
+        gap_end: End of the gap (first candle after gap).
+
+    Returns:
+        Tuple of (is_closure, reason):
+        - (True, "extended_closure:2024-12-23/2024-12-27")
+        - (False, "")
+    """
+    cal = load_calendar()
+    extended = cal.get("extended_closures", {})
+
+    if not extended:
+        return False, ""
+
+    # Ensure timezone awareness
+    if gap_start.tzinfo is None:
+        gap_start = gap_start.replace(tzinfo=UTC)
+    if gap_end.tzinfo is None:
+        gap_end = gap_end.replace(tzinfo=UTC)
+
+    gap_hours = (gap_end - gap_start).total_seconds() / 3600
+
+    # Extended closures are typically 2-7 days (48-168 hours)
+    if gap_hours < 24 or gap_hours > 240:
+        return False, ""
+
+    # Check closures for the year(s) spanned by the gap
+    years_to_check = {gap_start.year}
+    if gap_end.year != gap_start.year:
+        years_to_check.add(gap_end.year)
+
+    for year in years_to_check:
+        year_closures = extended.get(year, [])
+        for closure in year_closures:
+            closure_start_str = closure["start"]
+            closure_end_str = closure["end"]
+
+            cs_month, cs_day = map(int, closure_start_str.split("-"))
+            ce_month, ce_day = map(int, closure_end_str.split("-"))
+
+            # Handle year-crossing closures (e.g., Dec 30 → Jan 2)
+            cs_year = year
+            ce_year = year
+            if ce_month < cs_month:
+                ce_year = year + 1
+
+            closure_start_date = date(cs_year, cs_month, cs_day)
+            closure_end_date = date(ce_year, ce_month, ce_day)
+
+            # ±1 day tolerance on boundaries for timezone effects
+            start_ok = (
+                closure_start_date - timedelta(days=1)
+                <= gap_start.date()
+                <= closure_start_date + timedelta(days=1)
+            )
+            end_ok = (
+                closure_end_date - timedelta(days=1)
+                <= gap_end.date()
+                <= closure_end_date + timedelta(days=1)
+            )
+
+            if start_ok and end_ok:
+                return True, (
+                    f"extended_closure:"
+                    f"{closure_start_date.isoformat()}/{closure_end_date.isoformat()}"
+                )
+
+    return False, ""
 
 
 def _is_low_liquidity_period(gap_start: datetime, gap_end: datetime) -> bool:
@@ -163,12 +242,12 @@ def _is_low_liquidity_period(gap_start: datetime, gap_end: datetime) -> bool:
 
     # Ensure timezone awareness (convert to UTC for comparison)
     if gap_start.tzinfo is None:
-        gap_start = gap_start.replace(tzinfo=timezone.utc)
+        gap_start = gap_start.replace(tzinfo=UTC)
     if gap_end.tzinfo is None:
-        gap_end = gap_end.replace(tzinfo=timezone.utc)
+        gap_end = gap_end.replace(tzinfo=UTC)
 
-    gap_start_utc = gap_start.astimezone(timezone.utc)
-    gap_end_utc = gap_end.astimezone(timezone.utc)
+    gap_start_utc = gap_start.astimezone(UTC)
+    gap_end_utc = gap_end.astimezone(UTC)
 
     gap_hours = (gap_end_utc - gap_start_utc).total_seconds() / 3600
 
@@ -204,8 +283,10 @@ def is_market_closure(gap_start: datetime, gap_end: datetime) -> tuple[bool, str
 
     This is the main entry point for gap detection. Checks in order:
     1. Weekend closure (Friday PM to Sunday PM)
-    2. Holiday closure (Christmas, New Year, Good Friday)
-    3. Low-liquidity period (overnight hours with sparse data)
+    2. Extended closure (multi-day holiday periods like Christmas week)
+    3. Holiday closure (Christmas, New Year, Good Friday)
+    4. Early close (reduced liquidity days)
+    5. Low-liquidity period (overnight hours with sparse data)
 
     Args:
         gap_start: Timestamp of the candle before the gap.
@@ -214,6 +295,7 @@ def is_market_closure(gap_start: datetime, gap_end: datetime) -> tuple[bool, str
     Returns:
         Tuple of (is_closure, reason):
         - (True, "weekend") - Gap spans weekend
+        - (True, "extended_closure:...") - Gap spans multi-day holiday closure
         - (True, "holiday:2024-12-25") - Gap contains holiday
         - (True, "early_close:2024-12-24") - Gap contains early close day
         - (True, "low_liquidity") - Gap is during low-liquidity hours
@@ -223,22 +305,45 @@ def is_market_closure(gap_start: datetime, gap_end: datetime) -> tuple[bool, str
     if _spans_weekend(gap_start, gap_end):
         return True, "weekend"
 
-    # 2. Holiday check (iterate days in gap)
-    current = gap_start.date()
-    end_date = gap_end.date()
-    while current <= end_date:
-        if is_holiday(current):
-            return True, f"holiday:{current.isoformat()}"
-        current += timedelta(days=1)
+    # 2. Extended closure check (multi-day holiday periods)
+    is_ext, ext_reason = _spans_extended_closure(gap_start, gap_end)
+    if is_ext:
+        return True, ext_reason
 
-    # 3. Early close check (reduced liquidity expected)
-    current = gap_start.date()
-    while current <= end_date:
-        if is_early_close(current):
-            return True, f"early_close:{current.isoformat()}"
-        current += timedelta(days=1)
+    gap_hours = (gap_end - gap_start).total_seconds() / 3600
 
-    # 4. Low-liquidity period check
+    # 3. Holiday check — only for gaps up to 5 days (120 hours)
+    #    Boundary matching: gap must start on the day before or day of the holiday,
+    #    and end on the day of or day after the holiday.
+    if gap_hours <= 120:
+        current = gap_start.date()
+        end_date = gap_end.date()
+        while current <= end_date:
+            if is_holiday(current):
+                prev_day = current - timedelta(days=1)
+                next_day = current + timedelta(days=1)
+                start_ok = gap_start.date() in (prev_day, current)
+                end_ok = gap_end.date() in (current, next_day)
+                if start_ok and end_ok:
+                    return True, f"holiday:{current.isoformat()}"
+            current += timedelta(days=1)
+
+    # 4. Early close check — only for gaps up to 2 days (48 hours)
+    #    Boundary matching: gap must start on the early close day
+    #    and end on the same day or next day.
+    if gap_hours <= 48:
+        current = gap_start.date()
+        end_date = gap_end.date()
+        while current <= end_date:
+            if is_early_close(current):
+                next_day = current + timedelta(days=1)
+                start_ok = gap_start.date() == current
+                end_ok = gap_end.date() in (current, next_day)
+                if start_ok and end_ok:
+                    return True, f"early_close:{current.isoformat()}"
+            current += timedelta(days=1)
+
+    # 5. Low-liquidity period check
     if _is_low_liquidity_period(gap_start, gap_end):
         return True, "low_liquidity"
 

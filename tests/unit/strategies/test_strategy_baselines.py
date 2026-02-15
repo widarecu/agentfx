@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import pandas as pd
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
-from agentfx.core.strategy import RSIMeanReversion, DonchianBreakout
+import pandas as pd
+
+from agentfx.core.strategy import DonchianBreakout, RSIMeanReversion
 
 
 def make_df_from_close(values):
-    start = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(
+    start = datetime.now(UTC).replace(second=0, microsecond=0) - timedelta(
         minutes=len(values)
     )
     idx = pd.date_range(start=start, periods=len(values), freq="T", tz="UTC")

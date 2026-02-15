@@ -11,17 +11,16 @@ This should be run ONCE during initial deployment.
 The candle_ingestion worker handles all candle data (backfill and continuous updates).
 """
 
+import logging
 import os
 import sys
-import logging
 
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from agentfx.api.core.database import SessionLocal, engine
 from agentfx.api.core.config import settings
+from agentfx.api.core.database import Base, SessionLocal, engine
 from agentfx.api.models.instrument import Instrument
-from agentfx.api.core.database import Base
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"

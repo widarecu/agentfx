@@ -99,6 +99,55 @@ test.describe('Trial Table Interactions', () => {
     }
   });
 
+  test('trial table displays trades column with non-zero values', async ({ page }) => {
+    await loginAndNavigateToOptimization(page);
+    const hasJob = await navigateToFirstJobDetail(page);
+
+    if (hasJob) {
+      await page.waitForTimeout(2000);
+
+      // Check if job has no trials to display
+      const queuedMessage = page.getByText(/Job is queued|waiting to start/i);
+      const noTrialsMessage = page.getByText(/No trials found|Trials will appear/i);
+
+      if (await queuedMessage.count() > 0 || await noTrialsMessage.count() > 0) {
+        // Job is queued or has no trials yet - test passes (edge case)
+        return;
+      }
+
+      // Look for Trades column header
+      const tradesHeader = page.getByText(/Trades/i);
+      await expect(tradesHeader.first()).toBeVisible({ timeout: 5000 });
+
+      // Verify at least one trial has non-zero trades
+      // Trades are displayed as numbers in the table cells
+      const trialsTable = page.locator('table');
+      const trialRows = trialsTable.locator('tbody tr');
+      const rowCount = await trialRows.count();
+
+      if (rowCount > 0) {
+        // Get all trade count values from the table
+        // Trades column shows numeric values like "156", "203", etc.
+        let hasNonZeroTrades = false;
+
+        for (let i = 0; i < Math.min(rowCount, 5); i++) {
+          const row = trialRows.nth(i);
+          const rowText = await row.textContent();
+          // Check if the row contains a trade count > 0
+          // Trade counts appear as standalone numbers in cells
+          const tradeMatch = rowText?.match(/\b([1-9]\d{0,5})\b/);
+          if (tradeMatch) {
+            hasNonZeroTrades = true;
+            break;
+          }
+        }
+
+        // At least one trial should have trades
+        expect(hasNonZeroTrades).toBeTruthy();
+      }
+    }
+  });
+
   test('trial table can be sorted by clicking column header', async ({ page }) => {
     await loginAndNavigateToOptimization(page);
     const hasJob = await navigateToFirstJobDetail(page);

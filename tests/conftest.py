@@ -44,16 +44,16 @@ if _prev_env and _prev_env != "test":
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 # Now safe to import modules that depend on settings
-import pytest  # noqa: E402
 import asyncio  # noqa: E402
 from collections.abc import Generator  # noqa: E402
 from unittest.mock import MagicMock  # noqa: E402
-from sqlalchemy.orm import Session  # noqa: E402
-from fastapi.testclient import TestClient  # noqa: E402
 
-from src.agentfx.api.main import app  # noqa: E402
-from src.agentfx.api.core.database import get_db  # noqa: E402
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
 from src.agentfx.api import models  # noqa: E402
+from src.agentfx.api.core.database import get_db  # noqa: E402
+from src.agentfx.api.main import app  # noqa: E402
 from src.agentfx.api.models.user import UserRole  # noqa: E402
 
 
@@ -274,12 +274,12 @@ def test_environment():
     - Integration tests: Use PostgreSQL via settings.TEST_DATABASE_URL
     """
     # Verify environment is correctly set (should already be done at module level)
-    assert (
-        os.environ.get("ENVIRONMENT") == "test"
-    ), "ENVIRONMENT must be 'test' - check conftest.py module-level setup"
-    assert (
-        os.environ.get("TESTING") == "true"
-    ), "TESTING must be 'true' - check conftest.py module-level setup"
+    assert os.environ.get("ENVIRONMENT") == "test", (
+        "ENVIRONMENT must be 'test' - check conftest.py module-level setup"
+    )
+    assert os.environ.get("TESTING") == "true", (
+        "TESTING must be 'true' - check conftest.py module-level setup"
+    )
 
     yield
 

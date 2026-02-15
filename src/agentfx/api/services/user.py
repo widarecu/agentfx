@@ -16,7 +16,6 @@ from ..core import security
 from ..core.database import get_db
 from ..models.user import UserRole
 
-
 # =============================================================================
 # User CRUD Operations
 # =============================================================================

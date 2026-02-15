@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-import pandas as pd
 from collections import deque
+from dataclasses import dataclass
+
+import pandas as pd
 
 
 @dataclass
