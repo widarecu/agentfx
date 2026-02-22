@@ -134,7 +134,19 @@ def _spans_weekend(gap_start: datetime, gap_end: datetime) -> bool:
     # Include Thursday (3) for timezone edge cases (+11 hours Friday = Thursday UTC)
     # Gap should end around Sunday (6), Monday (0), or Tuesday (1)
     # Include Tuesday for gaps that end later due to timezone
-    return start_weekday in (3, 4, 5) and end_weekday in (6, 0, 1)
+    if not (start_weekday in (3, 4, 5) and end_weekday in (6, 0, 1)):
+        return False
+
+    # Verify gap_end is near the expected market reopen (~22:00 UTC Sunday)
+    # Allow UTC hours 19-01 to cover DST shifts and daily candle boundaries.
+    # This prevents gaps like Fri 22:00 → Mon 04:00 (54h) from being classified
+    # as weekends when Monday morning trading data is actually missing.
+    gap_end_utc = gap_end.astimezone(UTC)
+    gap_end_hour = gap_end_utc.hour
+    if not (gap_end_hour >= 19 or gap_end_hour <= 1):
+        return False
+
+    return True
 
 
 def _spans_extended_closure(gap_start: datetime, gap_end: datetime) -> tuple[bool, str]:

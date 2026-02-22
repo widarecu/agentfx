@@ -258,6 +258,17 @@ class Settings(BaseSettings):
         env="CANDLE_HEALTH_CHECK_INTERVAL",
         description="Seconds between gap detection/healing runs (0 to disable)",
     )
+    GAP_REVERIFY_DAYS: int = Field(
+        default=30,
+        env="GAP_REVERIFY_DAYS",
+        description="Days before re-checking a previously empty gap in case OANDA backfills",
+    )
+
+    MAX_GAPS_PER_HEALTH_CHECK: int = Field(
+        default=500,
+        env="MAX_GAPS_PER_HEALTH_CHECK",
+        description="Maximum gaps to process per instrument/granularity per health check cycle",
+    )
 
     @property
     def instruments_list(self) -> list[str]:

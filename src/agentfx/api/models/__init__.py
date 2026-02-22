@@ -12,6 +12,7 @@ from .optimization import (
 from .run import Order, Run, RunEnvironment, RunStatus, Trade
 from .strategy import Strategy
 from .user import User, UserRole
+from .verified_gap import VerifiedEmptyGap
 
 # Make models available at the package level
 __all__ = [
@@ -33,4 +34,5 @@ __all__ = [
     "OptimizationTrade",
     "JobStatus",
     "StrategyType",
+    "VerifiedEmptyGap",
 ]

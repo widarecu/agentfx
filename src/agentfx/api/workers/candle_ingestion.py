@@ -46,10 +46,8 @@ LARGE_GAP_THRESHOLD_SECONDS = (
 # The market_calendar then filters out weekends/holidays/early closes.
 GAP_DETECTION_MULTIPLIER = 5
 
-# Maximum gaps to process per instrument:granularity per health check.
-# Prevents a single pair with many historical gaps from consuming the entire
-# health check window. Gaps are processed newest-first so recent data is prioritized.
-MAX_GAPS_PER_HEALTH_CHECK = 50
+# Adaptive health check: re-run after this many seconds when gaps remain
+CATCH_UP_HEALTH_CHECK_INTERVAL = 300  # 5 minutes
 
 # Granularity to seconds mapping for time-based pagination
 # OANDA API doesn't allow count + from/to together, so we paginate by time windows
@@ -174,7 +172,8 @@ def fetch_candles_range(
 
         if not candles:
             # No data in this chunk - move to next
-            current_from = chunk_end + timedelta(seconds=1)
+            # Use chunk_end (not +1s) to avoid skipping candle at exact boundary
+            current_from = chunk_end
             continue
 
         # Filter out candles that are before the requested start time
@@ -197,7 +196,8 @@ def fetch_candles_range(
         if not valid_candles:
             # All returned candles were before the requested start
             # This happens when hitting market closures - move to next chunk
-            current_from = chunk_end + timedelta(seconds=1)
+            # Use chunk_end (not +1s) to avoid skipping candle at exact boundary
+            current_from = chunk_end
             continue
 
         # Parse last valid candle time
@@ -377,7 +377,8 @@ def heal_large_gap(
                 logger.error(f"Unexpected error healing chunk: {e}")
                 break
 
-        current = chunk_end
+        # Advance past chunk_end to avoid refetching the last candle
+        current = chunk_end + timedelta(seconds=1)
         # Rate limiting between chunks to avoid overwhelming the API
         time.sleep(RATE_LIMIT_DELAY)
 
@@ -527,7 +528,9 @@ def _merge_nearby_gaps(
         return []
 
     if merge_threshold_seconds is None:
-        merge_threshold_seconds = granularity_seconds * 10
+        # Merge gaps within 60 candle intervals of each other (1 hour for M1)
+        # to reduce API calls — fetching overlapping data is safe (upsert handles it)
+        merge_threshold_seconds = granularity_seconds * 60
 
     sorted_gaps = sorted(gaps, key=lambda g: g["from"])
 
@@ -546,7 +549,9 @@ def _merge_nearby_gaps(
     return merged
 
 
-def detect_and_heal_gaps(instrument: str, granularity: str, db=None) -> int:
+def detect_and_heal_gaps(
+    instrument: str, granularity: str, db=None
+) -> tuple[int, bool]:
     """
     Scan candle data for gaps and heal them by fetching missing data.
 
@@ -559,10 +564,12 @@ def detect_and_heal_gaps(instrument: str, granularity: str, db=None) -> int:
         db: Optional database session
 
     Returns:
-        Number of candles backfilled to heal gaps
+        Tuple of (candles_healed, hit_max_limit) where hit_max_limit indicates
+        more gaps remain to be processed.
     """
     from ..core.database import SessionLocal
     from ..services.market_data import MarketDataService
+    from ..services.verified_gap import VerifiedGapService
 
     granularity_seconds = GRANULARITY_SECONDS.get(granularity, 60)
     max_gap_seconds = granularity_seconds * GAP_DETECTION_MULTIPLIER
@@ -577,11 +584,17 @@ def detect_and_heal_gaps(instrument: str, granularity: str, db=None) -> int:
         )
 
         if len(timestamps) < 2:
-            return 0
+            return 0, False
+
+        # Load verified empty gaps to skip during detection
+        verified_set = VerifiedGapService.get_verified_gaps(
+            db, "oanda", instrument, granularity
+        )
 
         small_gaps = []
         large_gaps = []
         market_closures_skipped = 0
+        verified_skipped = 0
 
         for i in range(1, len(timestamps)):
             delta = (timestamps[i] - timestamps[i - 1]).total_seconds()
@@ -627,6 +640,26 @@ def detect_and_heal_gaps(instrument: str, granularity: str, db=None) -> int:
                     f"fetch ranges for {instrument}:{granularity}"
                 )
 
+        # Filter verified gaps AFTER merging — verified records store merged boundaries
+        if small_gaps:
+            pre_filter = len(small_gaps)
+            small_gaps = [
+                g for g in small_gaps if (g["from"], g["to"]) not in verified_set
+            ]
+            verified_skipped += pre_filter - len(small_gaps)
+
+        if large_gaps:
+            pre_filter = len(large_gaps)
+            large_gaps = [
+                g for g in large_gaps if (g["from"], g["to"]) not in verified_set
+            ]
+            verified_skipped += pre_filter - len(large_gaps)
+
+        if verified_skipped > 0:
+            logger.info(
+                f"Skipped {verified_skipped} verified empty gaps for {instrument}:{granularity}"
+            )
+
         # Sort gaps newest-first so recent (most likely healable) gaps are prioritized
         small_gaps.sort(key=lambda g: g["from"], reverse=True)
         large_gaps.sort(key=lambda g: g["from"], reverse=True)
@@ -634,7 +667,7 @@ def detect_and_heal_gaps(instrument: str, granularity: str, db=None) -> int:
         total_gaps = len(small_gaps) + len(large_gaps)
         if total_gaps == 0:
             logger.debug(f"No healable gaps found for {instrument}:{granularity}")
-            return 0
+            return 0, False
 
         if large_gaps:
             logger.info(
@@ -651,21 +684,31 @@ def detect_and_heal_gaps(instrument: str, granularity: str, db=None) -> int:
 
         # Process large gaps first using chunked healing
         for gap in large_gaps:
-            if gaps_processed >= MAX_GAPS_PER_HEALTH_CHECK:
+            if gaps_processed >= settings.MAX_GAPS_PER_HEALTH_CHECK:
                 logger.info(
-                    f"Reached max gaps limit ({MAX_GAPS_PER_HEALTH_CHECK}) "
+                    f"Reached max gaps limit ({settings.MAX_GAPS_PER_HEALTH_CHECK}) "
                     f"for {instrument}:{granularity}, deferring remaining gaps"
                 )
                 break
             healed = heal_large_gap(instrument, granularity, gap["from"], gap["to"], db)
+            if healed == 0:
+                VerifiedGapService.mark_gap_verified(
+                    db,
+                    "oanda",
+                    instrument,
+                    granularity,
+                    gap["from"],
+                    gap["to"],
+                    reason="no_data_large",
+                )
             total_healed += healed
             gaps_processed += 1
 
         # Process small gaps with direct fetch
         for gap in small_gaps:
-            if gaps_processed >= MAX_GAPS_PER_HEALTH_CHECK:
+            if gaps_processed >= settings.MAX_GAPS_PER_HEALTH_CHECK:
                 logger.info(
-                    f"Reached max gaps limit ({MAX_GAPS_PER_HEALTH_CHECK}) "
+                    f"Reached max gaps limit ({settings.MAX_GAPS_PER_HEALTH_CHECK}) "
                     f"for {instrument}:{granularity}, deferring remaining gaps"
                 )
                 break
@@ -682,16 +725,49 @@ def detect_and_heal_gaps(instrument: str, granularity: str, db=None) -> int:
                     logger.info(
                         f"Healed gap {gap['from']} to {gap['to']}: {stored} candles"
                     )
+                    # Remove from verified table if it was previously verified empty
+                    VerifiedGapService.remove_healed_gap(
+                        db,
+                        "oanda",
+                        instrument,
+                        granularity,
+                        gap["from"],
+                        gap["to"],
+                    )
                 else:
-                    # Data returned but all candles already exist
+                    # Data returned but all candles already exist — mark as verified
+                    # so we don't re-fetch this gap every cycle
                     logger.info(
-                        f"Gap {gap['from']} to {gap['to']}: data already exists"
+                        f"Gap {gap['from']} to {gap['to']}: data already exists, "
+                        f"marking as verified"
+                    )
+                    VerifiedGapService.mark_gap_verified(
+                        db,
+                        "oanda",
+                        instrument,
+                        granularity,
+                        gap["from"],
+                        gap["to"],
+                        reason="data_exists",
                     )
             else:
-                logger.info(f"No data for gap {gap['from']} to {gap['to']}")
+                logger.info(
+                    f"No data for gap {gap['from']} to {gap['to']}, "
+                    f"marking as verified empty"
+                )
+                VerifiedGapService.mark_gap_verified(
+                    db,
+                    "oanda",
+                    instrument,
+                    granularity,
+                    gap["from"],
+                    gap["to"],
+                    reason="no_data",
+                )
             gaps_processed += 1
 
-        return total_healed
+        hit_max = gaps_processed >= settings.MAX_GAPS_PER_HEALTH_CHECK
+        return total_healed, hit_max
     finally:
         if should_close:
             db.close()
@@ -745,7 +821,7 @@ def repair_candle_data(
                 )
 
                 try:
-                    healed = detect_and_heal_gaps(instrument, granularity, db)
+                    healed, _ = detect_and_heal_gaps(instrument, granularity, db)
                     stats["by_instrument"][instrument][granularity] = healed
                     stats["total_healed"] += healed
                 except Exception as e:
@@ -762,7 +838,7 @@ def repair_candle_data(
             db.close()
 
 
-async def run_health_check() -> int:
+async def run_health_check() -> tuple[int, bool]:
     """
     Run comprehensive health check: validate completeness and heal gaps.
 
@@ -770,7 +846,8 @@ async def run_health_check() -> int:
     CANDLE_HEALTH_CHECK_INTERVAL setting.
 
     Returns:
-        Total candles healed across all instruments
+        Tuple of (total_healed, needs_catchup) where needs_catchup indicates
+        at least one instrument/granularity hit the max gaps limit.
     """
     import concurrent.futures
 
@@ -782,6 +859,7 @@ async def run_health_check() -> int:
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     loop = asyncio.get_event_loop()
     total_healed = 0
+    any_hit_max = False
 
     db = SessionLocal()
     try:
@@ -810,10 +888,12 @@ async def run_health_check() -> int:
                         continue
 
                     # Step 2: Detect and heal gaps in the middle
-                    healed = await loop.run_in_executor(
+                    healed, hit_max = await loop.run_in_executor(
                         executor, detect_and_heal_gaps, instrument, granularity, db
                     )
                     total_healed += healed
+                    if hit_max:
+                        any_hit_max = True
 
                 except Exception as e:
                     logger.error(
@@ -822,8 +902,14 @@ async def run_health_check() -> int:
     finally:
         db.close()
 
-    logger.info(f"Health check complete: {total_healed} candles healed")
-    return total_healed
+    if any_hit_max:
+        logger.info(
+            f"Health check complete: {total_healed} candles healed "
+            f"(catch-up needed, next check in {CATCH_UP_HEALTH_CHECK_INTERVAL}s)"
+        )
+    else:
+        logger.info(f"Health check complete: {total_healed} candles healed")
+    return total_healed, any_hit_max
 
 
 async def startup_backfill() -> int:
@@ -921,13 +1007,19 @@ async def ingestion_loop():
     await startup_backfill()
 
     # Run initial health check
-    await run_health_check()
+    _, needs_catchup = await run_health_check()
     _last_health_check = datetime.now(UTC)
+    # Adaptive interval: use short interval when gaps remain, normal otherwise
+    current_health_interval = (
+        CATCH_UP_HEALTH_CHECK_INTERVAL
+        if needs_catchup
+        else settings.CANDLE_HEALTH_CHECK_INTERVAL
+    )
 
     logger.info(
         f"Entering continuous polling mode "
         f"(poll: {settings.INGESTION_POLL_INTERVAL}s, "
-        f"health check: {settings.CANDLE_HEALTH_CHECK_INTERVAL}s)"
+        f"health check: {current_health_interval}s)"
     )
 
     consecutive_failures = 0
@@ -939,12 +1031,18 @@ async def ingestion_loop():
         try:
             cycle_start = datetime.now(UTC)
 
-            # Check if health check is due
-            if settings.CANDLE_HEALTH_CHECK_INTERVAL > 0 and _last_health_check:
+            # Check if health check is due (uses adaptive interval)
+            if current_health_interval > 0 and _last_health_check:
                 time_since_check = (cycle_start - _last_health_check).total_seconds()
-                if time_since_check >= settings.CANDLE_HEALTH_CHECK_INTERVAL:
-                    await run_health_check()
+                if time_since_check >= current_health_interval:
+                    _, needs_catchup = await run_health_check()
                     _last_health_check = datetime.now(UTC)
+                    # Adapt interval based on whether gaps remain
+                    current_health_interval = (
+                        CATCH_UP_HEALTH_CHECK_INTERVAL
+                        if needs_catchup
+                        else settings.CANDLE_HEALTH_CHECK_INTERVAL
+                    )
 
             total_stored = 0
 

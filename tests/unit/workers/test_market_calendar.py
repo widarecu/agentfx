@@ -162,16 +162,15 @@ class TestSpansWeekend:
     def test_friday_to_tuesday_is_weekend(self):
         """Test Friday to Tuesday gap (72+ hours) is detected as weekend."""
         friday = datetime(2024, 1, 12, 22, 0, tzinfo=UTC)  # Friday
-        tuesday = datetime(2024, 1, 16, 2, 0, tzinfo=UTC)  # Tuesday
-        # ~76 hours, ends on Tuesday (weekday 1)
+        tuesday = datetime(2024, 1, 16, 0, 0, tzinfo=UTC)  # Tuesday 00:00 UTC
+        # ~74 hours, ends on Tuesday (weekday 1) within reopen window
         assert _spans_weekend(friday, tuesday) is True
 
-    def test_saturday_to_tuesday_is_weekend(self):
-        """Test Saturday to Tuesday gap is detected as weekend."""
-        # This was the bug - Saturday (5) to Tuesday (1) wasn't caught
+    def test_saturday_to_monday_is_weekend(self):
+        """Test Saturday to Monday gap is detected as weekend."""
         saturday = datetime(2026, 1, 10, 8, 0, tzinfo=UTC)  # Saturday
-        tuesday = datetime(2026, 1, 13, 2, 0, tzinfo=UTC)  # Tuesday
-        assert _spans_weekend(saturday, tuesday) is True
+        monday = datetime(2026, 1, 12, 22, 0, tzinfo=UTC)  # Monday 22:00 UTC
+        assert _spans_weekend(saturday, monday) is True
 
     def test_daily_candle_weekend_gap(self):
         """Test daily candle weekend gap (~72 hours) is detected."""
@@ -211,6 +210,20 @@ class TestSpansWeekend:
         # Monday 9:00 +11:00 = Sunday 22:00 UTC
         monday_local = datetime(2021, 11, 8, 9, 0, tzinfo=tz_plus11)
         assert _spans_weekend(friday_local, monday_local) is True
+
+    def test_weekend_rejected_when_gap_end_too_late(self):
+        """Gap from Friday to Monday 04:00 UTC (54h) is NOT a weekend —
+        it masks 6 hours of missing Monday trading data after the ~22:00 UTC reopen."""
+        friday = datetime(2026, 2, 13, 22, 0, tzinfo=UTC)  # Friday
+        monday = datetime(2026, 2, 16, 4, 0, tzinfo=UTC)  # Monday 04:00 UTC
+        # 54 hours, within 44-80 range, but end hour 4 is outside 19-01 window
+        assert _spans_weekend(friday, monday) is False
+
+    def test_weekend_accepted_at_reopen_boundary(self):
+        """Gap ending at Monday 01:00 UTC is still accepted (market may open late)."""
+        friday = datetime(2026, 2, 13, 22, 0, tzinfo=UTC)  # Friday
+        monday = datetime(2026, 2, 16, 1, 0, tzinfo=UTC)  # Monday 01:00 UTC
+        assert _spans_weekend(friday, monday) is True
 
 
 @pytest.mark.unit

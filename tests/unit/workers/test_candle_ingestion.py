@@ -11,7 +11,6 @@ from src.agentfx.api.workers.candle_ingestion import (
     LARGE_GAP_CHUNK_DAYS,
     LARGE_GAP_THRESHOLD_SECONDS,
     MAX_CANDLES_PER_REQUEST,
-    MAX_GAPS_PER_HEALTH_CHECK,
     _get_backfill_start_time,
     _merge_nearby_gaps,
     backfill_instrument,
@@ -946,7 +945,7 @@ class TestRepairCandleData:
 
     def test_repair_processes_all_combinations(self, mock_dependencies):
         """Test repair processes all instrument/granularity combinations."""
-        mock_dependencies["heal"].return_value = 10
+        mock_dependencies["heal"].return_value = (10, False)
 
         stats = repair_candle_data()
 
@@ -956,7 +955,7 @@ class TestRepairCandleData:
 
     def test_repair_with_specific_instruments(self, mock_dependencies):
         """Test repair with specific instruments only."""
-        mock_dependencies["heal"].return_value = 5
+        mock_dependencies["heal"].return_value = (5, False)
 
         stats = repair_candle_data(instruments=["EUR_USD"])
 
@@ -966,7 +965,7 @@ class TestRepairCandleData:
 
     def test_repair_with_specific_granularities(self, mock_dependencies):
         """Test repair with specific granularities only."""
-        mock_dependencies["heal"].return_value = 5
+        mock_dependencies["heal"].return_value = (5, False)
 
         stats = repair_candle_data(granularities=["M1"])
 
@@ -978,9 +977,9 @@ class TestRepairCandleData:
         """Test that repair continues when one combination fails."""
         mock_dependencies["heal"].side_effect = [
             Exception("API error"),
-            10,
-            5,
-            20,
+            (10, False),
+            (5, False),
+            (20, False),
         ]
 
         stats = repair_candle_data()
@@ -991,7 +990,12 @@ class TestRepairCandleData:
 
     def test_repair_returns_per_instrument_stats(self, mock_dependencies):
         """Test that repair returns stats broken down by instrument/granularity."""
-        mock_dependencies["heal"].side_effect = [10, 20, 30, 40]
+        mock_dependencies["heal"].side_effect = [
+            (10, False),
+            (20, False),
+            (30, False),
+            (40, False),
+        ]
 
         stats = repair_candle_data()
 
@@ -1119,34 +1123,39 @@ class TestGapPrioritization:
                 "src.agentfx.api.workers.candle_ingestion.store_candles",
                 return_value=1,
             ) as mock_store,
+            patch(
+                "src.agentfx.api.services.verified_gap.VerifiedGapService"
+            ) as mock_vgs,
         ):
             mock_db = MagicMock()
             mock_session.return_value = mock_db
+            mock_vgs.get_verified_gaps.return_value = set()
             yield {
                 "mds": mock_mds,
                 "db": mock_db,
                 "fetch": mock_fetch,
                 "store": mock_store,
+                "vgs": mock_vgs,
             }
 
     def test_gaps_processed_newest_first(self, mock_deps):
         """Test that the most recent gap is healed before older gaps."""
-        # Create timestamps with 3 gaps, each separated by >10 candles (>600s)
-        # to prevent _merge_nearby_gaps from merging them (merge threshold = 10 * 60s = 600s)
+        # Create timestamps with 3 gaps, each separated by >60 candles (>3600s)
+        # to prevent _merge_nearby_gaps from merging them (merge threshold = 60 * 60s = 3600s)
         base = datetime(2023, 1, 1, 0, 0, 0, tzinfo=UTC)
         timestamps = [
             base,  # 0: 00:00
             base + timedelta(minutes=1),  # 1: 00:01
             # GAP 1: 10 min gap
             base + timedelta(minutes=11),  # 2: 00:11
-            # 15 normal candles to separate gaps (> merge threshold)
-            *[base + timedelta(minutes=11 + i) for i in range(1, 16)],
-            # GAP 2: 10 min gap at minute 26
-            base + timedelta(minutes=36),  # ~: 00:36
-            # 15 normal candles to separate gaps
-            *[base + timedelta(minutes=36 + i) for i in range(1, 16)],
-            # GAP 3: 10 min gap at minute 51
-            base + timedelta(minutes=61),  # ~: 01:01
+            # 65 normal candles to separate gaps (> merge threshold of 60 min)
+            *[base + timedelta(minutes=11 + i) for i in range(1, 66)],
+            # GAP 2: 10 min gap at minute 76
+            base + timedelta(minutes=86),  # ~: 01:26
+            # 65 normal candles to separate gaps
+            *[base + timedelta(minutes=86 + i) for i in range(1, 66)],
+            # GAP 3: 10 min gap at minute 151
+            base + timedelta(minutes=161),  # ~: 02:41
         ]
         mock_deps["mds"].get_candle_timestamps.return_value = timestamps
 
@@ -1176,13 +1185,13 @@ class TestGapPrioritization:
         assert fetch_order[0] > fetch_order[1] > fetch_order[2]
 
     def test_max_gaps_limit_respected(self, mock_deps):
-        """Test that processing stops after MAX_GAPS_PER_HEALTH_CHECK gaps."""
-        # Create timestamps with 60 gaps, each separated by >10 candles
-        # to prevent merging (merge threshold = 10 * 60s = 600s for M1)
+        """Test that processing stops after settings.MAX_GAPS_PER_HEALTH_CHECK gaps."""
+        # Create timestamps with 10 gaps, each separated by >60 candles
+        # to prevent merging (merge threshold = 60 * 60s = 3600s for M1)
         base = datetime(2023, 1, 1, 0, 0, 0, tzinfo=UTC)
         timestamps = []
         offset = 0
-        for i in range(61):
+        for i in range(10):
             # Add a normal candle
             timestamps.append(base + timedelta(minutes=offset))
             offset += 1
@@ -1191,8 +1200,8 @@ class TestGapPrioritization:
             # Add candle after gap
             timestamps.append(base + timedelta(minutes=offset))
             offset += 1
-            # Add 15 normal candles to separate from next gap (> merge threshold)
-            for j in range(15):
+            # Add 65 normal candles to separate from next gap (> merge threshold)
+            for j in range(65):
                 timestamps.append(base + timedelta(minutes=offset))
                 offset += 1
 
@@ -1208,14 +1217,16 @@ class TestGapPrioritization:
             }
         ]
 
-        detect_and_heal_gaps("EUR_USD", "M1", mock_deps["db"])
+        # Patch settings to use a small limit for testing
+        with patch.object(settings, "MAX_GAPS_PER_HEALTH_CHECK", 5):
+            detect_and_heal_gaps("EUR_USD", "M1", mock_deps["db"])
 
-        # Should stop at MAX_GAPS_PER_HEALTH_CHECK
-        assert mock_deps["fetch"].call_count == MAX_GAPS_PER_HEALTH_CHECK
+        # Should stop at the patched limit
+        assert mock_deps["fetch"].call_count == 5
 
-    def test_max_gaps_per_health_check_constant(self):
-        """Test that MAX_GAPS_PER_HEALTH_CHECK is set to 50."""
-        assert MAX_GAPS_PER_HEALTH_CHECK == 50
+    def test_max_gaps_per_health_check_default(self):
+        """Test that MAX_GAPS_PER_HEALTH_CHECK defaults to 500."""
+        assert settings.MAX_GAPS_PER_HEALTH_CHECK == 500
 
 
 # NOTE: Market closure tests have been moved to test_market_calendar.py
