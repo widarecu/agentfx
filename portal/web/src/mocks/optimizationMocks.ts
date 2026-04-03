@@ -40,6 +40,7 @@ export const mockOptimizationJobs: OptimizationJob[] = [
     accountBalance: 10000,
     positionSize: 10000,
     dataYears: 5,
+    timeframe: 'H1',
   },
   {
     id: 'optjob_1702987200_d4e5f6',
@@ -62,6 +63,7 @@ export const mockOptimizationJobs: OptimizationJob[] = [
     accountBalance: 25000,
     positionSize: 10000,
     dataYears: 3,
+    timeframe: 'M30',
   },
   {
     id: 'optjob_1703073600_g7h8i9',
@@ -83,6 +85,7 @@ export const mockOptimizationJobs: OptimizationJob[] = [
     accountBalance: 50000,
     positionSize: 100000,
     dataYears: 2,
+    timeframe: 'H4',
   },
   {
     id: 'optjob_1702814400_j1k2l3',
@@ -104,6 +107,7 @@ export const mockOptimizationJobs: OptimizationJob[] = [
     accountBalance: 10000,
     positionSize: 1000,
     dataYears: 5,
+    timeframe: 'H1',
   },
 ];
 
