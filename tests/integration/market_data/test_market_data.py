@@ -7,18 +7,18 @@ These tests follow the test strategy:
 - Coverage: API endpoints, workflows, data pipelines
 """
 
-import pytest
 import os
-from datetime import datetime
+from datetime import UTC, datetime
+
+import psycopg2
+import pytest
 from fastapi.testclient import TestClient
+from psycopg2.extras import RealDictCursor
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-import psycopg2
-from psycopg2.extras import RealDictCursor
-
-from src.agentfx.api.main import app
-from src.agentfx.api.core.database import get_db
 from src.agentfx.api.core.config import settings
+from src.agentfx.api.core.database import get_db
+from src.agentfx.api.main import app
 
 # Set test environment before loading settings
 os.environ["TESTING"] = "true"
@@ -105,47 +105,38 @@ def db_cursor(real_db_session):
 
 @pytest.fixture(autouse=True)
 def cleanup_test_data(db_cursor):
-    """Clean up test data before and after each test."""
-    # Clean up before test
-    try:
-        # Clean up tables in order of dependencies
-        tables = [
-            "trades",
-            "orders",
-            "signals",
-            "candles",
-            "runs",
-            "strategies",
-            "users",
-        ]
+    """Clean up test data before and after each test.
 
-        for table in tables:
+    NOTE: Candles are EXCLUDED from cleanup. Historical candle data from OANDA
+    should persist across tests for backtesting and optimization tests to work.
+    Only user-created test data (users, runs, strategies, etc.) is cleaned up.
+    """
+    # Tables to clean in dependency order (children first).
+    # EXCLUDES candles and instruments (historical/metadata, persists across tests).
+    tables_to_clean = [
+        "orders",
+        "trades",
+        "runs",
+        "strategies",
+    ]
+
+    def _cleanup():
+        for table in tables_to_clean:
             try:
-                db_cursor.execute(
-                    f"DELETE FROM {table} WHERE email LIKE 'test%' OR name LIKE 'test%' OR instrument LIKE 'EUR_%' OR instrument LIKE 'GBP_%' OR instrument LIKE 'USD_%'"
-                )
+                db_cursor.execute(f"DELETE FROM {table}")
                 db_cursor.connection.commit()
             except Exception:
                 db_cursor.connection.rollback()
-                pass  # Ignore cleanup errors before test
-    except Exception:
-        pass  # Ignore cleanup errors before test
+        # Clean up test users (don't delete seeded users)
+        try:
+            db_cursor.execute("DELETE FROM users WHERE email LIKE 'integration_%'")
+            db_cursor.connection.commit()
+        except Exception:
+            db_cursor.connection.rollback()
 
+    _cleanup()
     yield
-
-    # Clean up after test
-    try:
-        for table in tables:
-            try:
-                db_cursor.execute(
-                    f"DELETE FROM {table} WHERE email LIKE 'test%' OR name LIKE 'test%' OR instrument LIKE 'EUR_%' OR instrument LIKE 'GBP_%' OR instrument LIKE 'USD_%'"
-                )
-                db_cursor.connection.commit()
-            except Exception:
-                db_cursor.connection.rollback()
-                pass  # Ignore cleanup errors after test
-    except Exception:
-        pass  # Ignore cleanup errors after test
+    _cleanup()
 
 
 @pytest.mark.integration
@@ -155,6 +146,7 @@ class TestMarketDataIntegration:
     def create_authenticated_user_and_token(self, test_client, db_cursor):
         """Helper method to create a test user and return JWT token for authentication."""
         import uuid
+
         from src.agentfx.api.core.security import get_password_hash
 
         # Create test user via direct database insertion with unique email
@@ -194,9 +186,8 @@ class TestMarketDataIntegration:
         token, _ = self.create_authenticated_user_and_token(test_client, db_cursor)
 
         # Insert test candle data via direct database insertion
-        from datetime import timezone
 
-        unique_timestamp = datetime.now(timezone.utc).replace(microsecond=0)
+        unique_timestamp = datetime.now(UTC).replace(microsecond=0)
         db_cursor.execute(
             """
             INSERT INTO candles (exchange, instrument, timeframe, timestamp, open, high, low, close, volume, complete)
@@ -220,6 +211,88 @@ class TestMarketDataIntegration:
         assert data["items"][0]["instrument"] == "EUR_USD"
         assert data["items"][0]["timeframe"] == "M1"
         assert data["items"][0]["open"] == 1.1000
+
+    def test_market_data_pagination_with_limit(self, test_client, db_cursor):
+        """Test that limit parameter correctly restricts returned candles while total reflects all matching."""
+        # Create authenticated user and get token
+        token, _ = self.create_authenticated_user_and_token(test_client, db_cursor)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Insert 50 test candles via direct SQL with unique timestamps
+        from datetime import timedelta
+
+        # Use a far-past base to avoid collisions with real ingested data
+        base_timestamp = datetime(2015, 1, 1, 0, 0, 0, tzinfo=UTC)
+        for i in range(50):
+            ts = base_timestamp + timedelta(minutes=i)
+            db_cursor.execute(
+                """
+                INSERT INTO candles (exchange, instrument, timeframe, timestamp, open, high, low, close, volume, complete)
+                VALUES ('oanda', 'USD_CHF', 'M1', %s, 0.9100, 0.9105, 0.9095, 0.9102, %s, true)
+                ON CONFLICT (instrument, timeframe, timestamp) DO NOTHING
+            """,
+                (ts, 100 + i),
+            )
+        db_cursor.connection.commit()
+
+        # Fetch with limit=20 - should return at most 20 items
+        response = test_client.get(
+            "/api/v1/market-data/candles?exchange=oanda&instrument=USD_CHF&timeframe=M1&limit=20",
+            headers=headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["items"]) == 20
+        assert data["total"] >= 50  # total reflects all matching candles
+
+        # Fetch with limit=10 - should return 10 items with same total
+        response2 = test_client.get(
+            "/api/v1/market-data/candles?exchange=oanda&instrument=USD_CHF&timeframe=M1&limit=10",
+            headers=headers,
+        )
+        assert response2.status_code == 200
+        data2 = response2.json()
+        assert len(data2["items"]) == 10
+        assert data2["total"] == data["total"]  # total should be consistent
+
+    def test_market_data_timeframes_from_db(self, test_client, db_cursor):
+        """Test that timeframes endpoint returns values from ingested candle data."""
+        token, _ = self.create_authenticated_user_and_token(test_client, db_cursor)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Insert candles with different timeframes using far-past timestamps
+
+        for tf in ["M1", "H1", "D"]:
+            db_cursor.execute(
+                """
+                INSERT INTO candles (exchange, instrument, timeframe, timestamp, open, high, low, close, volume, complete)
+                VALUES ('oanda', 'EUR_USD', %s, %s, 1.1000, 1.1005, 1.0995, 1.1002, 100, true)
+                ON CONFLICT (instrument, timeframe, timestamp) DO NOTHING
+            """,
+                (tf, datetime(2014, 1, 1, 0, 0, 0, tzinfo=UTC)),
+            )
+        db_cursor.connection.commit()
+
+        response = test_client.get(
+            "/api/v1/market-data/timeframes?exchange=oanda",
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        codes = [tf["code"] for tf in data]
+        # Verify our inserted timeframes are present
+        assert "M1" in codes
+        assert "H1" in codes
+        assert "D" in codes
+        # Verify display names
+        display_map = {tf["code"]: tf["display_name"] for tf in data}
+        assert display_map["M1"] == "1 Min"
+        assert display_map["H1"] == "1 Hour"
+        assert display_map["D"] == "Daily"
+        # Verify sort order: M1 should come before H1, and H1 before D
+        assert codes.index("M1") < codes.index("H1")
+        assert codes.index("H1") < codes.index("D")
 
     def test_market_data_crud_workflow(self, test_client, db_cursor):
         """Test complete CRUD workflow for market data."""
@@ -265,9 +338,8 @@ class TestMarketDataIntegration:
         assert len(data["items"]) >= 1  # Should have the candle we just created
 
         # Test direct database insertion and retrieval
-        from datetime import timezone
 
-        unique_timestamp = datetime.now(timezone.utc).replace(microsecond=0)
+        unique_timestamp = datetime.now(UTC).replace(microsecond=0)
         db_cursor.execute(
             """
             INSERT INTO candles (exchange, instrument, timeframe, timestamp, open, high, low, close, volume, complete)
@@ -309,9 +381,8 @@ class TestMarketDataIntegration:
         db_cursor.connection.commit()
 
         # Insert market data using migrated database schema with unique timestamp
-        from datetime import timezone
 
-        unique_timestamp = datetime.now(timezone.utc).replace(microsecond=0)
+        unique_timestamp = datetime.now(UTC).replace(microsecond=0)
         instrument_name = "GBP_USD_TEST"
 
         db_cursor.execute(
@@ -399,7 +470,7 @@ class TestMarketDataIntegration:
         headers = {"Authorization": f"Bearer {token}"}
 
         # Insert multiple candle records with unique timestamps
-        from datetime import timezone, timedelta
+        from datetime import timedelta
 
         start_time = datetime.now()
         import uuid
@@ -408,9 +479,7 @@ class TestMarketDataIntegration:
 
         for i in range(100):
             # Create unique timestamp to avoid constraint violations
-            timestamp = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(
-                minutes=i
-            )
+            timestamp = datetime.now(UTC).replace(microsecond=0) + timedelta(minutes=i)
             instrument_name = f"EUR_USD_{unique_id}"
             db_cursor.execute(
                 """
@@ -456,7 +525,6 @@ class TestMarketDataIntegration:
         import threading
         import time
         import uuid
-        from datetime import timezone
 
         # Create authenticated user and get token
         token, _ = self.create_authenticated_user_and_token(test_client, db_cursor)
@@ -464,7 +532,7 @@ class TestMarketDataIntegration:
 
         # Insert test data with unique identifiers
         unique_id = str(uuid.uuid4())[:8]
-        unique_timestamp = datetime.now(timezone.utc).replace(microsecond=0)
+        unique_timestamp = datetime.now(UTC).replace(microsecond=0)
         instrument_name = f"EUR_USD_{unique_id}"
 
         db_cursor.execute(

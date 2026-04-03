@@ -1,9 +1,18 @@
 # Import all models here to make them available via the models package
-from .user import User, UserRole
-from .run import Run, Trade, Order, RunStatus, RunEnvironment
-from .market_data import Candle, MarketDataUpdate
-from .strategy import Strategy
 from .instrument import Instrument
+from .market_data import Candle, MarketDataUpdate
+from .optimization import (
+    JobStatus,
+    OptimizationJob,
+    OptimizationSignal,
+    OptimizationTrade,
+    OptimizationTrial,
+    StrategyType,
+)
+from .run import Order, Run, RunEnvironment, RunStatus, Trade
+from .strategy import Strategy
+from .user import User, UserRole
+from .verified_gap import VerifiedEmptyGap
 
 # Make models available at the package level
 __all__ = [
@@ -18,4 +27,12 @@ __all__ = [
     "Candle",
     "MarketDataUpdate",
     "Instrument",
+    # Optimization
+    "OptimizationJob",
+    "OptimizationTrial",
+    "OptimizationSignal",
+    "OptimizationTrade",
+    "JobStatus",
+    "StrategyType",
+    "VerifiedEmptyGap",
 ]

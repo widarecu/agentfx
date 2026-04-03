@@ -1,8 +1,9 @@
-from typing import Any
-from datetime import datetime
-from sqlalchemy.orm import Session
-from sqlalchemy import desc
 import logging
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import desc
+from sqlalchemy.orm import Session
 
 from .. import models
 
@@ -54,10 +55,14 @@ class MarketDataService:
         candles_data: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """
-        Validate and clean a list of candle data.
-        Returns only valid candles, logs warnings for invalid ones.
+        Validate, clean, and deduplicate a list of candle data.
+        Returns only valid, unique candles, logs warnings for invalid/duplicate ones.
+
+        Deduplication: When duplicate timestamps exist, keeps the last occurrence
+        (assuming later data is more up-to-date from API responses).
         """
-        valid_candles = []
+        # Use dict to deduplicate by timestamp - last occurrence wins
+        candles_by_timestamp: dict[str, dict[str, Any]] = {}
         invalid_count = 0
 
         for i, candle in enumerate(candles_data):
@@ -78,7 +83,9 @@ class MarketDataService:
                 if "spread" in candle:
                     cleaned_candle["spread"] = float(candle["spread"])
 
-                valid_candles.append(cleaned_candle)
+                # Store by timestamp, overwriting duplicates
+                ts_key = str(candle["timestamp"])
+                candles_by_timestamp[ts_key] = cleaned_candle
 
             except ValueError as e:
                 invalid_count += 1
@@ -90,7 +97,14 @@ class MarketDataService:
                 f"Rejected {invalid_count} invalid candles out of {len(candles_data)} total"
             )
 
-        return valid_candles
+        # Count duplicates removed
+        duplicates_removed = (
+            len(candles_data) - invalid_count - len(candles_by_timestamp)
+        )
+        if duplicates_removed > 0:
+            logger.debug(f"Removed {duplicates_removed} duplicate candles by timestamp")
+
+        return list(candles_by_timestamp.values())
 
     @staticmethod
     def get_candles(
@@ -101,6 +115,7 @@ class MarketDataService:
         from_time: datetime | None = None,
         to_time: datetime | None = None,
         limit: int = 1000,
+        offset: int = 0,
         run_id: str | None = None,
     ) -> tuple[list[models.Candle], int]:
         """
@@ -136,9 +151,13 @@ class MarketDataService:
 
         # Get the most recent candles if no time range is specified
         if not from_time and not to_time:
-            query = query.order_by(desc(models.Candle.timestamp)).limit(limit)
+            query = (
+                query.order_by(desc(models.Candle.timestamp))
+                .offset(offset)
+                .limit(limit)
+            )
         else:
-            query = query.order_by(models.Candle.timestamp).limit(limit)
+            query = query.order_by(models.Candle.timestamp).offset(offset).limit(limit)
 
         return query.all(), total
 
@@ -161,6 +180,88 @@ class MarketDataService:
             query = query.filter(models.Candle.run_id == run_id)
 
         return query.order_by(desc(models.Candle.timestamp)).first()
+
+    @staticmethod
+    def get_earliest_candle(
+        db: Session,
+        exchange: str,
+        instrument: str,
+        timeframe: str,
+    ) -> models.Candle | None:
+        """Get the earliest candle for the given parameters."""
+        return (
+            db.query(models.Candle)
+            .filter(
+                models.Candle.exchange == exchange,
+                models.Candle.instrument == instrument.upper(),
+                models.Candle.timeframe == timeframe.upper(),
+            )
+            .order_by(models.Candle.timestamp.asc())
+            .first()
+        )
+
+    @staticmethod
+    def get_candle_timestamps(
+        db: Session,
+        exchange: str,
+        instrument: str,
+        timeframe: str,
+    ) -> list[datetime]:
+        """
+        Get all candle timestamps ordered ascending for gap detection.
+
+        Args:
+            db: Database session
+            exchange: Exchange identifier
+            instrument: Instrument symbol
+            timeframe: Candle timeframe
+
+        Returns:
+            List of timestamps in ascending order
+        """
+        results = (
+            db.query(models.Candle.timestamp)
+            .filter(
+                models.Candle.exchange == exchange,
+                models.Candle.instrument == instrument.upper(),
+                models.Candle.timeframe == timeframe.upper(),
+            )
+            .order_by(models.Candle.timestamp.asc())
+            .all()
+        )
+        return [r[0] for r in results]
+
+    @staticmethod
+    def delete_candles(
+        db: Session,
+        exchange: str,
+        instrument: str,
+        timeframe: str,
+    ) -> int:
+        """
+        Delete all candles for an instrument/timeframe.
+
+        Args:
+            db: Database session
+            exchange: Exchange identifier
+            instrument: Instrument symbol
+            timeframe: Candle timeframe
+
+        Returns:
+            Number of candles deleted
+        """
+        count = (
+            db.query(models.Candle)
+            .filter(
+                models.Candle.exchange == exchange,
+                models.Candle.instrument == instrument.upper(),
+                models.Candle.timeframe == timeframe.upper(),
+            )
+            .delete()
+        )
+        db.commit()
+        logger.info(f"Deleted {count} candles for {instrument}:{timeframe}")
+        return count
 
     @staticmethod
     def create_candles(
@@ -198,6 +299,9 @@ class MarketDataService:
             return []
 
         result = []
+        created_count = 0
+        updated_count = 0
+        skipped_count = 0
 
         for candle_data in validated_candles:
             # Check if candle already exists
@@ -213,13 +317,20 @@ class MarketDataService:
             )
 
             if existing and update_if_exists:
-                # Update existing candle
+                # Skip update if existing candle is already complete
+                # Complete candles never change - only update incomplete ones
+                if existing.complete:
+                    skipped_count += 1
+                    continue
+
+                # Update existing incomplete candle
                 for key, value in candle_data.items():
                     setattr(existing, key, value)
                 if run_id:
                     existing.run_id = run_id
                 db.add(existing)
                 result.append(existing)
+                updated_count += 1
             elif not existing:
                 # Create new candle
                 db_candle = models.Candle(
@@ -231,19 +342,30 @@ class MarketDataService:
                 )
                 db.add(db_candle)
                 result.append(db_candle)
+                created_count += 1
 
         try:
             db.commit()
-            logger.info(
-                f"Successfully created/updated {len(result)} candles for {instrument}:{timeframe}"
-            )
+            # Log with distinction between created, updated, and skipped
+            if skipped_count > 0:
+                logger.debug(
+                    f"Skipped {skipped_count} complete candles for {instrument}:{timeframe}"
+                )
+            if created_count > 0:
+                logger.info(
+                    f"Created {created_count} candles for {instrument}:{timeframe}"
+                )
+            if updated_count > 0:
+                logger.info(
+                    f"Updated {updated_count} incomplete candles for {instrument}:{timeframe}"
+                )
         except Exception as e:
             db.rollback()
             logger.error(f"Failed to commit candles: {e}")
             raise
 
         # Convert SQLAlchemy objects to Pydantic schemas for proper serialization
-        from src.agentfx.api.schemas.market_data import CandlePublic
+        from agentfx.api.schemas.market_data import CandlePublic
 
         return [CandlePublic.model_validate(candle) for candle in result]
 
@@ -327,6 +449,62 @@ class MarketDataService:
 
         return query.order_by(models.MarketDataUpdate.last_updated.desc()).all()
 
+    # Display names and sort order for timeframes (OANDA granularity codes)
+    TIMEFRAME_DISPLAY = {
+        "S5": "5 Sec",
+        "S10": "10 Sec",
+        "S15": "15 Sec",
+        "S30": "30 Sec",
+        "M1": "1 Min",
+        "M2": "2 Min",
+        "M4": "4 Min",
+        "M5": "5 Min",
+        "M10": "10 Min",
+        "M15": "15 Min",
+        "M30": "30 Min",
+        "H1": "1 Hour",
+        "H2": "2 Hour",
+        "H3": "3 Hour",
+        "H4": "4 Hour",
+        "H6": "6 Hour",
+        "H8": "8 Hour",
+        "H12": "12 Hour",
+        "D": "Daily",
+        "W": "Weekly",
+        "M": "Monthly",
+    }
+    TIMEFRAME_ORDER = list(TIMEFRAME_DISPLAY.keys())
+
+    @staticmethod
+    def get_timeframes(
+        db: Session,
+        exchange: str | None = None,
+        instrument: str | None = None,
+    ) -> list[dict[str, str]]:
+        """
+        Get list of available timeframes from ingested candle data.
+
+        Args:
+            db: Database session
+            exchange: Optional exchange filter
+            instrument: Optional instrument filter
+
+        Returns:
+            List of dicts with 'code' and 'display_name' keys, sorted by duration
+        """
+        query = db.query(models.Candle.timeframe).distinct()
+
+        if exchange:
+            query = query.filter(models.Candle.exchange == exchange)
+        if instrument:
+            query = query.filter(models.Candle.instrument == instrument.upper())
+
+        timeframes = [row[0] for row in query.all()]
+        order = MarketDataService.TIMEFRAME_ORDER
+        timeframes.sort(key=lambda t: order.index(t) if t in order else 999)
+        display = MarketDataService.TIMEFRAME_DISPLAY
+        return [{"code": tf, "display_name": display.get(tf, tf)} for tf in timeframes]
+
     @staticmethod
     def get_instruments(
         db: Session,
@@ -345,7 +523,7 @@ class MarketDataService:
         # Query the instruments table which is seeded by seed_instruments.py
         # This ensures instruments are available even before candle data is ingested
         query = db.query(models.Instrument.symbol).filter(
-            models.Instrument.is_active == True
+            models.Instrument.is_active.is_(True)
         )
 
         instruments = [row[0] for row in query.all()]

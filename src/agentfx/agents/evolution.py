@@ -8,7 +8,7 @@ See: planning/requirements/US-009 (to be created)
 
 from datetime import datetime
 
-from agentfx.agents.base import BaseAgent, AgentResult
+from agentfx.agents.base import AgentResult, BaseAgent
 
 
 class EvolutionAgent(BaseAgent):
@@ -71,7 +71,7 @@ class EvolutionAgent(BaseAgent):
             sharpe_ratio = current_sharpe / baseline_sharpe
             if sharpe_ratio < self.sharpe_drift_threshold:
                 drift_signals.append(
-                    f"Sharpe dropped {(1-sharpe_ratio)*100:.1f}% "
+                    f"Sharpe dropped {(1 - sharpe_ratio) * 100:.1f}% "
                     f"({baseline_sharpe:.2f} -> {current_sharpe:.2f})"
                 )
 
@@ -82,7 +82,7 @@ class EvolutionAgent(BaseAgent):
             dd_ratio = current_dd / baseline_dd
             if dd_ratio > self.drawdown_drift_threshold:
                 drift_signals.append(
-                    f"Drawdown increased {(dd_ratio-1)*100:.1f}% "
+                    f"Drawdown increased {(dd_ratio - 1) * 100:.1f}% "
                     f"({baseline_dd:.1%} -> {current_dd:.1%})"
                 )
 

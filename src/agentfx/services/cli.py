@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import argparse
+
+from agentfx.services.backtest import backtest_pairs
+from agentfx.services.ingest import backfill_all
 from agentfx.shared.config import (
-    load_config,
-    backtest_default_spread_pips,
     backtest_default_slippage_pips,
+    backtest_default_spread_pips,
+    load_config,
+    policy_default_daily_loss_threshold,
     policy_default_max_abs_position,
     policy_default_max_trades_per_hour,
-    policy_default_daily_loss_threshold,
 )
-from agentfx.services.ingest import backfill_all
-from agentfx.services.backtest import backtest_pairs
 
 
 def main():

@@ -38,17 +38,23 @@ export default function App() {
             <div className="flex items-center gap-6">
               <div className="font-semibold">AgentFX Portal</div>
               <nav className="flex items-center gap-4">
-                <Link 
-                  to="/" 
+                <Link
+                  to="/"
                   className="text-sm text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
                 >
                   Dashboard
                 </Link>
-                <Link 
-                  to="/market-data" 
+                <Link
+                  to="/market-data"
                   className="text-sm text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
                 >
                   Market Data
+                </Link>
+                <Link
+                  to="/optimization"
+                  className="text-sm text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
+                >
+                  Optimization
                 </Link>
               </nav>
               {user && (

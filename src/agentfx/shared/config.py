@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+
 from pydantic import BaseModel, Field
 
 # Note: Environment settings are read directly via os.environ for simplicity in MVP

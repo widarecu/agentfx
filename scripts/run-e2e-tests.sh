@@ -85,7 +85,7 @@ elif [ -x "/usr/local/bin/psql" ]; then
     PSQL_BIN="/usr/local/bin/psql"
 fi
 
-# Check for local PostgreSQL first
+# Check for local PostgreSQL
 if [ -n "$PSQL_BIN" ]; then
     echo "Checking local PostgreSQL (port 5432)..."
     if $PSQL_BIN -U $DB_USER -d $DB_NAME -h $DB_HOST -p 5432 -c "SELECT 1" > /dev/null 2>&1; then
@@ -93,39 +93,23 @@ if [ -n "$PSQL_BIN" ]; then
         DB_PORT="5432"
         DB_READY=true
     else
-        echo "Local PostgreSQL not accessible, trying Docker..."
+        echo "Local PostgreSQL not accessible."
         DB_READY=false
     fi
 else
-    echo "psql not found in PATH, trying Docker..."
+    echo "psql not found in PATH."
     DB_READY=false
 fi
 
-# Fall back to Docker if local PostgreSQL not available
 if [ "$DB_READY" != "true" ]; then
-    echo "Starting test database via Docker..."
-    if docker-compose -f docker-compose.test.yml up -d 2>/dev/null; then
-        echo "Waiting for Docker database (port 5433)..."
-        max_attempts=30
-        attempt=0
-        while [ $attempt -lt $max_attempts ]; do
-            if docker-compose -f docker-compose.test.yml exec -T postgres-test pg_isready -U $DB_USER -d $DB_NAME > /dev/null 2>&1; then
-                echo "Docker database is ready!"
-                DB_PORT="5433"  # Docker exposes on 5433 to avoid conflicts
-                DB_READY=true
-                break
-            fi
-            attempt=$((attempt + 1))
-            sleep 1
-        done
-    fi
-fi
-
-if [ "$DB_READY" != "true" ]; then
-    echo "Error: Database not available"
-    echo "Please either:"
-    echo "  1. Start local PostgreSQL: brew services start postgresql@15"
-    echo "  2. Start Docker and run: docker-compose -f docker-compose.test.yml up -d"
+    echo "Error: Local PostgreSQL not available"
+    echo "Please start local PostgreSQL: brew services start postgresql@15"
+    echo ""
+    echo "To set up the test database:"
+    echo "  createdb -U postgres agentfx_test"
+    echo "  createuser -U postgres test_user"
+    echo "  psql -U postgres -c \"ALTER USER test_user WITH PASSWORD 'test_password';\""
+    echo "  psql -U postgres -c \"GRANT ALL PRIVILEGES ON DATABASE agentfx_test TO test_user;\""
     exit 1
 fi
 

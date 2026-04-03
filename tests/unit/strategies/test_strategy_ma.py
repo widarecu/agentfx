@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pandas as pd
-from datetime import datetime, timedelta, timezone
 
 from agentfx.core.strategy import MACrossover
 
 
 def make_df(values):
     # Build a small OHLCV frame using provided close values
-    start = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(
+    start = datetime.now(UTC).replace(second=0, microsecond=0) - timedelta(
         minutes=len(values)
     )
     idx = pd.date_range(start=start, periods=len(values), freq="T", tz="UTC")

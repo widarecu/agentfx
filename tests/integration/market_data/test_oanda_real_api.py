@@ -5,20 +5,53 @@ Tests require:
 - OANDA_API_KEY: Practice API key
 - OANDA_ACCOUNT_ID: Practice account ID
 - OANDA_API_HOST: api-fxpractice.oanda.com
+- Network access to OANDA API (no SSL interception)
 """
 
-import pytest
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
+import pytest
+import requests
 from src.agentfx.adapters.oanda import OandaClient, OandaError, to_oanda_instrument
 from src.agentfx.api.core.config import settings
 
 
-# Skip if OANDA credentials are not configured
+def _oanda_is_reachable() -> tuple[bool, str]:
+    """Check if OANDA API is reachable without SSL issues.
+
+    Returns:
+        Tuple of (is_reachable, reason_if_not)
+    """
+    if not settings.OANDA_API_KEY or settings.OANDA_API_KEY == "your-api-key-here":
+        return False, "OANDA credentials not configured"
+
+    try:
+        # Quick connectivity test with timeout
+        requests.get(
+            f"https://{settings.OANDA_API_HOST}/v3/accounts",
+            headers={"Authorization": f"Bearer {settings.OANDA_API_KEY}"},
+            timeout=5,
+        )
+        # Any response (even 401) means we can reach OANDA
+        return True, ""
+    except requests.exceptions.SSLError as e:
+        return False, f"SSL error connecting to OANDA (likely network proxy): {e}"
+    except requests.exceptions.ConnectionError as e:
+        return False, f"Cannot connect to OANDA API: {e}"
+    except requests.exceptions.Timeout:
+        return False, "Connection to OANDA timed out"
+    except Exception as e:
+        return False, f"Unexpected error testing OANDA connectivity: {e}"
+
+
+# Check OANDA connectivity at module load time
+_oanda_reachable, _oanda_skip_reason = _oanda_is_reachable()
+
+# Skip all tests if OANDA is not reachable
 pytestmark = pytest.mark.skipif(
-    not settings.OANDA_API_KEY or settings.OANDA_API_KEY == "your-api-key-here",
-    reason="OANDA credentials not configured in environment",
+    not _oanda_reachable,
+    reason=_oanda_skip_reason,
 )
 
 
@@ -74,12 +107,12 @@ class TestOandaRealApiIntegration:
 
             # Verify price relationships
             assert candle["high"] >= candle["low"], "High price should be >= low price"
-            assert candle["high"] >= max(
-                candle["open"], candle["close"]
-            ), "High should be >= open and close"
-            assert candle["low"] <= min(
-                candle["open"], candle["close"]
-            ), "Low should be <= open and close"
+            assert candle["high"] >= max(candle["open"], candle["close"]), (
+                "High should be >= open and close"
+            )
+            assert candle["low"] <= min(candle["open"], candle["close"]), (
+                "Low should be <= open and close"
+            )
             assert candle["volume"] >= 0, "Volume should be non-negative"
 
     def test_real_candle_with_different_granularities(self, real_oanda_client):
@@ -90,9 +123,9 @@ class TestOandaRealApiIntegration:
             candles = real_oanda_client.get_candles(
                 instrument="EUR_USD", count=5, granularity=granularity
             )
-            assert isinstance(
-                candles, list
-            ), f"Candles for {granularity} should be a list"
+            assert isinstance(candles, list), (
+                f"Candles for {granularity} should be a list"
+            )
             assert len(candles) > 0, f"No candles returned for {granularity}"
 
     def test_real_candle_with_different_instruments(self, real_oanda_client):
@@ -103,9 +136,9 @@ class TestOandaRealApiIntegration:
             candles = real_oanda_client.get_candles(
                 instrument=instrument, count=5, granularity="M1"
             )
-            assert isinstance(
-                candles, list
-            ), f"Candles for {instrument} should be a list"
+            assert isinstance(candles, list), (
+                f"Candles for {instrument} should be a list"
+            )
             assert len(candles) > 0, f"No candles returned for {instrument}"
 
     def test_real_rate_limiting_behavior(self, real_oanda_client):
@@ -174,15 +207,15 @@ class TestOandaRealApiIntegration:
 
         for input_format, expected_output in test_cases:
             result = to_oanda_instrument(input_format)
-            assert (
-                result == expected_output
-            ), f"Conversion failed: {input_format} -> {result}, expected {expected_output}"
+            assert result == expected_output, (
+                f"Conversion failed: {input_format} -> {result}, expected {expected_output}"
+            )
 
     def test_real_historical_data_retrieval(self, real_oanda_client):
         """Test retrieving historical data with date range."""
         # Get candles from a specific date range
-        from_date = datetime.now(timezone.utc) - timedelta(days=1)
-        to_date = datetime.now(timezone.utc)
+        from_date = datetime.now(UTC) - timedelta(days=1)
+        to_date = datetime.now(UTC)
 
         candles = real_oanda_client.get_candles(
             instrument="EUR_USD",
@@ -218,12 +251,12 @@ class TestOandaRealApiIntegration:
         max_response_time = max(response_times)
 
         # Response times should be reasonable
-        assert (
-            avg_response_time < 2.0
-        ), f"Average response time too slow: {avg_response_time}s"
-        assert (
-            max_response_time < 5.0
-        ), f"Max response time too slow: {max_response_time}s"
+        assert avg_response_time < 2.0, (
+            f"Average response time too slow: {avg_response_time}s"
+        )
+        assert max_response_time < 5.0, (
+            f"Max response time too slow: {max_response_time}s"
+        )
 
     def test_candle_count_parameter(self, real_oanda_client):
         """Test that count parameter limits results correctly."""
@@ -242,13 +275,13 @@ class TestOandaRealApiIntegration:
 
         for candle in candles:
             # EUR/USD should be between 0.5 and 2.0 (realistic range)
-            assert (
-                0.5 < candle["open"] < 2.0
-            ), f"Open price {candle['open']} unrealistic"
-            assert (
-                0.5 < candle["high"] < 2.0
-            ), f"High price {candle['high']} unrealistic"
+            assert 0.5 < candle["open"] < 2.0, (
+                f"Open price {candle['open']} unrealistic"
+            )
+            assert 0.5 < candle["high"] < 2.0, (
+                f"High price {candle['high']} unrealistic"
+            )
             assert 0.5 < candle["low"] < 2.0, f"Low price {candle['low']} unrealistic"
-            assert (
-                0.5 < candle["close"] < 2.0
-            ), f"Close price {candle['close']} unrealistic"
+            assert 0.5 < candle["close"] < 2.0, (
+                f"Close price {candle['close']} unrealistic"
+            )

@@ -1,57 +1,123 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { marketDataService, Instrument, Candle, Timeframe } from '../services/marketData';
+import { marketDataService, Instrument, Candle, Timeframe, TimeframeInfo } from '../services/marketData';
 import { RefreshCw, AlertCircle, Clock } from 'lucide-react';
+import CandlestickChart from '../components/CandlestickChart';
+
+const CHART_PAGE_SIZE = 10000;
+const TABLE_PAGE_SIZE = 50;
 
 const MarketData: React.FC = () => {
   const [instruments, setInstruments] = useState<Instrument[]>([]);
   const [selectedInstrument, setSelectedInstrument] = useState<string>('');
-  const [selectedTimeframe, setSelectedTimeframe] = useState<Timeframe>('M1');
-  const [candles, setCandles] = useState<Candle[]>([]);
+  const [timeframes, setTimeframes] = useState<TimeframeInfo[]>([]);
+  const [selectedTimeframe, setSelectedTimeframe] = useState<Timeframe>('');
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string>('');
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [autoRefresh, setAutoRefresh] = useState<boolean>(true);
 
-  const pollingInterval = useRef<NodeJS.Timeout | null>(null);
-  const timeframes: Timeframe[] = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1', 'MN1'];
+  // Chart state — accumulated candles, grows as user scrolls left
+  const [chartCandles, setChartCandles] = useState<Candle[]>([]);
+  const [chartTotal, setChartTotal] = useState<number>(0);
+  const [chartLoading, setChartLoading] = useState<boolean>(false);
+  const chartOffsetRef = useRef<number>(0);
 
-  // Fetch candles
-  const fetchCandles = useCallback(async () => {
-    if (!selectedInstrument) return;
+  // Table state — server-side pagination
+  const [tableCandles, setTableCandles] = useState<Candle[]>([]);
+  const [tableTotal, setTableTotal] = useState<number>(0);
+  const [tablePage, setTablePage] = useState<number>(1);
+  const [tableLoading, setTableLoading] = useState<boolean>(false);
+
+  const pollingInterval = useRef<NodeJS.Timeout | null>(null);
+
+  // Fetch chart candles (initial load or load-more)
+  const fetchChartCandles = useCallback(async (offset: number, append: boolean = false) => {
+    if (!selectedInstrument || !selectedTimeframe) return;
 
     try {
-      setLoading(true);
-      setError('');
+      setChartLoading(true);
       const response = await marketDataService.getCandles(
         'oanda',
         selectedInstrument,
         selectedTimeframe,
-        { limit: 100 }
+        { limit: CHART_PAGE_SIZE, offset }
       );
-      setCandles(response.items);
+
+      setChartTotal(response.total);
+
+      if (append && offset > 0) {
+        // Prepend older candles (API returns DESC, so new batch is older)
+        setChartCandles(prev => [...prev, ...response.items]);
+      } else {
+        setChartCandles(response.items);
+      }
+
+      chartOffsetRef.current = offset + response.items.length;
+    } catch (err) {
+      console.error('Failed to fetch chart candles:', err);
+    } finally {
+      setChartLoading(false);
+    }
+  }, [selectedInstrument, selectedTimeframe]);
+
+  // Fetch a specific page of table candles
+  const fetchTablePage = useCallback(async (page: number) => {
+    if (!selectedInstrument || !selectedTimeframe) return;
+
+    try {
+      setTableLoading(true);
+      const offset = (page - 1) * TABLE_PAGE_SIZE;
+      const response = await marketDataService.getCandles(
+        'oanda',
+        selectedInstrument,
+        selectedTimeframe,
+        { limit: TABLE_PAGE_SIZE, offset }
+      );
+
+      setTableCandles(response.items);
+      setTableTotal(response.total);
       setLastRefresh(new Date());
     } catch (err) {
       setError('Failed to fetch candle data. Please try again.');
       console.error(err);
     } finally {
-      setLoading(false);
+      setTableLoading(false);
     }
   }, [selectedInstrument, selectedTimeframe]);
 
-  // Start polling for updates
+  // Refresh both chart and table
+  const refreshAll = useCallback(async () => {
+    if (!selectedInstrument || !selectedTimeframe) return;
+    setLoading(true);
+    setError('');
+    try {
+      await Promise.all([
+        fetchChartCandles(0),
+        fetchTablePage(tablePage),
+      ]);
+    } finally {
+      setLoading(false);
+    }
+  }, [selectedInstrument, selectedTimeframe, tablePage, fetchChartCandles, fetchTablePage]);
+
+  // Chart load-more callback
+  const handleChartLoadMore = useCallback(() => {
+    if (chartLoading || chartOffsetRef.current >= chartTotal) return;
+    fetchChartCandles(chartOffsetRef.current, true);
+  }, [chartLoading, chartTotal, fetchChartCandles]);
+
+  // Polling
   const startPolling = useCallback(() => {
     if (pollingInterval.current) {
       clearInterval(pollingInterval.current);
     }
-
     if (autoRefresh && selectedInstrument && selectedTimeframe) {
       pollingInterval.current = setInterval(() => {
-        fetchCandles();
-      }, 60000); // Refresh every 60 seconds
+        refreshAll();
+      }, 60000);
     }
-  }, [autoRefresh, selectedInstrument, selectedTimeframe, fetchCandles]);
+  }, [autoRefresh, selectedInstrument, selectedTimeframe, refreshAll]);
 
-  // Stop polling
   const stopPolling = useCallback(() => {
     if (pollingInterval.current) {
       clearInterval(pollingInterval.current);
@@ -59,15 +125,23 @@ const MarketData: React.FC = () => {
     }
   }, []);
 
-  // Fetch instruments on component mount
+  // Fetch instruments and timeframes on mount
   useEffect(() => {
-    const fetchInstruments = async () => {
+    const fetchInitialData = async () => {
       try {
         setLoading(true);
-        const data = await marketDataService.getInstruments();
-        setInstruments(data);
-        if (data.length > 0 && !selectedInstrument) {
-          setSelectedInstrument(data[0].symbol);
+        const [instrumentsData, timeframesData] = await Promise.all([
+          marketDataService.getInstruments(),
+          marketDataService.getTimeframes(),
+        ]);
+        setInstruments(instrumentsData);
+        setTimeframes(timeframesData);
+        if (instrumentsData.length > 0 && !selectedInstrument) {
+          setSelectedInstrument(instrumentsData[0].symbol);
+        }
+        if (timeframesData.length > 0 && !selectedTimeframe) {
+          const m1 = timeframesData.find(tf => tf.code === 'M1');
+          setSelectedTimeframe(m1 ? m1.code : timeframesData[0].code);
         }
       } catch (err) {
         setError('Failed to fetch instruments. Please check your connection.');
@@ -76,19 +150,29 @@ const MarketData: React.FC = () => {
         setLoading(false);
       }
     };
-
-    fetchInstruments();
+    fetchInitialData();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Fetch candles when instrument or timeframe changes
+  // Fetch data when instrument or timeframe changes
   useEffect(() => {
     if (selectedInstrument && selectedTimeframe) {
-      fetchCandles();
+      setTablePage(1);
+      chartOffsetRef.current = 0;
+      setChartCandles([]);
+      setTableCandles([]);
+      fetchChartCandles(0);
+      fetchTablePage(1);
       startPolling();
     }
-
     return () => stopPolling();
   }, [selectedInstrument, selectedTimeframe]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Fetch table page when tablePage changes (user clicks prev/next)
+  useEffect(() => {
+    if (selectedInstrument && selectedTimeframe && tablePage > 0) {
+      fetchTablePage(tablePage);
+    }
+  }, [tablePage]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Toggle auto-refresh
   useEffect(() => {
@@ -123,8 +207,12 @@ const MarketData: React.FC = () => {
     return ((candle.close - candle.open) / candle.open) * 100;
   };
 
-  // Get the most recent candle as "current price"
-  const latestCandle = candles.length > 0 ? candles[0] : null;
+  // Latest candle from chart data (first item = most recent, DESC order)
+  const latestCandle = chartCandles.length > 0 ? chartCandles[0] : null;
+
+  // Table pagination
+  const tableTotalPages = Math.max(1, Math.ceil(tableTotal / TABLE_PAGE_SIZE));
+  const chartHasMore = chartOffsetRef.current < chartTotal;
 
   return (
     <div className="p-6 dark:bg-slate-900 min-h-screen">
@@ -226,11 +314,12 @@ const MarketData: React.FC = () => {
             value={selectedTimeframe}
             onChange={(e) => handleTimeframeChange(e.target.value as Timeframe)}
             className="w-full p-2 border border-gray-300 dark:border-slate-600 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white dark:bg-slate-800 text-gray-900 dark:text-white"
-            disabled={loading}
+            disabled={loading || timeframes.length === 0}
           >
-            {timeframes.map((timeframe) => (
-              <option key={timeframe} value={timeframe}>
-                {timeframe}
+            {timeframes.length === 0 && <option value="">Loading...</option>}
+            {timeframes.map((tf) => (
+              <option key={tf.code} value={tf.code}>
+                {tf.display_name}
               </option>
             ))}
           </select>
@@ -238,7 +327,7 @@ const MarketData: React.FC = () => {
 
         <div className="flex items-end">
           <button
-            onClick={fetchCandles}
+            onClick={refreshAll}
             disabled={loading || !selectedInstrument}
             className="w-full p-2 flex items-center justify-center gap-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
           >
@@ -255,7 +344,7 @@ const MarketData: React.FC = () => {
           <div>
             <p className="text-red-800 dark:text-red-300">{error}</p>
             <button
-              onClick={fetchCandles}
+              onClick={refreshAll}
               className="mt-2 text-sm text-red-600 dark:text-red-400 hover:underline"
             >
               Try again
@@ -264,20 +353,41 @@ const MarketData: React.FC = () => {
         </div>
       )}
 
-      {/* Loading State */}
-      {loading && (
+      {/* Candlestick Chart */}
+      {chartCandles.length > 0 && (
+        <div className="mb-6">
+          <CandlestickChart
+            candles={chartCandles}
+            instrument={selectedInstrument}
+            timeframe={selectedTimeframe}
+            isLoading={loading && chartCandles.length === 0}
+            error={error || null}
+            onLoadMore={handleChartLoadMore}
+            hasMore={chartHasMore}
+            loadingMore={chartLoading}
+          />
+        </div>
+      )}
+
+      {/* Loading State (initial load only) */}
+      {loading && chartCandles.length === 0 && tableCandles.length === 0 && (
         <div className="flex justify-center py-8">
           <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
         </div>
       )}
 
       {/* Candles Table */}
-      {!loading && candles.length > 0 && (
+      {(tableCandles.length > 0 || tableTotal > 0) && (
         <div className="bg-white dark:bg-slate-800 shadow rounded-lg overflow-hidden">
           <div className="px-4 py-3 border-b border-gray-200 dark:border-slate-700 flex items-center justify-between">
-            <h2 className="text-lg font-medium text-gray-900 dark:text-white">
-              Historical Candles - {selectedInstrument} ({selectedTimeframe})
-            </h2>
+            <div>
+              <h2 className="text-lg font-medium text-gray-900 dark:text-white">
+                Historical Candles - {selectedInstrument} ({selectedTimeframe})
+              </h2>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                {tableTotal.toLocaleString()} candles available
+              </p>
+            </div>
             {lastRefresh && (
               <span className="text-xs text-gray-500 dark:text-gray-400">
                 Updated: {lastRefresh.toLocaleTimeString()}
@@ -315,56 +425,90 @@ const MarketData: React.FC = () => {
                 </tr>
               </thead>
               <tbody className="bg-white dark:bg-slate-800 divide-y divide-gray-200 dark:divide-slate-700">
-                {candles.map((candle, index) => {
-                  const priceChange = getPriceChange(candle);
-                  const priceChangePercent = getPriceChangePercent(candle);
-                  const isPositive = priceChange >= 0;
+                {tableLoading ? (
+                  <tr>
+                    <td colSpan={8} className="px-4 py-8 text-center text-gray-500 dark:text-gray-400">
+                      <div className="flex items-center justify-center gap-2">
+                        <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600"></div>
+                        Loading page...
+                      </div>
+                    </td>
+                  </tr>
+                ) : (
+                  tableCandles.map((candle, index) => {
+                    const priceChange = getPriceChange(candle);
+                    const priceChangePercent = getPriceChangePercent(candle);
+                    const isPositive = priceChange >= 0;
 
-                  return (
-                    <tr key={index} className="hover:bg-gray-50 dark:hover:bg-slate-700">
-                      <td className="px-4 py-2 text-sm text-gray-900 dark:text-gray-100">
-                        {formatTimestamp(candle.timestamp)}
-                      </td>
-                      <td className="px-4 py-2 text-sm font-mono text-gray-900 dark:text-gray-100">
-                        {formatPrice(candle.open)}
-                      </td>
-                      <td className="px-4 py-2 text-sm font-mono text-gray-900 dark:text-gray-100">
-                        {formatPrice(candle.high)}
-                      </td>
-                      <td className="px-4 py-2 text-sm font-mono text-gray-900 dark:text-gray-100">
-                        {formatPrice(candle.low)}
-                      </td>
-                      <td className="px-4 py-2 text-sm font-mono font-medium text-gray-900 dark:text-gray-100">
-                        {formatPrice(candle.close)}
-                      </td>
-                      <td className={`px-4 py-2 text-sm font-mono font-medium ${
-                        isPositive ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'
-                      }`}>
-                        {isPositive ? '+' : ''}{formatPrice(priceChange)}
-                      </td>
-                      <td className={`px-4 py-2 text-sm font-mono font-medium ${
-                        isPositive ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'
-                      }`}>
-                        {isPositive ? '+' : ''}{priceChangePercent.toFixed(2)}%
-                      </td>
-                      <td className="px-4 py-2 text-sm font-mono text-gray-900 dark:text-gray-100">
-                        {candle.volume.toLocaleString()}
-                      </td>
-                    </tr>
-                  );
-                })}
+                    return (
+                      <tr key={index} className="hover:bg-gray-50 dark:hover:bg-slate-700">
+                        <td className="px-4 py-2 text-sm text-gray-900 dark:text-gray-100">
+                          {formatTimestamp(candle.timestamp)}
+                        </td>
+                        <td className="px-4 py-2 text-sm font-mono text-gray-900 dark:text-gray-100">
+                          {formatPrice(candle.open)}
+                        </td>
+                        <td className="px-4 py-2 text-sm font-mono text-gray-900 dark:text-gray-100">
+                          {formatPrice(candle.high)}
+                        </td>
+                        <td className="px-4 py-2 text-sm font-mono text-gray-900 dark:text-gray-100">
+                          {formatPrice(candle.low)}
+                        </td>
+                        <td className="px-4 py-2 text-sm font-mono font-medium text-gray-900 dark:text-gray-100">
+                          {formatPrice(candle.close)}
+                        </td>
+                        <td className={`px-4 py-2 text-sm font-mono font-medium ${
+                          isPositive ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'
+                        }`}>
+                          {isPositive ? '+' : ''}{formatPrice(priceChange)}
+                        </td>
+                        <td className={`px-4 py-2 text-sm font-mono font-medium ${
+                          isPositive ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'
+                        }`}>
+                          {isPositive ? '+' : ''}{priceChangePercent.toFixed(2)}%
+                        </td>
+                        <td className="px-4 py-2 text-sm font-mono text-gray-900 dark:text-gray-100">
+                          {candle.volume.toLocaleString()}
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
               </tbody>
             </table>
           </div>
+          {tableTotalPages > 1 && (
+            <div className="px-4 py-3 border-t border-gray-200 dark:border-slate-700 flex items-center justify-between">
+              <div className="text-sm text-gray-500 dark:text-gray-400">
+                Page {tablePage} of {tableTotalPages.toLocaleString()}
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setTablePage(p => Math.max(1, p - 1))}
+                  disabled={tablePage === 1 || tableLoading}
+                  className="px-3 py-1.5 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-slate-800 border border-gray-300 dark:border-slate-600 rounded-md hover:bg-gray-50 dark:hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  Previous
+                </button>
+                <button
+                  onClick={() => setTablePage(p => Math.min(tableTotalPages, p + 1))}
+                  disabled={tablePage === tableTotalPages || tableLoading}
+                  className="px-3 py-1.5 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-slate-800 border border-gray-300 dark:border-slate-600 rounded-md hover:bg-gray-50 dark:hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
       {/* No Data State */}
-      {!loading && !error && candles.length === 0 && selectedInstrument && (
+      {!loading && !error && chartCandles.length === 0 && tableCandles.length === 0 && selectedInstrument && (
         <div className="text-center py-8 bg-white dark:bg-slate-800 rounded-lg border border-gray-200 dark:border-slate-700">
           <p className="text-gray-500 dark:text-gray-400">No candle data available for {selectedInstrument}</p>
           <button
-            onClick={fetchCandles}
+            onClick={refreshAll}
             className="mt-4 text-blue-600 dark:text-blue-400 hover:underline text-sm"
           >
             Try fetching again

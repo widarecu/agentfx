@@ -35,34 +35,35 @@ make backtest-full PAIRS="AUDUSD,EURUSD" DAYS=2 STRATEGY=ma FAST=20 SLOW=50
 
 ## Testing
 
-### Quick Reference
+### CANONICAL COMMANDS - ALWAYS USE THESE
 
+| Test Type | Command | Database Required |
+|-----------|---------|-------------------|
+| **Unit tests** | `make test-unit` | No |
+| **Integration tests** | `make test-integration` | Yes (PostgreSQL:5432) |
+| **E2E tests** | `make e2e` | Yes + Servers (managed) |
+| **All tests** | `make test` | Yes (PostgreSQL:5432) |
+| **Specific file** | `make test-file FILE=path/to/test.py` | Depends on file |
+| **Pattern match** | `make test-pattern PATTERN="test_name"` | Depends on matches |
+
+**Why Makefile:** All `make` commands automatically set `ENVIRONMENT=test` and `PYTHONPATH=src`. This ensures the correct `.env.test` configuration is loaded.
+
+### DO NOT USE - ANTI-PATTERNS
+
+**These commands will cause configuration problems:**
+
+| Bad Command | Why It Fails |
+|-------------|--------------|
+| `pytest tests/unit/` | Missing `ENVIRONMENT=test`, loads wrong config |
+| `pytest tests/integration/` | Missing `ENVIRONMENT=test`, connects to wrong database |
+| `python -m pytest tests/` | Uses system Python, wrong dependencies |
+| `PYTHONPATH=src pytest tests/` | Still missing `ENVIRONMENT=test` |
+| Manual uvicorn + npm for E2E | Bypasses migrations, seeding, cleanup |
+
+**If you must run pytest directly, use the FULL command:**
 ```bash
-# Using Makefile (recommended)
-make test               # Run all tests (unit + integration)
-make test-unit          # Run unit tests only
-make test-integration   # Run integration tests only
-make e2e                # Run E2E tests (manages servers automatically)
-
-# Using run_tests.sh (more options)
-./run_tests.sh unit                    # Unit tests
-./run_tests.sh integration             # Integration tests
-./run_tests.sh e2e --headed            # E2E with visible browser
-./run_tests.sh --file tests/unit/auth/test_security.py
-./run_tests.sh --pattern "test_login"
+ENVIRONMENT=test PYTHONPATH=src .venv/bin/pytest tests/unit/ -v
 ```
-
-### Test Environment Configuration
-
-Tests require `ENVIRONMENT=test` to load the correct configuration from `.env.test`:
-
-| Setting | Value | Purpose |
-|---------|-------|---------|
-| `ENVIRONMENT` | `test` | Selects `.env.test` config file |
-| `DATABASE_URL` | `postgresql://...localhost:5432/agentfx_test` | Test PostgreSQL database |
-| `TESTING` | `true` | Enables test mode in application |
-
-**Important:** The Makefile targets automatically set `ENVIRONMENT=test`. Do not manually override `DATABASE_URL` unless you have a specific reason.
 
 ### Test Categories
 
@@ -72,9 +73,28 @@ Tests require `ENVIRONMENT=test` to load the correct configuration from `.env.te
 | **Integration** | `make test-integration` | Yes (PostgreSQL) | Tests with real database connections |
 | **E2E** | `make e2e` | Yes + Servers | Full-stack tests with Playwright |
 
-### Running Unit Tests
+### Prerequisites
 
-Unit tests are fast and do not require a database:
+**For Integration and E2E tests, PostgreSQL must be running:**
+```bash
+# Verify PostgreSQL is accessible
+psql -U test_user -d agentfx_test -h localhost -p 5432 -c "SELECT 1"
+
+# If not running, start it:
+brew services start postgresql@15
+```
+
+**For E2E tests, ensure ports are free:**
+```bash
+lsof -i :8000  # Should show nothing
+lsof -i :5173  # Should show nothing
+
+# Kill stuck processes if needed:
+kill -9 $(lsof -t -i:8000) 2>/dev/null || true
+kill -9 $(lsof -t -i:5173) 2>/dev/null || true
+```
+
+### Running Unit Tests
 
 ```bash
 make test-unit
@@ -84,26 +104,17 @@ make test-file FILE=tests/unit/market_data/test_market_data.py
 
 ### Running Integration Tests
 
-Integration tests require PostgreSQL running on port 5432:
-
 ```bash
-# Start PostgreSQL (choose one):
-brew services start postgresql@15              # macOS local
-docker-compose -f docker-compose.test.yml up -d  # Docker
-
-# Run integration tests:
+# Ensure PostgreSQL is running first, then:
 make test-integration
 ```
 
 ### Running E2E Tests
 
-E2E tests require both backend and frontend servers. The `make e2e` target handles everything:
+The `make e2e` target handles server lifecycle automatically:
 
 ```bash
-# Full automated E2E run (recommended):
-make e2e
-
-# With options:
+make e2e                 # Standard run
 make e2e E2E_HEADED=1    # Show browser
 make e2e E2E_DEBUG=1     # Debug mode
 ```
@@ -116,15 +127,38 @@ make test-file FILE=tests/unit/auth/test_security.py
 
 # Tests matching a pattern
 make test-pattern PATTERN="test_login"
-
-# Single test function
-ENVIRONMENT=test PYTHONPATH=src .venv/bin/pytest \
-  tests/unit/auth/test_security.py::TestSecurity::test_verify_password -v
 ```
+
+### Troubleshooting Tests
+
+**Symptom: "ModuleNotFoundError: No module named 'agentfx'"**
+- Cause: `PYTHONPATH` not set
+- Fix: Use `make test-unit` (sets automatically)
+
+**Symptom: Tests use wrong database / see development data**
+- Cause: `ENVIRONMENT=test` not set, config loaded `.env.development`
+- Fix: Use `make test-*` commands (set automatically)
+
+**Symptom: "could not connect to server" on integration tests**
+- Cause: PostgreSQL not running
+- Fix: `brew services start postgresql@15`
+
+**Symptom: E2E tests fail with "Target closed" / "Connection refused"**
+- Cause: Ports 8000/5173 blocked by previous processes
+- Fix: Kill processes and retry:
+  ```bash
+  kill -9 $(lsof -t -i:8000) 2>/dev/null || true
+  kill -9 $(lsof -t -i:5173) 2>/dev/null || true
+  make e2e
+  ```
+
+**Symptom: "relation 'users' does not exist"**
+- Cause: Migrations not applied
+- Fix: `ENVIRONMENT=test .venv/bin/alembic upgrade head`
 
 ### Test Markers
 
-Tests are auto-marked based on directory location. You can also use explicit markers:
+Tests are auto-marked based on directory location:
 
 ```python
 @pytest.mark.unit
@@ -135,35 +169,58 @@ Tests are auto-marked based on directory location. You can also use explicit mar
 @pytest.mark.slow         # Long-running tests
 ```
 
-### Troubleshooting Tests
+## Test Data Strategy
 
-**Integration tests fail with database connection error:**
-```bash
-# Check PostgreSQL is running on port 5432
-psql -U test_user -d agentfx_test -h localhost -p 5432 -c "SELECT 1"
+### Data by Test Type
 
-# If using Docker, ensure container is up:
-docker-compose -f docker-compose.test.yml up -d
+| Test Type | Market Data | User Data | Database |
+|-----------|-------------|-----------|----------|
+| **Unit** | Mocked fixtures | In-memory fixtures | None (mocked) |
+| **Integration** | Real OANDA API | Fixtures or seeded | Real PostgreSQL |
+| **E2E** | Real OANDA API | Seeded via script | Real PostgreSQL |
+
+### Seed Scripts
+
+| Script | Purpose | What It Creates |
+|--------|---------|-----------------|
+| `seed_instruments.py` | **Metadata only** (symbol names, pip locations) | 6 FX pairs: EUR_USD, GBP_USD, USD_JPY, AUD_USD, USD_CHF, USD_CAD |
+| `seed_test_data.py` | Test user accounts for E2E auth | 5 users with different roles |
+
+**IMPORTANT:** These scripts create **metadata and users only**, NOT price/candle data. Market data comes from OANDA API.
+
+### OANDA Integration Tests
+
+Tests that need real market data should:
+1. Use `@pytest.mark.oanda_real` marker
+2. Fetch live data from OANDA API
+3. Require valid OANDA credentials in `.env.test`
+
+```python
+@pytest.mark.oanda_real
+def test_fetch_live_prices():
+    """This test calls real OANDA API - requires network + credentials."""
+    ...
 ```
 
-**E2E tests fail to start servers:**
-```bash
-# Ensure ports 8000 and 5173 are free
-lsof -i :8000
-lsof -i :5173
+Run OANDA-dependent tests: `make test-integration` (includes oanda_real tests)
+Skip OANDA tests: `ENVIRONMENT=test PYTHONPATH=src pytest -m "not oanda_real"`
 
-# Kill any existing processes if needed
-kill -9 $(lsof -t -i:8000)
-```
+### DO NOT USE for OANDA Integration
 
-**Config loading wrong environment file:**
-```bash
-# Verify ENVIRONMENT is set correctly
-echo $ENVIRONMENT  # Should be 'test'
+- `seed_test_candles` fixture - Creates synthetic/fake candles
+- Hardcoded price data in tests
+- Any mocked market data for integration tests
 
-# Check which .env file will be loaded
-python -c "from agentfx.api.core.config import get_env_file; print(get_env_file())"
-```
+These defeat the purpose of integration testing against real OANDA.
+
+### Test Users (E2E)
+
+| Email | Password | Role |
+|-------|----------|------|
+| test@example.com | TestPass123! | VIEWER |
+| viewer@example.com | secretpassword | VIEWER |
+| trader@example.com | traderpassword | TRADER |
+| admin@example.com | adminpassword | ADMIN |
 
 ## Starting Servers (IMPORTANT)
 
@@ -198,9 +255,8 @@ ENVIRONMENT=staging ./scripts/start-backend.sh
 The startup scripts handle:
 1. **Environment selection** - Load correct `.env.{environment}` file
 2. **Database connectivity check** - Verify PostgreSQL is accessible
-3. **Automatic fallback to Docker** - Start DB container if local PostgreSQL unavailable
-4. **Database migrations** - Run `alembic upgrade head` before starting
-5. **Virtual environment activation** - Use correct Python from `.venv/`
+3. **Database migrations** - Run `alembic upgrade head` before starting
+4. **Virtual environment activation** - Use correct Python from `.venv/`
 
 ### Why NOT to Start Servers Directly
 

@@ -1,7 +1,9 @@
-from typing import Any
 from datetime import datetime
-from sqlalchemy.orm import Session
+from typing import Any
+
+from fastapi import HTTPException
 from sqlalchemy import desc
+from sqlalchemy.orm import Session
 
 from .. import models, schemas
 

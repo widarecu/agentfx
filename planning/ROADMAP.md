@@ -49,26 +49,28 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 
 ---
 
-## v0.2.0 - Parameter Optimizer Agent
+## v0.2.0 - Bayesian Parameter Optimizer Agent
 
 **Theme:** First autonomous capability
 
-**Goal:** System can autonomously optimize strategy parameters and identify profitable configurations.
+**Goal:** System can autonomously optimize strategy parameters using Bayesian optimization and identify profitable configurations with interactive visualization.
 
 **Key Capabilities:**
-- Grid search optimization over strategy parameter space
-- Experiment tracking with full lineage
-- Async job processing
-- Portal to view optimization results
-- Real-time WebSocket streaming (deferred from v0.1.0)
+- Bayesian optimization over strategy parameter space (more efficient than grid search)
+- Trial tracking with full lineage (params, metrics, signals)
+- Async job processing (202 Accepted pattern)
+- Portal to view optimization results with top 3 configurations
+- Strategy visualization with candlestick charts, entry/exit markers, and technical indicators
 
-**User Stories:** [US-001](requirements/US-001-optimization-runs.md), [US-002](requirements/US-002-view-optimization.md)
+**User Stories:** [US-001](requirements/US-001-optimization-runs.md), [US-002](requirements/US-002-view-optimization.md), [US-015](requirements/US-015-visualization.md)
 
 **Exit Criteria:**
-- [ ] Optimizer agent runs 90+ backtests without human intervention
+- [ ] Backtest service reads from PostgreSQL candles table (existing v0.1.0 infrastructure)
+- [ ] Bayesian optimizer runs autonomously (agent determines optimal iteration count)
 - [ ] Top 3 parameter sets identified and ranked by Sharpe
+- [ ] Gate B thresholds displayed (informational, not enforced)
+- [ ] Strategy visualization with candlestick + entry/exit markers + indicators
 - [ ] User can view results in portal
-- [ ] Real-time price streaming via WebSocket
 
 ---
 

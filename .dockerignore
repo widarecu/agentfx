@@ -1,0 +1,27 @@
+# Virtual environment - never copy into the image
+.venv
+
+# Python bytecode caches
+__pycache__
+*.pyc
+
+# Environment files - secrets must be injected at runtime, not baked in
+.env.*
+
+# Frontend portal - not part of the backend image
+portal/
+
+# Test suite - not needed at runtime
+tests/
+
+# Git metadata
+.git
+
+# Node package tree - unrelated to Python backend
+node_modules
+
+# Coverage reports
+htmlcov
+
+# Pytest artefacts
+.pytest_cache

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import os
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+
 import pandas as pd
 
 from agentfx.services.backtest import run_backtest
@@ -45,7 +46,7 @@ def test_window_fallback_uses_full_dataset_when_empty_filter():
         pair = "TESTUSD"
         gran = "M1"
         # Create data for last 2 hours
-        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        now = datetime.now(UTC).replace(second=0, microsecond=0)
         df = _make_sample_df(now - timedelta(hours=2), minutes=120)
         _write_csv_partition(data_root, pair, gran, df)
 
@@ -60,9 +61,9 @@ def test_window_fallback_uses_full_dataset_when_empty_filter():
             spread_pips=0.0,
             slippage_pips_per_side=0.0,
         )
-        assert (
-            res["n"] > 0
-        ), "Fallback should have used full dataset when filter emptied the slice"
+        assert res["n"] > 0, (
+            "Fallback should have used full dataset when filter emptied the slice"
+        )
 
 
 def test_costs_reduce_cagr_vs_no_costs():
@@ -71,7 +72,7 @@ def test_costs_reduce_cagr_vs_no_costs():
         pair = "TESTUSD"
         gran = "M1"
         # Create 6 hours of synthetic data
-        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        now = datetime.now(UTC).replace(second=0, microsecond=0)
         df = _make_sample_df(now - timedelta(hours=6), minutes=360)
         _write_csv_partition(data_root, pair, gran, df)
 
@@ -97,6 +98,6 @@ def test_costs_reduce_cagr_vs_no_costs():
         )
 
         assert with_cost["n"] == no_cost["n"]
-        assert (
-            with_cost["metrics"]["cagr"] <= no_cost["metrics"]["cagr"]
-        ), "Costs should not improve CAGR"
+        assert with_cost["metrics"]["cagr"] <= no_cost["metrics"]["cagr"], (
+            "Costs should not improve CAGR"
+        )

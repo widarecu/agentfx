@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
-from agentfx.shared.config import IngestConfig, load_config
-from agentfx.adapters.oanda import OandaClient
-from agentfx.adapters.storage.sqlite import Registry
-from agentfx.adapters.storage.csv import write_candles_csv, latest_timestamp
 from dateutil import parser as dtparser
+
+from agentfx.adapters.oanda import OandaClient
+from agentfx.adapters.storage.csv import latest_timestamp, write_candles_csv
+from agentfx.adapters.storage.sqlite import Registry
+from agentfx.shared.config import IngestConfig, load_config
 
 
 def _calc_start_end(now_utc: datetime, start_days: int) -> tuple[datetime, datetime]:
@@ -22,7 +23,7 @@ def backfill_pair(
     rows = 0
     gaps_fixed = 0
     try:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         existing_end = (
             None
             if cfg.force_start
@@ -65,8 +66,8 @@ def backfill_pair(
             reg.upsert_dataset(
                 instrument,
                 cfg.granularity,
-                start_ts=first_written.replace(tzinfo=timezone.utc).isoformat(),
-                end_ts=last_written.replace(tzinfo=timezone.utc).isoformat(),
+                start_ts=first_written.replace(tzinfo=UTC).isoformat(),
+                end_ts=last_written.replace(tzinfo=UTC).isoformat(),
             )
         reg.finish_run(
             run_id, rows_ingested=rows, gaps_fixed=gaps_fixed, status="success"

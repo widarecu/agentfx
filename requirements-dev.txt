@@ -78,6 +78,10 @@ pyproject-hooks==1.2.0
     #   pip-tools
 pytest==8.4.2
     # via -r requirements-dev.in
+pytest-cov==4.1.0
+    # test coverage reporting
+pytest-asyncio==0.23.5
+    # async test support
 fastapi==0.115.5
     # for mock API server
 uvicorn==0.32.0

@@ -3,15 +3,46 @@
 These tests require:
 1. PostgreSQL database running
 2. OANDA API credentials configured
+3. Network access to OANDA API (no SSL interception)
 
 Mark with @pytest.mark.oanda_real to require real OANDA connection.
 Mark with @pytest.mark.slow for long-running tests.
 """
 
-import pytest
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
 
+import pytest
+import requests
 from src.agentfx.api.core.config import settings
+
+
+def _oanda_is_reachable() -> tuple[bool, str]:
+    """Check if OANDA API is reachable without SSL issues.
+
+    Returns:
+        Tuple of (is_reachable, reason_if_not)
+    """
+    if not settings.OANDA_API_KEY or settings.OANDA_API_KEY == "your-api-key-here":
+        return False, "OANDA credentials not configured"
+
+    try:
+        # Quick connectivity test with timeout
+        requests.get(
+            f"https://{settings.OANDA_API_HOST}/v3/accounts",
+            headers={"Authorization": f"Bearer {settings.OANDA_API_KEY}"},
+            timeout=5,
+        )
+        # Any response (even 401) means we can reach OANDA
+        return True, ""
+    except requests.exceptions.SSLError as e:
+        return False, f"SSL error connecting to OANDA (likely network proxy): {e}"
+    except requests.exceptions.ConnectionError as e:
+        return False, f"Cannot connect to OANDA API: {e}"
+    except requests.exceptions.Timeout:
+        return False, "Connection to OANDA timed out"
+    except Exception as e:
+        return False, f"Unexpected error testing OANDA connectivity: {e}"
+
 
 # Skip all tests if database is not available
 pytestmark = pytest.mark.integration
@@ -102,7 +133,7 @@ class TestCandleStorage:
     @pytest.fixture
     def sample_candles(self):
         """Sample candle data for testing."""
-        base_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        base_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC)
         return [
             {
                 "timestamp": base_time,
@@ -123,8 +154,15 @@ class TestCandleStorage:
         ]
 
     def test_store_candles_to_database(self, db_connection, sample_candles):
-        """Test storing candles to real database."""
+        """Test storing candles to real database.
+
+        Uses TEST_EUR instrument to avoid conflicting with real OANDA data.
+        """
         cursor = db_connection.cursor()
+
+        # Clean up any previous test data
+        cursor.execute("DELETE FROM candles WHERE instrument = 'TEST_EUR'")
+        db_connection.commit()
 
         # Insert candles
         for candle in sample_candles:
@@ -134,7 +172,7 @@ class TestCandleStorage:
                     exchange, instrument, timeframe, timestamp,
                     open, high, low, close, volume, complete
                 )
-                VALUES ('oanda', 'EUR_USD', 'M1', %s, %s, %s, %s, %s, %s, true)
+                VALUES ('test', 'TEST_EUR', 'M1', %s, %s, %s, %s, %s, %s, true)
                 ON CONFLICT (instrument, timeframe, timestamp) DO NOTHING
                 """,
                 (
@@ -151,16 +189,27 @@ class TestCandleStorage:
 
         # Verify candles were stored
         cursor.execute(
-            "SELECT COUNT(*) as count FROM candles WHERE instrument = 'EUR_USD'"
+            "SELECT COUNT(*) as count FROM candles WHERE instrument = 'TEST_EUR'"
         )
         result = cursor.fetchone()
+
+        # Clean up test data
+        cursor.execute("DELETE FROM candles WHERE instrument = 'TEST_EUR'")
+        db_connection.commit()
         cursor.close()
 
         assert result["count"] == 2
 
     def test_get_latest_candle(self, db_connection, sample_candles):
-        """Test retrieving the latest candle from database."""
+        """Test retrieving the latest candle from database.
+
+        Uses TEST_EUR instrument to avoid conflicting with real OANDA data.
+        """
         cursor = db_connection.cursor()
+
+        # Clean up any previous test data
+        cursor.execute("DELETE FROM candles WHERE instrument = 'TEST_EUR'")
+        db_connection.commit()
 
         # Insert candles
         for candle in sample_candles:
@@ -170,7 +219,7 @@ class TestCandleStorage:
                     exchange, instrument, timeframe, timestamp,
                     open, high, low, close, volume, complete
                 )
-                VALUES ('oanda', 'EUR_USD', 'M1', %s, %s, %s, %s, %s, %s, true)
+                VALUES ('test', 'TEST_EUR', 'M1', %s, %s, %s, %s, %s, %s, true)
                 ON CONFLICT (instrument, timeframe, timestamp) DO NOTHING
                 """,
                 (
@@ -189,21 +238,32 @@ class TestCandleStorage:
         cursor.execute(
             """
             SELECT * FROM candles
-            WHERE exchange = 'oanda' AND instrument = 'EUR_USD' AND timeframe = 'M1'
+            WHERE exchange = 'test' AND instrument = 'TEST_EUR' AND timeframe = 'M1'
             ORDER BY timestamp DESC
             LIMIT 1
             """
         )
         result = cursor.fetchone()
+
+        # Clean up test data
+        cursor.execute("DELETE FROM candles WHERE instrument = 'TEST_EUR'")
+        db_connection.commit()
         cursor.close()
 
         assert result is not None
         assert result["close"] == 1.1006  # Latest candle
 
     def test_candle_upsert_on_conflict(self, db_connection):
-        """Test that candles are updated on conflict."""
+        """Test that candles are updated on conflict.
+
+        Uses TEST_EUR instrument to avoid conflicting with real OANDA data.
+        """
         cursor = db_connection.cursor()
-        timestamp = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        timestamp = datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+        # Clean up any previous test data
+        cursor.execute("DELETE FROM candles WHERE instrument = 'TEST_EUR'")
+        db_connection.commit()
 
         # Insert initial candle
         cursor.execute(
@@ -212,7 +272,7 @@ class TestCandleStorage:
                 exchange, instrument, timeframe, timestamp,
                 open, high, low, close, volume, complete
             )
-            VALUES ('oanda', 'EUR_USD', 'M1', %s, 1.1000, 1.1005, 1.0995, 1.1002, 1000, false)
+            VALUES ('test', 'TEST_EUR', 'M1', %s, 1.1000, 1.1005, 1.0995, 1.1002, 1000, false)
             ON CONFLICT (instrument, timeframe, timestamp)
             DO UPDATE SET close = EXCLUDED.close, volume = EXCLUDED.volume, complete = EXCLUDED.complete
             """,
@@ -227,7 +287,7 @@ class TestCandleStorage:
                 exchange, instrument, timeframe, timestamp,
                 open, high, low, close, volume, complete
             )
-            VALUES ('oanda', 'EUR_USD', 'M1', %s, 1.1000, 1.1010, 1.0990, 1.1008, 1500, true)
+            VALUES ('test', 'TEST_EUR', 'M1', %s, 1.1000, 1.1010, 1.0990, 1.1008, 1500, true)
             ON CONFLICT (instrument, timeframe, timestamp)
             DO UPDATE SET close = EXCLUDED.close, volume = EXCLUDED.volume, complete = EXCLUDED.complete
             """,
@@ -237,10 +297,14 @@ class TestCandleStorage:
 
         # Verify update
         cursor.execute(
-            "SELECT close, volume, complete FROM candles WHERE timestamp = %s",
+            "SELECT close, volume, complete FROM candles WHERE instrument = 'TEST_EUR' AND timestamp = %s",
             (timestamp,),
         )
         result = cursor.fetchone()
+
+        # Clean up test data
+        cursor.execute("DELETE FROM candles WHERE instrument = 'TEST_EUR'")
+        db_connection.commit()
         cursor.close()
 
         assert result["close"] == 1.1008
@@ -259,17 +323,17 @@ class TestOandaIntegration:
 
     @pytest.fixture
     def oanda_configured(self):
-        """Check if OANDA is configured using settings (loaded from .env.test)."""
-        api_key = settings.OANDA_API_KEY
-        if not api_key or api_key == "your-api-key-here":
-            pytest.skip("OANDA API key not configured")
+        """Check if OANDA is configured and reachable (no SSL interception)."""
+        is_reachable, skip_reason = _oanda_is_reachable()
+        if not is_reachable:
+            pytest.skip(skip_reason)
         return True
 
     def test_fetch_real_candles(self, oanda_configured):
         """Test fetching real candles from OANDA API."""
         from src.agentfx.api.workers.candle_ingestion import fetch_candles_range
 
-        from_time = datetime.now(timezone.utc) - timedelta(hours=1)
+        from_time = datetime.now(UTC) - timedelta(hours=1)
         candles = fetch_candles_range("EUR_USD", "M1", from_time)
 
         # Should get some candles (markets may be closed on weekends)
@@ -284,8 +348,8 @@ class TestOandaIntegration:
 
         Note: This test requires OANDA credentials to be configured.
         """
-        from src.agentfx.api.workers.candle_ingestion import backfill_instrument
         from src.agentfx.api.models.instrument import Instrument
+        from src.agentfx.api.workers.candle_ingestion import backfill_instrument
 
         # Seed instruments using SQLAlchemy (not psycopg2)
         instruments_data = [
@@ -329,8 +393,16 @@ class TestGapDetection:
         """Insert candles with a gap in the middle."""
         cursor = db_connection.cursor()
 
-        # Create candles from 2 hours ago to 1 hour ago (leaving 1 hour gap)
-        base_time = datetime.now(timezone.utc) - timedelta(hours=2)
+        # Clean up existing candles for EUR_USD to ensure test isolation
+        cursor.execute(
+            """
+            DELETE FROM candles
+            WHERE exchange = 'oanda' AND instrument = 'EUR_USD' AND timeframe = 'M1'
+            """
+        )
+
+        # Create candles from 2 hours ago to 1.5 hours ago (leaving 1.5 hour gap)
+        base_time = datetime.now(UTC) - timedelta(hours=2)
 
         for i in range(30):  # 30 minutes of data
             timestamp = base_time + timedelta(minutes=i)
@@ -341,7 +413,6 @@ class TestGapDetection:
                     open, high, low, close, volume, complete
                 )
                 VALUES ('oanda', 'EUR_USD', 'M1', %s, 1.1, 1.11, 1.09, 1.105, 100, true)
-                ON CONFLICT (instrument, timeframe, timestamp) DO NOTHING
                 """,
                 (timestamp,),
             )
@@ -370,9 +441,9 @@ class TestGapDetection:
         if result:
             latest_time = result["timestamp"]
             if latest_time.tzinfo is None:
-                latest_time = latest_time.replace(tzinfo=timezone.utc)
+                latest_time = latest_time.replace(tzinfo=UTC)
 
-            gap = datetime.now(timezone.utc) - latest_time
+            gap = datetime.now(UTC) - latest_time
             gap_minutes = gap.total_seconds() / 60
 
             # Should have at least 30 minutes gap (we created data ending 1h30m ago)
@@ -384,7 +455,7 @@ class TestGapDetection:
 
         # Gap fill should start from last candle + 1 second
         gap_fill_start = last_candle_time + timedelta(seconds=1)
-        gap_fill_end = datetime.now(timezone.utc)
+        gap_fill_end = datetime.now(UTC)
 
         # Calculate expected candles in gap
         gap_duration = gap_fill_end - gap_fill_start

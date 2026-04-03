@@ -1,6 +1,7 @@
-from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
 
 OUT_DIR = Path(__file__).resolve().parents[3] / "planning" / "wireframes"
 OUT_DIR.mkdir(parents=True, exist_ok=True)

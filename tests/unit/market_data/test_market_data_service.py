@@ -1,12 +1,12 @@
 """Unit tests for the market data service."""
 
-import pytest
 from datetime import datetime
 from unittest.mock import MagicMock, patch
-from sqlalchemy.orm import Session
 
-from src.agentfx.api.services.market_data import MarketDataService
+import pytest
+from sqlalchemy.orm import Session
 from src.agentfx.api.schemas.market_data import CandleBase, Timeframe
+from src.agentfx.api.services.market_data import MarketDataService
 
 
 @pytest.mark.unit
@@ -54,6 +54,7 @@ class TestMarketDataService:
         mock_db.query.return_value = mock_query
         mock_query.filter.return_value = mock_query
         mock_query.order_by.return_value = mock_query
+        mock_query.offset.return_value = mock_query
         mock_query.limit.return_value = mock_query
         mock_query.all.return_value = sample_candle_data
         mock_query.count.return_value = len(sample_candle_data)
@@ -82,6 +83,7 @@ class TestMarketDataService:
         mock_db.query.return_value = mock_query
         mock_query.filter.return_value = mock_query
         mock_query.order_by.return_value = mock_query
+        mock_query.offset.return_value = mock_query
         mock_query.limit.return_value = mock_query
         mock_query.all.return_value = sample_candle_data[:1]
         mock_query.count.return_value = 1
@@ -99,7 +101,7 @@ class TestMarketDataService:
         assert len(candles) == 1
         assert total == 1
 
-    @patch("src.agentfx.api.schemas.market_data.CandlePublic")
+    @patch("agentfx.api.schemas.market_data.CandlePublic")
     def test_create_candles_validation_success(
         self, mock_candle_public, mock_db, sample_candle_data
     ):

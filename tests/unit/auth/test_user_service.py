@@ -1,14 +1,14 @@
 """Unit tests for user service functions."""
 
-import pytest
 from datetime import datetime
 from unittest.mock import MagicMock
-from sqlalchemy.orm import Session
 
-from src.agentfx.api.services import user as user_service
+import pytest
+from sqlalchemy.orm import Session
 from src.agentfx.api import schemas
-from src.agentfx.api.models.user import User, UserRole
 from src.agentfx.api.core.security import get_password_hash
+from src.agentfx.api.models.user import User, UserRole
+from src.agentfx.api.services import user as user_service
 
 
 class TestUserServiceGet:
@@ -315,6 +315,7 @@ class TestUserServiceCurrentUser:
     def test_get_current_user_valid(self):
         """Test getting current user with valid token."""
         from datetime import timedelta
+
         from src.agentfx.api.core.security import create_access_token
 
         mock_user = User(
@@ -342,6 +343,7 @@ class TestUserServiceCurrentUser:
     def test_get_current_user_expired_token(self):
         """Test getting current user with expired token."""
         from datetime import timedelta
+
         from fastapi import HTTPException
         from src.agentfx.api.core.security import create_access_token
 
@@ -373,6 +375,7 @@ class TestUserServiceCurrentUser:
     def test_get_current_user_user_not_found(self):
         """Test getting current user when user doesn't exist."""
         from datetime import timedelta
+
         from fastapi import HTTPException
         from src.agentfx.api.core.security import create_access_token
 

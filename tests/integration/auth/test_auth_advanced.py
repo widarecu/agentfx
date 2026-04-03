@@ -4,17 +4,17 @@ NOTE: This test file has been migrated from SQLite to PostgreSQL.
 It now uses the settings.TEST_DATABASE_URL from config.py as the single source of truth.
 """
 
-import pytest
 import time
+
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
-from src.agentfx.api.main import app
-from src.agentfx.api.core.database import get_db, Base
 from src.agentfx.api.core.config import settings
-from src.agentfx.api.models.user import User, UserRole
+from src.agentfx.api.core.database import Base, get_db
 from src.agentfx.api.core.security import get_password_hash
+from src.agentfx.api.main import app
+from src.agentfx.api.models.user import User, UserRole
 
 # Use PostgreSQL for auth integration tests (from settings.TEST_DATABASE_URL)
 # This is the SINGLE SOURCE OF TRUTH for test database configuration
@@ -27,15 +27,40 @@ def adv_test_db():
     """Setup test database for advanced auth tests.
 
     Uses cleanup instead of drop_all for PostgreSQL compatibility.
+    Cleans up BEFORE and AFTER tests to handle leftover data from previous runs.
     """
     Base.metadata.create_all(bind=engine)
 
-    yield
+    # Test-specific emails that need cleanup (excluding seeded users)
+    test_emails = [
+        "active@example.com",
+        "wasactive@example.com",
+        "multitoken@example.com",
+        "longpass@example.com",
+        "minpass@example.com",
+        "special@example.com",
+        "user@exämple.com",
+        "testviewer@example.com",
+    ]
 
-    # Clean up test data (delete users created during tests)
+    # Clean up any leftover test data BEFORE test runs
     db = TestingSessionLocal()
     try:
-        db.query(User).delete()
+        for email in test_emails:
+            db.query(User).filter(User.email == email).delete()
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+    yield
+
+    # Clean up test data AFTER test
+    db = TestingSessionLocal()
+    try:
+        for email in test_emails:
+            db.query(User).filter(User.email == email).delete()
         db.commit()
     except Exception:
         db.rollback()
@@ -67,6 +92,12 @@ def adv_test_client(adv_test_db):
 def active_user(adv_test_db):
     """Create active test user in database."""
     db = TestingSessionLocal()
+    # Delete existing user if present (from seed scripts or previous runs)
+    existing = db.query(User).filter(User.email == "active@example.com").first()
+    if existing:
+        db.delete(existing)
+        db.commit()
+
     user = User(
         email="active@example.com",
         hashed_password=get_password_hash("ActivePass123!"),
@@ -85,6 +116,12 @@ def active_user(adv_test_db):
 def inactive_user(adv_test_db):
     """Create inactive test user in database."""
     db = TestingSessionLocal()
+    # Delete existing user if present (from seed scripts or previous runs)
+    existing = db.query(User).filter(User.email == "inactive@example.com").first()
+    if existing:
+        db.delete(existing)
+        db.commit()
+
     user = User(
         email="inactive@example.com",
         hashed_password=get_password_hash("InactivePass123!"),
@@ -103,6 +140,12 @@ def inactive_user(adv_test_db):
 def admin_user(adv_test_db):
     """Create admin test user in database."""
     db = TestingSessionLocal()
+    # Delete existing user if present (from seed scripts or previous runs)
+    existing = db.query(User).filter(User.email == "admin@example.com").first()
+    if existing:
+        db.delete(existing)
+        db.commit()
+
     user = User(
         email="admin@example.com",
         hashed_password=get_password_hash("AdminPass123!"),
@@ -147,6 +190,12 @@ class TestInactiveUserAuth:
         """
         # Create user as active first
         db = TestingSessionLocal()
+        # Delete existing user if present
+        existing = db.query(User).filter(User.email == "wasactive@example.com").first()
+        if existing:
+            db.delete(existing)
+            db.commit()
+
         user = User(
             email="wasactive@example.com",
             hashed_password=get_password_hash("WasActivePass123!"),
@@ -190,10 +239,16 @@ class TestUserRoles:
 
     def test_viewer_role_user_login(self, adv_test_client, adv_test_db):
         """Test viewer role user can login."""
-        # Create viewer user
+        # Create viewer user with unique email (don't use viewer@example.com - it's seeded for E2E tests)
         db = TestingSessionLocal()
+        # Delete existing user if present (from previous runs)
+        existing = db.query(User).filter(User.email == "testviewer@example.com").first()
+        if existing:
+            db.delete(existing)
+            db.commit()
+
         user = User(
-            email="viewer@example.com",
+            email="testviewer@example.com",
             hashed_password=get_password_hash("ViewerPass123!"),
             full_name="Viewer User",
             is_active=True,
@@ -205,7 +260,7 @@ class TestUserRoles:
 
         response = adv_test_client.post(
             f"{settings.API_V1_STR}/login",
-            data={"username": "viewer@example.com", "password": "ViewerPass123!"},
+            data={"username": "testviewer@example.com", "password": "ViewerPass123!"},
         )
 
         assert response.status_code == 200
@@ -283,6 +338,12 @@ class TestTokenEdgeCases:
         """
         # Create user for this test
         db = TestingSessionLocal()
+        # Delete existing user if present (from seed scripts or previous runs)
+        existing = db.query(User).filter(User.email == "multitoken@example.com").first()
+        if existing:
+            db.delete(existing)
+            db.commit()
+
         user = User(
             email="multitoken@example.com",
             hashed_password=get_password_hash("MultiPass123!"),

@@ -6,40 +6,55 @@ The settings singleton is created at import time in config.py.
 
 import os
 import sys
+from pathlib import Path
 
 # =============================================================================
-# CRITICAL: Force set test environment BEFORE any imports that load settings
-# Use direct assignment (not setdefault) to override any existing values.
-# This ensures config.py loads .env.test instead of .env.development.
+# CRITICAL: Load .env.test FIRST, before any imports that load settings.
+# This ensures all environment variables (including OANDA_API_KEY) are available
+# to both pydantic-settings (agentfx.api.core.config) AND direct os.environ reads
+# (agentfx.shared.config).
 # =============================================================================
+from dotenv import load_dotenv
+
+# Find project root and load .env.test
+_project_root = Path(__file__).parent.parent
+_env_test_path = _project_root / ".env.test"
+if _env_test_path.exists():
+    load_dotenv(_env_test_path, override=True)
+
+# Force set test environment after loading .env.test
+_prev_env = os.environ.get("ENVIRONMENT")
 os.environ["ENVIRONMENT"] = "test"
 os.environ["TESTING"] = "true"
+
+# Warn if we had to override an incorrect environment setting
+# This helps developers identify when they're not using the correct test command
+if _prev_env and _prev_env != "test":
+    import warnings
+
+    warnings.warn(
+        f"Test environment forced from '{_prev_env}' to 'test'. "
+        "Use 'make test-unit' or 'make test-integration' to avoid this warning. "
+        "See CLAUDE.md for canonical test commands.",
+        UserWarning,
+        stacklevel=1,
+    )
 
 # Add src to Python path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 # Now safe to import modules that depend on settings
-import pytest
-import asyncio
-from collections.abc import Generator
-from unittest.mock import MagicMock
-from sqlalchemy.orm import Session
-from fastapi.testclient import TestClient
+import asyncio  # noqa: E402
+from collections.abc import Generator  # noqa: E402
+from unittest.mock import MagicMock  # noqa: E402
 
-from src.agentfx.api.main import app
-from src.agentfx.api.core.database import get_db
-from src.agentfx.api import models
-from src.agentfx.api.models.user import UserRole
-
-
-def pytest_configure(config):
-    """Configure custom pytest markers."""
-    config.addinivalue_line(
-        "markers", "oanda_real: marks tests as requiring real OANDA integration"
-    )
-    config.addinivalue_line(
-        "markers", "slow: marks tests as slow running (>10 seconds)"
-    )
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
+from src.agentfx.api import models  # noqa: E402
+from src.agentfx.api.core.database import get_db  # noqa: E402
+from src.agentfx.api.main import app  # noqa: E402
+from src.agentfx.api.models.user import UserRole  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -59,13 +74,18 @@ def mock_db() -> Generator[Session, None, None]:
 
 @pytest.fixture
 def test_user() -> models.User:
-    """Create a test user fixture."""
+    """Create a test user fixture.
+
+    Uses VIEWER role to align with seed_test_data.py and follow least-privilege.
+    For tests requiring elevated permissions, use test_admin_user or create
+    a specific fixture with the needed role.
+    """
     return models.User(
         id=1,
         email="test@example.com",
         hashed_password="hashed_password",
         is_active=True,
-        role=UserRole.TRADER,
+        role=UserRole.VIEWER,
     )
 
 
@@ -254,12 +274,12 @@ def test_environment():
     - Integration tests: Use PostgreSQL via settings.TEST_DATABASE_URL
     """
     # Verify environment is correctly set (should already be done at module level)
-    assert (
-        os.environ.get("ENVIRONMENT") == "test"
-    ), "ENVIRONMENT must be 'test' - check conftest.py module-level setup"
-    assert (
-        os.environ.get("TESTING") == "true"
-    ), "TESTING must be 'true' - check conftest.py module-level setup"
+    assert os.environ.get("ENVIRONMENT") == "test", (
+        "ENVIRONMENT must be 'test' - check conftest.py module-level setup"
+    )
+    assert os.environ.get("TESTING") == "true", (
+        "TESTING must be 'true' - check conftest.py module-level setup"
+    )
 
     yield
 

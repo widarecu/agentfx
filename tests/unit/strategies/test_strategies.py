@@ -1,19 +1,19 @@
 """Unit tests for the strategies router."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Any
+from unittest.mock import MagicMock
+from uuid import uuid4
+
 from fastapi import status
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
-from unittest.mock import MagicMock
-from uuid import uuid4
-from typing import Any
-
-from src.agentfx.api.main import app
 from src.agentfx.api import models
 from src.agentfx.api.core.database import get_db
 from src.agentfx.api.core.security import get_current_active_user
+from src.agentfx.api.main import app
+from src.agentfx.api.models.run import RunEnvironment, RunStatus
 from src.agentfx.api.models.user import UserRole
-from src.agentfx.api.models.run import RunStatus, RunEnvironment
 
 
 # Test data
@@ -29,8 +29,8 @@ def create_test_run(**overrides: dict[str, Any]) -> dict[str, Any]:
         "initial_balance": 10000.0,
         "current_balance": 10000.0,
         "pnl": 0.0,
-        "created_at": datetime.now(timezone.utc),
-        "updated_at": datetime.now(timezone.utc),
+        "created_at": datetime.now(UTC),
+        "updated_at": datetime.now(UTC),
         **overrides,
     }
 
@@ -54,8 +54,8 @@ def create_mock_current_user():
         full_name="Test User",
         is_active=True,
         role=UserRole.TRADER,
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
     )
 
 
@@ -82,9 +82,7 @@ class TestStrategiesRouter:
     def test_list_strategies_empty(self):
         """Test listing strategies when no strategies exist."""
         # Mock the database query
-        self.db.query.return_value.offset.return_value.limit.return_value.all.return_value = (
-            []
-        )
+        self.db.query.return_value.offset.return_value.limit.return_value.all.return_value = []
 
         # Make the request
         response = self.client.get(

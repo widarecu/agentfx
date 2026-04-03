@@ -1,16 +1,17 @@
+import logging
 from datetime import datetime, timedelta
 from typing import Any
+
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from jose.exceptions import ExpiredSignatureError
 from passlib.context import CryptContext
-from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
-import logging
 
+from ..models.user import User
 from .config import settings
 from .database import get_db
-from ..models.user import User
 
 logger = logging.getLogger(__name__)
 

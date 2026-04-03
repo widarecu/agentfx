@@ -19,11 +19,13 @@ os.environ.setdefault("TESTING", "true")
 if os.path.join(os.path.dirname(__file__), "..", "..", "src") not in sys.path:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
-import pytest
 from collections.abc import Generator
+from datetime import UTC
 from urllib.parse import urlparse
+
+import psycopg2
+import pytest
+from psycopg2.extras import RealDictCursor
 
 # Import settings AFTER environment is set
 from src.agentfx.api.core.config import settings
@@ -109,7 +111,14 @@ class TestDatabaseManager:
         return self.connection
 
     def cleanup_test_data(self):
-        """Clean up test data between tests."""
+        """Clean up test data between tests.
+
+        NOTE: Candles and instruments are PRESERVED.
+        - Candles contain historical market data from OANDA needed for backtesting
+        - Instruments contain metadata seeded once at startup
+
+        Only test-created transactional data (orders, trades, runs, etc.) is cleaned.
+        """
         conn = self.get_connection()
 
         # Rollback any aborted transactions first
@@ -122,19 +131,18 @@ class TestDatabaseManager:
 
         try:
             # Delete from tables in dependency order (children first, parents last)
-            # This avoids needing superuser privileges for session_replication_role
+            # EXCLUDES: candles (historical data), instruments (metadata)
             tables_in_order = [
-                "candles",
                 "orders",
                 "trades",
                 "runs",
                 "strategies",
                 "market_data_updates",
-                "instruments",
-                "users",
             ]
 
-            print(f"Cleaning up tables: {tables_in_order}")
+            print(
+                f"Cleaning up tables (preserving candles/instruments): {tables_in_order}"
+            )
 
             for table in tables_in_order:
                 try:
@@ -145,8 +153,16 @@ class TestDatabaseManager:
                     print(f"Skipping {table}: {e}")
                     conn.rollback()
 
+            # Clean up only test-created users (preserve seeded users)
+            try:
+                cursor.execute("DELETE FROM users WHERE email LIKE 'integration_%'")
+                print(f"Deleted integration test users: {cursor.rowcount} rows")
+            except Exception as e:
+                print(f"Skipping user cleanup: {e}")
+                conn.rollback()
+
             conn.commit()
-            print("Database cleanup completed")
+            print("Database cleanup completed (candles/instruments preserved)")
         except Exception as e:
             print(f"Error during cleanup: {e}")
             conn.rollback()
@@ -250,12 +266,12 @@ def seed_test_candles(db_connection, seed_instruments):
 
     This creates sample candle data for testing without requiring real OANDA API.
     """
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta
 
     cursor = db_connection.cursor()
 
     # Create 100 candles for EUR_USD M1
-    base_time = datetime.now(timezone.utc) - timedelta(hours=2)
+    base_time = datetime.now(UTC) - timedelta(hours=2)
 
     for i in range(100):
         timestamp = base_time + timedelta(minutes=i)
@@ -291,11 +307,11 @@ def seed_test_candles(db_connection, seed_instruments):
 # - Proper dependency injection for testing production code paths
 # =============================================================================
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy.orm import Session, sessionmaker  # noqa: E402
 
 # Import database models and base
-from src.agentfx.api.core.database import Base
+from src.agentfx.api.core.database import Base  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -341,8 +357,8 @@ def test_client_with_db(db_session):
     database isolation.
     """
     from fastapi.testclient import TestClient
-    from src.agentfx.api.main import app
     from src.agentfx.api.core.database import get_db
+    from src.agentfx.api.main import app
 
     def override_get_db():
         yield db_session

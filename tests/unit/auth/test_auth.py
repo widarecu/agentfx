@@ -1,17 +1,17 @@
 """Unit tests for the authentication router."""
 
 from datetime import datetime
+from unittest.mock import MagicMock
+
 from fastapi import FastAPI, status
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
-from unittest.mock import MagicMock
-
-from src.agentfx.api.routers import auth
 from src.agentfx.api import models
 from src.agentfx.api.core.config import settings
 from src.agentfx.api.core.database import get_db
 from src.agentfx.api.core.security import create_access_token
 from src.agentfx.api.models.user import UserRole
+from src.agentfx.api.routers import auth
 
 # Override settings for testing
 settings.TESTING = True
@@ -101,9 +101,9 @@ class TestAuthRouter:
         )
 
         # Assert the response
-        assert (
-            response.status_code == status.HTTP_401_UNAUTHORIZED
-        ), f"Response: {response.text}"
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED, (
+            f"Response: {response.text}"
+        )
         data = response.json()
         assert "detail" in data
         assert data["detail"] == "Incorrect email or password"
@@ -168,14 +168,14 @@ class TestAuthRouter:
         response = client.post(f"{API_PREFIX}/register", json=register_data)
 
         # Assert the response
-        assert (
-            response.status_code == status.HTTP_400_BAD_REQUEST
-        ), f"Response: {response.text}"
+        assert response.status_code == status.HTTP_400_BAD_REQUEST, (
+            f"Response: {response.text}"
+        )
         data = response.json()
         assert "detail" in data
-        assert (
-            "already exists" in data["detail"]
-        ), f"Unexpected error message: {data['detail']}"
+        assert "already exists" in data["detail"], (
+            f"Unexpected error message: {data['detail']}"
+        )
 
     def test_get_current_user(self):
         """Test getting the current user with a valid token."""
@@ -192,7 +192,10 @@ class TestAuthRouter:
 
         # Create a valid token with longer expiration for testing
         from datetime import timedelta
-        token = create_access_token(data={"sub": str(test_user.id)}, expires_delta=timedelta(hours=1))
+
+        token = create_access_token(
+            data={"sub": str(test_user.id)}, expires_delta=timedelta(hours=1)
+        )
 
         # Mock the database query
         db.query.return_value.filter.return_value.first.return_value = test_user
@@ -218,9 +221,9 @@ class TestAuthRouter:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         # Should return 422 for validation error (missing username)
-        assert (
-            response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
-        ), f"Response: {response.text}"
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY, (
+            f"Response: {response.text}"
+        )
 
         # Test with missing password
         response = client.post(
@@ -229,15 +232,15 @@ class TestAuthRouter:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         # Should return 422 for validation error (missing password)
-        assert (
-            response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
-        ), f"Response: {response.text}"
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY, (
+            f"Response: {response.text}"
+        )
 
         # Test with empty data
         response = client.post(f"{API_PREFIX}/login", data={"grant_type": "password"})
-        assert (
-            response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
-        ), f"Response: {response.text}"
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY, (
+            f"Response: {response.text}"
+        )
 
     def test_get_current_user_invalid_token(self):
         """Test getting current user with invalid token."""
@@ -245,26 +248,26 @@ class TestAuthRouter:
         response = client.get(
             f"{API_PREFIX}/me", headers={"Authorization": "Bearer invalid_token"}
         )
-        assert (
-            response.status_code == status.HTTP_401_UNAUTHORIZED
-        ), f"Response: {response.text}"
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED, (
+            f"Response: {response.text}"
+        )
         data = response.json()
         assert "detail" in data
         assert "Could not validate credentials" in data["detail"]
 
         # Test with missing Authorization header
         response = client.get(f"{API_PREFIX}/me", headers={})
-        assert (
-            response.status_code == status.HTTP_401_UNAUTHORIZED
-        ), f"Response: {response.text}"
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED, (
+            f"Response: {response.text}"
+        )
 
         # Test with invalid token format (no Bearer)
         response = client.get(
             f"{API_PREFIX}/me", headers={"Authorization": "InvalidTokenFormat"}
         )
-        assert (
-            response.status_code == status.HTTP_401_UNAUTHORIZED
-        ), f"Response: {response.text}"
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED, (
+            f"Response: {response.text}"
+        )
 
     def test_register_invalid_data(self):
         """Test user registration with invalid data."""
@@ -277,9 +280,9 @@ class TestAuthRouter:
                 "full_name": "Test User",
             },
         )
-        assert (
-            response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
-        ), f"Response: {response.text}"
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY, (
+            f"Response: {response.text}"
+        )
 
         # Test with short password
         response = client.post(
@@ -290,17 +293,17 @@ class TestAuthRouter:
                 "full_name": "Test User",
             },
         )
-        assert (
-            response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
-        ), f"Response: {response.text}"
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY, (
+            f"Response: {response.text}"
+        )
 
         # Test with missing required fields
         response = client.post(
             f"{API_PREFIX}/register", json={"email": "test@example.com"}
         )
-        assert (
-            response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
-        ), f"Response: {response.text}"
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY, (
+            f"Response: {response.text}"
+        )
 
     def test_test_token_endpoint(self):
         """Test the test-token endpoint."""
@@ -317,7 +320,10 @@ class TestAuthRouter:
 
         # Create a valid token with longer expiration for testing
         from datetime import timedelta
-        token = create_access_token(data={"sub": str(test_user.id)}, expires_delta=timedelta(hours=1))
+
+        token = create_access_token(
+            data={"sub": str(test_user.id)}, expires_delta=timedelta(hours=1)
+        )
 
         # Mock the database query
         db.query.return_value.filter.return_value.first.return_value = test_user

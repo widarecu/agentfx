@@ -1,0 +1,183 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # E2E tests: full-stack validation before deployment
+  # Starts backend + frontend, runs Playwright against real PostgreSQL.
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: agentfx_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test_user -d agentfx_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-api.txt
+
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt -r requirements-api.txt
+
+      - name: Run migrations and seed data
+        run: |
+          alembic upgrade head
+          python scripts/seed_instruments.py
+          python scripts/seed_test_data.py
+        env:
+          ENVIRONMENT: test
+          PYTHONPATH: src
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/agentfx_test
+
+      - name: Start backend server
+        run: |
+          uvicorn agentfx.api.main:app --host 0.0.0.0 --port 8000 &
+          # Wait for backend to be ready
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/health && break || sleep 1
+          done
+        env:
+          ENVIRONMENT: test
+          PYTHONPATH: src
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/agentfx_test
+          SECRET_KEY: test-secret-key-for-e2e
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+          OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID }}
+          OANDA_ENV: practice
+          INGESTION_ENABLED: "false"
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: portal/web/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: portal/web
+
+      - name: Start frontend server
+        run: |
+          npm run dev:test &
+          # Wait for frontend to be ready
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:5173 && break || sleep 1
+          done
+        working-directory: portal/web
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+        working-directory: portal/web
+
+      - name: Run E2E tests
+        run: npx playwright test
+        working-directory: portal/web
+
+      - name: Upload E2E artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results
+          path: test-results/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Deploy backend to Railway (only after E2E passes)
+  # ---------------------------------------------------------------------------
+  deploy-backend:
+    name: Deploy Backend → Railway
+    needs: e2e
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: |
+          curl -fsSL https://railway.app/install.sh | sh
+          railway --version
+
+      - name: Deploy to Railway
+        run: railway up --detach
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Deploy frontend to Vercel (only after E2E passes)
+  # ---------------------------------------------------------------------------
+  deploy-frontend:
+    name: Deploy Frontend → Vercel
+    needs: e2e
+    runs-on: ubuntu-latest
+    environment: production
+
+    defaults:
+      run:
+        working-directory: portal/web
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: portal/web/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend (staging mode)
+        run: npm run build:staging
+        env:
+          VITE_API_BASE_URL: ${{ secrets.RAILWAY_BACKEND_URL }}
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      - name: Pull Vercel project settings
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Deploy to Vercel (production)
+        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}

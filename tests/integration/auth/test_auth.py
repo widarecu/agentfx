@@ -4,18 +4,18 @@ NOTE: This test file has been migrated from SQLite to PostgreSQL.
 It now uses the settings.TEST_DATABASE_URL from config.py as the single source of truth.
 """
 
-import pytest
 import time
 from datetime import timedelta
+
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
-from src.agentfx.api.main import app
-from src.agentfx.api.core.database import get_db, Base
 from src.agentfx.api.core.config import settings
+from src.agentfx.api.core.database import Base, get_db
+from src.agentfx.api.core.security import create_access_token, get_password_hash
+from src.agentfx.api.main import app
 from src.agentfx.api.models.user import User, UserRole
-from src.agentfx.api.core.security import get_password_hash, create_access_token
 
 # Use PostgreSQL for auth integration tests (from settings.TEST_DATABASE_URL)
 # This is the SINGLE SOURCE OF TRUTH for test database configuration
@@ -35,16 +35,39 @@ def auth_test_db():
     """Setup test database for auth integration tests.
 
     Uses transaction-based cleanup for test isolation.
+    Cleans up BEFORE and AFTER tests to handle leftover data from previous runs.
     """
     # Ensure tables exist
     Base.metadata.create_all(bind=engine)
 
-    yield
-
-    # Clean up test data (delete users created during tests)
+    # Clean up any leftover test data BEFORE test runs
     db = TestingSessionLocal()
     try:
-        db.query(User).delete()
+        # Only delete test-specific users (not seeded users needed by E2E)
+        test_emails = [
+            "newuser@example.com",
+            "flowtest@example.com",
+        ]
+        for email in test_emails:
+            db.query(User).filter(User.email == email).delete()
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+    yield
+
+    # Clean up test data AFTER test (delete users created during tests)
+    db = TestingSessionLocal()
+    try:
+        # Only delete test-specific users
+        test_emails = [
+            "newuser@example.com",
+            "flowtest@example.com",
+        ]
+        for email in test_emails:
+            db.query(User).filter(User.email == email).delete()
         db.commit()
     except Exception:
         db.rollback()

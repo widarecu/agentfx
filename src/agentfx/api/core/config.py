@@ -1,7 +1,8 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Literal
-from pydantic import Field, field_validator
 import os
+from typing import Any, Literal
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def get_env_file() -> str:
@@ -133,7 +134,7 @@ class Settings(BaseSettings):
     )
 
     @field_validator("DATABASE_URL", mode="before")
-    def assemble_db_connection(cls, v: str, values: dict[str, any]) -> str:
+    def assemble_db_connection(cls, v: str, values: dict[str, Any]) -> str:
         """
         Automatically use test database when in testing mode.
         This ensures consistent database usage across all application components.
@@ -233,6 +234,51 @@ class Settings(BaseSettings):
         env="INGESTION_POLL_INTERVAL",
         description="Interval in seconds between candle ingestion cycles",
     )
+
+    BACKFILL_DAYS: int = Field(
+        default=7,
+        env="BACKFILL_DAYS",
+        description="Days of historical data to backfill on startup (default 7, set to 1825 for 5 years)",
+    )
+
+    CANDLE_INSTRUMENTS: str = Field(
+        default="EUR_USD,GBP_USD,USD_JPY,AUD_USD,USD_CHF,USD_CAD",
+        env="CANDLE_INSTRUMENTS",
+        description="Comma-separated list of instruments to ingest",
+    )
+
+    CANDLE_GRANULARITIES: str = Field(
+        default="M1,M5,M10,M30,H1,H4,H12,D,W,M",
+        env="CANDLE_GRANULARITIES",
+        description="Comma-separated list of granularities to ingest",
+    )
+
+    CANDLE_HEALTH_CHECK_INTERVAL: int = Field(
+        default=3600,
+        env="CANDLE_HEALTH_CHECK_INTERVAL",
+        description="Seconds between gap detection/healing runs (0 to disable)",
+    )
+    GAP_REVERIFY_DAYS: int = Field(
+        default=30,
+        env="GAP_REVERIFY_DAYS",
+        description="Days before re-checking a previously empty gap in case OANDA backfills",
+    )
+
+    MAX_GAPS_PER_HEALTH_CHECK: int = Field(
+        default=500,
+        env="MAX_GAPS_PER_HEALTH_CHECK",
+        description="Maximum gaps to process per instrument/granularity per health check cycle",
+    )
+
+    @property
+    def instruments_list(self) -> list[str]:
+        """Parse CANDLE_INSTRUMENTS into a list."""
+        return [i.strip() for i in self.CANDLE_INSTRUMENTS.split(",") if i.strip()]
+
+    @property
+    def granularities_list(self) -> list[str]:
+        """Parse CANDLE_GRANULARITIES into a list."""
+        return [g.strip() for g in self.CANDLE_GRANULARITIES.split(",") if g.strip()]
 
 
 # Create settings instance

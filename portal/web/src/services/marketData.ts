@@ -39,7 +39,12 @@ export interface MarketDataError {
   code?: string;
 }
 
-export type Timeframe = 'M1' | 'M5' | 'M15' | 'M30' | 'H1' | 'H4' | 'D1' | 'W1' | 'MN1';
+export type Timeframe = string;
+
+export interface TimeframeInfo {
+  code: string;
+  display_name: string;
+}
 
 // Simple in-memory cache for market data
 class MarketDataCache {
@@ -88,6 +93,7 @@ class MarketDataService {
   private cache = new MarketDataCache();
   private readonly CACHE_TTL = {
     INSTRUMENTS: 5 * 60 * 1000, // 5 minutes
+    TIMEFRAMES: 5 * 60 * 1000, // 5 minutes
     CANDLES: 30 * 1000, // 30 seconds
     STATUS: 60 * 1000, // 1 minute
   };
@@ -158,6 +164,35 @@ class MarketDataService {
     }
   }
 
+  async getTimeframes(instrument?: string, forceRefresh: boolean = false): Promise<TimeframeInfo[]> {
+    const params: Record<string, string> = { exchange: 'oanda' };
+    if (instrument) params.instrument = instrument;
+
+    const cacheKey = this.getCacheKey('timeframes', params);
+
+    if (!forceRefresh) {
+      const cached = this.cache.get(cacheKey);
+      if (cached) return cached;
+    }
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/market-data/timeframes?${new URLSearchParams(params)}`, {
+        headers: this.getAuthHeaders(),
+      });
+
+      const data = await this.handleResponse<TimeframeInfo[]>(response, 'Failed to fetch timeframes');
+      this.cache.set(cacheKey, data, this.CACHE_TTL.TIMEFRAMES);
+      return data;
+    } catch (error) {
+      const cached = this.cache.get(cacheKey);
+      if (cached) {
+        console.warn('Using cached timeframes due to error:', error);
+        return cached;
+      }
+      throw error;
+    }
+  }
+
   async getCandles(
     exchange: string,
     instrument: string,
@@ -166,6 +201,7 @@ class MarketDataService {
       from_time?: string;
       to_time?: string;
       limit?: number;
+      offset?: number;
       forceRefresh?: boolean;
     }
   ): Promise<CandleListResponse> {
@@ -174,6 +210,7 @@ class MarketDataService {
       instrument,
       timeframe,
       limit: (options?.limit || 100).toString(),
+      ...(options?.offset !== undefined && { offset: options.offset.toString() }),
       ...(options?.from_time && { from_time: options.from_time }),
       ...(options?.to_time && { to_time: options.to_time }),
     };

@@ -1,6 +1,6 @@
 """Instrument metadata model."""
 
-from sqlalchemy import Column, String, Integer, Boolean, Float, DateTime
+from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String
 from sqlalchemy.sql import func
 
 from ..core.database import Base

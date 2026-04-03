@@ -9,8 +9,7 @@ See: planning/requirements/US-005 (to be created)
 from datetime import datetime
 from typing import Any
 
-from agentfx.agents.base import BaseAgent, AgentResult
-
+from agentfx.agents.base import AgentResult, BaseAgent
 
 # Strategy templates for discovery
 STRATEGY_TEMPLATES = {
@@ -93,7 +92,7 @@ class DiscoveryAgent(BaseAgent):
                     all_combos = random.sample(all_combos, max_per_strategy)
 
                 for combo in all_combos:
-                    params = dict(zip(param_names, combo))
+                    params = dict(zip(param_names, combo, strict=False))
                     hypotheses.append(
                         {
                             "strategy": strategy_name,

@@ -12,22 +12,35 @@ For detailed test architecture, standards, and guidelines, see:
 
 ## 🚀 Quick Start
 
+> **IMPORTANT:** See `CLAUDE.md` for canonical test commands.
+> Always use Makefile targets to ensure proper environment configuration.
+
 ```bash
 # Run all unit tests (fast feedback)
-pytest tests/unit/
+make test-unit
 
-# Run all integration tests
-pytest tests/integration/
+# Run all integration tests (requires PostgreSQL on port 5432)
+make test-integration
 
-# Run all backend tests
-pytest tests/unit/ tests/integration/
+# Run all backend tests (unit + integration)
+make test
 
-# Run E2E tests
-cd portal/web && npm run test:e2e
+# Run E2E tests (handles servers automatically)
+make e2e
 
-# Run tests by feature
-pytest tests/unit/auth/ tests/integration/auth/ -k "auth"
-pytest tests/unit/strategies/ tests/integration/strategies/ -k "strategies"
+# Run specific test file
+make test-file FILE=tests/unit/auth/test_security.py
+
+# Run tests matching pattern
+make test-pattern PATTERN="test_login"
+```
+
+### DO NOT USE (Common Mistakes)
+```bash
+# These commands are UNSAFE - they don't set ENVIRONMENT=test
+pytest tests/unit/           # WRONG - missing environment
+pytest tests/integration/    # WRONG - will use wrong database
+python -m pytest tests/      # WRONG - uses system Python
 ```
 
 ## 📁 Structure
@@ -53,22 +66,20 @@ tests/
 
 ## 🏷️ Test Markers
 
+Test markers can be used with Makefile commands:
+
 ```bash
-# By test type
-pytest -m unit                    # Fast tests
-pytest -m integration             # Medium tests
-pytest -m e2e                     # Slow tests
+# Run tests by marker using make
+make test-unit                    # Fast tests (unit marker)
+make test-integration             # Medium tests (integration marker)
+make e2e                          # E2E tests
 
-# By feature
-pytest -m auth                    # Authentication tests
-pytest -m strategies              # Strategy tests
-pytest -m market_data             # Market data tests
-pytest -m backtest                # Backtest tests
-
-# By speed
-pytest -m "not slow"              # Skip slow tests
-pytest -m performance             # Performance tests only
+# For marker filtering, use ENVIRONMENT-safe direct pytest:
+ENVIRONMENT=test PYTHONPATH=src .venv/bin/pytest -m auth -v
+ENVIRONMENT=test PYTHONPATH=src .venv/bin/pytest -m "not slow" -v
 ```
+
+Available markers: `unit`, `integration`, `e2e`, `auth`, `strategies`, `market_data`, `backtest`, `slow`, `performance`
 
 ## 📝 Writing New Tests
 
@@ -115,19 +126,24 @@ rm -rf test-data/temp/            # Clear temporary files
 
 ## 🐛 Troubleshooting
 
-For detailed troubleshooting guides, see `planning/architecture/TEST_STRATEGY.md`.
+For detailed troubleshooting guides, see `CLAUDE.md` (Testing section).
 
 Quick fixes:
 ```bash
 # Check test discovery
-pytest --collect-only
+ENVIRONMENT=test PYTHONPATH=src .venv/bin/pytest --collect-only
 
-# Run with verbose output
-pytest -v
+# Run with verbose output (use Makefile)
+make test-file FILE=tests/unit/auth/test_auth.py
 
 # Stop on first failure
-pytest -x
+ENVIRONMENT=test PYTHONPATH=src .venv/bin/pytest -x
 
-# Run specific test file
-pytest tests/unit/auth/test_auth.py -v
+# Run specific test file (RECOMMENDED)
+make test-file FILE=tests/unit/auth/test_auth.py
 ```
+
+**Common Issues:**
+- "ModuleNotFoundError: No module named 'agentfx'" → Use `make test-unit` (sets PYTHONPATH)
+- Tests use wrong database → Use `make test-*` commands (sets ENVIRONMENT=test)
+- "could not connect to server" → Start PostgreSQL: `brew services start postgresql@15`
