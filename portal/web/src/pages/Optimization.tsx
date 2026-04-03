@@ -94,8 +94,19 @@ interface NewOptimizationFormData {
   accountBalance: number;
   positionSize: number;
   dataYears: number;
+  timeframe: string;
   paramRanges: Record<string, { min: number; max: number }>;
 }
+
+const TIMEFRAME_OPTIONS = [
+  { value: 'M1', label: 'M1 (1 Minute)' },
+  { value: 'M5', label: 'M5 (5 Minutes)' },
+  { value: 'M10', label: 'M10 (10 Minutes)' },
+  { value: 'M30', label: 'M30 (30 Minutes)' },
+  { value: 'H1', label: 'H1 (1 Hour)' },
+  { value: 'H4', label: 'H4 (4 Hours)' },
+  { value: 'D', label: 'D (Daily)' },
+];
 
 // Get default form data for a strategy
 function getDefaultFormData(strategy: StrategyType): NewOptimizationFormData {
@@ -110,6 +121,7 @@ function getDefaultFormData(strategy: StrategyType): NewOptimizationFormData {
     accountBalance: 10000,
     positionSize: 10000,
     dataYears: 5,
+    timeframe: 'H1',
     paramRanges,
   };
 }
@@ -180,6 +192,7 @@ export default function Optimization() {
         accountBalance: formData.accountBalance,
         positionSize: formData.positionSize,
         dataYears: formData.dataYears,
+        timeframe: formData.timeframe,
         paramRanges: formData.paramRanges,
       });
 
@@ -635,6 +648,21 @@ export default function Optimization() {
                         <option value={2}>2 Years</option>
                         <option value={3}>3 Years</option>
                         <option value={5}>5 Years</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
+                        Timeframe
+                      </label>
+                      <select
+                        value={formData.timeframe}
+                        onChange={e => setFormData(prev => ({ ...prev, timeframe: e.target.value }))}
+                        className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                      >
+                        {TIMEFRAME_OPTIONS.map(tf => (
+                          <option key={tf.value} value={tf.value}>{tf.label}</option>
+                        ))}
                       </select>
                     </div>
                   </div>

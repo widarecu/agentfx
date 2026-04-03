@@ -98,6 +98,7 @@ def create_job(
         account_balance=job_in.account_balance,
         position_size=job_in.position_size,
         data_years=job_in.data_years,
+        timeframe=job_in.timeframe,
         param_ranges={
             k: {"min": v.min, "max": v.max, "step": v.step}
             for k, v in job_in.param_ranges.items()
@@ -142,17 +143,22 @@ def complete_job(
     db_job: models.OptimizationJob,
     best_sharpe: float | None = None,
     best_trial_id: str | None = None,
+    data_range_start=None,
+    data_range_end=None,
 ) -> models.OptimizationJob:
     """Mark a job as completed."""
-    return update_job(
-        db,
-        db_job,
+    updates = dict(
         status=models.JobStatus.COMPLETED,
         completed_at=datetime.utcnow(),
         progress=100,
         best_sharpe=best_sharpe,
         best_trial_id=best_trial_id,
     )
+    if data_range_start is not None:
+        updates["data_range_start"] = data_range_start
+    if data_range_end is not None:
+        updates["data_range_end"] = data_range_end
+    return update_job(db, db_job, **updates)
 
 
 def fail_job(

@@ -46,6 +46,9 @@ class OptimizationJobBase(BaseModel):
         10000, description="Position size in units (10000 = 0.1 lot)"
     )
     data_years: int = Field(5, description="Years of historical data to use")
+    timeframe: str = Field(
+        "H1", description="Candle timeframe (M1, M5, M10, M30, H1, H4, D)"
+    )
 
 
 class OptimizationJobCreate(OptimizationJobBase):

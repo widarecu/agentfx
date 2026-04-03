@@ -86,6 +86,7 @@ class OptimizationJob(Base):
     account_balance = Column(Float, default=10000.0)  # Starting balance in dollars
     position_size = Column(Integer, default=10000)  # Units (10000 = 0.1 lot)
     data_years = Column(Integer, default=5)  # Years of historical data
+    timeframe = Column(String(4), default="H1")  # M1, M5, M10, M30, H1, H4, D
 
     # Parameter ranges (JSON: {param_name: {min, max, step?}})
     param_ranges = Column(JSON, nullable=False)

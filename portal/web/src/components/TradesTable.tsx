@@ -9,7 +9,7 @@
  */
 
 import React, { useState, useMemo } from 'react';
-import { ArrowUpDown, ArrowUp, ArrowDown, TrendingUp, TrendingDown } from 'lucide-react';
+import { ArrowUpDown, ArrowUp, ArrowDown, TrendingUp, TrendingDown, ChevronLeft, ChevronRight } from 'lucide-react';
 import {
   Trade,
   MetricsViewMode,
@@ -29,9 +29,12 @@ interface TradesTableProps {
 type SortField = 'entryTimestamp' | 'direction' | 'pips' | 'netPips' | 'durationMinutes' | 'spreadCostPips' | 'swapCostPips';
 type SortDirection = 'asc' | 'desc';
 
+const PAGE_SIZE = 50;
+
 export default function TradesTable({ trades, viewMode, pair }: TradesTableProps) {
   const [sortField, setSortField] = useState<SortField>('entryTimestamp');
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
+  const [currentPage, setCurrentPage] = useState(1);
 
   // Sort trades
   const sortedTrades = useMemo(() => {
@@ -55,6 +58,13 @@ export default function TradesTable({ trades, viewMode, pair }: TradesTableProps
         : (bVal as number) - (aVal as number);
     });
   }, [trades, sortField, sortDirection]);
+
+  // Pagination
+  const totalPages = Math.ceil(sortedTrades.length / PAGE_SIZE);
+  const paginatedTrades = useMemo(() => {
+    const start = (currentPage - 1) * PAGE_SIZE;
+    return sortedTrades.slice(start, start + PAGE_SIZE);
+  }, [sortedTrades, currentPage]);
 
   // Toggle sort
   const handleSort = (field: SortField) => {
@@ -219,13 +229,13 @@ export default function TradesTable({ trades, viewMode, pair }: TradesTableProps
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-200 dark:divide-slate-700">
-            {sortedTrades.map((trade, index) => (
+            {paginatedTrades.map((trade, index) => (
               <tr
                 key={trade.id}
                 className="hover:bg-slate-50 dark:hover:bg-slate-800/30 transition-colors"
               >
                 <td className="px-3 py-2 text-slate-500 dark:text-slate-400 font-mono text-xs">
-                  {index + 1}
+                  {(currentPage - 1) * PAGE_SIZE + index + 1}
                 </td>
                 <td className="px-3 py-2">
                   <div className="flex items-center gap-1.5">
@@ -276,11 +286,11 @@ export default function TradesTable({ trades, viewMode, pair }: TradesTableProps
                 {viewMode === 'dollars' && (
                   <>
                     <td className="px-3 py-2 text-right text-amber-600 dark:text-amber-400 font-mono text-xs">
-                      -{trade.spreadCostPips.toFixed(1)}p / {formatDollars(trade.spreadCostDollars, false)}
+                      -{(trade.spreadCostPips ?? 0).toFixed(1)}p / {formatDollars(trade.spreadCostDollars, false)}
                     </td>
                     <td className="px-3 py-2 text-right text-amber-600 dark:text-amber-400 font-mono text-xs">
-                      {trade.swapCostPips > 0 ? `-${trade.swapCostPips.toFixed(1)}p` : '0'}
-                      {trade.swapCostDollars > 0 ? ` / ${formatDollars(trade.swapCostDollars, false)}` : ''}
+                      {(trade.swapCostPips ?? 0) > 0 ? `-${(trade.swapCostPips ?? 0).toFixed(1)}p` : '0'}
+                      {(trade.swapCostDollars ?? 0) > 0 ? ` / ${formatDollars(trade.swapCostDollars, false)}` : ''}
                     </td>
                     <td className="px-3 py-2 text-right font-mono text-xs">
                       <span
@@ -300,6 +310,34 @@ export default function TradesTable({ trades, viewMode, pair }: TradesTableProps
           </tbody>
         </table>
       </div>
+
+      {/* Pagination */}
+      {totalPages > 1 && (
+        <div className="flex items-center justify-between text-sm">
+          <span className="text-slate-500 dark:text-slate-400">
+            Showing {(currentPage - 1) * PAGE_SIZE + 1}-{Math.min(currentPage * PAGE_SIZE, sortedTrades.length)} of {sortedTrades.length} trades
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+              disabled={currentPage === 1}
+              className="p-1.5 rounded border border-slate-300 dark:border-slate-600 disabled:opacity-30 hover:bg-slate-100 dark:hover:bg-slate-700"
+            >
+              <ChevronLeft className="w-4 h-4" />
+            </button>
+            <span className="text-slate-700 dark:text-slate-300 font-mono">
+              {currentPage} / {totalPages}
+            </span>
+            <button
+              onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+              disabled={currentPage === totalPages}
+              className="p-1.5 rounded border border-slate-300 dark:border-slate-600 disabled:opacity-30 hover:bg-slate-100 dark:hover:bg-slate-700"
+            >
+              <ChevronRight className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Footer note */}
       <p className="text-xs text-slate-500 dark:text-slate-400">

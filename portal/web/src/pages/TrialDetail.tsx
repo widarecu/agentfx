@@ -433,8 +433,8 @@ export default function TrialDetail() {
           <div className="text-xs text-slate-500 dark:text-slate-400">Avg Loss</div>
           <div className="text-lg font-mono font-semibold text-red-600 dark:text-red-400">
             {viewMode === 'pips'
-              ? `-${((metrics.avgLoss || 0) * 10000).toFixed(1)} pips`
-              : formatDollars(-((metrics.avgLoss || 0) * 10000 * 0.1))}
+              ? `${((metrics.avgLoss || 0) * 10000).toFixed(1)} pips`
+              : formatDollars((metrics.avgLoss || 0) * 10000 * 0.1)}
           </div>
         </div>
         <div className="bg-slate-50 dark:bg-slate-800/50 rounded-lg p-3">

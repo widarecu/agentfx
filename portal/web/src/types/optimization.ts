@@ -46,6 +46,7 @@ export interface OptimizationJob {
   accountBalance: number; // Starting account balance in dollars
   positionSize: number; // Units (e.g., 10000 = 0.1 lot)
   dataYears: number; // Years of historical data to use
+  timeframe: string; // M1, M5, M10, M30, H1, H4, D
 }
 
 // Trial metrics from backtest
@@ -209,7 +210,8 @@ export function formatSharpe(value: number | null | undefined): string {
   return value.toFixed(2);
 }
 
-export function formatPrice(price: number, decimals: number = 5): string {
+export function formatPrice(price: number | null | undefined, decimals: number = 5): string {
+  if (price == null) return '-';
   return price.toFixed(decimals);
 }
 
@@ -238,20 +240,23 @@ export function getStatusColor(status: JobStatus): string {
   return colors[status];
 }
 
-export function formatPips(pips: number, showSign: boolean = true): string {
+export function formatPips(pips: number | null | undefined, showSign: boolean = true): string {
+  if (pips == null) return '-';
   const formatted = pips.toFixed(1);
   if (showSign && pips > 0) return `+${formatted}`;
   return formatted;
 }
 
-export function formatDollars(dollars: number, showSign: boolean = true): string {
+export function formatDollars(dollars: number | null | undefined, showSign: boolean = true): string {
+  if (dollars == null) return '-';
   const formatted = Math.abs(dollars).toFixed(2);
   if (dollars < 0) return `-$${formatted}`;
   if (showSign && dollars > 0) return `+$${formatted}`;
   return `$${formatted}`;
 }
 
-export function formatDuration(minutes: number): string {
+export function formatDuration(minutes: number | null | undefined): string {
+  if (minutes == null) return '-';
   if (minutes < 60) {
     return `${Math.round(minutes)}m`;
   }
@@ -267,6 +272,7 @@ export function formatDuration(minutes: number): string {
 
 export function formatDateTime(isoString: string): string {
   return new Date(isoString).toLocaleString('en-US', {
+    timeZone: 'UTC',
     month: 'short',
     day: 'numeric',
     hour: '2-digit',

@@ -134,20 +134,20 @@ export default function StrategyChart({
           return;
         }
 
-        const timestamp = new Date((param.time as number) * 1000).toISOString();
-        const candle = candles.find(c => c.timestamp === timestamp);
-
-        if (candle) {
+        const ohlcData = param.seriesData.get(candlestickSeries) as any;
+        if (ohlcData && ohlcData.open !== undefined) {
           setCrosshairData({
-            time: new Date(timestamp).toLocaleString(),
-            price: candle.close.toFixed(5),
+            time: new Date((param.time as number) * 1000).toLocaleString(),
+            price: ohlcData.close.toFixed(5),
             ohlc: {
-              o: candle.open.toFixed(5),
-              h: candle.high.toFixed(5),
-              l: candle.low.toFixed(5),
-              c: candle.close.toFixed(5),
+              o: ohlcData.open.toFixed(5),
+              h: ohlcData.high.toFixed(5),
+              l: ohlcData.low.toFixed(5),
+              c: ohlcData.close.toFixed(5),
             },
           });
+        } else {
+          setCrosshairData(null);
         }
       });
 
@@ -195,8 +195,16 @@ export default function StrategyChart({
       // Set data
       candlestickSeriesRef.current.setData(chartData);
 
+      // Filter signals to candle time range to prevent markers stacking off-screen
+      const candleTimeMin = chartData[0]?.time as number ?? 0;
+      const candleTimeMax = chartData[chartData.length - 1]?.time as number ?? Infinity;
+      const filteredSignals = signals.filter(s => {
+        const t = toChartTime(s.timestamp);
+        return t >= candleTimeMin && t <= candleTimeMax;
+      });
+
       // Add trade signal markers
-      const markers: SeriesMarker<Time>[] = signals.map(signal => {
+      const markers: SeriesMarker<Time>[] = filteredSignals.map(signal => {
         const isEntry = signal.signalType.startsWith('entry');
         const isLong = signal.signalType.includes('long');
         const isProfitable = signal.pnl !== undefined && signal.pnl > 0;
@@ -230,6 +238,8 @@ export default function StrategyChart({
         };
       });
 
+      // lightweight-charts requires markers sorted by time ascending
+      markers.sort((a, b) => (a.time as number) - (b.time as number));
       candlestickSeriesRef.current.setMarkers(markers);
 
       // Fit content

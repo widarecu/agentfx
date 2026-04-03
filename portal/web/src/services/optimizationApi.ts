@@ -14,6 +14,11 @@ import {
   OptimizationJobListResponse,
   OptimizationTrialListResponse,
   TrialDetailData,
+  TrialMetricsExtended,
+  Trade,
+  TradeSignal,
+  CandleData,
+  IndicatorLine,
   StrategyType,
 } from '../types/optimization';
 import {
@@ -44,6 +49,7 @@ interface CreateJobRequest {
   account_balance: number;
   position_size: number;
   data_years: number;
+  timeframe: string;
 }
 
 class OptimizationApiService {
@@ -220,7 +226,7 @@ class OptimizationApiService {
       return getTrialDetailData(jobId, trialId);
     }
 
-    // For real API, we need to fetch multiple endpoints
+    // Fetch trial, job, signals, and trades in parallel
     const [trial, job, signals, trades] = await Promise.all([
       this.getTrial(jobId, trialId),
       this.getJob(jobId),
@@ -232,61 +238,129 @@ class OptimizationApiService {
       return null;
     }
 
-    // Note: Candles come from market-data API, indicators are calculated client-side
+    // Fetch candles from market-data API (needs job.pair for instrument)
+    let candles: CandleData[] = [];
+    try {
+      // Date range fallback chain
+      let fromTime: string | null = null;
+      let toTime: string | null = null;
+
+      if (job.dataRangeStart && job.dataRangeEnd) {
+        fromTime = job.dataRangeStart;
+        toTime = job.dataRangeEnd;
+      } else if (job.dataYears) {
+        const end = job.completedAt ? new Date(job.completedAt) : new Date();
+        const start = new Date(end.getTime() - job.dataYears * 365 * 24 * 3600 * 1000);
+        fromTime = start.toISOString();
+        toTime = end.toISOString();
+      } else if (trades.length > 0) {
+        fromTime = trades[0].entryTimestamp;
+        toTime = trades[trades.length - 1].exitTimestamp;
+      }
+
+      if (fromTime && toTime) {
+        const pageSize = 10000;
+        let offset = 0;
+        let total = Infinity;
+
+        while (offset < total) {
+          const params = new URLSearchParams({
+            exchange: 'oanda',
+            instrument: job.pair,
+            timeframe: job.timeframe || 'H1',
+            from_time: typeof fromTime === 'string' ? fromTime : new Date(fromTime).toISOString(),
+            to_time: typeof toTime === 'string' ? toTime : new Date(toTime).toISOString(),
+            limit: String(pageSize),
+            offset: String(offset),
+          });
+          const candleResponse = await fetch(
+            `${API_BASE_URL}/market-data/candles?${params}`,
+            { headers: this.getAuthHeaders() }
+          );
+          if (!candleResponse.ok) break;
+          const candleData = await candleResponse.json();
+          total = candleData.total ?? 0;
+          const page = (candleData.items || []).map(this.mapCandleResponse);
+          candles.push(...page);
+          offset += pageSize;
+          if (page.length < pageSize) break;
+        }
+      }
+    } catch {
+      // Candle fetch is best-effort; chart will show empty state
+    }
+
+    // Compute extended metrics from trades
+    const extendedMetrics = this.computeExtendedMetrics(trial, trades);
+
+    // Build continuous indicator lines from candle data
+    const indicators = this.buildIndicatorsFromCandles(candles, job.strategy, trial.params);
+
     return {
       trial,
       job,
-      candles: [], // Would fetch from /api/v1/market-data/candles
+      candles,
       signals,
-      indicators: [], // Calculated from candles + strategy params
+      indicators,
       trades,
-      extendedMetrics: {
-        ...trial.metrics,
-        totalPips: 0,
-        avgPipsPerTrade: 0,
-        totalSpreadCostPips: 0,
-        totalSwapCostPips: 0,
-        totalCostPips: 0,
-        netPips: 0,
-        avgNetPipsPerTrade: 0,
-        grossPnlDollars: 0,
-        totalSpreadCostDollars: 0,
-        totalSwapCostDollars: 0,
-        netPnlDollars: 0,
-      },
+      extendedMetrics,
     };
   }
 
   /**
    * Get trade signals for a trial
    */
-  async getTrialSignals(jobId: string, trialId: string): Promise<any[]> {
+  async getTrialSignals(jobId: string, trialId: string): Promise<TradeSignal[]> {
     if (USE_MOCK_DATA) {
       return [];
     }
 
-    const response = await fetch(
-      `${API_BASE_URL}/optimization-jobs/${jobId}/trials/${trialId}/signals`,
-      { headers: this.getAuthHeaders() }
-    );
-    const data = await this.handleResponse<{ items: any[] }>(response);
-    return data.items;
+    const allSignals: TradeSignal[] = [];
+    let skip = 0;
+    const pageSize = 1000;
+    let total = Infinity;
+
+    while (skip < total) {
+      const response = await fetch(
+        `${API_BASE_URL}/optimization-jobs/${jobId}/trials/${trialId}/signals?skip=${skip}&limit=${pageSize}`,
+        { headers: this.getAuthHeaders() }
+      );
+      const data = await this.handleResponse<{ items: any[]; total: number }>(response);
+      total = data.total;
+      allSignals.push(...data.items.map(this.mapSignalResponse));
+      skip += pageSize;
+      if (data.items.length < pageSize) break;
+    }
+
+    return allSignals;
   }
 
   /**
    * Get trades for a trial
    */
-  async getTrialTrades(jobId: string, trialId: string): Promise<any[]> {
+  async getTrialTrades(jobId: string, trialId: string): Promise<Trade[]> {
     if (USE_MOCK_DATA) {
       return [];
     }
 
-    const response = await fetch(
-      `${API_BASE_URL}/optimization-jobs/${jobId}/trials/${trialId}/trades`,
-      { headers: this.getAuthHeaders() }
-    );
-    const data = await this.handleResponse<{ items: any[] }>(response);
-    return data.items;
+    // Fetch all trades with pagination (API defaults to 1000 per page)
+    const allTrades: Trade[] = [];
+    let skip = 0;
+    const pageSize = 1000;
+    let total = Infinity;
+
+    while (skip < total) {
+      const response = await fetch(
+        `${API_BASE_URL}/optimization-jobs/${jobId}/trials/${trialId}/trades?skip=${skip}&limit=${pageSize}`,
+        { headers: this.getAuthHeaders() }
+      );
+      const data = await this.handleResponse<{ items: any[]; total: number }>(response);
+      total = data.total;
+      allTrades.push(...data.items.map(this.mapTradeResponse));
+      skip += pageSize;
+    }
+
+    return allTrades;
   }
 
   /**
@@ -298,6 +372,7 @@ class OptimizationApiService {
     accountBalance: number;
     positionSize: number;
     dataYears: number;
+    timeframe: string;
     paramRanges: Record<string, { min: number; max: number }>;
   }): Promise<OptimizationJob> {
     if (USE_MOCK_DATA) {
@@ -318,6 +393,7 @@ class OptimizationApiService {
         accountBalance: config.accountBalance,
         positionSize: config.positionSize,
         dataYears: config.dataYears,
+        timeframe: config.timeframe,
       };
       return newJob;
     }
@@ -330,6 +406,7 @@ class OptimizationApiService {
       account_balance: config.accountBalance,
       position_size: config.positionSize,
       data_years: config.dataYears,
+      timeframe: config.timeframe,
     };
 
     const response = await fetch(
@@ -365,6 +442,7 @@ class OptimizationApiService {
       accountBalance: config.accountBalance,
       positionSize: config.positionSize,
       dataYears: config.dataYears,
+      timeframe: config.timeframe,
     };
   }
 
@@ -408,6 +486,7 @@ class OptimizationApiService {
     accountBalance: job.account_balance ?? job.accountBalance ?? 10000,
     positionSize: job.position_size ?? job.positionSize ?? 10000,
     dataYears: job.data_years ?? job.dataYears ?? 5,
+    timeframe: job.timeframe ?? 'H1',
   });
 
   private mapTrialResponse = (trial: any): OptimizationTrial => ({
@@ -430,6 +509,188 @@ class OptimizationApiService {
     gateBFailures: trial.gate_b_failures ?? trial.gateBFailures,
     createdAt: trial.created_at ?? trial.createdAt,
   });
+
+  private mapTradeResponse = (trade: any): Trade => ({
+    id: trade.id,
+    trialId: trade.trial_id ?? trade.trialId,
+    direction: trade.direction,
+    entryTimestamp: trade.entry_timestamp ?? trade.entryTimestamp,
+    exitTimestamp: trade.exit_timestamp ?? trade.exitTimestamp,
+    entryPrice: trade.entry_price ?? trade.entryPrice,
+    exitPrice: trade.exit_price ?? trade.exitPrice,
+    pips: trade.pips,
+    spreadCostPips: trade.spread_cost_pips ?? trade.spreadCostPips,
+    swapCostPips: trade.swap_cost_pips ?? trade.swapCostPips,
+    netPips: trade.net_pips ?? trade.netPips,
+    grossPnlDollars: trade.gross_pnl_dollars ?? trade.grossPnlDollars,
+    spreadCostDollars: trade.spread_cost_dollars ?? trade.spreadCostDollars,
+    swapCostDollars: trade.swap_cost_dollars ?? trade.swapCostDollars,
+    netPnlDollars: trade.net_pnl_dollars ?? trade.netPnlDollars,
+    durationMinutes: trade.duration_minutes ?? trade.durationMinutes,
+    positionSize: trade.position_size ?? trade.positionSize,
+  });
+
+  private mapSignalResponse = (signal: any): TradeSignal => ({
+    timestamp: signal.timestamp,
+    signal: signal.signal,
+    signalType: signal.signal_type ?? signal.signalType,
+    price: signal.price,
+    pnl: signal.pnl,
+    indicatorValues: signal.indicator_values ?? signal.indicatorValues ?? {},
+  });
+
+  private mapCandleResponse = (candle: any): CandleData => ({
+    timestamp: candle.timestamp,
+    open: candle.open,
+    high: candle.high,
+    low: candle.low,
+    close: candle.close,
+    volume: candle.volume ?? 0,
+  });
+
+  private computeExtendedMetrics(trial: OptimizationTrial, trades: Trade[]): TrialMetricsExtended {
+    const count = trades.length;
+    const totalPips = trades.reduce((sum, t) => sum + (t.pips ?? 0), 0);
+    const totalSpreadCostPips = trades.reduce((sum, t) => sum + (t.spreadCostPips ?? 0), 0);
+    const totalSwapCostPips = trades.reduce((sum, t) => sum + (t.swapCostPips ?? 0), 0);
+    const totalCostPips = totalSpreadCostPips + totalSwapCostPips;
+    const netPips = totalPips - totalCostPips;
+    const grossPnlDollars = trades.reduce((sum, t) => sum + (t.grossPnlDollars ?? 0), 0);
+    const totalSpreadCostDollars = trades.reduce((sum, t) => sum + (t.spreadCostDollars ?? 0), 0);
+    const totalSwapCostDollars = trades.reduce((sum, t) => sum + (t.swapCostDollars ?? 0), 0);
+    const netPnlDollars = grossPnlDollars - totalSpreadCostDollars - totalSwapCostDollars;
+
+    return {
+      ...trial.metrics,
+      totalPips,
+      avgPipsPerTrade: count > 0 ? totalPips / count : 0,
+      totalSpreadCostPips,
+      totalSwapCostPips,
+      totalCostPips,
+      netPips,
+      avgNetPipsPerTrade: count > 0 ? netPips / count : 0,
+      grossPnlDollars,
+      totalSpreadCostDollars,
+      totalSwapCostDollars,
+      netPnlDollars,
+    };
+  }
+
+  private buildIndicatorsFromCandles(
+    candles: CandleData[],
+    strategy: string,
+    params: Record<string, number>,
+  ): IndicatorLine[] {
+    if (candles.length === 0) return [];
+
+    const closes = candles.map(c => c.close);
+    const highs = candles.map(c => c.high);
+    const lows = candles.map(c => c.low);
+    const timestamps = candles.map(c => c.timestamp);
+    const colors = ['#3b82f6', '#f59e0b', '#8b5cf6', '#ec4899'];
+
+    if (strategy === 'ma') {
+      const fast = Math.round(params.fast ?? 20);
+      const slow = Math.round(params.slow ?? 50);
+      return [
+        { name: 'fast_ma', color: colors[0], data: sma(closes, fast, timestamps) },
+        { name: 'slow_ma', color: colors[1], data: sma(closes, slow, timestamps) },
+      ];
+    }
+
+    if (strategy === 'donchian') {
+      const window = Math.round(params.window ?? params.fast ?? 20);
+      return [
+        { name: 'upper_band', color: colors[0], data: rollingMax(highs, window, timestamps) },
+        { name: 'lower_band', color: colors[1], data: rollingMin(lows, window, timestamps) },
+      ];
+    }
+
+    if (strategy === 'rsi') {
+      const window = Math.round(params.window ?? params.fast ?? 14);
+      return [
+        { name: 'rsi', color: colors[2], data: rsi(closes, window, timestamps) },
+      ];
+    }
+
+    return [];
+  }
+}
+
+// Indicator calculation helpers
+
+function sma(
+  values: number[], period: number, timestamps: string[]
+): { timestamp: string; value: number }[] {
+  const result: { timestamp: string; value: number }[] = [];
+  for (let i = period - 1; i < values.length; i++) {
+    let sum = 0;
+    for (let j = i - period + 1; j <= i; j++) sum += values[j];
+    result.push({ timestamp: timestamps[i], value: sum / period });
+  }
+  return result;
+}
+
+function rollingMax(
+  values: number[], period: number, timestamps: string[]
+): { timestamp: string; value: number }[] {
+  const result: { timestamp: string; value: number }[] = [];
+  for (let i = period - 1; i < values.length; i++) {
+    let max = -Infinity;
+    for (let j = i - period + 1; j <= i; j++) {
+      if (values[j] > max) max = values[j];
+    }
+    result.push({ timestamp: timestamps[i], value: max });
+  }
+  return result;
+}
+
+function rollingMin(
+  values: number[], period: number, timestamps: string[]
+): { timestamp: string; value: number }[] {
+  const result: { timestamp: string; value: number }[] = [];
+  for (let i = period - 1; i < values.length; i++) {
+    let min = Infinity;
+    for (let j = i - period + 1; j <= i; j++) {
+      if (values[j] < min) min = values[j];
+    }
+    result.push({ timestamp: timestamps[i], value: min });
+  }
+  return result;
+}
+
+function rsi(
+  closes: number[], period: number, timestamps: string[]
+): { timestamp: string; value: number }[] {
+  if (closes.length < period + 1) return [];
+  const result: { timestamp: string; value: number }[] = [];
+
+  // Initial average gain/loss
+  let avgGain = 0;
+  let avgLoss = 0;
+  for (let i = 1; i <= period; i++) {
+    const change = closes[i] - closes[i - 1];
+    if (change > 0) avgGain += change;
+    else avgLoss += Math.abs(change);
+  }
+  avgGain /= period;
+  avgLoss /= period;
+
+  const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+  result.push({ timestamp: timestamps[period], value: 100 - 100 / (1 + rs) });
+
+  // Wilder smoothing
+  for (let i = period + 1; i < closes.length; i++) {
+    const change = closes[i] - closes[i - 1];
+    const gain = change > 0 ? change : 0;
+    const loss = change < 0 ? Math.abs(change) : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    const curRs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+    result.push({ timestamp: timestamps[i], value: 100 - 100 / (1 + curRs) });
+  }
+
+  return result;
 }
 
 export const optimizationApi = new OptimizationApiService();

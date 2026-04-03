@@ -8,6 +8,7 @@ in a background thread, persisting trial results to the database.
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -165,6 +166,7 @@ def _execute_optimization(job_id: str) -> None:
             pair=job.pair,
             param_ranges=job.param_ranges,
             data_years=job.data_years,
+            granularity=job.timeframe or "H1",
             account_balance=job.account_balance,
             position_size=job.position_size,
             max_iterations=job.estimated_iterations,
@@ -183,12 +185,18 @@ def _execute_optimization(job_id: str) -> None:
             if top_trials:
                 best_trial_id = top_trials[0].id
 
+        # Compute data range from job config
+        data_range_end = datetime.now(UTC)
+        data_range_start = data_range_end - timedelta(days=job.data_years * 365)
+
         # Mark job as completed
         optimization_service.complete_job(
             db,
             job,
             best_sharpe=best_sharpe,
             best_trial_id=best_trial_id,
+            data_range_start=data_range_start,
+            data_range_end=data_range_end,
         )
         logger.info(
             f"Completed optimization job {job_id} with best Sharpe: {best_sharpe}"

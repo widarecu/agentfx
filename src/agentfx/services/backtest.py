@@ -280,8 +280,10 @@ def run_backtest_from_db(
                     entry_time = timestamp
                     entry_price = float(df.loc[timestamp, "close"])
                     entry_signal = signal_val
-                elif prev_signal != 0 and signal_val == 0:
-                    # Exit
+                elif prev_signal != 0 and (
+                    signal_val == 0 or signal_val != prev_signal
+                ):
+                    # Exit (or flip — close current position first)
                     signal_type = "exit_long" if prev_signal > 0 else "exit_short"
                     exit_price = float(df.loc[timestamp, "close"])
 
@@ -329,11 +331,26 @@ def run_backtest_from_db(
                         )
                         trade_id += 1
 
-                    entry_time = None
-                    entry_price = None
-                else:
-                    # Flip (e.g., long to short)
-                    signal_type = "entry_long" if signal_val > 0 else "entry_short"
+                    # If flipping to a new position, open the new entry
+                    if signal_val != 0:
+                        # Emit exit signal for closed position
+                        signal_list.append(
+                            {
+                                "timestamp": timestamp.isoformat(),
+                                "signal": 0,
+                                "signal_type": signal_type,
+                                "price": float(df.loc[timestamp, "close"]),
+                                "indicator_values": indicator_values,
+                            }
+                        )
+                        # Set up entry signal for the new position
+                        entry_time = timestamp
+                        entry_price = exit_price
+                        entry_signal = signal_val
+                        signal_type = "entry_long" if signal_val > 0 else "entry_short"
+                    else:
+                        entry_time = None
+                        entry_price = None
 
                 signal_list.append(
                     {
@@ -349,6 +366,64 @@ def run_backtest_from_db(
 
         result["signals"] = signal_list
         result["trades"] = trade_list
+
+        # Compute additional metrics from closed trades
+        if trade_list:
+            pips_list = [t["pips"] for t in trade_list]
+            wins = [p for p in pips_list if p > 0]
+            losses = [p for p in pips_list if p < 0]
+
+            # avg_win/avg_loss as decimal price returns (frontend multiplies by 10000 for pips display)
+            metrics["avg_win"] = (sum(wins) / len(wins)) * pip_size if wins else 0.0
+            metrics["avg_loss"] = (
+                (sum(losses) / len(losses)) * pip_size if losses else 0.0
+            )
+            metrics["profit_factor"] = sum(wins) / abs(sum(losses)) if losses else 0.0
+            metrics["n_trades"] = len(trade_list)
+            metrics["hit_rate"] = len(wins) / len(trade_list)
+
+            # Max consecutive losses
+            max_consec = 0
+            current_consec = 0
+            for p in pips_list:
+                if p < 0:
+                    current_consec += 1
+                    max_consec = max(max_consec, current_consec)
+                else:
+                    current_consec = 0
+            metrics["max_consecutive_losses"] = max_consec
+
+            # Average trade duration
+            durations = [t["duration_minutes"] for t in trade_list]
+            metrics["avg_trade_duration"] = (
+                sum(durations) / len(durations) / 60.0
+            )  # in hours
+
+            # Total return from equity curve
+            eq = (1.0 + rets).cumprod()
+            metrics["total_return"] = float(eq.iloc[-1] - 1.0) if len(eq) > 0 else 0.0
+
+            # Pips-based extended metrics
+            total_pips_val = sum(t["pips"] for t in trade_list)
+            total_spread = sum(t["spread_cost_pips"] for t in trade_list)
+            total_swap = sum(t["swap_cost_pips"] for t in trade_list)
+            metrics["total_pips"] = total_pips_val
+            metrics["avg_pips_per_trade"] = total_pips_val / len(trade_list)
+            metrics["total_spread_cost_pips"] = total_spread
+            metrics["total_swap_cost_pips"] = total_swap
+            metrics["net_pips"] = total_pips_val - total_spread - total_swap
+
+            # Dollar-based extended metrics
+            metrics["gross_pnl_dollars"] = sum(
+                t["gross_pnl_dollars"] for t in trade_list
+            )
+            metrics["total_spread_cost_dollars"] = sum(
+                t["spread_cost_dollars"] for t in trade_list
+            )
+            metrics["total_swap_cost_dollars"] = sum(
+                t["swap_cost_dollars"] for t in trade_list
+            )
+            metrics["net_pnl_dollars"] = sum(t["net_pnl_dollars"] for t in trade_list)
 
     return result
 
