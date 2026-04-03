@@ -96,9 +96,8 @@ jobs:
           done
         working-directory: portal/web
 
-      - name: Install E2E test dependencies
-        run: npm install @playwright/test
-        working-directory: tests/e2e
+      - name: Link E2E test dependencies
+        run: ln -s ${{ github.workspace }}/portal/web/node_modules ${{ github.workspace }}/tests/e2e/node_modules
 
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
