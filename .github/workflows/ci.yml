@@ -85,12 +85,11 @@ jobs:
       # executing any job step.
       # ------------------------------------------------------------------
       - name: Run integration tests
-        run: ENVIRONMENT=test PYTHONPATH=src pytest tests/integration/ -v -m integration --no-cov
+        run: ENVIRONMENT=test PYTHONPATH=src pytest tests/integration/ -v -m "integration and not slow" --no-cov
         env:
-          # Provide the database URL explicitly so tests that bypass the
-          # settings loader (e.g. direct SQLAlchemy usage) still connect
-          # to the correct service container.
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/agentfx_test
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+          OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID }}
 
   # ---------------------------------------------------------------------------
   # Frontend: install → build → type check
