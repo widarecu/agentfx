@@ -76,9 +76,7 @@ jobs:
       # No database required; fixtures mock all DB interactions.
       # ------------------------------------------------------------------
       - name: Run unit tests
-        run: ENVIRONMENT=test PYTHONPATH=src pytest tests/unit/ -v -m unit
-        # pytest.ini already sets --cov, but we restrict it here to what the
-        # unit suite exercises so integration noise doesn't skew the report.
+        run: ENVIRONMENT=test PYTHONPATH=src pytest tests/unit/ -v -m unit --no-cov
 
       # ------------------------------------------------------------------
       # Integration tests
@@ -87,7 +85,7 @@ jobs:
       # executing any job step.
       # ------------------------------------------------------------------
       - name: Run integration tests
-        run: ENVIRONMENT=test PYTHONPATH=src pytest tests/integration/ -v -m integration
+        run: ENVIRONMENT=test PYTHONPATH=src pytest tests/integration/ -v -m integration --no-cov
         env:
           # Provide the database URL explicitly so tests that bypass the
           # settings loader (e.g. direct SQLAlchemy usage) still connect

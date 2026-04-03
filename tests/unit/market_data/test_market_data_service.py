@@ -101,7 +101,7 @@ class TestMarketDataService:
         assert len(candles) == 1
         assert total == 1
 
-    @patch("src.agentfx.api.schemas.market_data.CandlePublic")
+    @patch("agentfx.api.schemas.market_data.CandlePublic")
     def test_create_candles_validation_success(
         self, mock_candle_public, mock_db, sample_candle_data
     ):
