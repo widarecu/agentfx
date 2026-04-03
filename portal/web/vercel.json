@@ -2,7 +2,6 @@
   "framework": "vite",
   "buildCommand": "npm run build:staging",
   "outputDirectory": "dist",
-  "rootDirectory": "portal/web",
   "rewrites": [
     {
       "source": "/(.*)",
