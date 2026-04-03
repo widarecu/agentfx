@@ -111,62 +111,32 @@ def cleanup_test_data(db_cursor):
     should persist across tests for backtesting and optimization tests to work.
     Only user-created test data (users, runs, strategies, etc.) is cleaned up.
     """
-    # Tables to clean - EXCLUDES candles (historical market data)
-    # Also excludes instruments (metadata seeded once)
+    # Tables to clean in dependency order (children first).
+    # EXCLUDES candles and instruments (historical/metadata, persists across tests).
     tables_to_clean = [
-        "trades",
         "orders",
-        "signals",
+        "trades",
         "runs",
         "strategies",
     ]
 
-    # Clean up before test
-    try:
+    def _cleanup():
         for table in tables_to_clean:
             try:
-                # Only delete test-created records (those with test-like names/emails)
-                db_cursor.execute(
-                    f"DELETE FROM {table} WHERE email LIKE 'test%' OR email LIKE 'integration_%' OR name LIKE 'test%'"
-                )
+                db_cursor.execute(f"DELETE FROM {table}")
                 db_cursor.connection.commit()
             except Exception:
                 db_cursor.connection.rollback()
-                pass  # Ignore cleanup errors before test
-
-        # Clean up test users separately (don't delete seeded users)
+        # Clean up test users (don't delete seeded users)
         try:
             db_cursor.execute("DELETE FROM users WHERE email LIKE 'integration_%'")
             db_cursor.connection.commit()
         except Exception:
             db_cursor.connection.rollback()
-            pass
-    except Exception:
-        pass  # Ignore cleanup errors before test
 
+    _cleanup()
     yield
-
-    # Clean up after test
-    try:
-        for table in tables_to_clean:
-            try:
-                db_cursor.execute(
-                    f"DELETE FROM {table} WHERE email LIKE 'test%' OR email LIKE 'integration_%' OR name LIKE 'test%'"
-                )
-                db_cursor.connection.commit()
-            except Exception:
-                db_cursor.connection.rollback()
-                pass  # Ignore cleanup errors after test
-
-        # Clean up test users separately
-        try:
-            db_cursor.execute("DELETE FROM users WHERE email LIKE 'integration_%'")
-            db_cursor.connection.commit()
-        except Exception:
-            db_cursor.connection.rollback()
-            pass
-    except Exception:
-        pass  # Ignore cleanup errors after test
+    _cleanup()
 
 
 @pytest.mark.integration
