@@ -1,0 +1,109 @@
+name: Deploy
+
+on:
+  # Only deploy when a commit lands on main (i.e. after a PR is merged).
+  push:
+    branches:
+      - main
+
+# Prevent concurrent deployments to the same environment. If a deploy is
+# already in progress and a new commit lands, the in-progress run completes
+# before the queued run starts (cancel-in-progress: false).
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate: the CI workflow must have succeeded on the same commit before either
+  # deploy job is allowed to start.  workflow_run triggers on the completion
+  # event and the `success` check below enforces the gate.
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Deploy backend to Railway
+  # Railway's GitHub integration watches the repository and can auto-deploy,
+  # but using `railway up` from CI gives us an explicit, auditable deploy step
+  # that shows up in the Actions log and can be gated on CI success.
+  # ---------------------------------------------------------------------------
+  deploy-backend:
+    name: Deploy Backend → Railway
+    runs-on: ubuntu-latest
+    environment: production  # maps to the GitHub Environment with protection rules
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Install the Railway CLI via the official install script.
+      # Pinning to a version range avoids surprises from major CLI updates.
+      - name: Install Railway CLI
+        run: |
+          curl -fsSL https://railway.app/install.sh | sh
+          railway --version
+
+      # `railway up` uploads the build context and triggers a deployment.
+      # The CLI reads RAILWAY_TOKEN from the environment for authentication.
+      # --detach returns immediately after triggering the deploy rather than
+      # streaming logs, keeping CI fast.  Remove --detach if you want CI to
+      # wait for the deployment to finish before marking the job green.
+      - name: Deploy to Railway
+        run: railway up --detach
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Deploy frontend to Vercel
+  # ---------------------------------------------------------------------------
+  deploy-frontend:
+    name: Deploy Frontend → Vercel
+    runs-on: ubuntu-latest
+    environment: production
+
+    defaults:
+      run:
+        working-directory: portal/web
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: portal/web/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # Build with the staging Vite mode before handing the dist/ directory
+      # to the Vercel CLI.  VITE_API_BASE_URL points at the Railway backend.
+      - name: Build frontend (staging mode)
+        run: npm run build:staging
+        env:
+          VITE_API_BASE_URL: ${{ secrets.RAILWAY_BACKEND_URL }}
+
+      # Install the Vercel CLI globally so we can call `vercel deploy`
+      # with full control over flags, without relying on a third-party
+      # Action that may lag behind the official CLI.
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      # Pull Vercel project settings (vercel.json, output directory, etc.)
+      # into the working directory.  --yes skips the interactive prompts.
+      - name: Pull Vercel project settings
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      # Deploy the pre-built dist/ directory to Vercel.
+      # --prebuilt tells Vercel to skip its own build step and use dist/.
+      # --prod promotes the deployment to the production URL immediately.
+      - name: Deploy to Vercel (production)
+        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}

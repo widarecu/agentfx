@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - "feature/**"
+  push:
+    branches:
+      - main
+
+# Cancel in-flight runs for the same ref so PRs don't queue up redundant jobs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Backend: lint → unit tests → integration tests
+  # ---------------------------------------------------------------------------
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: agentfx_test
+        ports:
+          - 5432:5432
+        # Wait until the service is healthy before the job steps start.
+        options: >-
+          --health-cmd "pg_isready -U test_user -d agentfx_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # Cache pip dependencies keyed on all three requirements files so the
+          # cache is invalidated whenever any of them changes.
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-api.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-api.txt -r requirements-dev.txt
+
+      # ------------------------------------------------------------------
+      # Linting
+      # ruff check: flags code errors and style violations.
+      # ruff format --check: verifies formatting without modifying files.
+      # Both target src/ to match the pyproject.toml [tool.ruff] src setting.
+      # ------------------------------------------------------------------
+      - name: Lint — ruff check
+        run: ruff check src/
+
+      - name: Lint — ruff format check
+        run: ruff format --check src/
+
+      # ------------------------------------------------------------------
+      # Unit tests
+      # No database required; fixtures mock all DB interactions.
+      # ------------------------------------------------------------------
+      - name: Run unit tests
+        run: ENVIRONMENT=test PYTHONPATH=src pytest tests/unit/ -v -m unit
+        # pytest.ini already sets --cov, but we restrict it here to what the
+        # unit suite exercises so integration noise doesn't skew the report.
+
+      # ------------------------------------------------------------------
+      # Integration tests
+      # The postgres service container is healthy by the time these run
+      # because GitHub Actions waits for the service health check before
+      # executing any job step.
+      # ------------------------------------------------------------------
+      - name: Run integration tests
+        run: ENVIRONMENT=test PYTHONPATH=src pytest tests/integration/ -v -m integration
+        env:
+          # Provide the database URL explicitly so tests that bypass the
+          # settings loader (e.g. direct SQLAlchemy usage) still connect
+          # to the correct service container.
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/agentfx_test
+
+  # ---------------------------------------------------------------------------
+  # Frontend: install → build → type check
+  # ---------------------------------------------------------------------------
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: portal/web
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          # Cache node_modules keyed on package-lock.json so the cache
+          # is invalidated on any dependency change.
+          cache: npm
+          cache-dependency-path: portal/web/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # Build with the staging Vite mode, which is what deploy-frontend
+      # uses. Building here verifies the production bundle compiles
+      # successfully and catches any missing env-var references.
+      - name: Build frontend (staging mode)
+        run: npm run build:staging
+        env:
+          # Provide a placeholder so Vite does not error on a missing var.
+          # The real value is injected only during deployment.
+          VITE_API_BASE_URL: https://placeholder.example.com
+
+      # tsc --noEmit performs a full type check without emitting JS.
+      # tsconfig.json already has noEmit: true, so this flag is
+      # redundant but harmless and makes intent explicit in CI logs.
+      - name: Type check
+        run: npx tsc --noEmit

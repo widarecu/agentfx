@@ -1,0 +1,19 @@
+[build]
+# Use the Dockerfile at the repository root for all build steps.
+# Railway will pass DATABASE_URL and other service variables as build args
+# automatically when a PostgreSQL plugin is attached.
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Port the uvicorn process binds to (must match EXPOSE in Dockerfile)
+port = 8000
+
+# Restart the container on non-zero exits so transient failures self-heal.
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+[deploy.healthcheck]
+# Railway polls this endpoint to determine readiness before routing traffic.
+# The /health route is registered in src/agentfx/api/main.py.
+path = "/health"
