@@ -324,7 +324,7 @@ test.describe('Market Data Integration', () => {
       await expect(page.getByText('EUR_USD').first()).toBeVisible();
 
       // Verify chart shows candle count info (use paragraph text, not option elements)
-      await expect(page.locator('p').filter({ hasText: /\d+ candles/ })).toBeVisible();
+      await expect(page.locator('p').filter({ hasText: /\d+ candles/ }).first()).toBeVisible();
     }
   });
 
@@ -431,7 +431,7 @@ test.describe('Market Data Integration', () => {
     const hasData = await dataTable.count() > 0;
 
     if (hasData) {
-      await expect(page.getByText(/Fetched \d+ of [\d,]+ available/)).toBeVisible();
+      await expect(page.getByText(/\d+ candles available/)).toBeVisible();
     }
   });
 });
