@@ -256,6 +256,10 @@ test.describe('Registration Flows', () => {
   });
 
   test('registration with existing email shows error', async ({ page }) => {
+    // Clear any leftover auth session from previous tests
+    await page.goto('/login');
+    await page.evaluate(() => localStorage.clear());
+
     // Navigate to register page
     await page.goto('/register', { waitUntil: 'networkidle' });
 

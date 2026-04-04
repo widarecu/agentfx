@@ -54,6 +54,7 @@ jobs:
           alembic upgrade head
           python scripts/seed_instruments.py
           python scripts/seed_test_data.py
+          python scripts/seed_test_candles.py
         env:
           ENVIRONMENT: test
           PYTHONPATH: src
@@ -61,11 +62,13 @@ jobs:
 
       - name: Start backend server
         run: |
-          uvicorn agentfx.api.main:app --host 0.0.0.0 --port 8000 &
+          nohup uvicorn agentfx.api.main:app --host 0.0.0.0 --port 8000 > /tmp/backend.log 2>&1 &
           # Wait for backend to be ready
           for i in $(seq 1 30); do
             curl -sf http://localhost:8000/health && break || sleep 1
           done
+          # Verify backend is responding
+          curl -sf http://localhost:8000/health || (cat /tmp/backend.log && exit 1)
         env:
           ENVIRONMENT: test
           PYTHONPATH: src
@@ -95,6 +98,8 @@ jobs:
             curl -sf http://localhost:5173 && break || sleep 1
           done
         working-directory: portal/web
+        env:
+          VITE_API_BASE_URL: http://localhost:8000/api/v1
 
       - name: Link E2E test dependencies
         run: ln -s ${{ github.workspace }}/portal/web/node_modules ${{ github.workspace }}/tests/e2e/node_modules

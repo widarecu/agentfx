@@ -436,13 +436,14 @@ test.describe('Job Execution', () => {
       // Completed job should have trials
       await page.waitForTimeout(2000);
 
-      // Should show trials table with sharpe ratios
-      const trialsTable = page.locator('table');
-      const sharpeText = page.getByText(/sharpe/i);
+      // Should show trials section with sharpe data or a table
+      // Wait for trials data to load
+      await page.waitForTimeout(3000);
 
-      expect(
-        await trialsTable.isVisible() || await sharpeText.count() > 0
-      ).toBeTruthy();
+      const hasTrialsContent = await page.getByText(/sharpe/i).count() > 0
+        || await page.locator('table tbody tr').count() > 0;
+
+      expect(hasTrialsContent).toBeTruthy();
     }
   });
 
