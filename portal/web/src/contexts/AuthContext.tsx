@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useReducer, useEffect, ReactNode } from 'react'
 import { useToast } from './ToastContext'
+import { API_BASE_URL } from '../services/config'
 
 export interface User {
   id: string
@@ -119,7 +120,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       if (token) {
         try {
           // Verify token with backend
-          const response = await fetch('/api/v1/me', {
+          const response = await fetch(`${API_BASE_URL}/me`, {
             headers: {
               'Authorization': `Bearer ${token}`,
               'Content-Type': 'application/json',
@@ -158,7 +159,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       formData.append('username', email)
       formData.append('password', password)
 
-      const response = await fetch('/api/v1/login', {
+      const response = await fetch(`${API_BASE_URL}/login`, {
         method: 'POST',
         body: formData,
       })
@@ -204,7 +205,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     dispatch({ type: 'REGISTER_START' })
     
     try {
-      const response = await fetch('/api/v1/register', {
+      const response = await fetch(`${API_BASE_URL}/register`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -240,7 +241,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       const data = await response.json()
       
       // After successful registration, automatically log the user in
-      const loginResponse = await fetch('/api/v1/login', {
+      const loginResponse = await fetch(`${API_BASE_URL}/login`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
