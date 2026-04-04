@@ -11,17 +11,22 @@ from starlette.responses import Response
 from .core.config import settings
 from .routers import auth, market_data, optimization, runs, strategies
 
-# Configure root logger
+# Configure root logger to use stdout (so Railway tags normal logs as [inf], not [err])
 logging.basicConfig(
     level=logging.DEBUG if settings.DEBUG else logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,
 )
 
-# Add console handler
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(
-    logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-)
+# Redirect uvicorn loggers to stdout (they default to stderr)
+for _uv_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    _uv_logger = logging.getLogger(_uv_name)
+    _uv_logger.handlers.clear()
+    _uv_handler = logging.StreamHandler(sys.stdout)
+    _uv_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
+    _uv_logger.addHandler(_uv_handler)
 
 # Configure file handler
 try:

@@ -27,9 +27,8 @@ data/
 # Claude Code plans and settings
 .claude/
 
-# Screenshot artifacts from testing (keep only in portal/web/)
-/login-failure.png
-/registration-*.png
+# Screenshot artifacts from E2E tests (Playwright captures on failure automatically)
+*.png
 
 # Root package files (Playwright uses these, not for production)
 /package.json

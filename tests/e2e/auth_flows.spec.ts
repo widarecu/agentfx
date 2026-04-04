@@ -127,10 +127,6 @@ test.describe('Authentication Flows', () => {
     // Wait for the page to be fully loaded
     await page.waitForLoadState('networkidle');
     
-    // Take a screenshot of the current page
-    await page.screenshot({ path: 'dashboard-loaded.png', fullPage: true });
-    console.log('Screenshot saved as dashboard-loaded.png');
-    
     // Check for any loading indicators
     const loadingIndicator = page.locator('.loading, [aria-busy="true"]');
     if (await loadingIndicator.count() > 0) {
@@ -250,9 +246,6 @@ test.describe('Registration Flows', () => {
     
     // Verify user is logged in (check for logout button)
     await expect(page.getByRole('button', { name: /logout/i })).toBeVisible({ timeout: 5000 });
-    
-    // Take screenshot for verification
-    await page.screenshot({ path: 'registration-success.png', fullPage: true });
   });
 
   test('registration with existing email shows error', async ({ page }) => {
