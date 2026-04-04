@@ -141,7 +141,7 @@ jobs:
           railway --version
 
       - name: Deploy to Railway
-        run: railway up --detach
+        run: railway up --detach --service agentfx
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
 
