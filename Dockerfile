@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt -r requirements-api.txt
 COPY src/ ./src/
 COPY alembic.ini ./
 COPY migrations/ ./migrations/
+COPY scripts/seed_instruments.py ./scripts/seed_instruments.py
 
 # Set PYTHONPATH so agentfx package is importable from src/
 ENV PYTHONPATH=src
@@ -26,4 +27,4 @@ EXPOSE 8000
 # Using 'sh -c' keeps the entrypoint a single layer with no extra script file.
 # --no-reload is intentional: reload is a development-only convenience that
 # causes unnecessary worker restarts in production.
-CMD ["sh", "-c", "alembic upgrade head && uvicorn agentfx.api.main:app --host 0.0.0.0 --port 8000"]
+CMD ["sh", "-c", "alembic upgrade head && python scripts/seed_instruments.py && uvicorn agentfx.api.main:app --host 0.0.0.0 --port 8000"]

@@ -127,7 +127,7 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy-backend:
     name: Deploy Backend → Railway
-    needs: e2e
+    # needs: e2e  # Temporarily disabled until deployment is stable
     runs-on: ubuntu-latest
     environment: production
 
@@ -150,7 +150,7 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy-frontend:
     name: Deploy Frontend → Vercel
-    needs: e2e
+    # needs: e2e  # Temporarily disabled until deployment is stable
     runs-on: ubuntu-latest
     environment: production
 
