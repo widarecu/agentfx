@@ -5,6 +5,7 @@ export default defineConfig({
   timeout: 60_000,
   expect: { timeout: 5_000 },
   retries: process.env.CI ? 2 : 0,
+  workers: 1,
   use: {
     baseURL: 'http://localhost:5173',
     trace: 'retain-on-failure',

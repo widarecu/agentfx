@@ -272,6 +272,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         payload: error instanceof Error ? error.message : 'Registration failed'
       })
       showToast(error instanceof Error ? error.message : 'Registration failed', 'error')
+      throw error
     }
   }
 

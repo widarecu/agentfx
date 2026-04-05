@@ -8,7 +8,7 @@ const NAVIGATION_TIMEOUT = 10000;
 const EMAIL = 'viewer@example.com';
 const PASSWORD = 'secretpassword';
 const INVALID_PASSWORD = 'wrongpassword';
-const NEW_USER_EMAIL = 'testuser@example.com';
+const NEW_USER_EMAIL = `testuser_${Date.now()}@example.com`;
 const NEW_USER_PASSWORD = 'newuserpassword123';
 const NEW_USER_NAME = 'Test User';
 
@@ -17,7 +17,7 @@ test.describe('Authentication Flows', () => {
     // Common setup for each test
     test.setTimeout(TEST_TIMEOUT);
     
-    // Clear all cookies and storage before each test
+    // Clear all cookies, permissions, and localStorage before each test
     await context.clearCookies();
     await context.clearPermissions();
   });
@@ -96,10 +96,6 @@ test.describe('Authentication Flows', () => {
       } else {
         console.log('No error message found on login page');
       }
-      
-      // Take a screenshot for debugging
-      await page.screenshot({ path: 'login-failure.png', fullPage: true });
-      console.log('Screenshot saved as login-failure.png');
       
       // Check if there are any console errors
       const consoleMessages = await page.evaluate(() => {
@@ -249,9 +245,6 @@ test.describe('Registration Flows', () => {
   });
 
   test('registration with existing email shows error', async ({ page }) => {
-    // Clear any leftover auth session then navigate to register
-    await page.goto('/register');
-    await page.evaluate(() => localStorage.clear());
     await page.goto('/register', { waitUntil: 'networkidle' });
 
     // Try to register with existing email
@@ -271,9 +264,6 @@ test.describe('Registration Flows', () => {
     // The error message should appear in the error container
     // Use .first() since the message may appear in multiple elements (toast + inline error)
     await expect(page.getByText(/already exists in the system/i).first()).toBeVisible({ timeout: 5000 });
-
-    // Take screenshot for verification
-    await page.screenshot({ path: 'registration-existing-email.png', fullPage: true });
   });
 
   test('registration validation errors', async ({ page }) => {

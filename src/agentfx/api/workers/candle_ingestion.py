@@ -1110,7 +1110,7 @@ async def ingestion_loop():
     logger.info("Candle ingestion worker stopped")
 
 
-async def start_ingestion_worker() -> None:
+async def start_ingestion_worker() -> bool:
     """Start the candle ingestion background worker.
 
     This should be called from FastAPI lifespan startup.
@@ -1121,7 +1121,7 @@ async def start_ingestion_worker() -> None:
     # Skip if ingestion is disabled
     if not settings.INGESTION_ENABLED:
         logger.info("Ingestion worker disabled via INGESTION_ENABLED setting")
-        return
+        return False
 
     # Skip if OANDA credentials not configured
     if not settings.OANDA_API_KEY or settings.OANDA_API_KEY == "your-api-key-here":
@@ -1129,14 +1129,14 @@ async def start_ingestion_worker() -> None:
             "OANDA credentials not configured - ingestion worker disabled. "
             "Set OANDA_API_KEY in environment to enable."
         )
-        return
+        return False
 
     # INGESTION_ENABLED is the single source of truth for controlling ingestion.
     # Set INGESTION_ENABLED=false in .env.test if you want to disable ingestion in tests.
 
     if _worker_task is not None:
         logger.warning("Ingestion worker already running")
-        return
+        return False
 
     _shutdown_event = asyncio.Event()
     _worker_task = asyncio.create_task(ingestion_loop())
@@ -1148,6 +1148,7 @@ async def start_ingestion_worker() -> None:
         f"polling every {settings.INGESTION_POLL_INTERVAL}s, "
         f"health check every {settings.CANDLE_HEALTH_CHECK_INTERVAL}s"
     )
+    return True
 
 
 async def stop_ingestion_worker() -> None:

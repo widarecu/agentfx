@@ -67,6 +67,7 @@ fi
 # Set environment
 export ENVIRONMENT=test
 export PYTHONPATH=src
+export INGESTION_ENABLED=false
 
 # Database configuration
 DB_USER="test_user"
