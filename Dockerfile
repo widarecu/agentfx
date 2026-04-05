@@ -17,6 +17,7 @@ COPY src/ ./src/
 COPY alembic.ini ./
 COPY migrations/ ./migrations/
 COPY scripts/seed_instruments.py ./scripts/seed_instruments.py
+COPY config/ ./config/
 
 # Set PYTHONPATH so agentfx package is importable from src/
 ENV PYTHONPATH=src
