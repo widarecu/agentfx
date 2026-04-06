@@ -280,6 +280,68 @@ def store_candles(
             db.close()
 
 
+def fetch_and_store_chunked(
+    instrument: str,
+    granularity: str,
+    from_time: datetime,
+    to_time: datetime | None = None,
+    chunk_days: int = LARGE_GAP_CHUNK_DAYS,
+    db=None,
+) -> int:
+    """Fetch and store candles in time-bounded chunks to limit memory usage.
+
+    Unlike calling fetch_candles_range() for the full range (which accumulates
+    all candles in memory), this fetches one chunk at a time, stores it, then
+    moves to the next. Each chunk is independently committed to the database.
+
+    This is the preferred method for any range > LARGE_GAP_CHUNK_DAYS.
+    """
+    to_time = to_time or datetime.now(UTC)
+    total_stored = 0
+    current = from_time
+    chunk_count = 0
+
+    total_days = (to_time - from_time).total_seconds() / 86400
+    estimated_chunks = max(1, int(total_days / chunk_days) + 1)
+    logger.info(
+        f"Chunked backfill for {instrument}:{granularity}: "
+        f"{total_days:.0f} days in ~{estimated_chunks} chunks of {chunk_days} days"
+    )
+
+    while current < to_time:
+        chunk_end = min(current + timedelta(days=chunk_days), to_time)
+        chunk_count += 1
+
+        try:
+            candles = fetch_candles_range(instrument, granularity, current, chunk_end)
+            if candles:
+                stored = store_candles(instrument, granularity, candles, db=db)
+                total_stored += stored
+            else:
+                stored = 0
+
+            if chunk_count % 10 == 0 or stored > 0:
+                logger.info(
+                    f"  Chunk {chunk_count}/{estimated_chunks}: "
+                    f"{current.date()} to {chunk_end.date()}, "
+                    f"{stored} stored, {total_stored} total"
+                )
+        except Exception as e:
+            logger.warning(
+                f"  Chunk {chunk_count} failed ({current.date()} to {chunk_end.date()}): {e}"
+            )
+
+        current = chunk_end + timedelta(seconds=1)
+        # Brief pause between chunks to avoid OANDA rate limits
+        time.sleep(0.5)
+
+    logger.info(
+        f"Chunked backfill complete for {instrument}:{granularity}: "
+        f"{total_stored} candles in {chunk_count} chunks"
+    )
+    return total_stored
+
+
 def heal_large_gap(
     instrument: str,
     granularity: str,
@@ -448,11 +510,14 @@ def backfill_instrument(instrument: str, granularity: str, db=None) -> int:
         if should_close:
             db.close()
 
-    # Fetch and store (pass db if we're using injected session)
-    candles = fetch_candles_range(instrument, granularity, from_time)
-    stored = store_candles(
-        instrument, granularity, candles, db=db if not should_close else None
-    )
+    # Fetch and store — use chunked processing for large ranges to avoid OOM
+    pass_db = db if not should_close else None
+    range_days = (datetime.now(UTC) - from_time).total_seconds() / 86400
+    if range_days > LARGE_GAP_CHUNK_DAYS:
+        stored = fetch_and_store_chunked(instrument, granularity, from_time, db=pass_db)
+    else:
+        candles = fetch_candles_range(instrument, granularity, from_time)
+        stored = store_candles(instrument, granularity, candles, db=pass_db)
 
     if stored > 0:
         logger.info(f"Backfilled {stored} candles for {instrument}:{granularity}")

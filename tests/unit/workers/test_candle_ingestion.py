@@ -333,6 +333,7 @@ class TestBackfillInstrument:
             patch(
                 "src.agentfx.api.workers.candle_ingestion.store_candles"
             ) as mock_store,
+            patch("src.agentfx.api.workers.candle_ingestion.time.sleep"),
         ):
             mock_db = MagicMock()
             mock_session.return_value = mock_db
@@ -345,17 +346,24 @@ class TestBackfillInstrument:
             }
 
     def test_backfill_no_existing_data(self, mock_dependencies):
-        """Test backfill when no existing data (7-day backfill)."""
+        """Test backfill when no existing data — uses chunked backfill for large ranges."""
         mock_dependencies["service"].get_latest_candle.return_value = None
         mock_dependencies["fetch"].return_value = [{"time": "2023-01-01T12:00:00Z"}]
         mock_dependencies["store"].return_value = 100
 
         result = backfill_instrument("EUR_USD", "M1")
 
-        assert result == 100
         mock_dependencies["service"].get_latest_candle.assert_called_once()
-        mock_dependencies["fetch"].assert_called_once()
-        mock_dependencies["store"].assert_called_once()
+        # For BACKFILL_DAYS > LARGE_GAP_CHUNK_DAYS (7), uses chunked processing
+        # which calls fetch+store once per chunk instead of once total
+        if settings.BACKFILL_DAYS > LARGE_GAP_CHUNK_DAYS:
+            assert mock_dependencies["fetch"].call_count > 0
+            assert mock_dependencies["store"].call_count > 0
+            assert result == 100 * mock_dependencies["store"].call_count
+        else:
+            assert result == 100
+            mock_dependencies["fetch"].assert_called_once()
+            mock_dependencies["store"].assert_called_once()
 
     def test_backfill_with_existing_data_gap(self, mock_dependencies):
         """Test backfill when there's a gap (data exists but outdated)."""

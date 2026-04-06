@@ -303,27 +303,43 @@ class MarketDataService:
         updated_count = 0
         skipped_count = 0
 
-        for candle_data in validated_candles:
-            # Check if candle already exists
-            existing = (
-                db.query(models.Candle)
-                .filter(
-                    models.Candle.exchange == exchange,
-                    models.Candle.instrument == instrument,
-                    models.Candle.timeframe == timeframe,
-                    models.Candle.timestamp == candle_data["timestamp"],
+        # Batch-fetch existing candle timestamps to avoid N individual queries.
+        # For a 7-day M1 chunk (~7000 candles), this reduces 7000 SELECTs to 7.
+        all_timestamps = [c["timestamp"] for c in validated_candles]
+        existing_complete = set()
+        existing_incomplete = {}  # timestamp -> Candle object
+        BATCH_SIZE = 1000
+
+        if update_if_exists:
+            for i in range(0, len(all_timestamps), BATCH_SIZE):
+                batch_ts = all_timestamps[i : i + BATCH_SIZE]
+                rows = (
+                    db.query(models.Candle)
+                    .filter(
+                        models.Candle.exchange == exchange,
+                        models.Candle.instrument == instrument,
+                        models.Candle.timeframe == timeframe,
+                        models.Candle.timestamp.in_(batch_ts),
+                    )
+                    .all()
                 )
-                .first()
-            )
+                for row in rows:
+                    if row.complete:
+                        existing_complete.add(row.timestamp)
+                    else:
+                        existing_incomplete[row.timestamp] = row
 
-            if existing and update_if_exists:
-                # Skip update if existing candle is already complete
-                # Complete candles never change - only update incomplete ones
-                if existing.complete:
-                    skipped_count += 1
-                    continue
+        for candle_data in validated_candles:
+            ts = candle_data["timestamp"]
 
+            if ts in existing_complete:
+                # Complete candles never change — skip
+                skipped_count += 1
+                continue
+
+            if ts in existing_incomplete:
                 # Update existing incomplete candle
+                existing = existing_incomplete[ts]
                 for key, value in candle_data.items():
                     setattr(existing, key, value)
                 if run_id:
@@ -331,7 +347,7 @@ class MarketDataService:
                 db.add(existing)
                 result.append(existing)
                 updated_count += 1
-            elif not existing:
+            else:
                 # Create new candle
                 db_candle = models.Candle(
                     exchange=exchange,
