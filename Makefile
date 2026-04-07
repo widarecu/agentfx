@@ -13,7 +13,7 @@ MAXABS?=1
 MAXRATE?=60
 LOSS?=0.02
 
-.PHONY: venv install dev lock update precommit test test-unit test-integration test-e2e lint typecheck format backtest backtest-full portal-mock portal-mock-test portal-web-e2e start-backend start-frontend start-all e2e
+.PHONY: venv install dev lock update precommit test test-unit test-integration test-e2e lint typecheck format backtest backtest-full portal-mock portal-mock-test portal-web-e2e start-backend start-frontend start-all e2e docker-up docker-down docker-logs docker-backend-logs docker-restart docker-rebuild
 
 venv:
 	$(PY) -m venv $(VENV)
@@ -164,6 +164,31 @@ start-frontend:
 # Usage: make start-all [ENV=development]
 start-all:
 	ENVIRONMENT=$(ENV) ./scripts/start-all.sh
+
+# --- Docker Development ---
+# Run the full stack in Docker (same image as Railway)
+# Usage: make docker-up PROFILE=dev   # Development stack (ports 8000/5173/5432)
+#        make docker-up PROFILE=test  # Test stack (ports 8001/5174/5433, ingestion off)
+# Credentials loaded from .env.development / .env.test automatically.
+PROFILE?=dev
+
+docker-up:
+	docker compose --profile $(PROFILE) up --build -d
+
+docker-down:
+	docker compose --profile $(PROFILE) down
+
+docker-logs:
+	docker compose --profile $(PROFILE) logs -f
+
+docker-backend-logs:
+	docker compose logs -f $(if $(filter test,$(PROFILE)),backend-test,backend)
+
+docker-restart:
+	docker compose restart $(if $(filter test,$(PROFILE)),backend-test,backend)
+
+docker-rebuild:
+	docker compose --profile $(PROFILE) up --build -d $(if $(filter test,$(PROFILE)),backend-test,backend)
 
 # --- E2E Testing ---
 # Run full E2E test suite (starts servers, runs tests, cleans up)

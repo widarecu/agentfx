@@ -1,0 +1,114 @@
+# AgentFX Docker Development Stack
+#
+# Usage:
+#   make docker-up PROFILE=dev  # Start dev stack
+#   make docker-up PROFILE=test # Start test stack
+#   make docker-down PROFILE=dev
+#   make docker-logs PROFILE=dev
+#
+# Credentials are loaded from .env.development / .env.test automatically.
+
+services:
+  # ── Development services (--profile dev) ────────────────────────────
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: agentfx-postgres
+    profiles: ["dev"]
+    environment:
+      POSTGRES_USER: agentfx
+      POSTGRES_PASSWORD: agentfx
+      POSTGRES_DB: agentfx_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "agentfx", "-d", "agentfx_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agentfx-backend
+    profiles: ["dev"]
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.development
+    environment:
+      # Override DB host for Docker networking (localhost -> postgres service)
+      DATABASE_URL: postgresql://agentfx:agentfx@postgres:5432/agentfx_dev
+      BACKEND_CORS_ORIGINS: http://localhost:5173,http://localhost:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./portal/web
+      dockerfile: Dockerfile
+    container_name: agentfx-frontend
+    profiles: ["dev"]
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000/api/v1
+      VITE_ENVIRONMENT: development
+
+  # ── Test services (--profile test) ──────────────────────────────────
+
+  postgres-test:
+    image: postgres:15-alpine
+    container_name: agentfx-postgres-test
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_password
+      POSTGRES_DB: agentfx_test
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "test_user", "-d", "agentfx_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agentfx-backend-test
+    profiles: ["test"]
+    ports:
+      - "8001:8000"
+    env_file:
+      - .env.test
+    environment:
+      # Override for Docker networking
+      DATABASE_URL: postgresql://test_user:test_password@postgres-test:5432/agentfx_test
+      BACKEND_CORS_ORIGINS: http://localhost:5174,http://localhost:8001
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+
+  frontend-test:
+    build:
+      context: ./portal/web
+      dockerfile: Dockerfile
+    container_name: agentfx-frontend-test
+    profiles: ["test"]
+    ports:
+      - "5174:5173"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8001/api/v1
+      VITE_ENVIRONMENT: test
+
+volumes:
+  postgres_data:
+  postgres_test_data:
