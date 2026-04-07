@@ -18,10 +18,17 @@ The system integrates with OANDA for real-time market data and trading execution
 ## Common Commands
 
 ```bash
-# Environment setup
+# Environment setup (venv-based, for local dev without Docker)
 make venv          # Create virtual environment
 make install       # Install production dependencies
 make dev           # Install dev dependencies + pre-commit hooks
+
+# Docker development (preferred — matches Railway deployment)
+make docker-up PROFILE=dev   # Start dev stack (backend:8000, frontend:5173, postgres:5432)
+make docker-up PROFILE=test  # Start test stack (backend:8001, frontend:5174, postgres:5433)
+make docker-down PROFILE=dev # Stop dev stack
+make docker-logs PROFILE=dev # Follow logs
+make docker-rebuild PROFILE=dev # Rebuild and restart backend
 
 # Code quality
 make lint          # Run ruff + black --check
@@ -222,59 +229,47 @@ These defeat the purpose of integration testing against real OANDA.
 | trader@example.com | traderpassword | TRADER |
 | admin@example.com | adminpassword | ADMIN |
 
-## Starting Servers (IMPORTANT)
+## Starting Servers
 
-**ALWAYS use the startup scripts in `scripts/` to start servers.** Do NOT start uvicorn or npm dev directly, as this bypasses environment configuration and database setup.
+### Docker (Preferred)
 
-### Available Scripts
+Docker runs the **same image** deployed to Railway, ensuring environment parity. All credentials are loaded from `.env.development` or `.env.test` automatically.
 
 ```bash
-scripts/start-backend.sh   # Start backend API server
-scripts/start-frontend.sh  # Start frontend dev server
-scripts/start-all.sh       # Start both backend and frontend
-scripts/seed_test_data.py  # Seed test users for E2E tests
+# Development stack — full stack with ingestion worker
+make docker-up PROFILE=dev     # Start (backend:8000, frontend:5173, postgres:5432)
+make docker-down PROFILE=dev   # Stop
+make docker-logs PROFILE=dev   # Follow all logs
+make docker-backend-logs PROFILE=dev  # Backend logs only
+
+# Test stack — separate DB, separate ports
+make docker-up PROFILE=test    # Start (backend:8001, frontend:5174, postgres:5433)
+make docker-down PROFILE=test  # Stop
+
+# Rebuild after code changes
+make docker-rebuild PROFILE=dev
 ```
 
-### Starting Servers by Environment
+**Important:** Dev and test profiles are fully isolated — different containers, databases, and ports. Only one profile's services start at a time.
+
+The `docker-compose.yml` defines both profiles:
+- **dev**: Loads `.env.development`, ingestion enabled, PostgreSQL `agentfx_dev`
+- **test**: Loads `.env.test`, separate PostgreSQL `agentfx_test` on port 5433
+
+### Venv (Alternative — for fast iteration with hot-reload)
+
+Use the shell scripts when you need hot-reload or want to run individual components:
 
 ```bash
 # Development environment (default)
 ENVIRONMENT=development ./scripts/start-backend.sh
 ENVIRONMENT=development ./scripts/start-all.sh
 
-# Test environment (for E2E tests, integration tests)
+# Test environment
 ENVIRONMENT=test ./scripts/start-backend.sh
-ENVIRONMENT=test ./scripts/start-all.sh
-
-# Staging environment
-ENVIRONMENT=staging ./scripts/start-backend.sh
 ```
 
-### What the Scripts Do
-
-The startup scripts handle:
-1. **Environment selection** - Load correct `.env.{environment}` file
-2. **Database connectivity check** - Verify PostgreSQL is accessible
-3. **Database migrations** - Run `alembic upgrade head` before starting
-4. **Virtual environment activation** - Use correct Python from `.venv/`
-
-### Why NOT to Start Servers Directly
-
-```bash
-# DON'T DO THIS:
-PYTHONPATH=src .venv/bin/uvicorn agentfx.api.main:app --reload
-cd portal/web && npm run dev
-
-# DO THIS INSTEAD:
-ENVIRONMENT=test ./scripts/start-backend.sh
-ENVIRONMENT=test ./scripts/start-frontend.sh
-```
-
-Starting servers directly bypasses:
-- Environment-specific configuration loading
-- Database connectivity verification
-- Automatic migration application
-- Proper PYTHONPATH and environment variable setup
+The startup scripts handle environment selection, database checks, migrations, and venv activation. **Do NOT start uvicorn or npm dev directly** — it bypasses configuration and migrations.
 
 ### Seed Test Data (Before E2E Tests)
 
@@ -289,6 +284,41 @@ This creates the standard test users:
 - `viewer@example.com` / `secretpassword` (viewer)
 - `trader@example.com` / `traderpassword` (trader)
 - `admin@example.com` / `adminpassword` (admin)
+
+## Deployment
+
+### Infrastructure
+
+| Component | Platform | URL |
+|-----------|----------|-----|
+| **Backend** | Railway | `https://agentfx-staging.up.railway.app` |
+| **Frontend** | Vercel | `https://agentfx-liart.vercel.app` |
+| **Database** | Railway PostgreSQL | Internal (via `DATABASE_URL`) |
+
+### CI/CD Pipeline
+
+Defined in `.github/workflows/deploy.yml`. On push to `main`:
+1. E2E tests run (currently disabled, re-enable with `needs: e2e`)
+2. Backend deploys to Railway (`railway up --detach --service agentfx`)
+3. Frontend deploys to Vercel (`vercel deploy --prod`)
+
+### Dockerfile
+
+The backend `Dockerfile` is the single source of truth for the production image. It runs:
+1. `alembic upgrade head` — apply migrations
+2. `python scripts/seed_instruments.py` — seed FX pair metadata
+3. `uvicorn agentfx.api.main:app` — start the API server
+
+The same Dockerfile is used by `docker-compose.yml` locally, ensuring parity.
+
+### Railway Configuration
+
+Environment variables are set in Railway's dashboard (not `.env` files). Key variables:
+- `DATABASE_URL` — injected by Railway PostgreSQL plugin
+- `OANDA_API_KEY`, `OANDA_ACCOUNT_ID` — OANDA credentials
+- `BACKEND_CORS_ORIGINS` — must include the Vercel frontend domain
+- `BACKFILL_DAYS` — controls historical data depth (default 7)
+- `DEBUG` — set to `false` for INFO-level logging
 
 ## Agentic Architecture
 
@@ -374,16 +404,18 @@ Key markers: `@pytest.mark.unit`, `@pytest.mark.integration`, `@pytest.mark.e2e`
 ## Configuration
 
 Environment-based config via `.env.{environment}` files:
-- `.env.development` - Local development
-- `.env.test` - Test environment
-- `.env.staging` / `.env.production` - Deployed environments
+- `.env.development` - Local development (loaded by Docker dev profile and venv scripts)
+- `.env.test` - Test environment (loaded by Docker test profile and E2E scripts)
+- Railway/Vercel - Environment variables set in platform dashboards, not `.env` files
 
-Set `ENVIRONMENT=development|test|staging|production` to select config file.
+Set `ENVIRONMENT=development|test|staging|production` to select config file. Pydantic Settings in `src/agentfx/api/core/config.py` loads the matching `.env.{environment}` file. Environment variables override `.env` file values.
 
-Key settings in `src/agentfx/api/core/config.py`:
+Key settings:
 - `OANDA_API_KEY`, `OANDA_ACCOUNT_ID` - Broker credentials
-- `DATABASE_URL` - PostgreSQL connection string
-- `WEBSOCKET_ENABLED` - Toggle real-time market data streaming
+- `DATABASE_URL` - PostgreSQL connection string (`localhost` for venv, `postgres` service name for Docker)
+- `INGESTION_ENABLED` - Enable/disable candle ingestion worker
+- `BACKFILL_DAYS` - Days of historical candle data to backfill (7 for dev, 1825 for 5 years)
+- `DEBUG` - `true` for DEBUG-level logging, `false` for INFO-level
 
 ## Planning System
 
