@@ -932,12 +932,55 @@ def repair_candle_data(
             db.close()
 
 
+def _health_check_one(instrument: str, granularity: str) -> tuple[int, bool]:
+    """Run health check for a single instrument/granularity combination.
+
+    This runs in a thread pool worker. Creates its own DB session
+    to avoid sharing sessions across threads.
+
+    Returns:
+        Tuple of (healed_count, hit_max_gaps)
+    """
+    import threading
+
+    from ..core.database import SessionLocal
+    from ..services.market_data import MarketDataService
+
+    worker_id = threading.current_thread().name
+    tag = f"[{worker_id}] {instrument}:{granularity}"
+
+    db = SessionLocal()
+    try:
+        # Step 1: Validate backfill completeness
+        if not validate_backfill_completeness(instrument, granularity, db):
+            logger.info(f"{tag} Triggering full re-backfill")
+            MarketDataService.delete_candles(db, "oanda", instrument, granularity)
+            # Pass the same db session so backfill uses the same connection
+            # and the delete + insert are visible within the same session
+            stored = backfill_instrument(instrument, granularity, db=db)
+            return stored, False
+
+        # Step 2: Detect and heal gaps
+        # The db session is passed through to all sub-operations
+        # (heal_large_gap, store_candles, VerifiedGapService) so all
+        # reads and writes within one instrument:granularity are consistent.
+        healed, hit_max = detect_and_heal_gaps(instrument, granularity, db)
+        if healed > 0:
+            logger.info(f"{tag} Healed {healed} candles")
+        return healed, hit_max
+    except Exception as e:
+        logger.error(f"{tag} Health check failed: {e}")
+        return 0, False
+    finally:
+        db.close()
+
+
 async def run_health_check() -> tuple[int, bool]:
     """
     Run comprehensive health check: validate completeness and heal gaps.
 
-    This is called periodically during the poll loop based on
-    CANDLE_HEALTH_CHECK_INTERVAL setting.
+    All instrument/timeframe combinations are checked in parallel
+    using a thread pool (max 4 workers).
 
     Returns:
         Tuple of (total_healed, needs_catchup) where needs_catchup indicates
@@ -945,56 +988,38 @@ async def run_health_check() -> tuple[int, bool]:
     """
     import concurrent.futures
 
-    from ..core.database import SessionLocal
-    from ..services.market_data import MarketDataService
+    combos = [
+        (instrument, granularity)
+        for instrument in settings.instruments_list
+        for granularity in settings.granularities_list
+    ]
 
-    logger.info("Running candle data health check...")
+    logger.info(f"Running candle data health check ({len(combos)} combinations)...")
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     loop = asyncio.get_event_loop()
+
+    tasks = [
+        loop.run_in_executor(executor, _health_check_one, instrument, granularity)
+        for instrument, granularity in combos
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
     total_healed = 0
     any_hit_max = False
-
-    db = SessionLocal()
-    try:
-        for instrument in settings.instruments_list:
-            if _shutdown_event and _shutdown_event.is_set():
-                break
-
-            for granularity in settings.granularities_list:
-                if _shutdown_event and _shutdown_event.is_set():
-                    break
-
-                try:
-                    # Step 1: Validate backfill completeness
-                    if not validate_backfill_completeness(instrument, granularity, db):
-                        # Delete incomplete data and trigger full backfill
-                        logger.info(
-                            f"Triggering full re-backfill for {instrument}:{granularity}"
-                        )
-                        MarketDataService.delete_candles(
-                            db, "oanda", instrument, granularity
-                        )
-                        stored = await loop.run_in_executor(
-                            executor, backfill_instrument, instrument, granularity
-                        )
-                        total_healed += stored
-                        continue
-
-                    # Step 2: Detect and heal gaps in the middle
-                    healed, hit_max = await loop.run_in_executor(
-                        executor, detect_and_heal_gaps, instrument, granularity, db
-                    )
-                    total_healed += healed
-                    if hit_max:
-                        any_hit_max = True
-
-                except Exception as e:
-                    logger.error(
-                        f"Health check failed for {instrument}:{granularity}: {e}"
-                    )
-    finally:
-        db.close()
+    failed = 0
+    for (instrument, granularity), result in zip(combos, results):
+        if isinstance(result, Exception):
+            logger.error(
+                f"Health check failed for {instrument}:{granularity}: {result}"
+            )
+            failed += 1
+        else:
+            healed, hit_max = result
+            total_healed += healed
+            if hit_max:
+                any_hit_max = True
 
     if any_hit_max:
         logger.info(
@@ -1002,7 +1027,10 @@ async def run_health_check() -> tuple[int, bool]:
             f"(catch-up needed, next check in {CATCH_UP_HEALTH_CHECK_INTERVAL}s)"
         )
     else:
-        logger.info(f"Health check complete: {total_healed} candles healed")
+        logger.info(
+            f"Health check complete: {total_healed} candles healed"
+            + (f", {failed} failed" if failed else "")
+        )
     return total_healed, any_hit_max
 
 

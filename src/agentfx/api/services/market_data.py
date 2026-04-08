@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Any
 
 from sqlalchemy import desc
@@ -302,6 +302,37 @@ class MarketDataService:
         created_count = 0
         updated_count = 0
         skipped_count = 0
+
+        # Normalise all timestamps to datetime objects so comparisons
+        # between OANDA strings and DB datetime values work correctly.
+        from datetime import datetime
+
+        def _parse_ts(ts_value):
+            """Convert timestamp string or datetime to timezone-aware datetime."""
+            if isinstance(ts_value, datetime):
+                if ts_value.tzinfo is None:
+                    return ts_value.replace(tzinfo=UTC)
+                return ts_value
+            ts_str = str(ts_value)
+            # Handle OANDA nanosecond format: "2025-02-24T22:04:00.000000000Z"
+            if ts_str.endswith("Z"):
+                ts_str = ts_str[:-1] + "+00:00"
+            # Truncate nanoseconds to microseconds for Python datetime
+            if "." in ts_str:
+                parts = ts_str.split(".")
+                frac_and_tz = parts[1]
+                # Split fraction from timezone
+                for tz_sep in ("+", "-"):
+                    if tz_sep in frac_and_tz[1:]:  # skip first char (could be sign)
+                        idx = frac_and_tz.index(tz_sep, 1)
+                        frac = frac_and_tz[:idx][:6]  # truncate to 6 digits
+                        tz_part = frac_and_tz[idx:]
+                        ts_str = f"{parts[0]}.{frac}{tz_part}"
+                        break
+            return datetime.fromisoformat(ts_str)
+
+        for candle in validated_candles:
+            candle["timestamp"] = _parse_ts(candle["timestamp"])
 
         # Batch-fetch existing candle timestamps to avoid N individual queries.
         # For a 7-day M1 chunk (~7000 candles), this reduces 7000 SELECTs to 7.
