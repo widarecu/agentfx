@@ -285,7 +285,7 @@ def fetch_and_store_chunked(
     granularity: str,
     from_time: datetime,
     to_time: datetime | None = None,
-    chunk_days: int = LARGE_GAP_CHUNK_DAYS,
+    chunk_days: int | None = None,
     db=None,
 ) -> int:
     """Fetch and store candles in time-bounded chunks to limit memory usage.
@@ -294,8 +294,23 @@ def fetch_and_store_chunked(
     all candles in memory), this fetches one chunk at a time, stores it, then
     moves to the next. Each chunk is independently committed to the database.
 
+    Chunk size adapts to timeframe: M1 uses 7-day chunks (~10K candles),
+    while D/W/M use larger chunks to avoid overhead from near-empty fetches.
+
     This is the preferred method for any range > LARGE_GAP_CHUNK_DAYS.
     """
+    from ..core.database import SessionLocal
+
+    # Adaptive chunk size: target ~500 candles per chunk based on timeframe
+    if chunk_days is None:
+        granularity_secs = GRANULARITY_SECONDS.get(granularity, 60)
+        chunk_days = max(
+            LARGE_GAP_CHUNK_DAYS,
+            int((granularity_secs * MAX_CANDLES_PER_REQUEST) / 86400) + 1,
+        )
+
+    import threading
+
     to_time = to_time or datetime.now(UTC)
     total_stored = 0
     current = from_time
@@ -303,41 +318,55 @@ def fetch_and_store_chunked(
 
     total_days = (to_time - from_time).total_seconds() / 86400
     estimated_chunks = max(1, int(total_days / chunk_days) + 1)
+    worker_id = threading.current_thread().name
+    tag = f"[{worker_id}] {instrument}:{granularity}"
+
     logger.info(
-        f"Chunked backfill for {instrument}:{granularity}: "
+        f"{tag} Starting chunked backfill: "
         f"{total_days:.0f} days in ~{estimated_chunks} chunks of {chunk_days} days"
     )
 
-    while current < to_time:
-        chunk_end = min(current + timedelta(days=chunk_days), to_time)
-        chunk_count += 1
+    # Reuse a single DB session across all chunks to avoid connection overhead
+    should_close = db is None
+    if db is None:
+        db = SessionLocal()
 
-        try:
-            candles = fetch_candles_range(instrument, granularity, current, chunk_end)
-            if candles:
-                stored = store_candles(instrument, granularity, candles, db=db)
-                total_stored += stored
-            else:
-                stored = 0
+    try:
+        while current < to_time:
+            chunk_end = min(current + timedelta(days=chunk_days), to_time)
+            chunk_count += 1
 
-            if chunk_count % 10 == 0 or stored > 0:
-                logger.info(
-                    f"  Chunk {chunk_count}/{estimated_chunks}: "
-                    f"{current.date()} to {chunk_end.date()}, "
-                    f"{stored} stored, {total_stored} total"
+            try:
+                candles = fetch_candles_range(
+                    instrument, granularity, current, chunk_end
                 )
-        except Exception as e:
-            logger.warning(
-                f"  Chunk {chunk_count} failed ({current.date()} to {chunk_end.date()}): {e}"
-            )
+                if candles:
+                    stored = store_candles(instrument, granularity, candles, db=db)
+                    total_stored += stored
+                else:
+                    stored = 0
 
-        current = chunk_end + timedelta(seconds=1)
-        # Brief pause between chunks to avoid OANDA rate limits
-        time.sleep(0.5)
+                if chunk_count % 10 == 0 or stored > 0:
+                    logger.info(
+                        f"{tag} chunk {chunk_count}/{estimated_chunks} "
+                        f"({current.date()} to {chunk_end.date()}) "
+                        f"stored={stored} total={total_stored}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"{tag} chunk {chunk_count}/{estimated_chunks} FAILED "
+                    f"({current.date()} to {chunk_end.date()}): {e}"
+                )
+
+            current = chunk_end + timedelta(seconds=1)
+            # Brief pause between chunks to respect OANDA rate limits
+            time.sleep(0.05)
+    finally:
+        if should_close:
+            db.close()
 
     logger.info(
-        f"Chunked backfill complete for {instrument}:{granularity}: "
-        f"{total_stored} candles in {chunk_count} chunks"
+        f"{tag} Backfill complete: {total_stored} candles in {chunk_count} chunks"
     )
     return total_stored
 
@@ -370,7 +399,7 @@ def heal_large_gap(
 
     MAX_RETRIES = 5
     BASE_BACKOFF = 5  # seconds
-    RATE_LIMIT_DELAY = 0.5  # seconds between chunks
+    RATE_LIMIT_DELAY = 0.05  # seconds between chunks
 
     total_stored = 0
     current = gap_start + timedelta(seconds=1)
@@ -984,12 +1013,25 @@ async def startup_backfill() -> int:
     It ensures all instruments have current data regardless of how long
     the server was down.
 
+    All instrument/timeframe combinations are submitted to a thread pool
+    for parallel processing (max 4 concurrent workers). Failed tasks are
+    logged but don't prevent other tasks from completing.
+
     Returns:
         Total number of candles stored across all instruments
     """
     import concurrent.futures
 
-    logger.info("Starting candle backfill...")
+    combos = [
+        (instrument, granularity)
+        for instrument in settings.instruments_list
+        for granularity in settings.granularities_list
+    ]
+
+    logger.info(
+        f"Starting candle backfill: {len(combos)} instrument/timeframe combinations "
+        f"across {len(settings.instruments_list)} instruments"
+    )
     logger.info(
         f"Instruments: {settings.instruments_list}, "
         f"Granularities: {settings.granularities_list}"
@@ -998,28 +1040,30 @@ async def startup_backfill() -> int:
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     loop = asyncio.get_event_loop()
 
+    # Submit all combinations in parallel
+    tasks = [
+        loop.run_in_executor(executor, backfill_instrument, instrument, granularity)
+        for instrument, granularity in combos
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Tally results and log failures
     total_stored = 0
+    failed = 0
+    for (instrument, granularity), result in zip(combos, results):
+        if isinstance(result, Exception):
+            logger.error(f"Backfill failed for {instrument}:{granularity}: {result}")
+            failed += 1
+        elif isinstance(result, int):
+            total_stored += result
 
-    for instrument in settings.instruments_list:
-        if _shutdown_event and _shutdown_event.is_set():
-            break
-
-        for granularity in settings.granularities_list:
-            if _shutdown_event and _shutdown_event.is_set():
-                break
-
-            try:
-                stored = await loop.run_in_executor(
-                    executor,
-                    backfill_instrument,
-                    instrument,
-                    granularity,
-                )
-                total_stored += stored
-            except Exception as e:
-                logger.error(f"Backfill failed for {instrument}:{granularity}: {e}")
-
-    logger.info(f"Backfill complete: {total_stored} total candles stored")
+    if failed:
+        logger.warning(
+            f"Backfill complete with {failed} failures: {total_stored} total candles stored"
+        )
+    else:
+        logger.info(f"Backfill complete: {total_stored} total candles stored")
     return total_stored
 
 

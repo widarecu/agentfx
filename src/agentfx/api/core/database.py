@@ -10,8 +10,13 @@ if settings.DATABASE_URL.startswith("sqlite"):
         settings.DATABASE_URL, connect_args={"check_same_thread": False}
     )
 else:
-    # PostgreSQL configuration
-    engine = create_engine(settings.DATABASE_URL)
+    # PostgreSQL configuration with connection pooling
+    engine = create_engine(
+        settings.DATABASE_URL,
+        pool_size=20,
+        max_overflow=10,
+        pool_pre_ping=True,
+    )
 
 # Session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
