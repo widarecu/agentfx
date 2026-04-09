@@ -20,6 +20,7 @@ import {
   DollarSign,
   Layers,
   Database,
+  BarChart3,
 } from 'lucide-react';
 import { optimizationApi } from '../services/optimizationApi';
 import {
@@ -227,6 +228,10 @@ export default function OptimizationDetail() {
           <div className="flex items-center gap-1.5 text-slate-600 dark:text-slate-400">
             <Settings className="w-4 h-4" />
             <span>{job.completedIterations}/{job.estimatedIterations} iterations</span>
+          </div>
+          <div className="flex items-center gap-1.5 text-slate-600 dark:text-slate-400">
+            <BarChart3 className="w-4 h-4" />
+            <span>Timeframe: {job.timeframe}</span>
           </div>
         </div>
       </div>

@@ -39,6 +39,34 @@ import {
 import StrategyChart from '../components/StrategyChart';
 import TradesTable from '../components/TradesTable';
 
+/**
+ * Inline tooltip for metric labels.
+ * Shows an ⓘ icon that reveals a description on hover — no external library.
+ */
+function MetricTooltip({ text }: { text: string }) {
+  return (
+    <span className="relative group ml-1 cursor-help">
+      <svg
+        className="inline-block w-3.5 h-3.5 text-slate-400"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={2}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        <circle cx="12" cy="12" r="10" />
+        <line x1="12" y1="16" x2="12" y2="12" />
+        <line x1="12" y1="8" x2="12.01" y2="8" />
+      </svg>
+      <span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-2 text-xs font-normal normal-case text-slate-200 bg-slate-800 rounded-lg shadow-lg opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none w-64 z-50">
+        {text}
+      </span>
+    </span>
+  );
+}
+
 export default function TrialDetail() {
   const { jobId, trialId } = useParams<{ jobId: string; trialId: string }>();
   const [data, setData] = useState<TrialDetailData | null>(null);
@@ -223,6 +251,7 @@ export default function TrialDetail() {
             <TrendingUp className="w-4 h-4 text-slate-400" />
             <span className="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase">
               Sharpe
+              <MetricTooltip text="Risk-adjusted return. Measures excess return per unit of risk. Values above 1.0 are considered good, above 2.0 excellent. Calculated by annualizing daily returns (√252)." />
             </span>
           </div>
           <div
@@ -249,6 +278,11 @@ export default function TrialDetail() {
             )}
             <span className="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase">
               {viewMode === 'pips' ? 'Total P&L' : 'Net P&L'}
+              {viewMode === 'pips' ? (
+                <MetricTooltip text="Total profit or loss in pips from all closed trades, before financing costs (spread and swap)." />
+              ) : (
+                <MetricTooltip text="Profit or loss after deducting spread and swap costs. This is the realistic return you would have achieved." />
+              )}
             </span>
           </div>
           <div
@@ -275,6 +309,7 @@ export default function TrialDetail() {
             <TrendingDown className="w-4 h-4 text-slate-400" />
             <span className="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase">
               Max DD
+              <MetricTooltip text="Maximum Drawdown — the largest peak-to-trough decline in account equity during the backtest period. Lower is better; above 10% is considered high risk." />
             </span>
           </div>
           <div
@@ -297,6 +332,7 @@ export default function TrialDetail() {
             <Target className="w-4 h-4 text-slate-400" />
             <span className="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase">
               Hit Rate
+              <MetricTooltip text="Percentage of winning trades out of total closed trades. A strategy can be profitable with a hit rate below 50% if average wins exceed average losses." />
             </span>
           </div>
           <div
@@ -319,6 +355,7 @@ export default function TrialDetail() {
             <Hash className="w-4 h-4 text-slate-400" />
             <span className="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase">
               Trades
+              <MetricTooltip text="Total number of closed trades during the backtest. More trades provide higher statistical confidence. Minimum 300 trades recommended for reliable results." />
             </span>
           </div>
           <div
@@ -341,6 +378,7 @@ export default function TrialDetail() {
             <BarChart3 className="w-4 h-4 text-slate-400" />
             <span className="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase">
               Profit Factor
+              <MetricTooltip text="Ratio of gross profit to gross loss. Values above 1.0 mean the strategy is profitable. Above 1.5 is good, above 2.0 is excellent." />
             </span>
           </div>
           <div
@@ -369,7 +407,10 @@ export default function TrialDetail() {
           </div>
           <div className="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm">
             <div>
-              <div className="text-slate-500 dark:text-slate-400">Gross P&L</div>
+              <div className="text-slate-500 dark:text-slate-400">
+                Gross P&L
+                <MetricTooltip text="Total profit or loss before any financing costs are deducted. Represents raw strategy performance." />
+              </div>
               <div
                 className={`text-lg font-mono font-semibold ${
                   extendedMetrics.grossPnlDollars >= 0
@@ -382,14 +423,20 @@ export default function TrialDetail() {
               <div className="text-xs text-slate-400">{formatPips(extendedMetrics.totalPips)} pips</div>
             </div>
             <div>
-              <div className="text-slate-500 dark:text-slate-400">Spread Cost</div>
+              <div className="text-slate-500 dark:text-slate-400">
+                Spread Cost
+                <MetricTooltip text="Cumulative cost of bid-ask spreads across all trades. Each trade incurs a spread cost upon entry." />
+              </div>
               <div className="text-lg font-mono font-semibold text-amber-600 dark:text-amber-400">
                 -{formatDollars(extendedMetrics.totalSpreadCostDollars, false)}
               </div>
               <div className="text-xs text-slate-400">-{extendedMetrics.totalSpreadCostPips.toFixed(1)} pips</div>
             </div>
             <div>
-              <div className="text-slate-500 dark:text-slate-400">Swap/Interest</div>
+              <div className="text-slate-500 dark:text-slate-400">
+                Swap/Interest
+                <MetricTooltip text="Overnight financing charges for holding positions past the daily rollover time. Can be positive or negative depending on the interest rate differential." />
+              </div>
               <div className="text-lg font-mono font-semibold text-amber-600 dark:text-amber-400">
                 -{formatDollars(extendedMetrics.totalSwapCostDollars, false)}
               </div>
@@ -403,7 +450,10 @@ export default function TrialDetail() {
               <div className="text-xs text-slate-400">-{extendedMetrics.totalCostPips.toFixed(1)} pips</div>
             </div>
             <div className="bg-slate-50 dark:bg-slate-700/50 rounded-lg p-2 -m-2">
-              <div className="text-slate-500 dark:text-slate-400">Net P&L</div>
+              <div className="text-slate-500 dark:text-slate-400">
+                Net P&L
+                <MetricTooltip text="Profit or loss after deducting spread and swap costs. This is the realistic return you would have achieved." />
+              </div>
               <div
                 className={`text-lg font-mono font-bold ${
                   extendedMetrics.netPnlDollars >= 0
@@ -422,7 +472,10 @@ export default function TrialDetail() {
       {/* Additional Metrics Row */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <div className="bg-slate-50 dark:bg-slate-800/50 rounded-lg p-3">
-          <div className="text-xs text-slate-500 dark:text-slate-400">Avg Win</div>
+          <div className="text-xs text-slate-500 dark:text-slate-400">
+            Avg Win
+            <MetricTooltip text="Average profit per winning trade in pips or dollars. Higher values indicate the strategy captures larger moves." />
+          </div>
           <div className="text-lg font-mono font-semibold text-green-600 dark:text-green-400">
             {viewMode === 'pips'
               ? `+${((metrics.avgWin || 0) * 10000).toFixed(1)} pips`
@@ -430,7 +483,10 @@ export default function TrialDetail() {
           </div>
         </div>
         <div className="bg-slate-50 dark:bg-slate-800/50 rounded-lg p-3">
-          <div className="text-xs text-slate-500 dark:text-slate-400">Avg Loss</div>
+          <div className="text-xs text-slate-500 dark:text-slate-400">
+            Avg Loss
+            <MetricTooltip text="Average loss per losing trade in pips or dollars. Smaller values indicate tighter risk management." />
+          </div>
           <div className="text-lg font-mono font-semibold text-red-600 dark:text-red-400">
             {viewMode === 'pips'
               ? `${((metrics.avgLoss || 0) * 10000).toFixed(1)} pips`
@@ -438,7 +494,10 @@ export default function TrialDetail() {
           </div>
         </div>
         <div className="bg-slate-50 dark:bg-slate-800/50 rounded-lg p-3">
-          <div className="text-xs text-slate-500 dark:text-slate-400">Avg P&L per Trade</div>
+          <div className="text-xs text-slate-500 dark:text-slate-400">
+            Avg P&L per Trade
+            <MetricTooltip text="Expected value per trade — the average profit or loss across all trades. Positive values indicate a profitable edge." />
+          </div>
           <div
             className={`text-lg font-mono font-semibold ${
               extendedMetrics.avgPipsPerTrade >= 0
@@ -452,7 +511,10 @@ export default function TrialDetail() {
           </div>
         </div>
         <div className="bg-slate-50 dark:bg-slate-800/50 rounded-lg p-3">
-          <div className="text-xs text-slate-500 dark:text-slate-400">Max Consec. Losses</div>
+          <div className="text-xs text-slate-500 dark:text-slate-400">
+            Max Consec. Losses
+            <MetricTooltip text="Longest streak of consecutive losing trades. Important for sizing positions and managing psychological risk during drawdowns." />
+          </div>
           <div className="text-lg font-mono font-semibold text-slate-900 dark:text-slate-100">
             {metrics.maxConsecutiveLosses || 'N/A'}
           </div>
@@ -492,6 +554,7 @@ export default function TrialDetail() {
           instrument={job.pair}
           strategy={job.strategy}
           params={params}
+          timeframe={job.timeframe}
         />
       </div>
 

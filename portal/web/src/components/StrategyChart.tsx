@@ -34,6 +34,7 @@ interface StrategyChartProps {
   instrument: string;
   strategy: string;
   params: Record<string, number>;
+  timeframe?: string;
   isLoading?: boolean;
   error?: string | null;
 }
@@ -45,6 +46,7 @@ export default function StrategyChart({
   instrument,
   strategy,
   params,
+  timeframe,
   isLoading = false,
   error = null,
 }: StrategyChartProps) {
@@ -417,7 +419,8 @@ export default function StrategyChart({
             {instrument}
           </h3>
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            Strategy: {strategy.toUpperCase()} | Params:{' '}
+            Strategy: {strategy.toUpperCase()}
+            {timeframe ? ` | Timeframe: ${timeframe}` : ''} | Params:{' '}
             {Object.entries(params)
               .map(([k, v]) => `${k}=${v}`)
               .join(', ')}

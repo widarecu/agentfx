@@ -373,6 +373,9 @@ export default function Optimization() {
                         Pair
                       </th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">
+                        Timeframe
+                      </th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">
                         Status
                       </th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider min-w-[160px]">
@@ -418,6 +421,13 @@ export default function Optimization() {
                         <td className="px-4 py-4 whitespace-nowrap">
                           <span className="text-sm font-mono text-slate-900 dark:text-slate-100">
                             {job.pair}
+                          </span>
+                        </td>
+
+                        {/* Timeframe */}
+                        <td className="px-4 py-4 whitespace-nowrap">
+                          <span className="text-sm font-mono font-medium text-slate-700 dark:text-slate-300">
+                            {job.timeframe}
                           </span>
                         </td>
 
