@@ -273,6 +273,7 @@ export function formatDuration(minutes: number | null | undefined): string {
 export function formatDateTime(isoString: string): string {
   return new Date(isoString).toLocaleString('en-US', {
     timeZone: 'UTC',
+    year: 'numeric',
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
