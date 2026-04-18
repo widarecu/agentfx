@@ -76,7 +76,6 @@ const STRATEGY_CONFIGS: Record<StrategyType, {
     description: 'Buy on breakout above channel high, sell on breakout below',
     params: [
       { key: 'period', label: 'Channel Period', min: 5, max: 100, defaultMin: 10, defaultMax: 55, step: 1 },
-      { key: 'exit_period', label: 'Exit Period', min: 2, max: 50, defaultMin: 5, defaultMax: 20, step: 1 },
     ],
   },
 };
@@ -95,7 +94,7 @@ interface NewOptimizationFormData {
   positionSize: number;
   dataYears: number;
   timeframe: string;
-  paramRanges: Record<string, { min: number; max: number }>;
+  paramRanges: Record<string, { min: number; max: number; step?: number | null }>;
 }
 
 const TIMEFRAME_OPTIONS = [
@@ -111,9 +110,9 @@ const TIMEFRAME_OPTIONS = [
 // Get default form data for a strategy
 function getDefaultFormData(strategy: StrategyType): NewOptimizationFormData {
   const config = STRATEGY_CONFIGS[strategy];
-  const paramRanges: Record<string, { min: number; max: number }> = {};
+  const paramRanges: Record<string, { min: number; max: number; step?: number | null }> = {};
   config.params.forEach(p => {
-    paramRanges[p.key] = { min: p.defaultMin, max: p.defaultMax };
+    paramRanges[p.key] = { min: p.defaultMin, max: p.defaultMax, step: p.step ?? null };
   });
   return {
     strategy,
@@ -161,9 +160,9 @@ export default function Optimization() {
   // Handle strategy change - reset param ranges to defaults for new strategy
   const handleStrategyChange = (strategy: StrategyType) => {
     const config = STRATEGY_CONFIGS[strategy];
-    const paramRanges: Record<string, { min: number; max: number }> = {};
+    const paramRanges: Record<string, { min: number; max: number; step?: number | null }> = {};
     config.params.forEach(p => {
-      paramRanges[p.key] = { min: p.defaultMin, max: p.defaultMax };
+      paramRanges[p.key] = { min: p.defaultMin, max: p.defaultMax, step: p.step ?? null };
     });
     setFormData(prev => ({ ...prev, strategy, paramRanges }));
   };

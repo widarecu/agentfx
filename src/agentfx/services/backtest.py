@@ -492,13 +492,12 @@ def make_strategy(name: str, **kwargs) -> Strategy:
             fast=int(kwargs.get("fast", 20)), slow=int(kwargs.get("slow", 50))
         )
     if n in ("rsi", "rsi_mr", "rsi_mean_reversion"):
-        # Map generic FAST/SLOW to RSI window if provided
-        window = int(kwargs.get("window", kwargs.get("fast", 14)))
-        lower = float(kwargs.get("lower", 30.0))
-        upper = float(kwargs.get("upper", 70.0))
+        window = int(kwargs.get("period", kwargs.get("window", kwargs.get("fast", 14))))
+        lower = float(kwargs.get("oversold", kwargs.get("lower", 30.0)))
+        upper = float(kwargs.get("overbought", kwargs.get("upper", 70.0)))
         return RSIMeanReversion(window=window, lower=lower, upper=upper)
     if n in ("donchian", "breakout", "donchian_breakout"):
-        window = int(kwargs.get("window", kwargs.get("fast", 20)))
+        window = int(kwargs.get("window", kwargs.get("period", kwargs.get("fast", 20))))
         return DonchianBreakout(window=window)
     raise ValueError(f"Unknown strategy: {name}")
 
