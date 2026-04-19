@@ -662,32 +662,30 @@ function rollingMin(
 function rsi(
   closes: number[], period: number, timestamps: string[]
 ): { timestamp: string; value: number }[] {
+  // SMA-based RSI matching the backend (strategy.py RSIMeanReversion).
+  // Uses simple rolling mean of gains/losses, NOT Wilder's exponential smoothing.
   if (closes.length < period + 1) return [];
   const result: { timestamp: string; value: number }[] = [];
 
-  // Initial average gain/loss
-  let avgGain = 0;
-  let avgLoss = 0;
-  for (let i = 1; i <= period; i++) {
-    const change = closes[i] - closes[i - 1];
-    if (change > 0) avgGain += change;
-    else avgLoss += Math.abs(change);
+  // Compute per-bar changes
+  const changes: number[] = [0]; // first bar has no change
+  for (let i = 1; i < closes.length; i++) {
+    changes.push(closes[i] - closes[i - 1]);
   }
-  avgGain /= period;
-  avgLoss /= period;
 
-  const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-  result.push({ timestamp: timestamps[period], value: 100 - 100 / (1 + rs) });
-
-  // Wilder smoothing
-  for (let i = period + 1; i < closes.length; i++) {
-    const change = closes[i] - closes[i - 1];
-    const gain = change > 0 ? change : 0;
-    const loss = change < 0 ? Math.abs(change) : 0;
-    avgGain = (avgGain * (period - 1) + gain) / period;
-    avgLoss = (avgLoss * (period - 1) + loss) / period;
-    const curRs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-    result.push({ timestamp: timestamps[i], value: 100 - 100 / (1 + curRs) });
+  // Rolling SMA of gains and losses
+  for (let i = period; i < closes.length; i++) {
+    let sumGain = 0;
+    let sumLoss = 0;
+    for (let j = i - period + 1; j <= i; j++) {
+      if (changes[j] > 0) sumGain += changes[j];
+      else sumLoss += Math.abs(changes[j]);
+    }
+    const avgGain = sumGain / period;
+    const avgLoss = sumLoss / period;
+    const rs = avgLoss === 0 ? Infinity : avgGain / avgLoss;
+    const value = avgLoss === 0 ? 100 : 100 - 100 / (1 + rs);
+    result.push({ timestamp: timestamps[i], value });
   }
 
   return result;

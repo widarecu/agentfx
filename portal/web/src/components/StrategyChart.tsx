@@ -1,22 +1,15 @@
 /**
  * StrategyChart Component
  *
- * Candlestick chart with:
- * - OHLC candles (green up, red down)
- * - Entry markers (triangles)
- * - Exit markers (circles with P&L color)
- * - Indicator overlays (MA lines, Donchian bands) on the main chart
- * - Oscillator pane (RSI) rendered in a separate chart below the main chart
- * - Crosshair with price/time on hover
- * - Zoom/pan controls (synchronized across both panes)
+ * Candlestick chart with trade markers and indicator overlays.
+ * - MA / Donchian: overlay lines on the main price chart
+ * - RSI: rendered in a separate panel below (like TradingView)
  *
- * Uses lightweight-charts library for high performance.
- * lightweight-charts v4.x has no native multi-pane support, so oscillator
- * indicators are rendered in a second createChart() instance that is kept
- * in sync with the main chart's time scale.
+ * The two panels use subscribeVisibleLogicalRangeChange for sync,
+ * which works reliably even before data is loaded.
  */
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
   createChart,
   IChartApi,
@@ -44,688 +37,414 @@ interface StrategyChartProps {
   error?: string | null;
 }
 
-/** Returns true when the indicator belongs in the oscillator pane (e.g. RSI). */
-function isOscillatorIndicator(indicator: IndicatorLine): boolean {
+function isOscillator(indicator: IndicatorLine): boolean {
   return indicator.name.toLowerCase().includes('rsi');
 }
 
-/** Convert an ISO timestamp string to the UTCTimestamp number lightweight-charts expects. */
-const toChartTime = (timestamp: string): UTCTimestamp =>
-  (new Date(timestamp).getTime() / 1000) as UTCTimestamp;
-
-/** Build shared dark/light chart options so both panes look identical. */
-function buildChartOptions(
-  width: number,
-  height: number,
-  isDarkMode: boolean,
-  showTimeAxis: boolean
-) {
-  return {
-    layout: {
-      background: { color: 'transparent' },
-      textColor: isDarkMode ? '#9ca3af' : '#6b7280',
-    },
-    grid: {
-      vertLines: { color: isDarkMode ? '#1f2937' : '#e5e7eb' },
-      horzLines: { color: isDarkMode ? '#1f2937' : '#e5e7eb' },
-    },
-    width,
-    height,
-    timeScale: {
-      timeVisible: showTimeAxis,
-      secondsVisible: false,
-      borderColor: isDarkMode ? '#374151' : '#d1d5db',
-      // Hide the time axis on the main chart when an oscillator pane sits below it –
-      // the oscillator pane shows the shared time axis instead.
-      visible: showTimeAxis,
-    },
-    rightPriceScale: {
-      borderColor: isDarkMode ? '#374151' : '#d1d5db',
-      scaleMargins: { top: 0.1, bottom: 0.1 },
-    },
-    crosshair: {
-      mode: CrosshairMode.Normal,
-      vertLine: {
-        color: isDarkMode ? '#6b7280' : '#9ca3af',
-        width: 1 as const,
-        style: 1 as const,
-        labelBackgroundColor: isDarkMode ? '#374151' : '#e5e7eb',
-      },
-      horzLine: {
-        color: isDarkMode ? '#6b7280' : '#9ca3af',
-        width: 1 as const,
-        style: 1 as const,
-        labelBackgroundColor: isDarkMode ? '#374151' : '#e5e7eb',
-      },
-    },
-  };
-}
+const toChartTime = (ts: string): UTCTimestamp =>
+  (new Date(ts).getTime() / 1000) as UTCTimestamp;
 
 export default function StrategyChart({
-  candles,
-  signals,
-  indicators,
-  instrument,
-  strategy,
-  params,
-  timeframe,
-  isLoading = false,
-  error = null,
+  candles, signals, indicators, instrument, strategy, params,
+  timeframe, isLoading = false, error = null,
 }: StrategyChartProps) {
-  // ── DOM refs ─────────────────────────────────────────────────────────────
-  const chartContainerRef = useRef<HTMLDivElement>(null);
-  const oscillatorContainerRef = useRef<HTMLDivElement>(null);
+  const mainContainerRef = useRef<HTMLDivElement>(null);
+  const oscContainerRef = useRef<HTMLDivElement>(null);
+  const mainChartRef = useRef<IChartApi | null>(null);
+  const oscChartRef = useRef<IChartApi | null>(null);
+  const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  const overlayRefs = useRef<ISeriesApi<'Line'>[]>([]);
+  const oscSeriesRefs = useRef<ISeriesApi<'Line'>[]>([]);
+  const syncingRef = useRef(false);
 
-  // ── Chart API refs ────────────────────────────────────────────────────────
-  const chartRef = useRef<IChartApi | null>(null);
-  const oscillatorChartRef = useRef<IChartApi | null>(null);
-
-  // ── Series refs ───────────────────────────────────────────────────────────
-  const candlestickSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
-  /** Series for overlay indicators (MA, Donchian) on the main chart. */
-  const overlaySeriesRefs = useRef<ISeriesApi<'Line'>[]>([]);
-  /** Series for oscillator indicators (RSI) on the oscillator chart. */
-  const oscillatorSeriesRefs = useRef<ISeriesApi<'Line'>[]>([]);
-
-  // ── Sync guard ────────────────────────────────────────────────────────────
-  // Prevents the two subscribeVisibleTimeRangeChange callbacks from triggering
-  // each other in an infinite loop.
-  const isSyncingRef = useRef(false);
-
-  // ── UI state ──────────────────────────────────────────────────────────────
   const [chartError, setChartError] = useState<string | null>(null);
   const [showIndicators, setShowIndicators] = useState(true);
   const [crosshairData, setCrosshairData] = useState<{
-    time: string;
-    price: string;
+    time: string; price: string;
     ohlc?: { o: string; h: string; l: string; c: string };
+    rsi?: string;
   } | null>(null);
+  const crosshairSyncingRef = useRef(false);
 
-  // Derived indicator classification (stable reference for effects)
-  const overlayIndicators = indicators.filter(i => !isOscillatorIndicator(i));
-  const oscillatorIndicators = indicators.filter(i => isOscillatorIndicator(i));
-  const hasOscillators = oscillatorIndicators.length > 0;
+  const overlayIndicators = indicators.filter(i => !isOscillator(i));
+  const oscIndicators = indicators.filter(i => isOscillator(i));
+  const hasOscillator = oscIndicators.length > 0;
 
-  // ── Initialize main chart ─────────────────────────────────────────────────
+  // Shared chart options builder
+  const chartOpts = useCallback((width: number, height: number, showTimeAxis: boolean) => {
+    const dark = document.documentElement.classList.contains('dark');
+    return {
+      layout: { background: { color: 'transparent' }, textColor: dark ? '#9ca3af' : '#6b7280' },
+      grid: {
+        vertLines: { color: dark ? '#1f2937' : '#e5e7eb' },
+        horzLines: { color: dark ? '#1f2937' : '#e5e7eb' },
+      },
+      width, height,
+      timeScale: { timeVisible: true, secondsVisible: false, visible: showTimeAxis, borderColor: dark ? '#374151' : '#d1d5db' },
+      rightPriceScale: { borderColor: dark ? '#374151' : '#d1d5db' },
+      crosshair: {
+        mode: CrosshairMode.Normal,
+        vertLine: { color: dark ? '#6b7280' : '#9ca3af', width: 1 as const, style: 1 as const, labelBackgroundColor: dark ? '#374151' : '#e5e7eb' },
+        horzLine: { color: dark ? '#6b7280' : '#9ca3af', width: 1 as const, style: 1 as const, labelBackgroundColor: dark ? '#374151' : '#e5e7eb' },
+      },
+    };
+  }, []);
+
+  // ── Main chart init ────────────────────────────────────────────────
   useEffect(() => {
-    if (!chartContainerRef.current) return;
-
+    if (!mainContainerRef.current) return;
     try {
-      const isDarkMode = document.documentElement.classList.contains('dark');
-
-      const chart = createChart(
-        chartContainerRef.current,
-        buildChartOptions(
-          chartContainerRef.current.clientWidth,
-          500,
-          isDarkMode,
-          // Show the main chart's time axis only when there is no oscillator pane
-          !hasOscillators
-        )
-      );
-
-      const candlestickSeries = chart.addCandlestickSeries({
-        upColor: '#22c55e',
-        downColor: '#ef4444',
-        borderUpColor: '#22c55e',
-        borderDownColor: '#ef4444',
-        wickUpColor: '#22c55e',
-        wickDownColor: '#ef4444',
+      const w = mainContainerRef.current.clientWidth;
+      // Hide time axis on main chart when oscillator pane is shown (it shows the axis)
+      const chart = createChart(mainContainerRef.current, chartOpts(w, hasOscillator ? 420 : 500, !hasOscillator));
+      const series = chart.addCandlestickSeries({
+        upColor: '#22c55e', downColor: '#ef4444',
+        borderUpColor: '#22c55e', borderDownColor: '#ef4444',
+        wickUpColor: '#22c55e', wickDownColor: '#ef4444',
       });
+      mainChartRef.current = chart;
+      candleSeriesRef.current = series;
 
-      chartRef.current = chart;
-      candlestickSeriesRef.current = candlestickSeries;
-
-      // Crosshair tooltip
       chart.subscribeCrosshairMove(param => {
         if (!param.time || !param.point) {
           setCrosshairData(null);
+          // Sync crosshair clear to oscillator
+          if (!crosshairSyncingRef.current && oscChartRef.current) {
+            crosshairSyncingRef.current = true;
+            oscChartRef.current.clearCrosshairPosition();
+            crosshairSyncingRef.current = false;
+          }
           return;
         }
-        const ohlcData = param.seriesData.get(candlestickSeries) as any;
-        if (ohlcData && ohlcData.open !== undefined) {
+        const d = param.seriesData.get(series) as any;
+        if (d?.open !== undefined) {
+          // Look up RSI value at this timestamp from the indicator data
+          let rsiVal: string | undefined;
+          if (hasOscillator && oscIndicators.length > 0 && param.time) {
+            const ts = (param.time as number) * 1000;
+            const rsiPoint = oscIndicators[0].data.find(p => Math.abs(new Date(p.timestamp).getTime() - ts) < 1000);
+            if (rsiPoint) rsiVal = rsiPoint.value.toFixed(1);
+          }
           setCrosshairData({
             time: new Date((param.time as number) * 1000).toLocaleString(),
-            price: ohlcData.close.toFixed(5),
-            ohlc: {
-              o: ohlcData.open.toFixed(5),
-              h: ohlcData.high.toFixed(5),
-              l: ohlcData.low.toFixed(5),
-              c: ohlcData.close.toFixed(5),
-            },
+            price: d.close.toFixed(5),
+            ohlc: { o: d.open.toFixed(5), h: d.high.toFixed(5), l: d.low.toFixed(5), c: d.close.toFixed(5) },
+            rsi: rsiVal,
           });
-        } else {
-          setCrosshairData(null);
+        } else { setCrosshairData(null); }
+        // Sync crosshair position to oscillator chart
+        if (!crosshairSyncingRef.current && oscChartRef.current && oscSeriesRefs.current.length > 0) {
+          crosshairSyncingRef.current = true;
+          try { oscChartRef.current.setCrosshairPosition(0, param.time, oscSeriesRefs.current[0]); } catch { /* */ }
+          crosshairSyncingRef.current = false;
         }
       });
 
-      // Resize handler
-      const handleResize = () => {
-        if (chartContainerRef.current && chartRef.current) {
-          const w = chartContainerRef.current.clientWidth;
-          chartRef.current.applyOptions({ width: w });
-          oscillatorChartRef.current?.applyOptions({ width: w });
-        }
+      const onResize = () => {
+        if (!mainContainerRef.current) return;
+        const nw = mainContainerRef.current.clientWidth;
+        mainChartRef.current?.applyOptions({ width: nw });
+        oscChartRef.current?.applyOptions({ width: nw });
       };
-      window.addEventListener('resize', handleResize);
+      window.addEventListener('resize', onResize);
 
       return () => {
-        window.removeEventListener('resize', handleResize);
+        window.removeEventListener('resize', onResize);
         chart.remove();
-        chartRef.current = null;
-        candlestickSeriesRef.current = null;
-        overlaySeriesRefs.current = [];
+        mainChartRef.current = null;
+        candleSeriesRef.current = null;
+        overlayRefs.current = [];
       };
     } catch (err) {
-      console.error('Failed to initialize main chart:', err);
-      setChartError(err instanceof Error ? err.message : 'Failed to initialize chart');
+      setChartError(err instanceof Error ? err.message : 'Failed to init chart');
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [chartOpts, hasOscillator]);
 
-  // ── Initialize oscillator chart ───────────────────────────────────────────
+  // ── Oscillator chart init ──────────────────────────────────────────
   useEffect(() => {
-    if (!oscillatorContainerRef.current || !hasOscillators) return;
-
-    try {
-      const isDarkMode = document.documentElement.classList.contains('dark');
-
-      const oscChart = createChart(
-        oscillatorContainerRef.current,
-        {
-          ...buildChartOptions(
-            oscillatorContainerRef.current.clientWidth,
-            150,
-            isDarkMode,
-            true // always show time axis on the oscillator pane
-          ),
-          rightPriceScale: {
-            borderColor: isDarkMode ? '#374151' : '#d1d5db',
-            // Keep the scale fixed to 0-100 so RSI always fills the pane correctly
-            scaleMargins: { top: 0.05, bottom: 0.05 },
-          },
-        }
-      );
-
-      // Fix the price range to 0–100
-      oscChart.priceScale('right').applyOptions({
-        autoScale: false,
-        scaleMargins: { top: 0.05, bottom: 0.05 },
-      });
-
-      // Reference lines at 30 (oversold) and 70 (overbought)
-      const refLineOptions = {
-        lineWidth: 1 as const,
-        lineStyle: LineStyle.Dashed,
-        priceLineVisible: false,
-        lastValueVisible: false,
-        crosshairMarkerVisible: false,
-        color: isDarkMode ? '#4b5563' : '#9ca3af',
-      };
-
-      const oversoldLine = oscChart.addLineSeries({ ...refLineOptions, title: '' });
-      const overboughtLine = oscChart.addLineSeries({ ...refLineOptions, title: '' });
-
-      oscillatorChartRef.current = oscChart;
-
-      // We need candle timestamps to anchor the reference lines across the full range.
-      // Store the line series so we can set data once candles are available.
-      // Use a short-lived ref trick: attach them to the chart object itself.
-      (oscChart as any)._refLines = { oversoldLine, overboughtLine };
-
-      // ── Time-scale synchronization ──
-      // Main → oscillator
-      chartRef.current?.timeScale().subscribeVisibleTimeRangeChange(range => {
-        if (isSyncingRef.current || !range || range.from == null || range.to == null) return;
-        isSyncingRef.current = true;
-        try {
-          oscChart.timeScale().setVisibleRange(range);
-        } catch { /* oscillator chart may not have data yet */ }
-        isSyncingRef.current = false;
-      });
-
-      // Oscillator → main
-      oscChart.timeScale().subscribeVisibleTimeRangeChange(range => {
-        if (isSyncingRef.current || !range || range.from == null || range.to == null) return;
-        isSyncingRef.current = true;
-        try {
-          chartRef.current?.timeScale().setVisibleRange(range);
-        } catch { /* main chart may not have data yet */ }
-        isSyncingRef.current = false;
-      });
-
-      return () => {
-        oscChart.remove();
-        oscillatorChartRef.current = null;
-        oscillatorSeriesRefs.current = [];
-      };
-    } catch (err) {
-      console.error('Failed to initialize oscillator chart:', err);
+    if (!oscContainerRef.current || !hasOscillator) {
+      if (oscChartRef.current) { oscChartRef.current.remove(); oscChartRef.current = null; }
+      return;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasOscillators]);
+    const w = oscContainerRef.current.clientWidth;
+    const osc = createChart(oscContainerRef.current, chartOpts(w, 150, true));
+    oscChartRef.current = osc;
 
-  // ── Update candle data + markers ──────────────────────────────────────────
-  useEffect(() => {
-    if (!candlestickSeriesRef.current || candles.length === 0) return;
+    // Sync scroll/zoom between charts using logical range
+    const syncFrom = (source: IChartApi, target: IChartApi) => {
+      source.timeScale().subscribeVisibleLogicalRangeChange(range => {
+        if (syncingRef.current || !range) return;
+        syncingRef.current = true;
+        try { target.timeScale().setVisibleLogicalRange(range); } catch { /* */ }
+        syncingRef.current = false;
+      });
+    };
+    if (mainChartRef.current) {
+      syncFrom(mainChartRef.current, osc);
+      syncFrom(osc, mainChartRef.current);
+    }
 
-    try {
-      const chartData: CandlestickData[] = candles
-        .map(candle => ({
-          time: toChartTime(candle.timestamp),
-          open: candle.open,
-          high: candle.high,
-          low: candle.low,
-          close: candle.close,
-        }))
+    // Add a hidden anchor series with the same timestamps as candles.
+    // This ensures both charts have identical logical bar indices so
+    // logical range sync maps to the same calendar times.
+    if (candles.length > 0) {
+      const anchor = osc.addLineSeries({
+        color: 'transparent', lineWidth: 1 as const, visible: false, priceLineVisible: false,
+        lastValueVisible: false, crosshairMarkerVisible: false,
+      });
+      const anchorData: LineData[] = candles
+        .map(c => ({ time: toChartTime(c.timestamp), value: 0 }))
         .sort((a, b) => (a.time as number) - (b.time as number));
+      anchor.setData(anchorData);
+      (osc as any)._anchor = anchor;
+    }
 
-      candlestickSeriesRef.current.setData(chartData);
-
-      // Set reference line data spanning the full candle range
-      if (oscillatorChartRef.current) {
-        const { oversoldLine, overboughtLine } = (oscillatorChartRef.current as any)._refLines ?? {};
-        if (oversoldLine && overboughtLine && chartData.length > 0) {
-          const first = chartData[0].time as UTCTimestamp;
-          const last = chartData[chartData.length - 1].time as UTCTimestamp;
-          oversoldLine.setData([
-            { time: first, value: 30 },
-            { time: last, value: 30 },
-          ] as LineData[]);
-          overboughtLine.setData([
-            { time: first, value: 70 },
-            { time: last, value: 70 },
-          ] as LineData[]);
-
-          // Lock the visible price range after data is loaded
-          oscillatorChartRef.current.priceScale('right').applyOptions({
-            autoScale: false,
-            scaleMargins: { top: 0.05, bottom: 0.05 },
+    // Crosshair sync: oscillator → main + RSI tooltip
+    osc.subscribeCrosshairMove(param => {
+      if (!param.time || !param.point) {
+        if (!crosshairSyncingRef.current && mainChartRef.current) {
+          crosshairSyncingRef.current = true;
+          mainChartRef.current.clearCrosshairPosition();
+          crosshairSyncingRef.current = false;
+        }
+        return;
+      }
+      // Update RSI value in tooltip when hovering on RSI pane
+      if (oscIndicators.length > 0) {
+        const ts = (param.time as number) * 1000;
+        const rsiPoint = oscIndicators[0].data.find(p => Math.abs(new Date(p.timestamp).getTime() - ts) < 1000);
+        if (rsiPoint) {
+          setCrosshairData(prev => prev ? { ...prev, rsi: rsiPoint.value.toFixed(1) } : {
+            time: new Date(ts).toLocaleString(), price: '', rsi: rsiPoint.value.toFixed(1),
           });
         }
       }
+      if (!crosshairSyncingRef.current && mainChartRef.current && candleSeriesRef.current) {
+        crosshairSyncingRef.current = true;
+        try { mainChartRef.current.setCrosshairPosition(0, param.time, candleSeriesRef.current); } catch { /* */ }
+        crosshairSyncingRef.current = false;
+      }
+    });
 
-      // Clamp signals to the candle time range to prevent off-screen markers
-      const candleTimeMin = (chartData[0].time as number) ?? 0;
-      const candleTimeMax = (chartData[chartData.length - 1].time as number) ?? Infinity;
-      const filteredSignals = signals.filter(s => {
-        const t = toChartTime(s.timestamp);
-        return t >= candleTimeMin && t <= candleTimeMax;
-      });
+    return () => { osc.remove(); oscChartRef.current = null; oscSeriesRefs.current = []; };
+  }, [chartOpts, hasOscillator, candles]);
 
-      // Build entry-exit pairs to compute exit P&L from price differences.
-      // The DB pnl field on signals is often null, so we derive it.
-      const exitPnlMap = new Map<string, number>(); // exit timestamp -> pips
-      let lastEntry: { price: number; direction: 'long' | 'short' } | null = null;
-      for (const sig of filteredSignals) {
-        if (sig.signalType.startsWith('entry')) {
-          lastEntry = {
-            price: sig.price,
-            direction: sig.signalType.includes('long') ? 'long' : 'short',
-          };
-        } else if (lastEntry && sig.price) {
-          const pips = lastEntry.direction === 'long'
-            ? (sig.price - lastEntry.price) / 0.0001
-            : (lastEntry.price - sig.price) / 0.0001;
-          exitPnlMap.set(sig.timestamp, pips);
+  // ── Set candle data + markers ──────────────────────────────────────
+  useEffect(() => {
+    if (!candleSeriesRef.current || candles.length === 0) return;
+    try {
+      const chartData: CandlestickData[] = candles
+        .map(c => ({ time: toChartTime(c.timestamp), open: c.open, high: c.high, low: c.low, close: c.close }))
+        .sort((a, b) => (a.time as number) - (b.time as number));
+      candleSeriesRef.current.setData(chartData);
+
+      const tMin = chartData[0].time as number;
+      const tMax = chartData[chartData.length - 1].time as number;
+      const filtered = signals.filter(s => { const t = toChartTime(s.timestamp); return t >= tMin && t <= tMax; });
+
+      // Build exit P&L map
+      const exitPnl = new Map<string, number>();
+      let lastEntry: { price: number; dir: string } | null = null;
+      for (const s of filtered) {
+        if (s.signalType.startsWith('entry')) { lastEntry = { price: s.price, dir: s.signalType.includes('long') ? 'long' : 'short' }; }
+        else if (lastEntry && s.price) {
+          const pips = lastEntry.dir === 'long' ? (s.price - lastEntry.price) / 0.0001 : (lastEntry.price - s.price) / 0.0001;
+          exitPnl.set(s.timestamp, pips);
           lastEntry = null;
         }
       }
 
-      const markers: SeriesMarker<Time>[] = filteredSignals.map(signal => {
-        const isEntry = signal.signalType.startsWith('entry');
-        const isLong = signal.signalType.includes('long');
-
-        let color: string;
-        let shape: 'arrowUp' | 'arrowDown' | 'circle';
-        let position: 'belowBar' | 'aboveBar';
-        let text: string;
-
+      const markers: SeriesMarker<Time>[] = filtered.map(sig => {
+        const isEntry = sig.signalType.startsWith('entry');
+        const isLong = sig.signalType.includes('long');
         if (isEntry) {
-          shape = isLong ? 'arrowUp' : 'arrowDown';
-          color = isLong ? '#22c55e' : '#ef4444';
-          position = isLong ? 'belowBar' : 'aboveBar';
-          text = isLong ? 'L' : 'S';
-        } else {
-          shape = 'circle';
-          const exitPips = signal.pnl != null
-            ? signal.pnl * 10000  // pnl is stored as decimal return
-            : exitPnlMap.get(signal.timestamp) ?? 0;
-          const isProfitable = exitPips > 0;
-          color = isProfitable ? '#22c55e' : '#ef4444';
-          position = 'aboveBar';
-          text = exitPips !== 0
-            ? exitPips > 0 ? `+${exitPips.toFixed(0)}` : `${exitPips.toFixed(0)}`
-            : 'X';
+          // Show RSI value on entry if available
+          const rsi = Object.entries(sig.indicatorValues ?? {}).find(([k]) => k.toLowerCase().includes('rsi'));
+          const label = isLong ? 'L' : 'S';
+          const text = rsi ? `${label} ${Number(rsi[1]).toFixed(0)}` : label;
+          const position: 'belowBar' | 'aboveBar' = isLong ? 'belowBar' : 'aboveBar';
+          const shape: 'arrowUp' | 'arrowDown' = isLong ? 'arrowUp' : 'arrowDown';
+          return { time: toChartTime(sig.timestamp), position, color: isLong ? '#22c55e' : '#ef4444', shape, text, size: 1 };
         }
-
-        return {
-          time: toChartTime(signal.timestamp),
-          position,
-          color,
-          shape,
-          text,
-          size: 1,
-        };
+        const pips = sig.pnl != null ? sig.pnl * 10000 : exitPnl.get(sig.timestamp) ?? 0;
+        const win = pips > 0;
+        return { time: toChartTime(sig.timestamp), position: 'aboveBar' as const, color: win ? '#22c55e' : '#ef4444', shape: 'circle' as const, text: pips !== 0 ? (win ? `+${pips.toFixed(0)}` : pips.toFixed(0)) : 'X', size: 1 };
       });
-
       markers.sort((a, b) => (a.time as number) - (b.time as number));
-      candlestickSeriesRef.current.setMarkers(markers);
-
-      chartRef.current?.timeScale().fitContent();
+      candleSeriesRef.current.setMarkers(markers);
+      mainChartRef.current?.timeScale().fitContent();
+      oscChartRef.current?.timeScale().fitContent();
       setChartError(null);
     } catch (err) {
-      console.error('Failed to update chart data:', err);
-      setChartError(err instanceof Error ? err.message : 'Failed to update chart data');
+      setChartError(err instanceof Error ? err.message : 'Failed to update chart');
     }
   }, [candles, signals]);
 
-  // ── Update overlay indicators (MA, Donchian) ─────────────────────────────
+  // ── Overlay indicators (MA, Donchian) ──────────────────────────────
   useEffect(() => {
-    if (!chartRef.current) return;
-
-    // Remove previous overlay series
-    overlaySeriesRefs.current.forEach(series => {
-      try {
-        chartRef.current?.removeSeries(series);
-      } catch {
-        // Series may already be gone
-      }
-    });
-    overlaySeriesRefs.current = [];
-
+    if (!mainChartRef.current) return;
+    overlayRefs.current.forEach(s => { try { mainChartRef.current?.removeSeries(s); } catch { /* */ } });
+    overlayRefs.current = [];
     if (!showIndicators || overlayIndicators.length === 0) return;
-
-    try {
-      overlayIndicators.forEach(indicator => {
-        const lineSeries = chartRef.current!.addLineSeries({
-          color: indicator.color,
-          lineWidth: 2,
-          title: indicator.name,
-          priceLineVisible: false,
-          lastValueVisible: false,
-        });
-
-        const lineData: LineData[] = indicator.data
-          .map(point => ({ time: toChartTime(point.timestamp), value: point.value }))
-          .sort((a, b) => (a.time as number) - (b.time as number));
-
-        lineSeries.setData(lineData);
-        overlaySeriesRefs.current.push(lineSeries);
-      });
-    } catch (err) {
-      console.error('Failed to update overlay indicators:', err);
-    }
-  }, [indicators, showIndicators]);
-
-  // ── Update oscillator indicators (RSI) ───────────────────────────────────
-  useEffect(() => {
-    if (!oscillatorChartRef.current) return;
-
-    // Remove previous oscillator series (but not the reference lines)
-    oscillatorSeriesRefs.current.forEach(series => {
-      try {
-        oscillatorChartRef.current?.removeSeries(series);
-      } catch {
-        // Series may already be gone
-      }
+    overlayIndicators.forEach(ind => {
+      const ls = mainChartRef.current!.addLineSeries({ color: ind.color, lineWidth: 2, title: ind.name, priceLineVisible: false, lastValueVisible: false });
+      const data: LineData[] = ind.data.map(p => ({ time: toChartTime(p.timestamp), value: p.value })).sort((a, b) => (a.time as number) - (b.time as number));
+      ls.setData(data);
+      overlayRefs.current.push(ls);
     });
-    oscillatorSeriesRefs.current = [];
-
-    if (!showIndicators || oscillatorIndicators.length === 0) return;
-
-    try {
-      oscillatorIndicators.forEach(indicator => {
-        const lineSeries = oscillatorChartRef.current!.addLineSeries({
-          color: indicator.color,
-          lineWidth: 2,
-          title: indicator.name,
-          priceLineVisible: false,
-          lastValueVisible: false,
-        });
-
-        const lineData: LineData[] = indicator.data
-          .map(point => ({ time: toChartTime(point.timestamp), value: point.value }))
-          .sort((a, b) => (a.time as number) - (b.time as number));
-
-        lineSeries.setData(lineData);
-        oscillatorSeriesRefs.current.push(lineSeries);
-      });
-    } catch (err) {
-      console.error('Failed to update oscillator indicators:', err);
-    }
   }, [indicators, showIndicators]);
 
-  // ── Chart control handlers ────────────────────────────────────────────────
-  const handleZoomIn = () => {
-    if (!chartRef.current) return;
-    const timeScale = chartRef.current.timeScale();
-    const visibleRange = timeScale.getVisibleRange();
-    if (visibleRange) {
-      const center = ((visibleRange.from as number) + (visibleRange.to as number)) / 2;
-      const halfRange = ((visibleRange.to as number) - (visibleRange.from as number)) / 4;
-      const newRange = {
-        from: (center - halfRange) as UTCTimestamp,
-        to: (center + halfRange) as UTCTimestamp,
-      };
-      timeScale.setVisibleRange(newRange);
-      // Oscillator chart syncs automatically via the subscribeVisibleTimeRangeChange listener
-    }
-  };
+  // ── Oscillator indicators (RSI) ────────────────────────────────────
+  useEffect(() => {
+    if (!oscChartRef.current) return;
+    oscSeriesRefs.current.forEach(s => { try { oscChartRef.current?.removeSeries(s); } catch { /* */ } });
+    oscSeriesRefs.current = [];
+    if (!showIndicators || oscIndicators.length === 0) return;
 
-  const handleZoomOut = () => {
-    if (!chartRef.current) return;
-    const timeScale = chartRef.current.timeScale();
-    const visibleRange = timeScale.getVisibleRange();
-    if (visibleRange) {
-      const center = ((visibleRange.from as number) + (visibleRange.to as number)) / 2;
-      const halfRange = (visibleRange.to as number) - (visibleRange.from as number);
-      const newRange = {
-        from: (center - halfRange) as UTCTimestamp,
-        to: (center + halfRange) as UTCTimestamp,
-      };
-      timeScale.setVisibleRange(newRange);
-    }
-  };
+    const dark = document.documentElement.classList.contains('dark');
+    oscIndicators.forEach(ind => {
+      const ls = oscChartRef.current!.addLineSeries({ color: ind.color, lineWidth: 2, title: ind.name, priceLineVisible: false, lastValueVisible: false });
+      const data: LineData[] = ind.data.map(p => ({ time: toChartTime(p.timestamp), value: p.value })).sort((a, b) => (a.time as number) - (b.time as number));
+      ls.setData(data);
+      oscSeriesRefs.current.push(ls);
+    });
 
+    // Reference lines at oversold/overbought from trial params (fallback 30/70)
+    const oversold = params.oversold ?? params.lower ?? 30;
+    const overbought = params.overbought ?? params.upper ?? 70;
+    if (candles.length > 0) {
+      const sorted = [...candles].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+      const t0 = toChartTime(sorted[0].timestamp);
+      const t1 = toChartTime(sorted[sorted.length - 1].timestamp);
+      const refOpts = { lineWidth: 1 as const, lineStyle: LineStyle.Dashed, color: dark ? '#4b5563' : '#9ca3af', priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, title: '' };
+      const lineLow = oscChartRef.current!.addLineSeries(refOpts);
+      lineLow.setData([{ time: t0, value: oversold }, { time: t1, value: oversold }] as LineData[]);
+      const lineHigh = oscChartRef.current!.addLineSeries(refOpts);
+      lineHigh.setData([{ time: t0, value: overbought }, { time: t1, value: overbought }] as LineData[]);
+      oscSeriesRefs.current.push(lineLow, lineHigh);
+    }
+
+    oscChartRef.current.timeScale().fitContent();
+  }, [indicators, showIndicators, candles]);
+
+  // ── Zoom handlers ──────────────────────────────────────────────────
+  const zoom = (factor: number) => {
+    if (!mainChartRef.current) return;
+    const ts = mainChartRef.current.timeScale();
+    const range = ts.getVisibleLogicalRange();
+    if (!range) return;
+    const center = (range.from + range.to) / 2;
+    const half = (range.to - range.from) / 2 * factor;
+    ts.setVisibleLogicalRange({ from: center - half, to: center + half });
+  };
   const handleReset = () => {
-    chartRef.current?.timeScale().fitContent();
-    // Oscillator will sync via listener; additionally trigger its own fitContent
-    // so the time labels render correctly before a pan event fires.
-    oscillatorChartRef.current?.timeScale().fitContent();
+    mainChartRef.current?.timeScale().fitContent();
+    oscChartRef.current?.timeScale().fitContent();
   };
 
-  // ── Loading state ─────────────────────────────────────────────────────────
-  if (isLoading) {
-    return (
-      <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-6">
-        <div className="flex items-center justify-center h-[500px]">
-          <div className="flex flex-col items-center gap-3">
-            <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-600 dark:border-blue-400" />
-            <p className="text-sm text-slate-600 dark:text-slate-400">Loading chart data...</p>
-          </div>
+  // ── Loading / Error / Empty states ─────────────────────────────────
+  if (isLoading) return (
+    <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-6">
+      <div className="flex items-center justify-center h-[500px]">
+        <div className="flex flex-col items-center gap-3">
+          <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-600 dark:border-blue-400" />
+          <p className="text-sm text-slate-600 dark:text-slate-400">Loading chart data...</p>
         </div>
       </div>
-    );
-  }
+    </div>
+  );
 
-  // ── Error state ───────────────────────────────────────────────────────────
   const displayError = error || chartError;
-  if (displayError) {
-    return (
-      <div className="bg-white dark:bg-slate-800 border border-red-200 dark:border-red-800 rounded-lg p-6">
-        <div className="flex items-center justify-center h-[500px]">
-          <div className="flex flex-col items-center gap-3 text-center max-w-md">
-            <div className="w-12 h-12 rounded-full bg-red-100 dark:bg-red-900/50 flex items-center justify-center">
-              <svg className="w-6 h-6 text-red-600 dark:text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-              </svg>
-            </div>
-            <p className="text-sm font-medium text-red-600 dark:text-red-400">Failed to load chart</p>
-            <p className="text-xs text-slate-600 dark:text-slate-400">{displayError}</p>
-          </div>
-        </div>
+  if (displayError) return (
+    <div className="bg-white dark:bg-slate-800 border border-red-200 dark:border-red-800 rounded-lg p-6">
+      <div className="flex items-center justify-center h-[500px]">
+        <p className="text-sm text-red-600 dark:text-red-400">{displayError}</p>
       </div>
-    );
-  }
+    </div>
+  );
 
-  // ── No data state ─────────────────────────────────────────────────────────
-  if (candles.length === 0) {
-    return (
-      <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-6">
-        <div className="flex items-center justify-center h-[500px]">
-          <div className="flex flex-col items-center gap-3 text-center">
-            <div className="w-12 h-12 rounded-full bg-slate-100 dark:bg-slate-700 flex items-center justify-center">
-              <svg className="w-6 h-6 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z" />
-              </svg>
-            </div>
-            <p className="text-sm font-medium text-slate-600 dark:text-slate-400">No chart data available</p>
-          </div>
-        </div>
+  if (candles.length === 0) return (
+    <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-6">
+      <div className="flex items-center justify-center h-[500px]">
+        <p className="text-sm text-slate-600 dark:text-slate-400">No chart data available</p>
       </div>
-    );
-  }
+    </div>
+  );
 
-  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg overflow-hidden">
-      {/* Chart Header */}
+      {/* Header */}
       <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-700 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">{instrument}</h3>
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            Strategy: {strategy.toUpperCase()}
-            {timeframe ? ` | Timeframe: ${timeframe}` : ''} | Params:{' '}
-            {Object.entries(params).map(([k, v]) => `${k}=${v}`).join(', ')}
+            Strategy: {strategy.toUpperCase()}{timeframe ? ` | Timeframe: ${timeframe}` : ''} | Params: {Object.entries(params).map(([k, v]) => `${k}=${v}`).join(', ')}
           </p>
         </div>
-
-        {/* Chart Controls */}
         <div className="flex items-center gap-2">
-          {/* Indicators Toggle */}
-          <button
-            onClick={() => setShowIndicators(!showIndicators)}
-            className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-colors ${
-              showIndicators
-                ? 'bg-blue-50 border-blue-200 text-blue-700 dark:bg-blue-900/30 dark:border-blue-800 dark:text-blue-400'
-                : 'bg-slate-50 border-slate-200 text-slate-700 dark:bg-slate-700 dark:border-slate-600 dark:text-slate-300'
-            }`}
-          >
+          <button onClick={() => setShowIndicators(!showIndicators)} className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-colors ${showIndicators ? 'bg-blue-50 border-blue-200 text-blue-700 dark:bg-blue-900/30 dark:border-blue-800 dark:text-blue-400' : 'bg-slate-50 border-slate-200 text-slate-700 dark:bg-slate-700 dark:border-slate-600 dark:text-slate-300'}`}>
             {showIndicators ? 'Hide Indicators' : 'Show Indicators'}
           </button>
-
           <div className="h-4 w-px bg-slate-200 dark:bg-slate-700" />
-
-          {/* Zoom Controls */}
-          <button
-            onClick={handleZoomIn}
-            className="p-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-400 transition-colors"
-            title="Zoom In"
-          >
-            <ZoomIn className="w-4 h-4" />
-          </button>
-          <button
-            onClick={handleZoomOut}
-            className="p-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-400 transition-colors"
-            title="Zoom Out"
-          >
-            <ZoomOut className="w-4 h-4" />
-          </button>
-          <button
-            onClick={handleReset}
-            className="p-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-400 transition-colors"
-            title="Reset View"
-          >
-            <Maximize2 className="w-4 h-4" />
-          </button>
+          <button onClick={() => zoom(0.5)} className="p-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-400" title="Zoom In"><ZoomIn className="w-4 h-4" /></button>
+          <button onClick={() => zoom(2)} className="p-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-400" title="Zoom Out"><ZoomOut className="w-4 h-4" /></button>
+          <button onClick={handleReset} className="p-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-400" title="Reset"><Maximize2 className="w-4 h-4" /></button>
         </div>
       </div>
 
-      {/* Crosshair Data Display */}
+      {/* OHLC tooltip */}
       {crosshairData && (
         <div className="px-4 py-2 bg-slate-50 dark:bg-slate-900/50 border-b border-slate-200 dark:border-slate-700 flex items-center gap-6 text-xs">
           <span className="text-slate-500 dark:text-slate-400">{crosshairData.time}</span>
-          {crosshairData.ohlc && (
-            <>
-              <span>
-                <span className="text-slate-500 dark:text-slate-400">O:</span>{' '}
-                <span className="font-mono text-slate-900 dark:text-slate-100">{crosshairData.ohlc.o}</span>
-              </span>
-              <span>
-                <span className="text-slate-500 dark:text-slate-400">H:</span>{' '}
-                <span className="font-mono text-slate-900 dark:text-slate-100">{crosshairData.ohlc.h}</span>
-              </span>
-              <span>
-                <span className="text-slate-500 dark:text-slate-400">L:</span>{' '}
-                <span className="font-mono text-slate-900 dark:text-slate-100">{crosshairData.ohlc.l}</span>
-              </span>
-              <span>
-                <span className="text-slate-500 dark:text-slate-400">C:</span>{' '}
-                <span className="font-mono font-medium text-slate-900 dark:text-slate-100">{crosshairData.ohlc.c}</span>
-              </span>
-            </>
+          {crosshairData.ohlc && <>
+            <span><span className="text-slate-500 dark:text-slate-400">O:</span> <span className="font-mono text-slate-900 dark:text-slate-100">{crosshairData.ohlc.o}</span></span>
+            <span><span className="text-slate-500 dark:text-slate-400">H:</span> <span className="font-mono text-slate-900 dark:text-slate-100">{crosshairData.ohlc.h}</span></span>
+            <span><span className="text-slate-500 dark:text-slate-400">L:</span> <span className="font-mono text-slate-900 dark:text-slate-100">{crosshairData.ohlc.l}</span></span>
+            <span><span className="text-slate-500 dark:text-slate-400">C:</span> <span className="font-mono font-medium text-slate-900 dark:text-slate-100">{crosshairData.ohlc.c}</span></span>
+          </>}
+          {crosshairData.rsi && (
+            <span><span className="text-purple-500 dark:text-purple-400 font-medium">RSI:</span> <span className="font-mono font-medium text-purple-700 dark:text-purple-300">{crosshairData.rsi}</span></span>
           )}
         </div>
       )}
 
-      {/* Main Candlestick Chart */}
-      <div ref={chartContainerRef} className="w-full" />
+      {/* Main candle chart */}
+      <div ref={mainContainerRef} className="w-full" />
 
-      {/* Oscillator Pane — only rendered when there are oscillator indicators */}
-      {hasOscillators && (
+      {/* RSI panel */}
+      {hasOscillator && showIndicators && (
         <>
-          {/* Divider with label */}
-          <div className="flex items-center gap-2 px-4 py-1 border-t border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/30">
-            <span className="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wide">
-              RSI
-            </span>
-            {showIndicators &&
-              oscillatorIndicators.map(ind => (
-                <span key={ind.name} className="flex items-center gap-1 text-xs text-slate-500 dark:text-slate-400">
-                  <span
-                    className="inline-block w-3 h-0.5 rounded"
-                    style={{ backgroundColor: ind.color }}
-                  />
-                  {ind.name}
-                </span>
-              ))}
-            <span className="ml-auto text-xs text-slate-400 dark:text-slate-500">30 / 70</span>
+          <div className="px-3 py-1 border-t border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/50 flex items-center justify-between">
+            <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+              <span className="font-medium">RSI</span>
+              <span className="text-slate-400 dark:text-slate-500">
+                {(params.oversold ?? 30).toFixed(1)} / {(params.overbought ?? 70).toFixed(1)}
+              </span>
+            </div>
           </div>
-          <div ref={oscillatorContainerRef} className="w-full" />
+          <div ref={oscContainerRef} className="w-full" />
         </>
       )}
 
-      {/* Chart Legend */}
+      {/* Legend */}
       <div className="px-4 py-3 border-t border-slate-200 dark:border-slate-700 flex flex-wrap items-center gap-4 text-xs">
-        {/* Overlay Indicator Legend */}
-        {showIndicators &&
-          overlayIndicators.map(indicator => (
-            <div key={indicator.name} className="flex items-center gap-1.5">
-              <div className="w-4 h-0.5 rounded" style={{ backgroundColor: indicator.color }} />
-              <span className="text-slate-600 dark:text-slate-400">{indicator.name}</span>
-            </div>
-          ))}
-
+        {showIndicators && overlayIndicators.map(ind => (
+          <div key={ind.name} className="flex items-center gap-1.5">
+            <div className="w-4 h-0.5 rounded" style={{ backgroundColor: ind.color }} />
+            <span className="text-slate-600 dark:text-slate-400">{ind.name}</span>
+          </div>
+        ))}
+        {showIndicators && oscIndicators.map(ind => (
+          <div key={ind.name} className="flex items-center gap-1.5">
+            <div className="w-4 h-0.5 rounded" style={{ backgroundColor: ind.color }} />
+            <span className="text-slate-600 dark:text-slate-400">{ind.name}</span>
+          </div>
+        ))}
         <div className="h-3 w-px bg-slate-200 dark:bg-slate-700" />
-
-        {/* Signal Legend */}
-        <div className="flex items-center gap-1.5">
-          <div className="w-0 h-0 border-l-4 border-r-4 border-b-8 border-transparent border-b-green-500" />
-          <span className="text-slate-600 dark:text-slate-400">Long Entry</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <div className="w-0 h-0 border-l-4 border-r-4 border-t-8 border-transparent border-t-red-500" />
-          <span className="text-slate-600 dark:text-slate-400">Short Entry</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <div className="w-3 h-3 rounded-full bg-green-500" />
-          <span className="text-slate-600 dark:text-slate-400">Profit Exit</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <div className="w-3 h-3 rounded-full bg-red-500" />
-          <span className="text-slate-600 dark:text-slate-400">Loss Exit</span>
-        </div>
+        <div className="flex items-center gap-1.5"><div className="w-0 h-0 border-l-4 border-r-4 border-b-8 border-transparent border-b-green-500" /><span className="text-slate-600 dark:text-slate-400">Long Entry</span></div>
+        <div className="flex items-center gap-1.5"><div className="w-0 h-0 border-l-4 border-r-4 border-t-8 border-transparent border-t-red-500" /><span className="text-slate-600 dark:text-slate-400">Short Entry</span></div>
+        <div className="flex items-center gap-1.5"><div className="w-3 h-3 rounded-full bg-green-500" /><span className="text-slate-600 dark:text-slate-400">Profit Exit</span></div>
+        <div className="flex items-center gap-1.5"><div className="w-3 h-3 rounded-full bg-red-500" /><span className="text-slate-600 dark:text-slate-400">Loss Exit</span></div>
       </div>
     </div>
   );
