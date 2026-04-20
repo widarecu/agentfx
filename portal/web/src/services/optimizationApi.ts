@@ -607,7 +607,7 @@ class OptimizationApiService {
     }
 
     if (strategy === 'rsi') {
-      const window = Math.round(params.window ?? params.fast ?? 14);
+      const window = Math.round(params.period ?? params.window ?? params.fast ?? 14);
       return [
         { name: 'rsi', color: colors[2], data: rsi(closes, window, timestamps) },
       ];
