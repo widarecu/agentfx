@@ -265,13 +265,24 @@ def run_backtest_from_db(
             signal_val = int(signal_val)
 
             if signal_val != prev_signal:
-                # Get indicator values at this point
+                # Get indicator values at the SIGNAL bar (previous bar),
+                # not the entry bar. The signal is shifted by 1 bar to
+                # prevent lookahead, so the indicator that triggered the
+                # trade is from the bar before.
                 indicator_values = {}
-                if indicator_df is not None and timestamp in indicator_df.index:
-                    for col in indicator_df.columns:
-                        val = indicator_df.loc[timestamp, col]
-                        if pd.notna(val):
-                            indicator_values[col] = float(val)
+                if indicator_df is not None:
+                    ts_idx = (
+                        indicator_df.index.get_loc(timestamp)
+                        if timestamp in indicator_df.index
+                        else -1
+                    )
+                    signal_bar_idx = ts_idx - 1 if ts_idx > 0 else ts_idx
+                    if signal_bar_idx >= 0:
+                        signal_bar_ts = indicator_df.index[signal_bar_idx]
+                        for col in indicator_df.columns:
+                            val = indicator_df.loc[signal_bar_ts, col]
+                            if pd.notna(val):
+                                indicator_values[col] = float(val)
 
                 # Determine signal type
                 if prev_signal == 0 and signal_val != 0:
@@ -459,7 +470,11 @@ def _get_indicator_values(
         )
 
     elif strategy_name in ("rsi", "rsi_mr", "rsi_mean_reversion"):
-        window = int(strategy_params.get("window", strategy_params.get("fast", 14)))
+        window = int(
+            strategy_params.get(
+                "period", strategy_params.get("window", strategy_params.get("fast", 14))
+            )
+        )
         delta = df["close"].diff()
         gain = delta.where(delta > 0, 0).rolling(window).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window).mean()
