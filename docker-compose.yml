@@ -93,6 +93,14 @@ services:
       # Override for Docker networking
       DATABASE_URL: postgresql://test_user:test_password@postgres-test:5432/agentfx_test
       BACKEND_CORS_ORIGINS: http://localhost:5174,http://localhost:8001
+      # Disable the ingestion worker for E2E. Tests pre-seed deterministic
+      # candle data via scripts/seed_test_candles.py; running OANDA backfill
+      # in parallel makes timeframe-availability tests timing-dependent.
+      INGESTION_ENABLED: "false"
+    volumes:
+      # Bind-mount scripts/ so `docker compose exec backend-test python scripts/seed_test_data.py`
+      # works without shipping test-only seed scripts in the production image.
+      - ./scripts:/app/scripts:ro
     depends_on:
       postgres-test:
         condition: service_healthy

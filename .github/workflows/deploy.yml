@@ -113,6 +113,11 @@ jobs:
         working-directory: portal/web
         env:
           NODE_PATH: ${{ github.workspace }}/portal/web/node_modules
+          # Override Playwright defaults (Docker test profile ports 5174/8001)
+          # because this CI job runs uvicorn/vite directly on 5173/8000 without
+          # docker-compose. Once CI migrates to docker-compose these can be removed.
+          PLAYWRIGHT_BASE_URL: http://localhost:5173
+          API_BASE_URL: http://localhost:8000/api/v1
 
       - name: Upload E2E artifacts on failure
         if: failure()

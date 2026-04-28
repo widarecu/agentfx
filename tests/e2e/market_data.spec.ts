@@ -1,8 +1,5 @@
 import { test, expect } from '@playwright/test';
 
-const BASE_URL = 'http://localhost:5173';
-const API_BASE_URL = 'http://localhost:8000/api/v1';
-
 /**
  * Market Data E2E Tests
  *

@@ -42,22 +42,21 @@ make backtest-full PAIRS="AUDUSD,EURUSD" DAYS=2 STRATEGY=ma FAST=20 SLOW=50
 
 ## Testing
 
+**Local runtime is Docker-only.** Postgres (and the backend/frontend during E2E) run in containers via `docker-compose.yml`. Installing local PostgreSQL is no longer supported or required.
+
 ### CANONICAL COMMANDS - ALWAYS USE THESE
 
-| Test Type | Command | Database Required |
-|-----------|---------|-------------------|
-| **Unit tests** | `make test-unit` | No |
-| **Integration tests** | `make test-integration` | Yes (PostgreSQL:5432) |
-| **E2E tests** | `make e2e` | Yes + Servers (managed) |
-| **All tests** | `make test` | Yes (PostgreSQL:5432) |
+| Test Type | Command | What it uses |
+|-----------|---------|--------------|
+| **Unit tests** | `make test-unit` | No DB, no Docker (mocked) |
+| **Integration tests** | `make test-integration` | Dockerised Postgres on host port **5433** (`docker-compose --profile test`) |
+| **E2E tests** | `make e2e` | Full Dockerised stack: postgres-test (5433), backend-test (8001), frontend-test (5174) |
 | **Specific file** | `make test-file FILE=path/to/test.py` | Depends on file |
 | **Pattern match** | `make test-pattern PATTERN="test_name"` | Depends on matches |
 
-**Why Makefile:** All `make` commands automatically set `ENVIRONMENT=test` and `PYTHONPATH=src`. This ensures the correct `.env.test` configuration is loaded.
+`make` targets automatically set `ENVIRONMENT=test` and `PYTHONPATH=src`, so `.env.test` is loaded and host-run tooling points at the Dockerised Postgres on `localhost:5433`.
 
 ### DO NOT USE - ANTI-PATTERNS
-
-**These commands will cause configuration problems:**
 
 | Bad Command | Why It Fails |
 |-------------|--------------|
@@ -65,7 +64,8 @@ make backtest-full PAIRS="AUDUSD,EURUSD" DAYS=2 STRATEGY=ma FAST=20 SLOW=50
 | `pytest tests/integration/` | Missing `ENVIRONMENT=test`, connects to wrong database |
 | `python -m pytest tests/` | Uses system Python, wrong dependencies |
 | `PYTHONPATH=src pytest tests/` | Still missing `ENVIRONMENT=test` |
-| Manual uvicorn + npm for E2E | Bypasses migrations, seeding, cleanup |
+| `brew services start postgresql@15` | Local Postgres is deprecated — use Docker |
+| Manual uvicorn + npm for E2E | Bypasses Docker stack, seeding, cleanup |
 
 **If you must run pytest directly, use the FULL command:**
 ```bash
@@ -74,31 +74,24 @@ ENVIRONMENT=test PYTHONPATH=src .venv/bin/pytest tests/unit/ -v
 
 ### Test Categories
 
-| Category | Command | Database Required | Description |
-|----------|---------|-------------------|-------------|
-| **Unit** | `make test-unit` | No (mocked) | Fast, isolated tests with mocked dependencies |
-| **Integration** | `make test-integration` | Yes (PostgreSQL) | Tests with real database connections |
-| **E2E** | `make e2e` | Yes + Servers | Full-stack tests with Playwright |
+| Category | Command | Runtime | Description |
+|----------|---------|---------|-------------|
+| **Unit** | `make test-unit` | Mocked | Fast, isolated tests with mocked dependencies |
+| **Integration** | `make test-integration` | Dockerised Postgres (5433) | Tests with a real database connection |
+| **E2E** | `make e2e` | Full Docker stack | Playwright against the containerised frontend/backend |
 
 ### Prerequisites
 
-**For Integration and E2E tests, PostgreSQL must be running:**
-```bash
-# Verify PostgreSQL is accessible
-psql -U test_user -d agentfx_test -h localhost -p 5432 -c "SELECT 1"
+**Docker Desktop (or Colima/OrbStack) must be running.** That is the only dependency for Integration and E2E tests.
 
-# If not running, start it:
-brew services start postgresql@15
+```bash
+docker info                # Verify the Docker daemon is up
+docker compose version     # Verify Compose v2 is available
 ```
 
-**For E2E tests, ensure ports are free:**
+For E2E, ensure the Docker test ports are free (`docker compose --profile test down` if a previous run is still up):
 ```bash
-lsof -i :8000  # Should show nothing
-lsof -i :5173  # Should show nothing
-
-# Kill stuck processes if needed:
-kill -9 $(lsof -t -i:8000) 2>/dev/null || true
-kill -9 $(lsof -t -i:5173) 2>/dev/null || true
+lsof -i :5433 -i :8001 -i :5174
 ```
 
 ### Running Unit Tests
@@ -111,19 +104,29 @@ make test-file FILE=tests/unit/market_data/test_market_data.py
 
 ### Running Integration Tests
 
+Integration tests hit a real Postgres running inside Docker. Bring up the `test` profile stack (or at least `postgres-test`), then run pytest:
+
 ```bash
-# Ensure PostgreSQL is running first, then:
+make docker-up PROFILE=test   # Starts postgres-test on host port 5433 (plus backend-test / frontend-test)
 make test-integration
+make docker-down PROFILE=test
 ```
+
+`make test-integration` reads `.env.test` which points `DATABASE_URL` at `localhost:5433`, so no extra env setup is needed.
 
 ### Running E2E Tests
 
-The `make e2e` target handles server lifecycle automatically:
+`make e2e` owns the full lifecycle — it builds and starts the `test` profile stack, seeds test users inside the `backend-test` container, runs Playwright on the host against the containerised frontend, then tears the stack down on exit:
 
 ```bash
-make e2e                 # Standard run
-make e2e E2E_HEADED=1    # Show browser
-make e2e E2E_DEBUG=1     # Debug mode
+make e2e                 # Standard run (stack up → seed → tests → stack down)
+make e2e E2E_HEADED=1    # Show the browser
+make e2e E2E_DEBUG=1     # Playwright debug mode
+```
+
+To keep the stack up after tests (useful for iterating on specs without rebuilding containers each time):
+```bash
+./scripts/run-e2e-tests.sh --keep
 ```
 
 ### Running Specific Tests
@@ -147,21 +150,20 @@ make test-pattern PATTERN="test_login"
 - Fix: Use `make test-*` commands (set automatically)
 
 **Symptom: "could not connect to server" on integration tests**
-- Cause: PostgreSQL not running
-- Fix: `brew services start postgresql@15`
+- Cause: Docker test Postgres not running
+- Fix: `make docker-up PROFILE=test`
 
-**Symptom: E2E tests fail with "Target closed" / "Connection refused"**
-- Cause: Ports 8000/5173 blocked by previous processes
-- Fix: Kill processes and retry:
-  ```bash
-  kill -9 $(lsof -t -i:8000) 2>/dev/null || true
-  kill -9 $(lsof -t -i:5173) 2>/dev/null || true
-  make e2e
-  ```
+**Symptom: E2E fails immediately with "Cannot connect to the Docker daemon"**
+- Cause: Docker Desktop not running
+- Fix: start Docker Desktop, then re-run `make e2e`
+
+**Symptom: E2E fails at startup with "port is already allocated" on 5433/8001/5174**
+- Cause: a previous test stack is still up, or another service is bound to the port
+- Fix: `make docker-down PROFILE=test` (or `docker compose --profile test down --remove-orphans`)
 
 **Symptom: "relation 'users' does not exist"**
-- Cause: Migrations not applied
-- Fix: `ENVIRONMENT=test .venv/bin/alembic upgrade head`
+- Cause: Migrations didn't complete — the `backend-test` container's entrypoint runs `alembic upgrade head`; if you see this, the container didn't finish startup
+- Fix: `make docker-logs PROFILE=test` and look for migration errors
 
 ### Test Markers
 
@@ -231,52 +233,35 @@ These defeat the purpose of integration testing against real OANDA.
 
 ## Starting Servers
 
-### Docker (Preferred)
-
-Docker runs the **same image** deployed to Railway, ensuring environment parity. All credentials are loaded from `.env.development` or `.env.test` automatically.
+Everything runs in Docker. The containers use the **same image** deployed to Railway, so local work stays in parity with production. Credentials are loaded from `.env.development` (dev profile) or `.env.test` (test profile) automatically.
 
 ```bash
 # Development stack — full stack with ingestion worker
-make docker-up PROFILE=dev     # Start (backend:8000, frontend:5173, postgres:5432)
-make docker-down PROFILE=dev   # Stop
-make docker-logs PROFILE=dev   # Follow all logs
+make docker-up PROFILE=dev     # backend:8000, frontend:5173, postgres:5432
+make docker-down PROFILE=dev
+make docker-logs PROFILE=dev          # Follow all logs
 make docker-backend-logs PROFILE=dev  # Backend logs only
 
-# Test stack — separate DB, separate ports
-make docker-up PROFILE=test    # Start (backend:8001, frontend:5174, postgres:5433)
-make docker-down PROFILE=test  # Stop
+# Test stack — separate DB, separate ports (no conflicts with dev)
+make docker-up PROFILE=test    # backend-test:8001, frontend-test:5174, postgres-test:5433
+make docker-down PROFILE=test
 
 # Rebuild after code changes
 make docker-rebuild PROFILE=dev
 ```
 
-**Important:** Dev and test profiles are fully isolated — different containers, databases, and ports. Only one profile's services start at a time.
+**Important:** Dev and test profiles are fully isolated — different containers, databases, and host ports. They can run simultaneously if you need both.
 
-The `docker-compose.yml` defines both profiles:
-- **dev**: Loads `.env.development`, ingestion enabled, PostgreSQL `agentfx_dev`
-- **test**: Loads `.env.test`, separate PostgreSQL `agentfx_test` on port 5433
-
-### Venv (Alternative — for fast iteration with hot-reload)
-
-Use the shell scripts when you need hot-reload or want to run individual components:
-
-```bash
-# Development environment (default)
-ENVIRONMENT=development ./scripts/start-backend.sh
-ENVIRONMENT=development ./scripts/start-all.sh
-
-# Test environment
-ENVIRONMENT=test ./scripts/start-backend.sh
-```
-
-The startup scripts handle environment selection, database checks, migrations, and venv activation. **Do NOT start uvicorn or npm dev directly** — it bypasses configuration and migrations.
+`docker-compose.yml` defines both profiles:
+- **dev**: Loads `.env.development`, ingestion enabled, database `agentfx_dev`
+- **test**: Loads `.env.test`, database `agentfx_test`, `scripts/` is bind-mounted read-only into `backend-test` so test-only seed scripts (`seed_test_data.py`, `seed_test_candles.py`) are executable via `docker compose exec backend-test python scripts/…` without shipping them in the production image.
 
 ### Seed Test Data (Before E2E Tests)
 
+`make e2e` handles this automatically. If you bring the test stack up yourself and need to seed test users manually:
+
 ```bash
-# Seed test users to the database
-DATABASE_URL=postgresql://test_user:test_password@localhost:5432/agentfx_test \
-  PYTHONPATH=src .venv/bin/python scripts/seed_test_data.py
+docker compose --profile test exec backend-test python scripts/seed_test_data.py
 ```
 
 This creates the standard test users:
@@ -298,9 +283,11 @@ This creates the standard test users:
 ### CI/CD Pipeline
 
 Defined in `.github/workflows/deploy.yml`. On push to `main`:
-1. E2E tests run (currently disabled, re-enable with `needs: e2e`)
-2. Backend deploys to Railway (`railway up --detach --service agentfx`)
-3. Frontend deploys to Vercel (`vercel deploy --prod`)
+1. E2E tests run (currently not a deploy blocker — `needs: e2e` is commented out on the backend/frontend deploy jobs).
+2. Backend deploys to Railway (`railway up --detach --service agentfx`).
+3. Frontend deploys to Vercel (`vercel deploy --prod`).
+
+**Note (CI E2E vs local E2E):** The CI E2E job still provisions Postgres via a GitHub Actions service container on port 5432 and runs uvicorn/vite directly on host ports 5173/8000 — it does **not** yet use `docker compose --profile test` like the local flow. The workflow sets `PLAYWRIGHT_BASE_URL=http://localhost:5173` and `API_BASE_URL=http://localhost:8000/api/v1` to pin Playwright to those ports (the config default is the Docker test profile on 5174/8001). Migrating CI to `make e2e` for a single code path is a pending follow-up.
 
 ### Dockerfile
 

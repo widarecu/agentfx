@@ -388,20 +388,17 @@ test.describe('Job Execution', () => {
     const hasRows = await firstRow.isVisible();
 
     if (hasRows) {
-      // Get initial status (Status is the 4th column: Job ID, Strategy, Pair, Status)
-      const statusCell = firstRow.locator('td').nth(3);
-      const initialStatus = await statusCell.textContent();
+      const statusRegex = /queued|running|completed|failed/i;
 
-      // Wait a bit and refresh
+      const initialStatus = await firstRow.getByText(statusRegex).first().textContent();
+
       await page.waitForTimeout(5000);
       await page.reload();
       await page.waitForTimeout(2000);
 
-      // Status might have changed if job was running
-      const newStatusCell = page.locator('table tbody tr').first().locator('td').nth(3);
-      const newStatus = await newStatusCell.textContent();
+      const newRow = page.locator('table tbody tr').first();
+      const newStatus = await newRow.getByText(statusRegex).first().textContent();
 
-      // Both should be valid statuses
       expect(
         ['queued', 'running', 'completed', 'failed'].some(s =>
           initialStatus?.toLowerCase().includes(s) || newStatus?.toLowerCase().includes(s)

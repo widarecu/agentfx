@@ -56,60 +56,8 @@ test.describe('Authentication Flows', () => {
     await page.locator('#email').fill(EMAIL);
     await page.locator('#password').fill(PASSWORD);
     
-    // Set up login response and navigation
-    const loginResponsePromise = page.waitForResponse(
-      response => response.url().includes('/api/v1/login') && response.request().method() === 'POST'
-    );
-    
-    // Submit the form
     await page.getByRole('button', { name: 'Sign in' }).click();
-    
-    // Wait for login response and log details
-    const loginResponse = await loginResponsePromise;
-    console.log('Login response status:', loginResponse.status());
-    console.log('Response headers:', JSON.stringify(loginResponse.headers(), null, 2));
-    
-    try {
-      const responseBody = await loginResponse.json();
-      console.log('Login response body:', JSON.stringify(responseBody, null, 2));
-    } catch (e) {
-      console.log('Could not parse login response as JSON');
-    }
-    
-    // Wait for any navigation
-    try {
-      await page.waitForURL('**/*', { timeout: NAVIGATION_TIMEOUT });
-      console.log('Navigated to:', page.url());
-    } catch (error) {
-      console.log('No navigation occurred after login, current URL:', page.url());
-    }
-    
-    // Check if we're still on the login page
-    const currentUrl = page.url();
-    console.log('Current URL after login attempt:', currentUrl);
-    
-    if (currentUrl.includes('/login')) {
-      // If we're still on the login page, check for error messages
-      const errorElement = await page.getByText(/error|failed|invalid/i).first();
-      if (await errorElement.isVisible()) {
-        console.log('Error message on login page:', await errorElement.textContent());
-      } else {
-        console.log('No error message found on login page');
-      }
-      
-      // Check if there are any console errors
-      const consoleMessages = await page.evaluate(() => {
-        return (window as any).consoleErrors || [];
-      });
-      
-      if (consoleMessages.length > 0) {
-        console.log('Console errors:', consoleMessages);
-      }
-      
-      throw new Error('Login failed - still on login page');
-    }
-    
-    // If we got here, we're not on the login page
+    await expect(page).toHaveURL('/', { timeout: NAVIGATION_TIMEOUT });
     await page.waitForLoadState('networkidle');
     
     // Verify we can see the logout button
