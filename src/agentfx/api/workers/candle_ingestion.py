@@ -996,15 +996,13 @@ async def run_health_check() -> tuple[int, bool]:
 
     logger.info(f"Running candle data health check ({len(combos)} combinations)...")
 
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     loop = asyncio.get_event_loop()
-
-    tasks = [
-        loop.run_in_executor(executor, _health_check_one, instrument, granularity)
-        for instrument, granularity in combos
-    ]
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        tasks = [
+            loop.run_in_executor(executor, _health_check_one, instrument, granularity)
+            for instrument, granularity in combos
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
     total_healed = 0
     any_hit_max = False
@@ -1065,16 +1063,14 @@ async def startup_backfill() -> int:
         f"Granularities: {settings.granularities_list}"
     )
 
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     loop = asyncio.get_event_loop()
-
-    # Submit all combinations in parallel
-    tasks = [
-        loop.run_in_executor(executor, backfill_instrument, instrument, granularity)
-        for instrument, granularity in combos
-    ]
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        # Submit all combinations in parallel
+        tasks = [
+            loop.run_in_executor(executor, backfill_instrument, instrument, granularity)
+            for instrument, granularity in combos
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Tally results and log failures
     total_stored = 0
@@ -1244,6 +1240,7 @@ async def ingestion_loop():
             except TimeoutError:
                 continue
 
+    executor.shutdown(wait=True)
     logger.info("Candle ingestion worker stopped")
 
 
