@@ -32,6 +32,14 @@ class Instrument(Base):
     is_tradeable = Column(Boolean, default=True)
     is_active = Column(Boolean, default=True)  # Soft delete flag
 
+    # OANDA financing rates (annualised decimal, e.g. 0.02 = 2%/year).
+    # Sign convention matches OANDA's account-statement view:
+    # positive = client pays, negative = client receives.
+    # Null means "not yet refreshed" — backtest falls back to zero swap cost.
+    financing_long_rate = Column(Float, nullable=True)
+    financing_short_rate = Column(Float, nullable=True)
+    financing_updated_at = Column(DateTime(timezone=True), nullable=True)
+
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

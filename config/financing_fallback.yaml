@@ -1,0 +1,31 @@
+# Static financing-rate fallback for pairs where OANDA's practice-account
+# REST API returns "0" instead of real rates. As of 2026-05-04 the missing
+# pairs are systematically all GBP- and JPY-quoted pairs (verified across
+# all 127 instruments OANDA exposes). Live OANDA accounts may return proper
+# data — refresh-financing should be re-run after going live to confirm.
+#
+# Rates are annualised decimals. Sign convention matches OANDA's
+# /v3/accounts/.../instruments payload:
+#   positive = position receives credit, negative = position pays.
+#
+# Derivation method: differential between the two currencies' central-bank
+# overnight rates, minus a typical 1% OANDA spread on each side (so both
+# directions are slightly worse than the pure interbank carry). Validated
+# against the 4 pairs OANDA does return (EUR_USD, AUD_USD, USD_CHF,
+# USD_CAD) — the API rates match this method within 40 basis points.
+#
+# Refresh policy: review when any central bank moves rates materially or
+# at most quarterly.
+#
+# Source for central-bank rates used in derivation (last refreshed 2026-05-04):
+#   USD 3.75% | EUR 2.15% | GBP 3.75% | JPY 0.75% |
+#   AUD 4.10% | CHF 0.00% | CAD 2.25%
+financing_fallback:
+  GBP_USD:
+    long_rate: -0.010
+    short_rate: -0.010
+    note: "BoE 3.75% = Fed 3.75% → ~0% differential; both sides eat OANDA spread."
+  USD_JPY:
+    long_rate: 0.020
+    short_rate: -0.040
+    note: "Fed 3.75% - BoJ 0.75% = +3% differential; ~1% OANDA spread on each side."

@@ -1,23 +1,37 @@
 #!/usr/bin/env python3
 """Seed instrument metadata for first-time deployment.
 
-This script populates the instruments table with supported FX pairs.
-It does NOT fetch candle data - that is handled by the ingestion worker.
+This script populates the instruments table with supported FX pairs and,
+when OANDA credentials are available, refreshes the per-instrument
+financing (swap) rates used by the backtest engine.
 
 Usage:
     PYTHONPATH=src python scripts/seed_instruments.py
+        Seed missing instruments and refresh financing rates.
 
-This should be run ONCE during initial deployment.
-The candle_ingestion worker handles all candle data (backfill and continuous updates).
+    PYTHONPATH=src python scripts/seed_instruments.py --refresh-financing
+        Skip metadata seed; only refresh financing rates for existing rows.
+
+    PYTHONPATH=src python scripts/seed_instruments.py --skip-financing
+        Seed metadata only; do not call OANDA for financing rates.
+
+The candle_ingestion worker handles all candle data (backfill and continuous
+updates) — this script only owns metadata and financing rates.
 """
 
+import argparse
 import logging
 import os
 import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+import yaml
 
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from agentfx.adapters.oanda import OandaClient, OandaError
 from agentfx.api.core.config import settings
 from agentfx.api.core.database import Base, SessionLocal, engine
 from agentfx.api.models.instrument import Instrument
@@ -86,26 +100,164 @@ def seed_instruments() -> dict[str, int]:
     return {"created": created, "skipped": skipped}
 
 
+_FALLBACK_PATH = (
+    Path(__file__).resolve().parent.parent / "config" / "financing_fallback.yaml"
+)
+
+
+def _load_financing_fallback() -> dict[str, dict[str, float]]:
+    """Load the static fallback rates keyed by symbol.
+
+    Returns an empty dict if the file is missing or malformed (the refresh
+    will then simply skip the fallback and persist whatever OANDA returned).
+    """
+    try:
+        with _FALLBACK_PATH.open() as f:
+            data = yaml.safe_load(f) or {}
+        return data.get("financing_fallback", {}) or {}
+    except FileNotFoundError:
+        logger.warning(f"Financing fallback file not found at {_FALLBACK_PATH}")
+        return {}
+    except Exception as e:
+        logger.warning(f"Could not parse {_FALLBACK_PATH}: {e}")
+        return {}
+
+
+def refresh_financing_rates() -> dict[str, int]:
+    """Fetch latest OANDA financing rates and persist them on instruments.
+
+    Failures (OANDA unreachable, missing credentials, malformed response) are
+    logged but do not raise — they leave existing rows untouched and allow
+    deploys to proceed even when OANDA is intermittently unavailable.
+
+    Returns:
+        Dictionary with counts: refreshed, failed, skipped (no row in DB yet).
+    """
+    if not settings.OANDA_API_KEY or not settings.OANDA_ACCOUNT_ID:
+        logger.warning(
+            "OANDA_API_KEY or OANDA_ACCOUNT_ID not set — skipping financing refresh."
+        )
+        return {"refreshed": 0, "failed": 0, "skipped": len(SUPPORTED_INSTRUMENTS)}
+
+    try:
+        client = OandaClient()
+    except OandaError as e:
+        logger.warning(f"Could not initialise OandaClient: {e}")
+        return {"refreshed": 0, "failed": len(SUPPORTED_INSTRUMENTS), "skipped": 0}
+
+    fallback_table = _load_financing_fallback()
+
+    db = SessionLocal()
+    refreshed = 0
+    fallback_used = 0
+    failed = 0
+    skipped = 0
+
+    try:
+        for instr_data in SUPPORTED_INSTRUMENTS:
+            symbol = instr_data["symbol"]
+            row = db.query(Instrument).filter(Instrument.symbol == symbol).first()
+            if row is None:
+                logger.warning(
+                    f"{symbol}: no row in instruments table — run seed first."
+                )
+                skipped += 1
+                continue
+
+            try:
+                rates = client.get_instrument_financing(symbol)
+            except OandaError as e:
+                logger.warning(f"{symbol}: financing fetch failed ({e})")
+                failed += 1
+                continue
+
+            # OANDA's practice account returns "0"/"0" for GBP- and JPY-quoted
+            # pairs (verified 2026-05-04 across all 127 instruments). Treat
+            # 0/0 as missing-data and substitute from the static fallback so
+            # backtests don't silently underestimate carry-trade strategies.
+            if (
+                rates["long_rate"] == 0.0
+                and rates["short_rate"] == 0.0
+                and symbol in fallback_table
+            ):
+                fb = fallback_table[symbol]
+                logger.warning(
+                    f"{symbol}: OANDA returned 0/0; using fallback "
+                    f"long={fb['long_rate']:.6f}, short={fb['short_rate']:.6f}"
+                )
+                rates = {
+                    "long_rate": float(fb["long_rate"]),
+                    "short_rate": float(fb["short_rate"]),
+                    "fetched_at": rates.get("fetched_at", datetime.now(UTC)),
+                }
+                fallback_used += 1
+
+            row.financing_long_rate = rates["long_rate"]
+            row.financing_short_rate = rates["short_rate"]
+            row.financing_updated_at = rates.get("fetched_at", datetime.now(UTC))
+            logger.info(
+                f"{symbol}: long={rates['long_rate']:.6f}, "
+                f"short={rates['short_rate']:.6f}"
+            )
+            refreshed += 1
+
+        db.commit()
+
+    finally:
+        db.close()
+
+    return {
+        "refreshed": refreshed,
+        "fallback_used": fallback_used,
+        "failed": failed,
+        "skipped": skipped,
+    }
+
+
 def main():
     """Main entry point for the instrument seeder."""
+    parser = argparse.ArgumentParser(
+        description="Seed instrument metadata and refresh financing rates."
+    )
+    parser.add_argument(
+        "--refresh-financing",
+        action="store_true",
+        help="Skip metadata seed; only refresh financing rates for existing rows.",
+    )
+    parser.add_argument(
+        "--skip-financing",
+        action="store_true",
+        help="Seed metadata only; do not call OANDA for financing rates.",
+    )
+    args = parser.parse_args()
+
     logger.info("=" * 60)
     logger.info("AgentFX Instrument Seeder")
     logger.info("=" * 60)
     logger.info(f"Environment: {settings.ENVIRONMENT}")
     logger.info(f"Database URL: {settings.DATABASE_URL[:50]}...")
     logger.info("")
-    logger.info("NOTE: This script seeds INSTRUMENT METADATA only.")
-    logger.info("Candle data is handled by the ingestion worker on server startup.")
-    logger.info("")
 
-    results = seed_instruments()
+    if not args.refresh_financing:
+        logger.info("Step 1: seeding instrument metadata")
+        results = seed_instruments()
+        logger.info("")
+        logger.info("Metadata Summary")
+        logger.info(f"  Created: {results['created']} instruments")
+        logger.info(f"  Skipped: {results['skipped']} instruments (already exist)")
+        logger.info("")
 
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info("Seeding Summary")
-    logger.info("=" * 60)
-    logger.info(f"  Created: {results['created']} instruments")
-    logger.info(f"  Skipped: {results['skipped']} instruments (already exist)")
+    if not args.skip_financing:
+        logger.info("Step 2: refreshing OANDA financing rates")
+        fin_results = refresh_financing_rates()
+        logger.info("")
+        logger.info("Financing Summary")
+        logger.info(f"  Refreshed:     {fin_results['refreshed']} instruments")
+        logger.info(
+            f"  Fallback used: {fin_results.get('fallback_used', 0)} instruments"
+        )
+        logger.info(f"  Failed:        {fin_results['failed']} instruments")
+        logger.info(f"  Skipped:       {fin_results['skipped']} instruments")
     logger.info("=" * 60)
 
     return 0

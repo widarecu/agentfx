@@ -37,7 +37,9 @@ MIN_CANDLES_FOR_BACKTEST = 100
 # Maximum time to wait for candle ingestion (seconds)
 # Ingestion processes M1, M5, M15, H1 for each instrument - H1 comes last
 # 5 days of backfill at ~500 candles/request means multiple API calls
-MAX_WAIT_FOR_CANDLES = 300  # 5 minutes for full ingestion cycle
+MAX_WAIT_FOR_CANDLES = 30  # 30 s — candles are pre-seeded by the
+# session-scope autouse fixture in tests/integration/conftest.py;
+# this is just a fail-fast guard for cases where seeding didn't run.
 
 
 @pytest.fixture(scope="module")

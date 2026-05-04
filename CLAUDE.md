@@ -94,6 +94,12 @@ For E2E, ensure the Docker test ports are free (`docker compose --profile test d
 lsof -i :5433 -i :8001 -i :5174
 ```
 
+**Required setting in `.env.test` (gitignored, per-dev):**
+```
+INGESTION_ENABLED=false
+```
+Pytest reads `.env.test` directly via Pydantic Settings; with the worker enabled, `TestClient(app)` triggers FastAPI lifespan startup → OANDA backfill → 60-second teardown timeouts. The integration suite has a session-scope autouse fixture in [tests/integration/conftest.py](tests/integration/conftest.py) that pre-seeds candles for tests that previously relied on the worker, so disabling it locally is safe.
+
 ### Running Unit Tests
 
 ```bash

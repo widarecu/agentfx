@@ -367,3 +367,28 @@ def test_client_with_db(db_session):
     with TestClient(app) as client:
         yield client
     app.dependency_overrides.pop(get_db, None)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _session_seed_test_candles(test_engine):
+    """Pre-seed deterministic candle data once per integration session.
+
+    With INGESTION_ENABLED=false in .env.test the OANDA worker no longer
+    runs during tests, so optimization/pipeline tests that previously
+    expected the worker to populate Postgres now need candles seeded
+    explicitly. We invoke scripts/seed_test_candles.py via subprocess so
+    it runs in a fresh process with .env.test loaded the same way the
+    application would. Idempotent: the script no-ops if EUR_USD M1
+    candles already exist.
+    """
+    import subprocess
+    import sys
+
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    subprocess.run(
+        [sys.executable, "scripts/seed_test_candles.py"],
+        check=True,
+        cwd=project_root,
+        env={**os.environ, "ENVIRONMENT": "test", "PYTHONPATH": "src"},
+    )
+    yield

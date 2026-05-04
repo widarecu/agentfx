@@ -40,19 +40,27 @@ def seed_candles():
             print(f"Candles already exist ({existing} EUR_USD M1). Skipping seed.")
             return
 
-        # Generate candles for multiple timeframes so the timeframe dropdown populates
-        base_time = datetime.now(UTC) - timedelta(days=1)
+        # Generate candles for multiple timeframes so the timeframe dropdown
+        # populates and backtests have enough history. base_time must be far
+        # enough in the past that the LATEST candle of every timeframe still
+        # lands in the past (D × 30 = 30 days forward, so we anchor 45 days
+        # back for safety).
+        base_time = datetime.now(UTC) - timedelta(days=45)
         base_price = 1.1000
         candles = []
 
+        # H1 count must exceed MIN_CANDLES_FOR_BACKTEST (=100) used by the
+        # optimization_pipeline integration tests. Other timeframes are sized
+        # generously so backtests across multiple resolutions still produce
+        # signals on this dataset.
         timeframes = [
-            ("M1", 1, 200),
-            ("M5", 5, 50),
-            ("M10", 10, 30),
-            ("M30", 30, 20),
-            ("H1", 60, 10),
-            ("H4", 240, 5),
-            ("D", 1440, 3),
+            ("M1", 1, 5040),
+            ("M5", 5, 1008),
+            ("M10", 10, 504),
+            ("M30", 30, 168),
+            ("H1", 60, 200),
+            ("H4", 240, 50),
+            ("D", 1440, 30),
         ]
 
         for tf_name, tf_minutes, count in timeframes:

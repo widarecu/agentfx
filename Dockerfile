@@ -25,8 +25,15 @@ ENV PYTHONPATH=src
 
 EXPOSE 8000
 
-# Run migrations then start the application server.
-# Using 'sh -c' keeps the entrypoint a single layer with no extra script file.
-# --no-reload is intentional: reload is a development-only convenience that
-# causes unnecessary worker restarts in production.
+# Entrypoint sequence on every container start:
+#   1. alembic upgrade head      — apply any pending migrations
+#   2. seed_instruments.py        — idempotent metadata seed AND refresh of
+#                                   OANDA financing rates (uses the static
+#                                   fallback in config/financing_fallback.yaml
+#                                   for pairs OANDA returns "0" for, e.g.
+#                                   GBP/JPY pairs on practice accounts).
+#                                   Failures are logged but do NOT block the
+#                                   deploy, so an OANDA outage can't prevent
+#                                   the service from coming up.
+#   3. uvicorn (no --reload)      — production server
 CMD ["sh", "-c", "alembic upgrade head && python scripts/seed_instruments.py && uvicorn agentfx.api.main:app --host 0.0.0.0 --port 8000"]

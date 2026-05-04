@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import glob
+import logging
 import os
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -16,6 +18,14 @@ from agentfx.core.strategy import (
     RSIMeanReversion,
     Strategy,
 )
+
+logger = logging.getLogger(__name__)
+
+# OANDA charges financing at 17:00 New York time. On Wednesdays the charge
+# is tripled to cover the upcoming weekend (when interest still accrues but
+# FX markets are closed).
+_ET_ZONE = ZoneInfo("America/New_York")
+_ROLLOVER_HOUR = 17  # 17:00 ET
 
 
 def _data_dir(root: str, pair: str, granularity: str = "M1") -> str:
@@ -132,6 +142,130 @@ def load_price_df_from_db(
         db.close()
 
 
+def _count_rollovers(prev_ts: pd.Timestamp, ts: pd.Timestamp) -> int:
+    """Sum the financing-charge multiplier for rollovers in (prev_ts, ts].
+
+    OANDA charges interest each weekday at 17:00 ET, with Wednesday counting
+    triple to cover Saturday and Sunday when FX is closed but interest still
+    accrues. The weekly schedule is therefore:
+
+        Mon : 1×   Thu : 1×
+        Tue : 1×   Fri : 1×
+        Wed : 3×   Sat : 0× (market closed)
+                   Sun : 0× (market closed)
+
+    which sums to 7 charges per 7 calendar days.
+
+    Both timestamps must be tz-aware (UTC).
+    """
+    prev_et = prev_ts.tz_convert(_ET_ZONE)
+    ts_et = ts.tz_convert(_ET_ZONE)
+
+    candidate = prev_et.normalize() + pd.Timedelta(hours=_ROLLOVER_HOUR)
+    if candidate <= prev_et:
+        candidate = candidate + pd.Timedelta(days=1)
+
+    total = 0
+    while candidate <= ts_et:
+        wd = candidate.weekday()  # Mon=0..Sun=6
+        if wd == 2:  # Wednesday
+            total += 3
+        elif wd in (5, 6):  # Sat, Sun — market closed
+            pass
+        else:  # Mon, Tue, Thu, Fri
+            total += 1
+        candidate = candidate + pd.Timedelta(days=1)
+    return total
+
+
+def compute_swap_returns(
+    df: pd.DataFrame,
+    signals: pd.Series,
+    long_rate: float | None,
+    short_rate: float | None,
+) -> pd.Series:
+    """Per-bar overnight financing return aligned to df.index.
+
+    For each bar whose interval (prev_close, this_close] crosses one or more
+    OANDA rollovers (17:00 ET) and where a position is held during the bar,
+    return ``rate / 365 * multiplier`` where rate is ``long_rate`` for longs
+    and ``short_rate`` for shorts.
+
+    Sign convention matches OANDA's ``/v3/instruments`` payload: positive
+    rate = position receives credit, negative rate = position pays. The
+    returned series is added directly to the strategy returns.
+
+    If either rate is ``None`` (financing not refreshed yet for this pair),
+    the helper returns a zero series so existing backtests continue to run.
+    """
+    if long_rate is None or short_rate is None or len(df) < 2:
+        return pd.Series(0.0, index=df.index)
+
+    swap_ret = pd.Series(0.0, index=df.index)
+    timestamps = df.index
+    sig_values = signals.to_numpy()
+
+    for i in range(1, len(timestamps)):
+        pos = float(sig_values[i])
+        if pos == 0.0:
+            continue
+        multiplier = _count_rollovers(timestamps[i - 1], timestamps[i])
+        if multiplier == 0:
+            continue
+        rate = long_rate if pos > 0 else short_rate
+        swap_ret.iloc[i] = rate / 365.0 * multiplier
+
+    return swap_ret
+
+
+def _lookup_financing_rates(instrument: str) -> tuple[float | None, float | None]:
+    """Read cached OANDA financing rates for an instrument from the DB.
+
+    Returns ``(long_rate, short_rate)`` or ``(None, None)`` if the row is
+    missing, the rates have not been seeded, or the database is unreachable
+    (e.g. unit tests run without a DB). A None result causes the backtest
+    to apply zero swap, preserving prior behaviour rather than crashing.
+    """
+    try:
+        from agentfx.api.core.database import SessionLocal
+        from agentfx.api.models.instrument import Instrument
+    except Exception as e:  # pragma: no cover - import guard
+        logger.debug("Cannot import DB layer for financing lookup: %s", e)
+        return None, None
+
+    try:
+        db = SessionLocal()
+    except Exception as e:
+        logger.debug("Could not open DB session for financing lookup: %s", e)
+        return None, None
+
+    try:
+        row = db.query(Instrument).filter(Instrument.symbol == instrument).first()
+        if row is None:
+            logger.warning(
+                "No instrument row for %s — swap costs will be zero in backtest.",
+                instrument,
+            )
+            return None, None
+        if row.financing_long_rate is None or row.financing_short_rate is None:
+            logger.warning(
+                "Financing rates not refreshed for %s — swap costs will be zero. "
+                "Run scripts/seed_instruments.py --refresh-financing to populate.",
+                instrument,
+            )
+            return None, None
+        return float(row.financing_long_rate), float(row.financing_short_rate)
+    except Exception as e:
+        # DB unreachable, table missing, etc. — degrade to zero swap.
+        logger.debug("Financing lookup failed for %s: %s", instrument, e)
+        return None, None
+    finally:
+        try:
+            db.close()
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+
 def run_backtest_from_db(
     instrument: str,
     granularity: str = "M1",
@@ -215,6 +349,13 @@ def run_backtest_from_db(
         cost_ret = (-total_pips * pip_size) / df["close"]
         cost_ret = cost_ret.where(trade_points, other=0.0)
         rets = rets + cost_ret
+    else:
+        pip_size = pip_size_for_pair(instrument)
+
+    # Apply OANDA overnight financing (swap) costs.
+    long_rate, short_rate = _lookup_financing_rates(instrument)
+    swap_ret = compute_swap_returns(df, signals, long_rate, short_rate)
+    rets = rets + swap_ret
 
     metrics = summarize(rets, signals)
 
@@ -307,10 +448,21 @@ def run_backtest_from_db(
                         pips = price_diff / pip_size
                         gross_pnl = pips * pip_size * position_size
 
-                        # Spread and swap costs
+                        # Spread and swap costs.
+                        # Swap is the sum of per-bar overnight financing
+                        # returns inside the trade window (entry, exit],
+                        # converted to pips using entry price as reference.
+                        # Sign-flipped because swap_ret > 0 means the position
+                        # gained, while swap_cost_pips uses cost convention
+                        # (positive = cost subtracted from net_pips).
                         spread_cost_pips = spread_pips
-                        # Simplified swap calculation (0 for now)
-                        swap_cost_pips = 0.0
+                        trade_swap_ret = float(
+                            swap_ret.loc[
+                                (swap_ret.index > entry_time)
+                                & (swap_ret.index <= timestamp)
+                            ].sum()
+                        )
+                        swap_cost_pips = -trade_swap_ret * entry_price / pip_size
                         net_pips = pips - spread_cost_pips - swap_cost_pips
 
                         trade_list.append(
@@ -561,6 +713,12 @@ def run_backtest(
         cost_ret = (-total_pips * pip_size) / df["close"]
         cost_ret = cost_ret.where(trade_points, other=0.0)
         rets = rets + cost_ret
+
+    # Apply OANDA overnight financing (swap) costs.
+    long_rate, short_rate = _lookup_financing_rates(pair)
+    swap_ret = compute_swap_returns(df, signals, long_rate, short_rate)
+    rets = rets + swap_ret
+
     metrics = summarize(rets, signals)
     result = {
         "pair": pair,

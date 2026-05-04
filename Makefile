@@ -60,10 +60,12 @@ test:
 test-unit:
 	ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/pytest -q -m unit
 
-# Integration tests: Tests with real database (PostgreSQL on port 5432)
-# Requires: PostgreSQL running locally or via 'docker-compose -f docker-compose.test.yml up -d'
+# Integration tests: Tests with real database (Dockerised PostgreSQL on port 5433)
+# Requires: docker-compose --profile test up first.
+# Optional extra pytest args via PYTEST_ARGS, e.g.:
+#   make test-integration PYTEST_ARGS="-v --timeout=60"
 test-integration:
-	ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/pytest -q -m integration
+	ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/pytest -q -m integration $(PYTEST_ARGS)
 
 # E2E tests via pytest markers (for individual test runs)
 # Note: Prefer 'make e2e' for full E2E suite with server management

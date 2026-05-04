@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 import requests  # type: ignore[import-untyped]
 
-from agentfx.shared.config import oanda_api_host, oanda_api_key
+from agentfx.shared.config import oanda_account_id, oanda_api_host, oanda_api_key
 
 ISO8601 = "%Y-%m-%dT%H:%M:%S.%fZ"
 
@@ -26,10 +26,12 @@ class OandaClient:
         self,
         api_key: str | None = None,
         host: str | None = None,
+        account_id: str | None = None,
         timeout: int = 15,
     ):
         self.api_key = api_key or oanda_api_key()
         self.host = host or oanda_api_host()
+        self.account_id = account_id or oanda_account_id()
         if not self.api_key:
             raise OandaError("OANDA_API_KEY is not set")
         self.base_url = f"https://{self.host}/v3"
@@ -120,3 +122,39 @@ class OandaClient:
                 }
             )
         return norm
+
+    def get_instrument_financing(self, instrument: str) -> dict:
+        """Fetch current long/short financing rates from OANDA.
+
+        Calls GET /v3/accounts/{accountID}/instruments?instruments={instrument}
+        and returns the per-day financing rates that OANDA charges or credits
+        when a position is held past 17:00 ET.
+
+        Returns:
+            dict with keys:
+              - long_rate: annualised decimal (positive = client pays)
+              - short_rate: annualised decimal (positive = client pays)
+              - fetched_at: datetime in UTC
+        """
+        if not self.account_id:
+            raise OandaError("OANDA_ACCOUNT_ID is not set")
+        instrument = to_oanda_instrument(instrument)
+        params = {"instruments": instrument}
+        path = f"/accounts/{self.account_id}/instruments"
+        data = self._request("GET", path, params)
+        instruments = data.get("instruments", [])
+        if not instruments:
+            raise OandaError(f"OANDA returned no metadata for {instrument}")
+        info = instruments[0]
+        financing = info.get("financing", {}) or {}
+        long_rate_raw = financing.get("longRate")
+        short_rate_raw = financing.get("shortRate")
+        if long_rate_raw is None or short_rate_raw is None:
+            raise OandaError(
+                f"OANDA response missing financing rates for {instrument}: {info}"
+            )
+        return {
+            "long_rate": float(long_rate_raw),
+            "short_rate": float(short_rate_raw),
+            "fetched_at": datetime.now(UTC),
+        }

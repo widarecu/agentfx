@@ -627,11 +627,20 @@ class TestTrialPersistence:
         trials = get_trials_from_db(session_factory, job_id)
 
         if completed_job.best_trial_id and trials:
-            # Find the best trial manually
-            best_trial = max(trials, key=lambda t: t.sharpe)
-            assert completed_job.best_trial_id == best_trial.id, (
-                f"best_trial_id mismatch: expected {best_trial.id}, "
-                f"got {completed_job.best_trial_id}"
+            # Verify best_trial_id points to a trial whose Sharpe equals the
+            # max — tolerating ties (multiple trials can produce identical
+            # Sharpe, and tie-breaking between the optimizer's pick and the
+            # DB's ORDER BY can legitimately diverge).
+            best_sharpe = max(t.sharpe for t in trials)
+            chosen = next(
+                (t for t in trials if t.id == completed_job.best_trial_id), None
+            )
+            assert chosen is not None, (
+                f"best_trial_id {completed_job.best_trial_id} not found in trials"
+            )
+            assert chosen.sharpe == best_sharpe, (
+                f"best_trial_id points to trial with Sharpe {chosen.sharpe}, "
+                f"but max Sharpe across all trials is {best_sharpe}"
             )
 
     @pytest.mark.asyncio
