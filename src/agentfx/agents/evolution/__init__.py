@@ -8,6 +8,8 @@ Sub-modules:
 - population: `Genome` dataclass + `Population` container + gen-0 init
 - ga: mutation, crossover, tournament selection, generation-to-generation step
 - fitness: backtest-based fitness scoring with diversity penalty + Gate B dilution
+- llm_client: Anthropic SDK wrapper for hypothesis injection (US-005)
+- prompts: prompt templates and LLM-facing response schema
 """
 
 from agentfx.agents.evolution.fitness import (
@@ -22,6 +24,14 @@ from agentfx.agents.evolution.ga import (
     mutate_spec,
     tournament_select,
 )
+from agentfx.agents.evolution.llm_client import (
+    InjectionProposal,
+    InjectionResult,
+    LLMCallCost,
+    LLMHypothesisInjector,
+    MODEL_PRICING,
+    ModelPricing,
+)
 from agentfx.agents.evolution.population import (
     Genome,
     Population,
@@ -30,6 +40,12 @@ from agentfx.agents.evolution.population import (
 
 __all__ = [
     "Genome",
+    "InjectionProposal",
+    "InjectionResult",
+    "LLMCallCost",
+    "LLMHypothesisInjector",
+    "MODEL_PRICING",
+    "ModelPricing",
     "Population",
     "compute_fitness",
     "crossover_specs",
