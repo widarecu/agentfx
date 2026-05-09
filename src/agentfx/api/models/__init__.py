@@ -1,4 +1,14 @@
 # Import all models here to make them available via the models package
+from .evolution import (
+    AgentType,
+    DecisionLog,
+    EvolutionRun,
+    EvolutionRunStatus,
+    Generation,
+    GenomeOrigin,
+    StrategyGenome,
+    ValidationFold,
+)
 from .instrument import Instrument
 from .market_data import Candle, MarketDataUpdate
 from .optimization import (
@@ -27,7 +37,7 @@ __all__ = [
     "Candle",
     "MarketDataUpdate",
     "Instrument",
-    # Optimization
+    # Optimization (v0.2.0)
     "OptimizationJob",
     "OptimizationTrial",
     "OptimizationSignal",
@@ -35,4 +45,13 @@ __all__ = [
     "JobStatus",
     "StrategyType",
     "VerifiedEmptyGap",
+    # Evolution (v0.3.0)
+    "EvolutionRun",
+    "EvolutionRunStatus",
+    "Generation",
+    "StrategyGenome",
+    "GenomeOrigin",
+    "ValidationFold",
+    "DecisionLog",
+    "AgentType",
 ]
