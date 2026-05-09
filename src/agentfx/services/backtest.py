@@ -654,6 +654,26 @@ def _get_indicator_values(
 
 def make_strategy(name: str, **kwargs) -> Strategy:
     n = name.lower()
+    if n == "dsl":
+        # DSL dispatch: compile a v0.3.0 StrategySpec into a Strategy.
+        # `spec` may be a StrategySpec instance or its dict form (for callers
+        # that round-trip through JSON, e.g. the optimizer storing genomes).
+        from agentfx.core.dsl import StrategySpec, compile_spec
+
+        spec_data = kwargs.get("spec")
+        if spec_data is None:
+            raise ValueError(
+                "strategy 'dsl' requires a 'spec' kwarg with a StrategySpec or dict"
+            )
+        if isinstance(spec_data, StrategySpec):
+            spec = spec_data
+        elif isinstance(spec_data, dict):
+            spec = StrategySpec.model_validate(spec_data)
+        else:
+            raise ValueError(
+                f"'spec' must be StrategySpec or dict, got {type(spec_data).__name__}"
+            )
+        return compile_spec(spec)
     if n in ("ma", "mac", "ma_crossover", "macrossover"):
         return MACrossover(
             fast=int(kwargs.get("fast", 20)), slow=int(kwargs.get("slow", 50))
