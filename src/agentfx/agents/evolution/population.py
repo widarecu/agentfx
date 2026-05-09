@@ -1,0 +1,142 @@
+"""Genome and Population containers for the evolutionary loop.
+
+A `Genome` wraps a `StrategySpec` with the metadata the GA and persistence
+layer need: origin (seed/crossover/mutation/llm), parent lineage, fitness
+(via DEAP's `Fitness` so selection algorithms work), and metrics.
+
+A `Population` is just a generation of genomes plus its index. Persistence
+of genome rows to Postgres happens in the orchestrator/service layer; this
+module is in-memory only.
+
+The DEAP fitness wrapper is created at module import time (idempotent —
+DEAP's `creator` rejects duplicate names cleanly).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from random import Random
+
+from deap import base, creator
+
+from agentfx.api.models import GenomeOrigin
+from agentfx.core.dsl import StrategySpec
+
+# DEAP creator state is module-global. Re-running tests in the same process
+# would otherwise raise "class FitnessMax already exists" on the second
+# import. Guard accordingly.
+if not hasattr(creator, "FitnessMax"):
+    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+
+
+@dataclass
+class Genome:
+    """A single genome in the GA population.
+
+    The DSL spec is the gene; everything else is bookkeeping. `id` is
+    populated by the persistence layer when the genome is saved; before
+    that it's None.
+    """
+
+    spec: StrategySpec
+    origin: GenomeOrigin
+    parent_ids: list[str] = field(default_factory=list)
+    metrics: dict | None = None
+    id: str | None = None
+    llm_reasoning: str | None = None
+    llm_call_id: str | None = None
+    fitness: object = field(init=False)
+
+    def __post_init__(self) -> None:
+        # Each genome gets its own FitnessMax instance — DEAP's selection
+        # functions read .fitness.values, so it must be a separate object.
+        self.fitness = creator.FitnessMax()
+
+    def set_fitness(self, value: float) -> None:
+        """Record the fitness value (single objective for v1)."""
+        self.fitness.values = (float(value),)
+
+    @property
+    def fitness_value(self) -> float:
+        """Convenience accessor returning -inf if fitness wasn't set."""
+        if not self.fitness.valid:
+            return float("-inf")
+        return float(self.fitness.values[0])
+
+    def has_fitness(self) -> bool:
+        return bool(self.fitness.valid)
+
+
+@dataclass
+class Population:
+    """The set of genomes in one generation."""
+
+    generation_index: int
+    genomes: list[Genome]
+
+    def __len__(self) -> int:
+        return len(self.genomes)
+
+    def __iter__(self):
+        return iter(self.genomes)
+
+    def best(self) -> Genome | None:
+        """Highest-fitness genome in the population, or None if no genome
+        has been evaluated yet."""
+        evaluated = [g for g in self.genomes if g.has_fitness()]
+        if not evaluated:
+            return None
+        return max(evaluated, key=lambda g: g.fitness_value)
+
+
+def initialize_population(
+    seeds: list[StrategySpec],
+    size: int,
+    rng: Random,
+    *,
+    mutate_fn,
+) -> Population:
+    """Construct generation 0.
+
+    Strategy: include every seed verbatim, then fill the rest of the
+    population with mutated copies of randomly-chosen seeds. This gives the
+    GA known-good priors plus locally-varied starting points — better than
+    random initialization, which often produces uninteresting strategies.
+
+    Args:
+        seeds: Initial well-known strategies (typically MA / RSI / Donchian
+            DSL specs from `agentfx.core.dsl.seeds`).
+        size: Total population size for generation 0.
+        rng: Random source (passed in for reproducibility).
+        mutate_fn: Callable `(spec, rng) -> spec` — kept as a parameter
+            rather than imported here to avoid a circular import with
+            `ga.py`. Pass `agentfx.agents.evolution.ga.mutate_spec` in the
+            normal case.
+
+    Returns:
+        Population at generation_index=0 with `size` genomes.
+    """
+    if not seeds:
+        raise ValueError("at least one seed strategy is required")
+    if size < len(seeds):
+        raise ValueError(
+            f"population size ({size}) must be >= number of seeds ({len(seeds)})"
+        )
+
+    genomes: list[Genome] = []
+    for seed_spec in seeds:
+        genomes.append(Genome(spec=seed_spec, origin=GenomeOrigin.SEED))
+
+    while len(genomes) < size:
+        parent_spec = rng.choice(seeds)
+        mutated = mutate_fn(parent_spec, rng)
+        genomes.append(Genome(spec=mutated, origin=GenomeOrigin.MUTATION))
+
+    return Population(generation_index=0, genomes=genomes)
+
+
+__all__ = [
+    "Genome",
+    "Population",
+    "initialize_population",
+]
