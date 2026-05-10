@@ -9,7 +9,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
 from .core.config import settings
-from .routers import auth, market_data, optimization, runs, strategies
+from .routers import auth, evolution, market_data, optimization, runs, strategies
 
 # Configure root logger to use stdout (so Railway tags normal logs as [inf], not [err])
 logging.basicConfig(
@@ -69,6 +69,7 @@ async def lifespan(app: FastAPI):
 
     # Start candle ingestion worker
     from .workers.candle_ingestion import start_ingestion_worker, stop_ingestion_worker
+    from .workers.evolution_runner import recover_queued_evolution_runs
     from .workers.optimization_runner import recover_queued_jobs
 
     started = await start_ingestion_worker()
@@ -81,6 +82,18 @@ async def lifespan(app: FastAPI):
     recovered = await recover_queued_jobs()
     if recovered > 0:
         logger.info(f"Scheduled {recovered} optimization jobs for recovery")
+
+    # Recover any queued evolution runs from previous app instances.
+    # `recover_queued_evolution_runs` is sync — it forks subprocesses but
+    # doesn't await anything. Run it directly.
+    try:
+        recovered_evo = recover_queued_evolution_runs()
+        if recovered_evo > 0:
+            logger.info(f"Scheduled {recovered_evo} evolution runs for recovery")
+    except Exception:  # noqa: BLE001
+        # Recovery failure must not block app startup — runs can be
+        # manually re-queued via the API.
+        logger.exception("evolution-run recovery failed; continuing startup")
 
     yield  # App runs here
 
@@ -164,6 +177,7 @@ app.include_router(
 app.include_router(
     optimization.router, prefix=settings.API_V1_STR, tags=["optimization"]
 )
+app.include_router(evolution.router, prefix=settings.API_V1_STR, tags=["evolution"])
 
 
 @app.get("/")

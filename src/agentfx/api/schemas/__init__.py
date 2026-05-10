@@ -1,5 +1,19 @@
 # Import all schemas here to make them available via the schemas package
 from .base import BaseSchema
+from .evolution import (
+    DecisionLogList,
+    DecisionLogPublic,
+    EvolutionRunCreate,
+    EvolutionRunCreated,
+    EvolutionRunList,
+    EvolutionRunPublic,
+    GenerationList,
+    GenerationPublic,
+    OrchestratorConfigSchema,
+    StopConditionsSchema,
+    StrategyGenomePublic,
+    ValidationFoldPublic,
+)
 from .market_data import (
     CandleBase,
     CandleBulkCreate,
@@ -144,4 +158,17 @@ __all__ = [
     "GateBThresholds",
     "GATE_B_THRESHOLDS",
     "evaluate_gate_b",
+    # Evolution related (v0.3.0)
+    "EvolutionRunCreate",
+    "EvolutionRunCreated",
+    "EvolutionRunPublic",
+    "EvolutionRunList",
+    "OrchestratorConfigSchema",
+    "StopConditionsSchema",
+    "GenerationPublic",
+    "GenerationList",
+    "StrategyGenomePublic",
+    "ValidationFoldPublic",
+    "DecisionLogPublic",
+    "DecisionLogList",
 ]
