@@ -355,7 +355,10 @@ def evolve_to_next_generation(
 
     # Elites are the best by fitness, carried unchanged. We make fresh
     # Genome instances so each new generation has independent genome
-    # objects (avoids shared identity across generations).
+    # objects (avoids shared identity across generations). LLM
+    # provenance (origin/reasoning/call_id) is preserved on carryover
+    # because the elite IS the same genome, just persisted into a new
+    # generation row — its origin doesn't change.
     elite_genomes_orig = elite_select(list(population.genomes), n_elites)
     next_genomes: list[Genome] = []
     for elite in elite_genomes_orig:
@@ -363,6 +366,8 @@ def evolve_to_next_generation(
             spec=elite.spec,
             origin=elite.origin,
             parent_ids=[elite.id] if elite.id else list(elite.parent_ids),
+            llm_reasoning=elite.llm_reasoning,
+            llm_call_id=elite.llm_call_id,
         )
         next_genomes.append(carryover)
 

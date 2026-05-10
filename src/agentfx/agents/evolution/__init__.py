@@ -37,6 +37,10 @@ from agentfx.agents.evolution.population import (
     Population,
     initialize_population,
 )
+from agentfx.agents.evolution.runner import (
+    ResourceLimits,
+    apply_resource_limits,
+)
 
 __all__ = [
     "Genome",
@@ -47,6 +51,8 @@ __all__ = [
     "MODEL_PRICING",
     "ModelPricing",
     "Population",
+    "ResourceLimits",
+    "apply_resource_limits",
     "compute_fitness",
     "crossover_specs",
     "elite_select",
