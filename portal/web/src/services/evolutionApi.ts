@@ -30,10 +30,26 @@ function authHeaders(): HeadersInit {
 
 async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
-    let detail = res.statusText;
+    let detail: string = res.statusText;
     try {
       const body = await res.json();
-      detail = body?.detail ?? detail;
+      const raw = body?.detail;
+      // FastAPI 422 returns an array of {loc, msg, type, ...} objects;
+      // flatten into a readable string instead of the default
+      // "[object Object]" stringification.
+      if (Array.isArray(raw)) {
+        detail = raw
+          .map((e) => {
+            const loc = Array.isArray(e?.loc) ? e.loc.join('.') : '';
+            const msg = e?.msg ?? JSON.stringify(e);
+            return loc ? `${loc}: ${msg}` : msg;
+          })
+          .join('; ');
+      } else if (typeof raw === 'string') {
+        detail = raw;
+      } else if (raw != null) {
+        detail = JSON.stringify(raw);
+      }
     } catch {
       // ignore parse failure — fall back to statusText
     }

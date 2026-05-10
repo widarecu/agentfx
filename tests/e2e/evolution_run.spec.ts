@@ -38,8 +38,9 @@ test.describe('Evolution Runs Page', () => {
     await login(page, TRADER_EMAIL, TRADER_PASSWORD);
     await page.getByRole('link', { name: 'Evolution' }).click();
     await expect(page).toHaveURL('/evolution', { timeout: 5000 });
+    // exact: true to disambiguate from the h2 "About Autonomous Strategy Evolution"
     await expect(
-      page.getByRole('heading', { name: /Autonomous Strategy Evolution/i })
+      page.getByRole('heading', { name: 'Autonomous Strategy Evolution', exact: true })
     ).toBeVisible();
   });
 
@@ -47,7 +48,10 @@ test.describe('Evolution Runs Page', () => {
     await login(page, TRADER_EMAIL, TRADER_PASSWORD);
     await page.goto('/evolution');
     await expect(
-      page.getByRole('heading', { name: /About Autonomous Strategy Evolution/i })
+      page.getByRole('heading', {
+        name: 'About Autonomous Strategy Evolution',
+        exact: true,
+      })
     ).toBeVisible();
     // The blurb mentions Gate B and OOS — text the orchestrator's plan emphasises
     await expect(page.getByText(/Gate B/)).toBeVisible();
@@ -98,16 +102,13 @@ test.describe('Evolution Runs Page', () => {
     page,
   }) => {
     await login(page, TRADER_EMAIL, TRADER_PASSWORD);
-    await page.goto('/evolution');
+    await page.goto('/evolution', { waitUntil: 'networkidle' });
     // Either the empty state or the runs table renders. Both are
     // acceptable; we just want the page not to error.
-    const hasEmptyState = await page
-      .getByText(/No evolution runs yet/i)
-      .count();
-    const hasTableHeading = await page
-      .getByRole('columnheader', { name: /Run ID/i })
-      .count();
-    expect(hasEmptyState + hasTableHeading).toBeGreaterThan(0);
+    const emptyOrTable = page.locator(
+      'text=/No evolution runs yet/i, th:has-text("Run ID")'
+    );
+    await expect(emptyOrTable.first()).toBeVisible({ timeout: 10000 });
   });
 });
 

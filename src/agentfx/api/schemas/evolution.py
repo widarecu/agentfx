@@ -36,10 +36,17 @@ class StopConditionsSchema(BaseModel):
 
 
 class OrchestratorConfigSchema(BaseModel):
-    """Per-run orchestrator config. Persisted on the run row as JSON."""
+    """Per-run orchestrator config. Persisted on the run row as JSON.
 
-    instrument: str = Field(min_length=1, max_length=10)
-    granularity: str = Field(default="M1", max_length=5)
+    All fields are optional — when used as an override on
+    `EvolutionRunCreate.config`, the service layer merges any provided
+    fields over the defaults. The top-level `EvolutionRunCreate.instrument`
+    + `granularity` are authoritative; the same fields here are accepted
+    for self-describing rows but ignored on conflict.
+    """
+
+    instrument: str | None = Field(default=None, max_length=10)
+    granularity: str | None = Field(default=None, max_length=5)
     population_size: int = Field(default=30, ge=4, le=200)
     llm_injection_every_n: int = Field(default=3, ge=1)
     n_llm_proposals: int = Field(default=5, ge=1, le=10)

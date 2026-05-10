@@ -98,18 +98,23 @@ def create_run(
 ) -> models.EvolutionRun:
     """Persist a new evolution_run row in QUEUED status. The actual
     loop is launched separately by the worker."""
-    config_dict = (
-        create.config.model_dump()
+    # Merge any partial override into the full defaults so callers don't
+    # have to repeat every field.
+    defaults = schemas.OrchestratorConfigSchema().model_dump()
+    overrides = (
+        create.config.model_dump(exclude_unset=True)
         if create.config is not None
-        else schemas.OrchestratorConfigSchema(
-            instrument=create.instrument, granularity=create.granularity
-        ).model_dump()
+        else {}
     )
-    stop_dict = (
-        create.stop_conditions.model_dump()
+    config_dict = {**defaults, **overrides}
+
+    stop_defaults = schemas.StopConditionsSchema().model_dump()
+    stop_overrides = (
+        create.stop_conditions.model_dump(exclude_unset=True)
         if create.stop_conditions is not None
-        else schemas.StopConditionsSchema().model_dump()
+        else {}
     )
+    stop_dict = {**stop_defaults, **stop_overrides}
     # Capture the caller-facing fields too so the row is fully self-describing
     config_dict.setdefault("instrument", create.instrument)
     config_dict.setdefault("granularity", create.granularity)
