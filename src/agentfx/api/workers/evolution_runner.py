@@ -83,7 +83,7 @@ def signal_run_stop(pid: int) -> bool:
         return False
 
 
-def recover_queued_evolution_runs() -> int:
+def recover_queued_evolution_runs(db=None) -> int:
     """Lifespan startup hook.
 
     1. Finds runs in RUNNING state — these are orphaned (their child died
@@ -92,6 +92,10 @@ def recover_queued_evolution_runs() -> int:
        schedules each via `schedule_run`.
 
     Returns the number of runs re-scheduled. The lifespan can log this.
+
+    Args:
+        db: Optional SQLAlchemy Session. Tests inject their own session;
+            production passes None and we open one via SessionLocal.
     """
     # Lazy imports — the lifespan calls this *during* startup, before the
     # app is ready, but after settings/DB are initialized.
@@ -99,7 +103,10 @@ def recover_queued_evolution_runs() -> int:
     from agentfx.api.models import EvolutionRunStatus
     from agentfx.api.services import evolution as evolution_service
 
-    db = SessionLocal()
+    own_session = db is None
+    if own_session:
+        db = SessionLocal()
+
     try:
         orphaned = evolution_service.find_orphaned_running_runs(db)
         for run in orphaned:
@@ -118,7 +125,8 @@ def recover_queued_evolution_runs() -> int:
 
         return len(queued)
     finally:
-        db.close()
+        if own_session:
+            db.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────
