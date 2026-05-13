@@ -17,3 +17,22 @@ restartPolicyMaxRetries = 10
 # Railway polls this endpoint to determine readiness before routing traffic.
 # The /health route is registered in src/agentfx/api/main.py.
 path = "/health"
+
+# ─────────────────────────────────────────────────────────────────────────
+# v0.3.0 Autonomous Strategy Loop — nightly evolution-run trigger
+# ─────────────────────────────────────────────────────────────────────────
+# Cron jobs in Railway run a one-shot container per scheduled tick. They
+# share the same image as the long-running backend service, so the script
+# below has access to the same Python environment + env vars.
+#
+# Schedule: 02:00 UTC nightly. The script reads CRON_INSTRUMENTS (default
+# "EUR_USD") and POSTs one evolution-run per instrument to the live API.
+# The orchestrator subprocess then runs inside the long-running service
+# (not the cron container) — the cron just kicks off the job.
+#
+# Auth: the script uses a service-account API key (env CRON_SERVICE_TOKEN)
+# rather than per-user JWT, so it doesn't have to refresh tokens. Set
+# CRON_SERVICE_TOKEN in the Railway service-variables panel.
+[[deploy.cronJobs]]
+schedule = "0 2 * * *"
+command = "python /app/scripts/trigger_nightly_evolution.py"
