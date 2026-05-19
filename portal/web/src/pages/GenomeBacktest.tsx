@@ -22,10 +22,12 @@ import { ArrowLeft, Loader2, AlertTriangle, BarChart3 } from 'lucide-react';
 import StrategyChart from '../components/StrategyChart';
 import TradesTable from '../components/TradesTable';
 import { API_BASE_URL } from '../services/config';
-import { getEvolutionRun, getGenomeBacktest } from '../services/evolutionApi';
+import { getEvolutionRun, getGenome, getGenomeBacktest } from '../services/evolutionApi';
+import { buildIndicatorsFromDsl } from '../utils/dslIndicators';
 import type {
   EvolutionRun,
   GenomeBacktestResult,
+  StrategyGenome,
 } from '../types/evolution';
 import type {
   CandleData,
@@ -122,6 +124,9 @@ export default function GenomeBacktest() {
 
   const [backtest, setBacktest] = useState<GenomeBacktestResult | null>(null);
   const [run, setRun] = useState<EvolutionRun | null>(null);
+  // Fetched in parallel with the backtest so we can render the DSL spec's
+  // indicators as chart overlays without an extra round-trip later.
+  const [genome, setGenome] = useState<StrategyGenome | null>(null);
   const [candles, setCandles] = useState<CandleData[]>([]);
   const [loading, setLoading] = useState(true);
   const [candlesLoading, setCandlesLoading] = useState(false);
@@ -135,13 +140,15 @@ export default function GenomeBacktest() {
       setLoading(true);
       setError(null);
       try {
-        const [bt, runData] = await Promise.all([
+        const [bt, runData, genomeData] = await Promise.all([
           getGenomeBacktest(runId, genomeId),
           getEvolutionRun(runId),
+          getGenome(runId, genomeId),
         ]);
         if (cancelled) return;
         setBacktest(bt);
         setRun(runData);
+        setGenome(genomeData);
         setLoading(false);
 
         // Fetch candles in the background — chart can render
@@ -180,6 +187,14 @@ export default function GenomeBacktest() {
   const signals = useMemo<TradeSignal[]>(
     () => (backtest ? backtest.signals.map(mapSignal) : []),
     [backtest],
+  );
+  // Indicator overlay lines derived from the genome's DSL — SMA/EMA on the
+  // price scale, RSI on a separate oscillator scale (StrategyChart handles
+  // the routing via isOscillator). Computed client-side from the candle
+  // data so the chart matches the spec exactly.
+  const indicators = useMemo(
+    () => buildIndicatorsFromDsl(genome?.dsl_json, candles),
+    [genome, candles],
   );
 
   if (loading) {
@@ -358,7 +373,7 @@ export default function GenomeBacktest() {
           <StrategyChart
             candles={candles}
             signals={signals}
-            indicators={[]}
+            indicators={indicators}
             instrument={backtest.instrument}
             strategy="dsl"
             params={{}}
