@@ -18,6 +18,7 @@ import type {
   Generation,
   GenerationListResponse,
   StrategyGenome,
+  StrategyGenomeSummaryList,
 } from '../types/evolution';
 
 function authHeaders(): HeadersInit {
@@ -136,6 +137,23 @@ export async function getGenome(
 ): Promise<StrategyGenome> {
   const res = await fetch(
     `${API_BASE_URL}/evolution-runs/${runId}/genomes/${genomeId}`,
+    { headers: authHeaders() },
+  );
+  return handleResponse(res);
+}
+
+export async function listRunGenomes(
+  runId: string,
+  filters: { generationIndex?: number; origin?: string; limit?: number } = {},
+): Promise<StrategyGenomeSummaryList> {
+  const params = new URLSearchParams();
+  if (filters.generationIndex != null)
+    params.set('generation_index', String(filters.generationIndex));
+  if (filters.origin) params.set('origin', filters.origin);
+  if (filters.limit) params.set('limit', String(filters.limit));
+  const qs = params.toString();
+  const res = await fetch(
+    `${API_BASE_URL}/evolution-runs/${runId}/genomes${qs ? `?${qs}` : ''}`,
     { headers: authHeaders() },
   );
   return handleResponse(res);

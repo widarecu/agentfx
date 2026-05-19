@@ -200,6 +200,30 @@ class StrategyGenomePublic(BaseSchema):
     validation_folds: list[ValidationFoldPublic] = Field(default_factory=list)
 
 
+class StrategyGenomeSummary(BaseSchema):
+    """Lightweight projection used for the run-wide lineage tree.
+
+    Excludes the (potentially large) `dsl_json` blob and the validation
+    folds. The portal renders one of these per node in the lineage DAG;
+    detail fetches are still per-genome via the full `StrategyGenomePublic`
+    endpoint when the user drills in.
+    """
+
+    id: str
+    generation_index: int
+    parent_ids: list[str]
+    origin: str
+    fitness: float | None = None
+    validator_passed: bool | None = None
+
+
+class StrategyGenomeSummaryList(BaseModel):
+    """Paginated list of genome summaries scoped to a single evolution run."""
+
+    items: list[StrategyGenomeSummary]
+    total: int
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Decision log
 # ─────────────────────────────────────────────────────────────────────────
@@ -239,5 +263,7 @@ __all__ = [
     "OrchestratorConfigSchema",
     "StopConditionsSchema",
     "StrategyGenomePublic",
+    "StrategyGenomeSummary",
+    "StrategyGenomeSummaryList",
     "ValidationFoldPublic",
 ]

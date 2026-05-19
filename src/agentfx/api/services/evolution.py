@@ -281,6 +281,55 @@ def list_decisions(
     return items, total
 
 
+def list_run_genome_summaries(
+    db: Session,
+    run_id: str,
+    *,
+    generation_index: int | None = None,
+    origin: str | None = None,
+    limit: int = 2000,
+) -> list[dict[str, Any]]:
+    """Lightweight list of all genomes in a run, projection-only.
+
+    Used by the portal's run-wide lineage tree. Excludes the heavy
+    `dsl_json` blob and validation folds — the user fetches those by
+    clicking through to the genome detail page. At pop=30 × gens=30 a
+    run has ~900 genomes; the projection keeps the payload to roughly
+    100KB.
+
+    Filters:
+        generation_index: limit to one generation (None = all)
+        origin: limit to one origin (None = all)
+    """
+    q = (
+        db.query(models.StrategyGenome, models.Generation.index.label("gen_index"))
+        .join(
+            models.Generation,
+            models.StrategyGenome.generation_id == models.Generation.id,
+        )
+        .filter(models.Generation.run_id == run_id)
+    )
+    if generation_index is not None:
+        q = q.filter(models.Generation.index == generation_index)
+    if origin is not None:
+        q = q.filter(models.StrategyGenome.origin == origin)
+    rows = (
+        q.order_by(models.Generation.index, models.StrategyGenome.id).limit(limit).all()
+    )
+
+    return [
+        {
+            "id": g.id,
+            "generation_index": gen_index,
+            "parent_ids": g.parent_ids or [],
+            "origin": g.origin.value if hasattr(g.origin, "value") else str(g.origin),
+            "fitness": g.fitness,
+            "validator_passed": g.validator_passed,
+        }
+        for g, gen_index in rows
+    ]
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # SQLAlchemy-backed EvolutionStatePersister (orchestrator dependency)
 # ─────────────────────────────────────────────────────────────────────────
@@ -535,6 +584,7 @@ __all__ = [
     "get_run",
     "list_decisions",
     "list_generations",
+    "list_run_genome_summaries",
     "list_runs",
     "stop_run",
 ]

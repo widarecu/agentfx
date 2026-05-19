@@ -171,6 +171,25 @@ export interface GenomeChild {
   generation_index: number;
 }
 
+/**
+ * Lightweight projection of a genome — used for the run-wide lineage tree.
+ * Excludes the heavy `dsl_json` blob and validation folds; click through to
+ * the full `StrategyGenome` via `getGenome(runId, id)` for drill-in.
+ */
+export interface StrategyGenomeSummary {
+  id: string;
+  generation_index: number;
+  parent_ids: string[];
+  origin: GenomeOrigin;
+  fitness: number | null;
+  validator_passed: boolean | null;
+}
+
+export interface StrategyGenomeSummaryList {
+  items: StrategyGenomeSummary[];
+  total: number;
+}
+
 export interface StrategyGenome {
   id: string;
   generation_id: string;

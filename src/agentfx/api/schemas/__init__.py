@@ -12,6 +12,8 @@ from .evolution import (
     OrchestratorConfigSchema,
     StopConditionsSchema,
     StrategyGenomePublic,
+    StrategyGenomeSummary,
+    StrategyGenomeSummaryList,
     ValidationFoldPublic,
 )
 from .market_data import (
@@ -168,6 +170,8 @@ __all__ = [
     "GenerationPublic",
     "GenerationList",
     "StrategyGenomePublic",
+    "StrategyGenomeSummary",
+    "StrategyGenomeSummaryList",
     "ValidationFoldPublic",
     "DecisionLogPublic",
     "DecisionLogList",

@@ -32,6 +32,7 @@ import {
 import FitnessCurveChart, {
   type FitnessCurvePoint,
 } from '../components/FitnessCurveChart';
+import GenomeLineageTree from '../components/GenomeLineageTree';
 import RunNarrative from '../components/RunNarrative';
 import LlmInjectionCard from '../components/LlmInjectionCard';
 import {
@@ -204,6 +205,16 @@ export default function EvolutionRunDetail() {
       {/* ── 5. Generations table ───────────────────────────────────── */}
       <Section title="Generations">
         <GenerationsTable generations={sortedGens} />
+      </Section>
+
+      {/* ── 5b. Lineage tree (all genomes across all gens) ─────────── */}
+      <Section
+        title="Lineage Tree"
+        subtitle="Every genome in the run, one row per generation. Edges connect parent → child. Click any node to drill in."
+      >
+        {runId && (
+          <GenomeLineageTree runId={runId} bestGenomeId={run.best_genome_id} />
+        )}
       </Section>
 
       {/* ── 6. LLM activity ────────────────────────────────────────── */}

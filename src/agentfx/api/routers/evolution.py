@@ -206,6 +206,43 @@ def list_run_generations(
 
 
 @router.get(
+    "/evolution-runs/{run_id}/genomes",
+    response_model=schemas.StrategyGenomeSummaryList,
+)
+def list_run_genomes(
+    run_id: str,
+    generation_index: int | None = None,
+    origin: str | None = None,
+    limit: int = 2000,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> schemas.StrategyGenomeSummaryList:
+    """List all genomes in a run, in a lightweight projection.
+
+    Used by the portal's run-wide lineage tree (Tier 3 of the UX fix).
+    Caller can filter by generation or origin; default returns every
+    genome for the run (capped at `limit`).
+    """
+    run = evolution_service.get_run(db, run_id)
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Evolution run not found"
+        )
+
+    rows = evolution_service.list_run_genome_summaries(
+        db,
+        run_id,
+        generation_index=generation_index,
+        origin=origin,
+        limit=limit,
+    )
+    return schemas.StrategyGenomeSummaryList(
+        items=[schemas.StrategyGenomeSummary.model_validate(r) for r in rows],
+        total=len(rows),
+    )
+
+
+@router.get(
     "/evolution-runs/{run_id}/genomes/{genome_id}",
     response_model=schemas.StrategyGenomePublic,
 )
