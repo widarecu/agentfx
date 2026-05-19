@@ -27,9 +27,13 @@ import DslTree from '../components/DslTree';
 import GenomeLineageStrip from '../components/GenomeLineageStrip';
 import LineageExplainer from '../components/LineageExplainer';
 import WalkForwardFoldTable from '../components/WalkForwardFoldTable';
-import { getGenome } from '../services/evolutionApi';
+import { getEvolutionRun, getGenome } from '../services/evolutionApi';
 import { inferArchetype, summarizeDsl } from '../utils/dslSummary';
-import type { GenomeOrigin, StrategyGenome } from '../types/evolution';
+import type {
+  EvolutionRun,
+  GenomeOrigin,
+  StrategyGenome,
+} from '../types/evolution';
 
 const ORIGIN_BADGE_COLORS: Record<GenomeOrigin, string> = {
   seed: 'bg-slate-200 text-slate-800 dark:bg-slate-600 dark:text-slate-100',
@@ -53,6 +57,7 @@ export default function GenomeDetail() {
   const navigate = useNavigate();
 
   const [genome, setGenome] = useState<StrategyGenome | null>(null);
+  const [run, setRun] = useState<EvolutionRun | null>(null);
   const [parents, setParents] = useState<StrategyGenome[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -67,9 +72,16 @@ export default function GenomeDetail() {
       setParents([]);
       setParentError(null);
       try {
-        const data = await getGenome(runId, genomeId);
+        // Fetch run + genome in parallel — run gives us instrument/granularity
+        // + data window for the page's "what data was this evaluated on" line.
+        const [genomeData, runData] = await Promise.all([
+          getGenome(runId, genomeId),
+          getEvolutionRun(runId),
+        ]);
         if (cancelled) return;
-        setGenome(data);
+        setGenome(genomeData);
+        setRun(runData);
+        const data = genomeData;
 
         // Fetch parents in parallel for the diff section. Failures are
         // non-fatal — diff just doesn't render. The genome page itself
@@ -135,6 +147,18 @@ export default function GenomeDetail() {
       ? genome.fitness.toFixed(3)
       : '—';
 
+  // Build the "evaluated on …" line from the run config. The fitness on
+  // this page is computed against this exact instrument+granularity+window.
+  const dataYears =
+    typeof run?.config_json?.data_years === 'number'
+      ? (run.config_json.data_years as number)
+      : null;
+  const evaluatedOnLine = run
+    ? `${run.instrument} ${run.granularity}${
+        dataYears ? ` · ${dataYears}y window` : ''
+      }`
+    : null;
+
   return (
     <div className="container mx-auto px-4 py-8 space-y-6">
       <Link
@@ -156,6 +180,14 @@ export default function GenomeDetail() {
               Generation {genome.generation_index} ·{' '}
               {new Date(genome.created_at).toLocaleString()}
             </p>
+            {evaluatedOnLine && (
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                Backtested on{' '}
+                <span className="font-semibold text-slate-700 dark:text-slate-300">
+                  {evaluatedOnLine}
+                </span>
+              </p>
+            )}
           </div>
           <div className="flex flex-wrap items-center gap-2 shrink-0">
             <span
