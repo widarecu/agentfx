@@ -26,6 +26,7 @@ import logging
 import multiprocessing
 import os
 import signal
+import threading
 from datetime import UTC, datetime, timedelta
 
 from agentfx.agents.evolution import ResourceLimits, apply_resource_limits
@@ -37,6 +38,10 @@ logger = logging.getLogger(__name__)
 # the FastAPI event loop + threads, which causes hangs and exhausted DB
 # connections in the child. Spawn gives a clean Python process.
 _MP_CONTEXT = multiprocessing.get_context("spawn")
+
+# How often the parent-side watchdog checks subprocess liveness. Cheap
+# (a single Process.is_alive() call), so polling every few seconds is fine.
+_WATCHDOG_POLL_SECONDS = 5.0
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -50,6 +55,14 @@ def schedule_run(run_id: str) -> None:
     Called from a FastAPI BackgroundTask. Returns immediately after
     starting the child; child completion is observed via the run row's
     status (the child writes its own status updates).
+
+    A daemon watchdog thread polls `proc.is_alive()` every
+    `_WATCHDOG_POLL_SECONDS`. When the child exits, the watchdog reaps
+    it (preventing zombie accumulation) and — if the run row is still
+    marked RUNNING — flips it to FAILED with `stop_reason='process_crashed'`.
+    The watchdog is the safety net for crashes where the child can't
+    update its own DB row (SIGKILL, segfault, hard OOM, anthropic SDK
+    deadlock followed by external kill, etc.).
     """
     proc = _MP_CONTEXT.Process(
         target=_subprocess_entry,
@@ -60,6 +73,62 @@ def schedule_run(run_id: str) -> None:
     proc.start()
     logger.info("scheduled evolution run %s as pid=%s", run_id, proc.pid)
     _record_child_pid(run_id, proc.pid)
+    _start_watchdog(run_id, proc)
+
+
+def _start_watchdog(run_id: str, proc: multiprocessing.Process) -> None:
+    """Start a daemon thread that reaps the child and marks the run
+    FAILED if the child exits while the DB still says RUNNING."""
+
+    def _watch() -> None:
+        # Block until the child exits — this also reaps it (no zombie).
+        proc.join()
+        exit_code = proc.exitcode
+        logger.info(
+            "watchdog: evolution run %s child exited (pid=%s exit_code=%s)",
+            run_id,
+            proc.pid,
+            exit_code,
+        )
+
+        if exit_code == 0:
+            # Clean exit: the orchestrator marked the run COMPLETED itself.
+            return
+
+        # Non-zero exit: only mark FAILED if the orchestrator didn't
+        # already record its own status (FAILED via internal handler, or
+        # STOPPED via explicit stop). Idempotent — never overwrites a
+        # terminal state.
+        try:
+            from agentfx.api.core.database import SessionLocal
+            from agentfx.api.models import EvolutionRunStatus
+            from agentfx.api.services import evolution as evolution_service
+
+            db = SessionLocal()
+            try:
+                run = evolution_service.get_run(db, run_id)
+                if run is None:
+                    logger.warning(
+                        "watchdog: run %s vanished from DB before update", run_id
+                    )
+                    return
+                if run.status == EvolutionRunStatus.RUNNING:
+                    run.status = EvolutionRunStatus.FAILED
+                    run.stop_reason = f"process_crashed (exit_code={exit_code})"
+                    run.completed_at = datetime.now(UTC)
+                    db.commit()
+                    logger.error(
+                        "watchdog: marked run %s FAILED (child exit_code=%s)",
+                        run_id,
+                        exit_code,
+                    )
+            finally:
+                db.close()
+        except Exception:  # noqa: BLE001
+            logger.exception("watchdog: failed to mark run %s as FAILED", run_id)
+
+    t = threading.Thread(target=_watch, name=f"evorun-watchdog-{run_id}", daemon=True)
+    t.start()
 
 
 def signal_run_stop(pid: int) -> bool:
@@ -153,6 +222,54 @@ def _record_child_pid(run_id: str, pid: int | None) -> None:
         db.close()
 
 
+def _clamp_window_to_data(
+    db,
+    *,
+    instrument: str,
+    granularity: str,
+    requested_window: tuple[datetime, datetime],
+) -> tuple[datetime, datetime] | None:
+    """Clamp the requested data window to what's actually in the DB.
+
+    The GA + validator run backtests across this window. If the requested
+    start predates the oldest candle (e.g. a 5-year request against a DB
+    that's only been backfilling for a week), the walk-forward validator's
+    earliest fold gets zero data and crashes. Clamping makes the run
+    adapt to data availability instead of demanding more than exists.
+
+    Returns None if no candles exist for the instrument:granularity at
+    all — the caller should fail-fast rather than proceed with an empty
+    window.
+    """
+    from agentfx.api.models import Candle
+
+    oldest = (
+        db.query(Candle.timestamp)
+        .filter(Candle.instrument == instrument, Candle.timeframe == granularity)
+        .order_by(Candle.timestamp.asc())
+        .first()
+    )
+    newest = (
+        db.query(Candle.timestamp)
+        .filter(Candle.instrument == instrument, Candle.timeframe == granularity)
+        .order_by(Candle.timestamp.desc())
+        .first()
+    )
+    if oldest is None or newest is None:
+        return None
+
+    oldest_ts = oldest[0]
+    newest_ts = newest[0]
+    if oldest_ts.tzinfo is None:
+        oldest_ts = oldest_ts.replace(tzinfo=UTC)
+    if newest_ts.tzinfo is None:
+        newest_ts = newest_ts.replace(tzinfo=UTC)
+
+    clamped_start = max(requested_window[0], oldest_ts)
+    clamped_end = min(requested_window[1], newest_ts)
+    return (clamped_start, clamped_end)
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Internal: subprocess entry (runs in the child)
 # ─────────────────────────────────────────────────────────────────────────
@@ -176,7 +293,21 @@ def _subprocess_entry(run_id: str) -> None:
     handler so the failure is reflected in the DB even if the parent's
     monitor isn't running.
     """
-    logging.basicConfig(level=logging.INFO)
+    # Configure logging with force=True so it overrides any inherited
+    # root handlers from the parent process's spawn context, AND with an
+    # explicit StreamHandler pointed at stderr so log records flow into
+    # docker's captured stdout/stderr stream. Unbuffer stdout/stderr so
+    # log lines appear in real time, not after process exit.
+    import sys
+
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [child-%(process)d] %(name)s - %(levelname)s - %(message)s",
+        stream=sys.stderr,
+        force=True,
+    )
     logger.info("evolution run %s child process starting (pid=%s)", run_id, os.getpid())
 
     try:
@@ -238,19 +369,50 @@ def _subprocess_entry(run_id: str) -> None:
         )
 
         data_years = int(config_dict.get("data_years", 5))
-        data_window = (
+        requested_window = (
             datetime.now(UTC) - timedelta(days=data_years * 365),
             datetime.now(UTC),
+        )
+        # Clamp the requested window to what's actually in the DB. The
+        # validator runs K=4 walk-forward folds across this window — if
+        # the oldest fold spans dates with no candles, the per-fold
+        # backtest raises FileNotFoundError and crashes the run. Better
+        # to run validation on a smaller-but-real window than to fail on
+        # data scarcity. Also clamp the end so we don't validate against
+        # the still-incomplete trailing candle.
+        data_window = _clamp_window_to_data(
+            db,
+            instrument=run.instrument,
+            granularity=run.granularity,
+            requested_window=requested_window,
+        )
+        if data_window is None:
+            raise RuntimeError(
+                f"No candle data available for {run.instrument}:{run.granularity}; "
+                f"cannot proceed with evolution run. Backfill the instrument first."
+            )
+        logger.info(
+            "data window for run %s: requested=%s..%s clamped=%s..%s",
+            run_id,
+            requested_window[0].isoformat(),
+            requested_window[1].isoformat(),
+            data_window[0].isoformat(),
+            data_window[1].isoformat(),
         )
 
         llm_budget_usd = float(config_dict.get("llm_budget_usd", 5.0))
 
         # LLM injector — only constructed if ANTHROPIC_API_KEY is set.
         # Without a key, runs proceed without LLM injection (the
-        # orchestrator handles this gracefully).
+        # orchestrator handles this gracefully). EVOLUTION_LLM_MODEL lets
+        # deployments override the default model (e.g. haiku for cheap
+        # diversity-injection variants) without API callers having to know.
         llm_injector: LLMHypothesisInjector | None = None
         if os.environ.get("ANTHROPIC_API_KEY"):
-            llm_injector = LLMHypothesisInjector(budget_usd=llm_budget_usd)
+            llm_model = os.environ.get("EVOLUTION_LLM_MODEL", "claude-sonnet-4-6")
+            llm_injector = LLMHypothesisInjector(
+                model=llm_model, budget_usd=llm_budget_usd
+            )
         else:
             logger.warning(
                 "ANTHROPIC_API_KEY not set; running without LLM hypothesis injection"
@@ -280,8 +442,15 @@ def _subprocess_entry(run_id: str) -> None:
     except Exception:  # noqa: BLE001
         logger.exception("evolution run %s crashed in child process", run_id)
         # Mark the run failed from inside the child so the DB reflects
-        # reality even without parent-side monitoring.
+        # reality even without parent-side monitoring. The original session
+        # may be in a failed-transaction state (e.g. IntegrityError leaves
+        # the session unusable), so roll back first AND fall back to a
+        # fresh session if the existing one is unrecoverable. The parent
+        # watchdog catches non-zero exits regardless, but this internal
+        # handler gives faster visibility in the DB while the parent
+        # watchdog is still waiting on proc.join().
         try:
+            db.rollback()
             run = evolution_service.get_run(db, run_id)
             if run is not None:
                 from agentfx.api.models import EvolutionRunStatus
@@ -291,7 +460,10 @@ def _subprocess_entry(run_id: str) -> None:
                 run.completed_at = datetime.now(UTC)
                 db.commit()
         except Exception:  # noqa: BLE001
-            logger.exception("failed to record run failure in DB")
+            logger.exception(
+                "failed to record run failure in DB via primary session; "
+                "watchdog will catch this via process exit code"
+            )
         raise
     finally:
         db.close()

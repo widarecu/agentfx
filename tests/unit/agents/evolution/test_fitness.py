@@ -136,24 +136,85 @@ class TestComputeFitness:
         assert kwargs["position_size"] == 5000
         assert kwargs["spread_pips"] == 0.3
 
-    def test_gate_b_failure_dilutes_positive_fitness(self) -> None:
+    def test_gate_b_failure_applies_trade_shortfall_penalty(self) -> None:
+        # n_trades=100 vs min=300 → shortfall_ratio = 2/3 → -6.667 additive
         backtest = _make_backtest_mock(_gate_failing_metrics(sharpe=1.8))
         fitness, _ = compute_fitness(
             MA_CROSSOVER_SEED,
             instrument="EUR_USD",
             backtest_fn=backtest,
         )
-        assert fitness == pytest.approx(1.8 * GATE_B_FAILURE_DILUTION)
+        # 1.8 raw - (2/3 * 10.0 shortfall) = -4.867. Negative now, so the
+        # Gate B *dilution* doesn't apply (only halves positive fitness).
+        expected = 1.8 - (200 / 300) * 10.0
+        assert fitness == pytest.approx(expected)
 
-    def test_gate_b_failure_does_not_alter_negative_fitness(self) -> None:
+    def test_gate_b_failure_compounds_with_negative_fitness(self) -> None:
+        # Negative sharpe AND insufficient trades — both penalties stack
         backtest = _make_backtest_mock(_gate_failing_metrics(sharpe=-0.5))
         fitness, _ = compute_fitness(
             MA_CROSSOVER_SEED,
             instrument="EUR_USD",
             backtest_fn=backtest,
         )
-        # Negative fitness shouldn't be "diluted upward" by a multiplier
-        assert fitness == pytest.approx(-0.5)
+        # -0.5 raw + (-6.667 shortfall) = -7.167
+        expected = -0.5 - (200 / 300) * 10.0
+        assert fitness == pytest.approx(expected)
+
+    def test_zero_trades_degenerate_genome_strongly_penalized(self) -> None:
+        """Regression test for v0.3.0 acceptance runs #5 + #6:
+
+        A DSL genome where long and short conditions are identical never
+        triggers any trades. The trade-shortfall penalty alone proved too
+        weak (a zero-trade genome at -10 still beat a 100-trade losing
+        strategy at -21). The fix is a hard penalty floor of -100 for
+        any genome with literally zero trades — they should ALWAYS lose
+        tournaments to active strategies."""
+        zero_trade_metrics = {
+            "sharpe": 0.0,
+            "max_drawdown": 0.0,
+            "hit_rate": 0.0,
+            "n_trades": 0,
+        }
+        backtest = _make_backtest_mock(zero_trade_metrics)
+        fitness, _ = compute_fitness(
+            MA_CROSSOVER_SEED,
+            instrument="EUR_USD",
+            backtest_fn=backtest,
+        )
+        # Hard floor: 0 sharpe - 100 zero-trade penalty = -100
+        assert fitness == pytest.approx(-100.0)
+
+    def test_one_trade_strategy_beats_zero_trade_degenerate(self) -> None:
+        """Regression test: even a single-trade strategy with a bad sharpe
+        should rank above the zero-trade degenerate. This is what
+        validates the *hard* floor on zero-trade genomes — without it the
+        GA's elitism perpetuates do-nothing genomes."""
+        # 1-trade strategy losing badly
+        one_trade_loser = {
+            "sharpe": -20.0,
+            "max_drawdown": 0.5,
+            "hit_rate": 0.0,
+            "n_trades": 1,
+        }
+        zero_trade = {
+            "sharpe": 0.0,
+            "max_drawdown": 0.0,
+            "hit_rate": 0.0,
+            "n_trades": 0,
+        }
+        backtest_one = _make_backtest_mock(one_trade_loser)
+        backtest_zero = _make_backtest_mock(zero_trade)
+        fit_one, _ = compute_fitness(
+            MA_CROSSOVER_SEED, instrument="EUR_USD", backtest_fn=backtest_one
+        )
+        fit_zero, _ = compute_fitness(
+            MA_CROSSOVER_SEED, instrument="EUR_USD", backtest_fn=backtest_zero
+        )
+        assert fit_one > fit_zero, (
+            f"1-trade loser ({fit_one}) must outrank 0-trade degenerate "
+            f"({fit_zero}) — otherwise GA picks do-nothing genomes"
+        )
 
     def test_diversity_penalty_applied_when_near_elite(self) -> None:
         backtest = _make_backtest_mock(_gate_passing_metrics(sharpe=2.0))
@@ -183,8 +244,9 @@ class TestComputeFitness:
             backtest_fn=backtest,
             elite_specs=[MA_CROSSOVER_SEED],
         )
-        # Both penalties apply: 2.0 * 0.5 (gate B) * 0.5 (diversity) = 0.5
-        expected = 2.0 * GATE_B_FAILURE_DILUTION * DIVERSITY_PENALTY_FACTOR
+        # Penalties: 2.0 raw - 6.667 trade-shortfall = -4.667 (negative,
+        # Gate B dilution skipped) → -4.667 * 0.5 (diversity) = -2.333
+        expected = (2.0 - (200 / 300) * 10.0) * DIVERSITY_PENALTY_FACTOR
         assert fitness == pytest.approx(expected)
 
     def test_missing_sharpe_returns_neg_inf(self) -> None:

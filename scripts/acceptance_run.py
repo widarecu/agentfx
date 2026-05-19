@@ -43,6 +43,13 @@ from typing import Any
 
 import requests
 
+# Force line-buffered stdout so progress is visible in real time when the
+# script is piped through `tee` or otherwise has its stdout redirected.
+# Python defaults to block-buffering on non-tty stdout, which means every
+# print() is silently queued until the buffer fills (or the process exits).
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 BASE_URL = os.environ.get("AGENTFX_BASE_URL", "http://localhost:8001/api/v1")
 TRADER_EMAIL = os.environ.get("ACCEPTANCE_USER", "trader@example.com")
 TRADER_PASSWORD = os.environ.get("ACCEPTANCE_PASSWORD", "traderpassword")
@@ -74,7 +81,7 @@ def fmt_dt(s: str | None) -> str:
 
 def login() -> str:
     r = requests.post(
-        f"{BASE_URL}/auth/login",
+        f"{BASE_URL}/login",
         data={"username": TRADER_EMAIL, "password": TRADER_PASSWORD},
         timeout=10,
     )
@@ -126,16 +133,25 @@ def api_post(path: str, token: str, json_body: dict) -> Any:
 
 
 def kick_off_run(token: str, *, quick: bool, no_llm: bool) -> str:
-    """Create a small evolution run + return the run_id."""
-    population_size = 5 if quick else 10
-    max_generations = 2 if quick else 4
+    """Create a small evolution run + return the run_id.
+
+    Two presets:
+      - --quick: pop=5, gens=2, budget=$0.50 (smoke test, ~30s)
+      - default: pop=15, gens=8, budget=$2.00 (representative acceptance,
+        ~15min on 1-year EUR_USD M1). The plan calls for pop=30 × gens=30
+        in production; we run smaller here to keep the acceptance loop
+        observable while still exercising selection pressure + multiple
+        LLM injection rounds (gens 2, 4, 6, 8).
+    """
+    population_size = 5 if quick else 15
+    max_generations = 2 if quick else 8
     body = {
         "instrument": "EUR_USD",
         "granularity": "M1",
         "data_years": 1,
         "config": {
             "population_size": population_size,
-            "llm_injection_every_n": 2,  # injects at gen 2 (and 4 if reached)
+            "llm_injection_every_n": 2,  # gens 2, 4, 6, 8 in default mode
             "n_llm_proposals": 3,
             "rng_seed": 7,
         },
@@ -210,9 +226,11 @@ def evaluate_criteria(
         (
             "1. Scheduled Railway cron declared",
             cron_in_toml,
-            "railway.toml [[deploy.cronJobs]] present"
-            if cron_in_toml
-            else "missing — add [[deploy.cronJobs]] to railway.toml",
+            (
+                "railway.toml [[deploy.cronJobs]] present"
+                if cron_in_toml
+                else "missing — add [[deploy.cronJobs]] to railway.toml"
+            ),
         )
     )
 
@@ -259,9 +277,11 @@ def evaluate_criteria(
         (
             "3. At least one validated genome differs from gen-0 seeds",
             has_validated and structurally_different,
-            f"best validated={has_validated} structurally_different={structurally_different}"
-            if has_validated
-            else "no validated genome — best may have failed Gate B",
+            (
+                f"best validated={has_validated} structurally_different={structurally_different}"
+                if has_validated
+                else "no validated genome — best may have failed Gate B"
+            ),
         )
     )
 

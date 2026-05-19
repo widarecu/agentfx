@@ -19,9 +19,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Protocol
 
-from agentfx.api.models.optimization import StrategyType  # noqa: F401  (re-export safety)
 from agentfx.core.dsl import StrategySpec
-from agentfx.core.gates import evaluate_gate_b
+from agentfx.core.gates import GATE_B_THRESHOLDS, evaluate_gate_b
 
 
 class BacktestFn(Protocol):
@@ -98,6 +97,26 @@ def is_near_elite(
 GATE_B_FAILURE_DILUTION = 0.5
 DIVERSITY_PENALTY_FACTOR = 0.5
 
+# Zero-trade hard penalty: a strategy that produces literally zero trades
+# isn't trading at all — it's a degenerate genome (typically: long and
+# short DSL conditions are identical, or both never fire on the data). A
+# proportional shortfall penalty isn't enough; a real losing strategy with
+# 100 trades at sharpe=-15 gets penalty -22 (worse than a 0-trade genome
+# at -10), so the GA's elitism would keep picking the do-nothing genome.
+# Hard floor at -100 guarantees zero-trade genomes always lose tournaments.
+# (See v0.3.0 acceptance run #6: this is the regression that uncovered it.)
+ZERO_TRADE_HARD_PENALTY = 100.0
+
+# Trade-count shortfall penalty: linear additive penalty for strategies
+# that DO trade but produce fewer than Gate B's minimum (300 OOS). Scale
+# is intentionally lower than the zero-trade penalty so an active losing
+# strategy can still recover via mutation/crossover with more trades.
+TRADE_SHORTFALL_PENALTY_SCALE = 10.0
+
+# Drawdown breach penalty: additive, scales with how far over the cap.
+# Per Gate B threshold (10%), a strategy at 30% drawdown gets -10.0 added.
+DRAWDOWN_BREACH_PENALTY_SCALE = 50.0
+
 
 def _apply_penalties(
     raw_fitness: float,
@@ -106,15 +125,48 @@ def _apply_penalties(
     elite_specs: list[StrategySpec] | None,
     diversity_threshold: int,
 ) -> float:
-    """Apply Gate B and diversity penalties to a raw fitness value."""
+    """Apply Gate B and diversity penalties to a raw fitness value.
+
+    Penalty order (additive, then multiplicative):
+      1. Trade-count shortfall: additive penalty that scales 0 → -10 as
+         n_trades drops from the Gate B minimum to 0. This is what keeps
+         zero-trade degenerate genomes from winning tournaments — without
+         it, raw_sharpe=0 beats real-but-losing strategies.
+      2. Drawdown breach: additive penalty proportional to how far over
+         the Gate B max_drawdown the strategy went.
+      3. Gate B dilution: halves *positive* fitness when Gate B fails.
+         The additive penalties above already handle the negative case.
+      4. Diversity penalty: halves fitness for genomes too close to an
+         elite, preventing premature convergence.
+    """
     fitness = raw_fitness
 
-    # Gate B dilution: halve positive fitness, leave negative alone.
+    # 1a. Zero-trade hard penalty — for genuinely degenerate genomes that
+    # never open a position. Without this hard floor, the proportional
+    # shortfall penalty alone lets do-nothing genomes beat active losers.
+    n_trades = metrics.get("n_trades", 0) or 0
+    if n_trades == 0:
+        fitness -= ZERO_TRADE_HARD_PENALTY
+    else:
+        # 1b. Proportional shortfall — for strategies that DO trade but
+        # come up short of Gate B's minimum.
+        min_trades = GATE_B_THRESHOLDS["min_trades"]
+        if n_trades < min_trades:
+            shortfall_ratio = (min_trades - n_trades) / min_trades
+            fitness -= shortfall_ratio * TRADE_SHORTFALL_PENALTY_SCALE
+
+    # 2. Drawdown breach — additive, proportional to over-cap excess.
+    max_dd = metrics.get("max_drawdown", 0) or 0
+    if max_dd > GATE_B_THRESHOLDS["max_drawdown"]:
+        breach = max_dd - GATE_B_THRESHOLDS["max_drawdown"]
+        fitness -= breach * DRAWDOWN_BREACH_PENALTY_SCALE
+
+    # 3. Gate B dilution: halve positive fitness if any threshold breached.
     passes_gate_b, _ = evaluate_gate_b(metrics)
     if not passes_gate_b and fitness > 0:
         fitness = fitness * GATE_B_FAILURE_DILUTION
 
-    # Diversity penalty: halve fitness if too close to an elite.
+    # 4. Diversity penalty: halve fitness if too close to an elite.
     if (
         candidate is not None
         and elite_specs

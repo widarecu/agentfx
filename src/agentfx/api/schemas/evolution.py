@@ -12,6 +12,7 @@ endpoints.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -19,6 +20,20 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from .base import BaseSchema
+
+
+def _default_llm_budget_usd() -> float:
+    """Per-run LLM budget cap, default $5.00.
+
+    Pulled from the EVOLUTION_LLM_BUDGET_USD env var so deployments can
+    override the default without API callers having to know about it.
+    A bad value falls back silently to 5.00 — this is a default, not a
+    hard validation point.
+    """
+    try:
+        return float(os.environ.get("EVOLUTION_LLM_BUDGET_USD", "5.0"))
+    except ValueError:
+        return 5.0
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -78,7 +93,7 @@ class EvolutionRunCreate(BaseModel):
     # OrchestratorConfigSchema/StopConditionsSchema apply.
     config: OrchestratorConfigSchema | None = None
     stop_conditions: StopConditionsSchema | None = None
-    llm_budget_usd: float = Field(default=5.0, ge=0.0)
+    llm_budget_usd: float = Field(default_factory=_default_llm_budget_usd, ge=0.0)
 
 
 class EvolutionRunCreated(BaseModel):

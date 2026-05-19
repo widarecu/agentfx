@@ -489,9 +489,23 @@ class SqlAlchemyPersister:
         reasoning_text: str | None = None,
         llm_call_id: str | None = None,
     ) -> None:
+        # The orchestrator can log a decision *for* a future generation
+        # (e.g. LLM injection happens between gen N-1 completion and gen N
+        # evaluation, but the proposals are conceptually "for" gen N). If
+        # gen N's row doesn't exist in the DB yet, the FK constraint on
+        # decision_logs.generation_id would fail. Detect that case and
+        # store generation_id=None — the decision still logs cleanly, and
+        # callers can correlate via the action + outputs_json instead.
         generation_id: str | None = None
         if generation_index is not None:
-            generation_id = generate_generation_id(run_id, generation_index)
+            candidate_id = generate_generation_id(run_id, generation_index)
+            exists = (
+                self.db.query(models.Generation.id)
+                .filter(models.Generation.id == candidate_id)
+                .first()
+                is not None
+            )
+            generation_id = candidate_id if exists else None
 
         row = models.DecisionLog(
             id=uuid.uuid4().hex,
