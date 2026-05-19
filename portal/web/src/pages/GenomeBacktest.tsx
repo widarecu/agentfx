@@ -307,18 +307,46 @@ export default function GenomeBacktest() {
 
       {/* Chart */}
       <section className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-4">
-        <div className="flex items-center justify-between mb-2">
-          <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-            Price + trade markers
-          </h2>
-          {candlesLoading && (
-            <span className="text-xs text-slate-500 dark:text-slate-400 inline-flex items-center gap-1">
-              <Loader2 className="w-3 h-3 animate-spin" />
-              loading candles…
-            </span>
-          )}
+        <div className="flex items-center justify-between mb-2 gap-3 flex-wrap">
+          <div>
+            <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+              Price + trade markers
+            </h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+              {backtest.granularity} candles — backtest's native timeframe.
+              Default view shows the last ~1500 bars so individual entries +
+              exits are legible. Pan/scroll the chart or hit the maximise
+              icon to see the full window.
+            </p>
+          </div>
+          <div className="flex items-center gap-3">
+            {!candlesLoading && candles.length > 0 && (
+              <span className="text-xs text-slate-500 dark:text-slate-400">
+                {candles.length.toLocaleString()} bars loaded
+              </span>
+            )}
+            {candlesLoading && (
+              <span className="text-xs text-slate-500 dark:text-slate-400 inline-flex items-center gap-1">
+                <Loader2 className="w-3 h-3 animate-spin" />
+                loading candles…
+              </span>
+            )}
+          </div>
         </div>
-        {candles.length === 0 && !candlesLoading ? (
+        {candlesLoading && candles.length === 0 ? (
+          // Don't mount StrategyChart while candles are loading.
+          // StrategyChart's isLoading branch returns a placeholder *before*
+          // its chart container div is rendered, so its useRef never gets
+          // populated and the init useEffect bails — the chart is never
+          // created. Render our own spinner here and only mount the chart
+          // once candles are present.
+          <div className="flex items-center justify-center h-[500px] border border-slate-200 dark:border-slate-700 rounded-lg">
+            <div className="flex flex-col items-center gap-2 text-sm text-slate-600 dark:text-slate-400">
+              <Loader2 className="w-6 h-6 animate-spin" />
+              Loading {backtest.granularity} candles for the chart…
+            </div>
+          </div>
+        ) : candles.length === 0 ? (
           <div className="text-sm text-slate-500 dark:text-slate-400 italic py-8 flex items-start gap-2">
             <AlertTriangle className="w-4 h-4 mt-0.5 text-amber-500 shrink-0" />
             Couldn't load candles for the backtest window — the chart needs
@@ -335,7 +363,7 @@ export default function GenomeBacktest() {
             strategy="dsl"
             params={{}}
             timeframe={backtest.granularity}
-            isLoading={candlesLoading && candles.length === 0}
+            defaultVisibleBars={1500}
           />
         )}
       </section>

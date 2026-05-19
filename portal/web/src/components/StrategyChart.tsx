@@ -34,6 +34,15 @@ interface StrategyChartProps {
   timeframe?: string;
   isLoading?: boolean;
   error?: string | null;
+  /**
+   * Optional default visible bars. When set, after the data + markers
+   * are loaded the chart zooms to show the *last* N bars rather than
+   * fitting all of them in view. Lets the chart render readably even
+   * for very-long M1 windows (e.g. a 9-month genome backtest = 277K
+   * bars; auto-fit would compress them to a flat strip). User can still
+   * pan/zoom freely from the default view.
+   */
+  defaultVisibleBars?: number;
 }
 
 function isOscillator(ind: IndicatorLine): boolean {
@@ -45,7 +54,7 @@ const toTime = (ts: string): UTCTimestamp =>
 
 export default function StrategyChart({
   candles, signals, indicators, instrument, strategy, params,
-  timeframe, isLoading = false, error = null,
+  timeframe, isLoading = false, error = null, defaultVisibleBars,
 }: StrategyChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -171,12 +180,39 @@ export default function StrategyChart({
       });
       markers.sort((a, b) => (a.time as number) - (b.time as number));
       candleRef.current.setMarkers(markers);
-      chartRef.current?.timeScale().fitContent();
+      // Default view: if the caller passed `defaultVisibleBars` and the
+      // dataset is bigger than that, scroll to the LAST N bars so the
+      // candles render at a useful density. Setting `barSpacing` first
+      // forces the chart to allocate at least 1px per bar — without this,
+      // lightweight-charts auto-fits all 277K bars into the available
+      // pixel width on first paint, which silently overrides any
+      // subsequent setVisibleLogicalRange call. Otherwise auto-fit the
+      // whole dataset, matching the legacy behaviour trials rely on.
+      const applyDefaultView = () => {
+        const chart = chartRef.current;
+        if (!chart) return;
+        if (
+          defaultVisibleBars != null &&
+          candles.length > defaultVisibleBars
+        ) {
+          const ts = chart.timeScale();
+          // Force a minimum bar width so the chart can't compress 277K
+          // bars into a flat strip. With barSpacing=3 and a typical
+          // chart width ~1500px, ~500 bars fit on screen — readable.
+          ts.applyOptions({ barSpacing: 3, rightOffset: 12 });
+          ts.scrollToPosition(0, false); // 0 = latest bar
+        } else {
+          chart.timeScale().fitContent();
+        }
+      };
+      // Defer past the current task so lightweight-charts has finished
+      // its internal layout for setData before we override the view.
+      requestAnimationFrame(applyDefaultView);
       setChartError(null);
     } catch (err) {
       setChartError(err instanceof Error ? err.message : 'Failed to update chart');
     }
-  }, [candles, signals]);
+  }, [candles, signals, defaultVisibleBars]);
 
   // ── Overlay indicators (MA, Donchian) ──────────────────────────────
   useEffect(() => {
