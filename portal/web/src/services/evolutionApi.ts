@@ -17,6 +17,7 @@ import type {
   EvolutionRunStatus,
   Generation,
   GenerationListResponse,
+  GenomeBacktestResult,
   StrategyGenome,
   StrategyGenomeSummaryList,
 } from '../types/evolution';
@@ -137,6 +138,17 @@ export async function getGenome(
 ): Promise<StrategyGenome> {
   const res = await fetch(
     `${API_BASE_URL}/evolution-runs/${runId}/genomes/${genomeId}`,
+    { headers: authHeaders() },
+  );
+  return handleResponse(res);
+}
+
+export async function getGenomeBacktest(
+  runId: string,
+  genomeId: string,
+): Promise<GenomeBacktestResult> {
+  const res = await fetch(
+    `${API_BASE_URL}/evolution-runs/${runId}/genomes/${genomeId}/backtest`,
     { headers: authHeaders() },
   );
   return handleResponse(res);

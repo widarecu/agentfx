@@ -190,6 +190,27 @@ export interface StrategyGenomeSummaryList {
   total: number;
 }
 
+/**
+ * Result of the on-demand backtest endpoint
+ * (`GET /evolution-runs/{run_id}/genomes/{id}/backtest`).
+ *
+ * Shapes for `trades` and `signals` are intentionally loose (Record) so
+ * the existing Trade / TradeSignal interfaces from `types/optimization.ts`
+ * can be used directly — the snake_case → camelCase mapping happens in
+ * the API-client layer, mirroring the trial-detail flow.
+ */
+export interface GenomeBacktestResult {
+  run_id: string;
+  genome_id: string;
+  instrument: string;
+  granularity: string;
+  data_range_start: string;
+  data_range_end: string;
+  metrics: Record<string, number>;
+  trades: Record<string, unknown>[];
+  signals: Record<string, unknown>[];
+}
+
 export interface StrategyGenome {
   id: string;
   generation_id: string;

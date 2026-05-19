@@ -225,6 +225,39 @@ class StrategyGenomeSummaryList(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Genome backtest detail — on-demand re-execution
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class GenomeBacktestResult(BaseModel):
+    """Full backtest output for a single genome.
+
+    Computed on-demand by re-running `services.backtest.run_backtest_from_db`
+    with the genome's DSL spec over the run's training window. Used by the
+    portal's `GenomeBacktest` page to show metrics + trades + per-bar
+    signals at the same level of detail an optimization trial offers, with
+    no per-genome persistence overhead.
+
+    Field shapes for `trades` and `signals` match the existing
+    optimization-trial `OptimizationTrade` / `TradeSignal` response shapes
+    so the same frontend chart + table components render both. Each is a
+    list of free-form dicts to avoid recreating the optimisation schemas
+    here — see [src/agentfx/services/backtest.py:capture_signals] for the
+    exact keys.
+    """
+
+    run_id: str
+    genome_id: str
+    instrument: str
+    granularity: str
+    data_range_start: datetime
+    data_range_end: datetime
+    metrics: dict[str, Any]
+    trades: list[dict[str, Any]]
+    signals: list[dict[str, Any]]
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Decision log
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -262,6 +295,7 @@ __all__ = [
     "GenerationPublic",
     "OrchestratorConfigSchema",
     "StopConditionsSchema",
+    "GenomeBacktestResult",
     "StrategyGenomePublic",
     "StrategyGenomeSummary",
     "StrategyGenomeSummaryList",

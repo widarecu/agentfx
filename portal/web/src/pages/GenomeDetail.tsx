@@ -21,7 +21,14 @@
 
 import React, { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, ChevronLeft, Loader2, AlertTriangle } from 'lucide-react';
+import {
+  ArrowLeft,
+  BarChart3,
+  ChevronLeft,
+  ChevronRight,
+  Loader2,
+  AlertTriangle,
+} from 'lucide-react';
 
 import DslTree from '../components/DslTree';
 import GenomeLineageStrip from '../components/GenomeLineageStrip';
@@ -229,6 +236,21 @@ export default function GenomeDetail() {
             {summary}
           </p>
         )}
+
+        <div className="mb-4">
+          <Link
+            to={`/evolution/${runId}/genomes/${genomeId}/backtest`}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium"
+          >
+            <BarChart3 className="w-4 h-4" />
+            View full backtest detail
+            <ChevronRight className="w-4 h-4" />
+          </Link>
+          <span className="ml-3 text-xs text-slate-500 dark:text-slate-400">
+            Re-runs the backtest on demand to show every trade, signal, and
+            the price chart with markers.
+          </span>
+        </div>
 
         <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
           <Stat label="Training fitness" value={fitnessText} />

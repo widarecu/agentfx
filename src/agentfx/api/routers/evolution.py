@@ -264,6 +264,108 @@ def get_genome_detail(
 
 
 @router.get(
+    "/evolution-runs/{run_id}/genomes/{genome_id}/backtest",
+    response_model=schemas.GenomeBacktestResult,
+)
+def get_genome_backtest(
+    run_id: str,
+    genome_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> schemas.GenomeBacktestResult:
+    """Re-run the backtest for one genome and return full trade-level detail.
+
+    The GA only persists the genome's fitness + walk-forward fold summary;
+    individual trades and per-bar signals are not stored. To match the
+    "drill into a trial" experience users have for optimisation jobs, we
+    re-execute the backtest on demand from the genome's DSL spec + the
+    run's data window. Result is deterministic (same DSL + same candles =
+    same trades), so re-running is safe and idempotent.
+
+    Compute cost: ~1s on 120K candles. The page is interactive — re-run
+    on every navigation — so no caching needed yet. If this becomes a hot
+    path, persist results to a `genome_backtest_cache` table keyed by
+    (genome_id, data_window_hash).
+    """
+    # Lazy imports — the backtest engine pulls in pandas + numpy which we
+    # don't want at router-import time.
+    from agentfx.api.workers.evolution_runner import _clamp_window_to_data
+    from agentfx.core.validation import make_walk_forward_folds, training_window
+    from agentfx.services.backtest import run_backtest_from_db
+
+    run = evolution_service.get_run(db, run_id)
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Evolution run not found"
+        )
+
+    genome_detail = evolution_service.get_genome_with_lineage(db, run_id, genome_id)
+    if genome_detail is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Genome not found"
+        )
+
+    # Reconstruct the same training window the orchestrator used so the
+    # backtest's metrics line up with the displayed `fitness` value.
+    config_dict = run.config_json or {}
+    data_years = int(config_dict.get("data_years", 5))
+    requested_window = (
+        datetime.now(tz=run.created_at.tzinfo) - timedelta(days=data_years * 365),
+        datetime.now(tz=run.created_at.tzinfo),
+    )
+    clamped = _clamp_window_to_data(
+        db,
+        instrument=run.instrument,
+        granularity=run.granularity,
+        requested_window=requested_window,
+    )
+    if clamped is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"No candle data available for {run.instrument}:{run.granularity}; "
+                f"cannot rerun the backtest."
+            ),
+        )
+
+    # Slice to the training window (folds 0..k-2) so the re-run matches
+    # what the GA evaluated. OOS metrics live in `validation_folds`.
+    n_folds = int(config_dict.get("n_validation_folds", 4))
+    folds = make_walk_forward_folds(start=clamped[0], end=clamped[1], k=n_folds)
+    train_start, train_end = training_window(folds)
+
+    backtest_kwargs: dict = {
+        "account_balance": float(config_dict.get("account_balance", 10000.0)),
+        "position_size": int(config_dict.get("position_size", 10000)),
+    }
+    if config_dict.get("spread_pips") is not None:
+        backtest_kwargs["spread_pips"] = float(config_dict["spread_pips"])
+
+    result = run_backtest_from_db(
+        instrument=run.instrument,
+        granularity=run.granularity,
+        start=train_start,
+        end=train_end,
+        strategy_name="dsl",
+        strategy_params={"spec": genome_detail["dsl_json"]},
+        capture_signals=True,
+        **backtest_kwargs,
+    )
+
+    return schemas.GenomeBacktestResult(
+        run_id=run.id,
+        genome_id=genome_id,
+        instrument=run.instrument,
+        granularity=run.granularity,
+        data_range_start=train_start,
+        data_range_end=train_end,
+        metrics=result.get("metrics", {}),
+        trades=result.get("trades", []),
+        signals=result.get("signals", []),
+    )
+
+
+@router.get(
     "/evolution-runs/{run_id}/decisions", response_model=schemas.DecisionLogList
 )
 def list_run_decisions(
