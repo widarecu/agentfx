@@ -28,7 +28,11 @@ import GenomeLineageStrip from '../components/GenomeLineageStrip';
 import LineageExplainer from '../components/LineageExplainer';
 import WalkForwardFoldTable from '../components/WalkForwardFoldTable';
 import { getEvolutionRun, getGenome } from '../services/evolutionApi';
-import { inferArchetype, summarizeDsl } from '../utils/dslSummary';
+import {
+  archetypeTooltip,
+  inferArchetype,
+  summarizeDsl,
+} from '../utils/dslSummary';
 import type {
   EvolutionRun,
   GenomeOrigin,
@@ -196,7 +200,10 @@ export default function GenomeDetail() {
               {genome.origin}
             </span>
             {archetype && (
-              <span className="px-2 py-0.5 text-xs uppercase rounded bg-slate-100 text-slate-700 dark:bg-slate-700 dark:text-slate-300">
+              <span
+                className="px-2 py-0.5 text-xs uppercase rounded bg-slate-100 text-slate-700 dark:bg-slate-700 dark:text-slate-300 cursor-help"
+                title={archetypeTooltip(genome.dsl_json, archetype)}
+              >
                 {ARCHETYPE_LABELS[archetype] ?? archetype}
               </span>
             )}

@@ -105,13 +105,20 @@ export function summarizeDsl(spec: DslSpec | null | undefined): string {
     .join(' ');
 }
 
+export type ArchetypeKind =
+  | 'trend'
+  | 'mean-reversion'
+  | 'breakout'
+  | 'mixed'
+  | 'degenerate';
+
 /**
  * Heuristic archetype label for a spec — used as a one-word badge.
  * Returns null when no archetype can be inferred.
  */
 export function inferArchetype(
   spec: DslSpec | null | undefined,
-): 'trend' | 'mean-reversion' | 'breakout' | 'mixed' | 'degenerate' | null {
+): ArchetypeKind | null {
   if (!spec?.entry) return null;
   const long = spec.entry.long;
   const short = spec.entry.short;
@@ -160,4 +167,102 @@ export function inferArchetype(
   }
   if (hasMomentum || hasBands) return 'mean-reversion';
   return 'mixed';
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Archetype tooltip content
+// ─────────────────────────────────────────────────────────────────────
+
+const ARCHETYPE_MEANING: Record<ArchetypeKind, string> = {
+  trend:
+    'Trend-following: enters in the direction of an established move; bets the trend continues.',
+  'mean-reversion':
+    'Mean-reverting: bets price returns to a moving average or oscillator midpoint; buys weakness, sells strength.',
+  breakout:
+    'Breakout: enters when price escapes a recent high/low channel.',
+  mixed:
+    "Mixed-signal: doesn't match trend / mean-reversion / breakout cleanly — couldn't classify with confidence.",
+  degenerate:
+    'Degenerate: long and short entry conditions are identical, so neither side ever fires exclusive of the other → no trades open. Caught by the fitness function\'s −100 zero-trade penalty.',
+};
+
+/**
+ * Returns the specific reason the heuristic tagged a genome as the given
+ * archetype, based on its DSL spec. Used in the tooltip alongside the
+ * generic meaning so the user can see *why* this particular genome was
+ * classified that way (and decide whether to trust the inference).
+ */
+export function archetypeReason(
+  spec: DslSpec | null | undefined,
+  archetype: ArchetypeKind,
+): string {
+  if (!spec?.entry) return '';
+  const long = spec.entry.long;
+  const short = spec.entry.short;
+
+  if (archetype === 'degenerate') {
+    return 'Long and short entry conditions are structurally identical (deepEqual check).';
+  }
+
+  // Collect indicator names used by the spec to mention them in the reason.
+  const inds = new Set<string>();
+  function collect(cond: DslCondition | null | undefined): void {
+    if (!cond) return;
+    if (isComparison(cond)) {
+      [cond.lhs, cond.rhs].forEach((expr) => {
+        if (typeof expr === 'object' && expr != null && 'ind' in expr) {
+          inds.add((expr as { ind: string }).ind);
+        }
+      });
+    } else if ('args' in cond) {
+      cond.args.forEach(collect);
+    }
+  }
+  collect(long);
+  collect(short);
+
+  if (archetype === 'breakout') {
+    const donchian = Array.from(inds).filter((i) => i.startsWith('donchian'));
+    return donchian.length > 0
+      ? `Uses Donchian channel indicator(s): ${donchian.join(', ')}.`
+      : 'Donchian-channel indicator detected.';
+  }
+
+  if (archetype === 'trend') {
+    const ma = Array.from(inds).filter((i) => i === 'sma' || i === 'ema');
+    const longCmp =
+      long && isComparison(long) ? (long as DslComparison).cmp : '?';
+    const shortCmp =
+      short && isComparison(short) ? (short as DslComparison).cmp : '?';
+    return `MA-family (${ma.join('/')}) with trend-shape sign convention: long uses ${longCmp}, short uses ${shortCmp}.`;
+  }
+
+  if (archetype === 'mean-reversion') {
+    if (inds.has('rsi')) return 'Uses RSI — a momentum oscillator typically traded mean-reversion-style.';
+    const bands = Array.from(inds).filter((i) => i.startsWith('bb_'));
+    if (bands.length > 0)
+      return `Uses Bollinger Bands (${bands.join(', ')}) — typically traded mean-reversion-style.`;
+    const ma = Array.from(inds).filter((i) => i === 'sma' || i === 'ema');
+    const longCmp =
+      long && isComparison(long) ? (long as DslComparison).cmp : '?';
+    const shortCmp =
+      short && isComparison(short) ? (short as DslComparison).cmp : '?';
+    return `MA-family (${ma.join('/')}) with INVERTED sign convention: long uses ${longCmp}, short uses ${shortCmp} (opposite of trend-following).`;
+  }
+
+  // mixed
+  const indsArr = Array.from(inds);
+  return indsArr.length > 0
+    ? `Indicators ${indsArr.join('/')} used, but the comparator/structure combination doesn't fit trend, mean-reversion, or breakout.`
+    : "Couldn't classify the spec's structure into a known archetype.";
+}
+
+/** Combined tooltip text for the archetype badge: meaning + heuristic. */
+export function archetypeTooltip(
+  spec: DslSpec | null | undefined,
+  archetype: ArchetypeKind,
+): string {
+  const meaning = ARCHETYPE_MEANING[archetype];
+  const reason = archetypeReason(spec, archetype);
+  return reason ? `${meaning}\n\nTagged because: ${reason}` : meaning;
 }
