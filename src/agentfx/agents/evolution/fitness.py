@@ -1,13 +1,46 @@
 """Fitness evaluation for evolved genomes.
 
-A genome's fitness is its OOS Sharpe with two penalties:
-- **Gate B dilution**: a genome that fails Gate B has its positive fitness
-  halved (negative fitness untouched). The point is to *deprioritise*
-  Gate-B failures in tournament selection without eliminating them
-  entirely — they may still contribute useful crossover material.
-- **Diversity penalty**: if the genome is structurally near an elite, its
-  fitness is reduced by 50%. This stops the population converging onto a
-  single archetype too quickly.
+A genome's fitness is its **training-window Sharpe** with five penalties
+applied additively or multiplicatively. The training window is the
+concatenation of walk-forward folds 0..K-2 (constructed by the
+orchestrator in `_training_range()`); the final fold (K-1) is held out
+as OOS and is *only* evaluated by the validator at the end of the run.
+The GA never sees the OOS fold during evolution — that's the whole
+point of the walk-forward setup.
+
+(The earlier draft of this plan called it "OOS Sharpe with penalties";
+the implementation correctly trains on the held-in folds and reserves
+OOS for the validator's Gate-B verdict.)
+
+Penalties, in order of application:
+
+1. **Zero-trade hard penalty** (additive, -100): a genome that opens
+   zero trades on the training window is degenerate (typically: long
+   and short DSL conditions are identical, so neither side ever fires
+   exclusive of the other). Without this hard floor, raw Sharpe = 0.0
+   would beat any active losing strategy with Sharpe < 0, and the
+   GA's elitism would lock in do-nothing genomes from gen 2 onward.
+
+2. **Trade-shortfall penalty** (additive, scales 0 → -10): for genomes
+   that *do* trade but produce fewer than Gate B's 300-trade minimum.
+   Scale chosen so an active losing strategy with sharpe ~ -15 still
+   ranks above a 100-trade strategy at Sharpe -5 (because trade count
+   is a signal of strategy viability, not just final P&L).
+
+3. **Drawdown breach penalty** (additive): if max_drawdown exceeds
+   the Gate B 10% cap, subtract `(max_dd - 0.10) × 50`. A 30% DD
+   strategy loses 10 points of fitness.
+
+4. **Gate B dilution** (multiplicative, × 0.5): if *any* Gate B
+   threshold fails AND fitness is currently positive, halve the
+   fitness. The additive penalties (1–3) already handle the negative
+   case, so this only fires for "passes most thresholds but not all"
+   strategies that nonetheless cleared training.
+
+5. **Diversity penalty** (multiplicative, × 0.5): if the genome is
+   within edit-distance 2 of a current elite (a previously-evaluated
+   genome in the top 10%), halve the fitness. Stops the population
+   converging on a single archetype too quickly.
 
 The fitness function delegates the actual backtest to an injectable
 callable (`backtest_fn`) so unit tests can mock it without needing a
