@@ -1,33 +1,51 @@
 /**
  * Genome Detail Page (v0.3.0).
  *
- * Sections:
- * - Header (id, origin badge, fitness, validator pass/fail badge)
- * - DSL spec (rendered as a tree, not raw JSON)
- * - LLM reasoning (only shown if origin='llm')
- * - Walk-forward fold table (with OOS row highlighted)
- * - Lineage (parent IDs as links + children as links)
+ * Top-to-bottom layout, designed to answer "why did this specific
+ * genome win/lose?" in a single scroll:
+ *
+ *   1. Hero — id, origin badge, validator verdict + plain-English DSL
+ *      summary so the user immediately knows what the strategy *does*.
+ *   2. Lineage strip — clickable horizontal chain of parents → this →
+ *      children. The lighter alternative to the full lineage tree (Tier 3).
+ *   3. Mutation diff — for each parent, fetched on-demand and diffed
+ *      against this genome. Highlights what changed and (if origin='llm')
+ *      surfaces the LLM's reasoning.
+ *   4. Walk-forward validation — per-fold metrics with per-threshold
+ *      Gate B coloring.
+ *   5. Strategy DSL — full tree (the original DslTree component).
+ *
+ * Parent specs are fetched client-side via the existing
+ * `getGenome(runId, parentId)` call (no backend change).
  */
 
 import React, { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, ChevronLeft, Loader2 } from 'lucide-react';
+import { ArrowLeft, ChevronLeft, Loader2, AlertTriangle } from 'lucide-react';
 
 import DslTree from '../components/DslTree';
+import GenomeLineageStrip from '../components/GenomeLineageStrip';
+import LineageExplainer from '../components/LineageExplainer';
 import WalkForwardFoldTable from '../components/WalkForwardFoldTable';
 import { getGenome } from '../services/evolutionApi';
-import type {
-  GenomeOrigin,
-  StrategyGenome,
-} from '../types/evolution';
+import { inferArchetype, summarizeDsl } from '../utils/dslSummary';
+import type { GenomeOrigin, StrategyGenome } from '../types/evolution';
 
 const ORIGIN_BADGE_COLORS: Record<GenomeOrigin, string> = {
   seed: 'bg-slate-200 text-slate-800 dark:bg-slate-600 dark:text-slate-100',
   crossover:
-    'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300',
+    'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300',
   mutation:
-    'bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300',
-  llm: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300',
+    'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300',
+  llm: 'bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300',
+};
+
+const ARCHETYPE_LABELS: Record<string, string> = {
+  trend: 'Trend-following',
+  'mean-reversion': 'Mean-reverting',
+  breakout: 'Breakout',
+  mixed: 'Mixed-signal',
+  degenerate: 'Degenerate (no trades)',
 };
 
 export default function GenomeDetail() {
@@ -35,8 +53,10 @@ export default function GenomeDetail() {
   const navigate = useNavigate();
 
   const [genome, setGenome] = useState<StrategyGenome | null>(null);
+  const [parents, setParents] = useState<StrategyGenome[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [parentError, setParentError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -44,9 +64,29 @@ export default function GenomeDetail() {
       if (!runId || !genomeId) return;
       setLoading(true);
       setError(null);
+      setParents([]);
+      setParentError(null);
       try {
         const data = await getGenome(runId, genomeId);
-        if (!cancelled) setGenome(data);
+        if (cancelled) return;
+        setGenome(data);
+
+        // Fetch parents in parallel for the diff section. Failures are
+        // non-fatal — diff just doesn't render. The genome page itself
+        // is still usable.
+        if (data.parent_ids.length > 0) {
+          try {
+            const fetched = await Promise.all(
+              data.parent_ids.map((pid) => getGenome(runId, pid)),
+            );
+            if (!cancelled) setParents(fetched);
+          } catch (perr) {
+            if (!cancelled)
+              setParentError(
+                perr instanceof Error ? perr.message : 'Failed to load parents',
+              );
+          }
+        }
       } catch (err) {
         if (!cancelled) {
           setError(
@@ -88,6 +128,8 @@ export default function GenomeDetail() {
     );
   }
 
+  const summary = summarizeDsl(genome.dsl_json);
+  const archetype = inferArchetype(genome.dsl_json);
   const fitnessText =
     genome.fitness != null && Number.isFinite(genome.fitness)
       ? genome.fitness.toFixed(3)
@@ -103,11 +145,11 @@ export default function GenomeDetail() {
         Back to run
       </Link>
 
-      {/* Header */}
+      {/* ── 1. Hero ─────────────────────────────────────────────── */}
       <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-5">
-        <div className="flex items-start justify-between mb-3">
-          <div>
-            <h1 className="font-mono text-base text-slate-900 dark:text-slate-100">
+        <div className="flex items-start justify-between mb-3 gap-3">
+          <div className="min-w-0">
+            <h1 className="font-mono text-base text-slate-900 dark:text-slate-100 break-all">
               {genome.id}
             </h1>
             <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
@@ -115,20 +157,25 @@ export default function GenomeDetail() {
               {new Date(genome.created_at).toLocaleString()}
             </p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
             <span
               className={`px-2 py-0.5 text-xs uppercase rounded ${ORIGIN_BADGE_COLORS[genome.origin]}`}
             >
               {genome.origin}
             </span>
+            {archetype && (
+              <span className="px-2 py-0.5 text-xs uppercase rounded bg-slate-100 text-slate-700 dark:bg-slate-700 dark:text-slate-300">
+                {ARCHETYPE_LABELS[archetype] ?? archetype}
+              </span>
+            )}
             {genome.validator_passed === true && (
-              <span className="px-2 py-0.5 text-xs uppercase rounded bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300">
+              <span className="px-2 py-0.5 text-xs uppercase rounded bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">
                 validated
               </span>
             )}
             {genome.validator_passed === false && (
               <span
-                className="px-2 py-0.5 text-xs uppercase rounded bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300"
+                className="px-2 py-0.5 text-xs uppercase rounded bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300"
                 title={genome.validation_failures.join('\n')}
               >
                 gate B fail
@@ -137,18 +184,25 @@ export default function GenomeDetail() {
           </div>
         </div>
 
+        {/* Plain-English summary */}
+        {summary && (
+          <p className="text-sm text-slate-700 dark:text-slate-300 italic border-l-2 border-blue-300 dark:border-blue-700 pl-3 mb-4">
+            {summary}
+          </p>
+        )}
+
         <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
-          <Stat label="Training Sharpe" value={fitnessText} />
+          <Stat label="Training fitness" value={fitnessText} />
           <Stat label="Parents" value={String(genome.parent_ids.length)} />
           <Stat label="Children" value={String(genome.children.length)} />
         </div>
 
         {genome.validation_failures.length > 0 && (
-          <div className="mt-4 px-3 py-2 rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800">
-            <div className="text-xs font-semibold uppercase tracking-wide text-red-700 dark:text-red-300 mb-1">
+          <div className="mt-4 px-3 py-2 rounded-md bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800">
+            <div className="text-xs font-semibold uppercase tracking-wide text-rose-700 dark:text-rose-300 mb-1">
               Gate B failures
             </div>
-            <ul className="text-sm text-red-700 dark:text-red-300 list-disc list-inside space-y-0.5">
+            <ul className="text-sm text-rose-700 dark:text-rose-300 list-disc list-inside space-y-0.5">
               {genome.validation_failures.map((f, i) => (
                 <li key={i}>{f}</li>
               ))}
@@ -157,80 +211,55 @@ export default function GenomeDetail() {
         )}
       </div>
 
-      {/* DSL spec */}
-      <Section title="Strategy DSL">
-        <DslTree spec={genome.dsl_json} />
-      </Section>
-
-      {/* LLM reasoning */}
-      {genome.origin === 'llm' && genome.llm_reasoning && (
-        <Section title="LLM Reasoning">
-          <div className="rounded-lg border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/20 px-4 py-3 text-sm text-slate-700 dark:text-slate-300 italic">
-            "{genome.llm_reasoning}"
-            {genome.llm_call_id && (
-              <div className="mt-2 not-italic font-mono text-xs text-slate-500">
-                call: {genome.llm_call_id}
-              </div>
-            )}
-          </div>
-        </Section>
+      {/* ── 2. Lineage strip ─────────────────────────────────────── */}
+      {runId && (
+        <GenomeLineageStrip
+          runId={runId}
+          parents={parents.map((p) => ({
+            id: p.id,
+            origin: p.origin,
+            fitness: p.fitness,
+            generationIndex: p.generation_index,
+          }))}
+          current={{
+            id: genome.id,
+            origin: genome.origin,
+            fitness: genome.fitness,
+            generationIndex: genome.generation_index,
+          }}
+          children={genome.children.map((c) => ({
+            id: c.id,
+            generationIndex: c.generation_index,
+          }))}
+        />
       )}
 
-      {/* Walk-forward folds */}
-      <Section title="Walk-Forward Validation">
+      {/* ── 3. Lineage explainer (origin-aware plain-English) ────── */}
+      {runId && (genome.origin !== 'mutation' || parents.length > 0) && (
+        <LineageExplainer runId={runId} genome={genome} parents={parents} />
+      )}
+
+      {parentError && parents.length === 0 && genome.parent_ids.length > 0 && (
+        <div className="rounded-md border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 p-3 text-sm text-amber-700 dark:text-amber-300 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+          <span>
+            Couldn't fetch parent genomes for the lineage explainer ({parentError}).
+            The rest of the page is still usable.
+          </span>
+        </div>
+      )}
+
+      {/* ── 4. Walk-forward validation ──────────────────────────── */}
+      <Section
+        title="Walk-Forward Validation"
+        subtitle="Per-fold metrics. Cells are colored by whether each metric passes its Gate B threshold independently. Hover any cell for the delta vs threshold."
+      >
         <WalkForwardFoldTable folds={genome.validation_folds} />
       </Section>
 
-      {/* Lineage */}
-      <Section title="Lineage">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
-          <div>
-            <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">
-              Parents
-            </div>
-            {genome.parent_ids.length === 0 ? (
-              <span className="italic text-slate-400">
-                None (seed or direct LLM proposal)
-              </span>
-            ) : (
-              <ul className="space-y-1">
-                {genome.parent_ids.map((pid) => (
-                  <li key={pid}>
-                    <Link
-                      to={`/evolution/${runId}/genomes/${pid}`}
-                      className="font-mono text-xs text-blue-600 dark:text-blue-400 hover:underline break-all"
-                    >
-                      {pid}
-                    </Link>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-          <div>
-            <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">
-              Children
-            </div>
-            {genome.children.length === 0 ? (
-              <span className="italic text-slate-400">
-                None — this genome is a leaf or the run is still ongoing
-              </span>
-            ) : (
-              <ul className="space-y-1">
-                {genome.children.map((c) => (
-                  <li key={c.id}>
-                    <Link
-                      to={`/evolution/${runId}/genomes/${c.id}`}
-                      className="font-mono text-xs text-blue-600 dark:text-blue-400 hover:underline break-all"
-                    >
-                      gen {c.generation_index} · {c.id}
-                    </Link>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        </div>
+      {/* ── 5. Full DSL tree ────────────────────────────────────── */}
+      <Section title="Strategy DSL (full spec)">
+        <DslTree spec={genome.dsl_json} />
       </Section>
     </div>
   );
@@ -255,17 +284,25 @@ function Stat({ label, value }: { label: string; value: string }) {
 
 function Section({
   title,
+  subtitle,
   children,
 }: {
   title: string;
+  subtitle?: string;
   children: React.ReactNode;
 }) {
   return (
-    <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-5">
-      <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100 mb-3">
+    <section className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-5">
+      <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
         {title}
       </h2>
+      {subtitle && (
+        <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 mb-3">
+          {subtitle}
+        </p>
+      )}
+      {!subtitle && <div className="mb-3" />}
       {children}
-    </div>
+    </section>
   );
 }

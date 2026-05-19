@@ -1,19 +1,39 @@
 /**
  * Evolution Run Detail Page (v0.3.0).
  *
- * Three sections:
- * 1. Header — status badge, instrument, generation count, LLM cost,
- *    stop reason, started/completed timestamps + Stop button.
- * 2. Fitness curve — best fitness per generation, with target as a
- *    dashed line.
- * 3. Decision log — paginated, filterable by agent_type.
+ * Layout, top → bottom:
+ *
+ *   1. Hero — plain-English run summary + config callout (pop, gens, budget, data window).
+ *   2. Outcome banner — ✓ / ✗ / ⚠ headline + one-line diagnostic.
+ *   3. Run narrative — derived story of what happened across the loop.
+ *   4. Fitness curve — chart with tooltips, LLM-injection markers, Gate B target.
+ *   5. Generations table — index, fitness, Δ-vs-prev, LLM-invoked flag, duration.
+ *   6. LLM activity panel — one card per LLM injection (or skip event).
+ *   7. Best genome shortcut.
+ *   8. Decision log (raw, filterable) — for power users who want the audit trail.
+ *
+ * The goal is "open this page and understand the run in under 30s of
+ * scrolling". Sections 1–3 are the headline; the rest is supporting
+ * evidence.
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, ChevronLeft, Loader2, Square } from 'lucide-react';
+import {
+  ArrowLeft,
+  ChevronLeft,
+  Loader2,
+  Square,
+  CheckCircle2,
+  XCircle,
+  AlertTriangle,
+} from 'lucide-react';
 
-import FitnessCurveChart from '../components/FitnessCurveChart';
+import FitnessCurveChart, {
+  type FitnessCurvePoint,
+} from '../components/FitnessCurveChart';
+import RunNarrative from '../components/RunNarrative';
+import LlmInjectionCard from '../components/LlmInjectionCard';
 import {
   formatLlmCost,
   getEvolutionRun,
@@ -37,6 +57,7 @@ export default function EvolutionRunDetail() {
   const [run, setRun] = useState<EvolutionRun | null>(null);
   const [generations, setGenerations] = useState<Generation[]>([]);
   const [decisions, setDecisions] = useState<DecisionLogEntry[]>([]);
+  const [allDecisions, setAllDecisions] = useState<DecisionLogEntry[]>([]);
   const [decisionTotal, setDecisionTotal] = useState(0);
   const [decisionPage, setDecisionPage] = useState(1);
   const [agentFilter, setAgentFilter] = useState<string>('all');
@@ -48,7 +69,7 @@ export default function EvolutionRunDetail() {
     if (!runId) return;
     setError(null);
     try {
-      const [runData, gensData, decisionsData] = await Promise.all([
+      const [runData, gensData, decisionsData, allDecisionsData] = await Promise.all([
         getEvolutionRun(runId),
         listGenerations(runId),
         listDecisions(
@@ -57,11 +78,17 @@ export default function EvolutionRunDetail() {
           50,
           agentFilter === 'all' ? undefined : agentFilter,
         ),
+        // Pull the full unfiltered decision log once (paginated by 200) so the
+        // narrative + LLM panel always see the lifecycle, even if the user
+        // has the filter set to something narrow. The decision-log fetch
+        // above remains the paginated view shown in the raw log section.
+        listDecisions(runId, 1, 200, undefined),
       ]);
       setRun(runData);
       setGenerations(gensData.items);
       setDecisions(decisionsData.items);
       setDecisionTotal(decisionsData.total);
+      setAllDecisions(allDecisionsData.items);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load run');
     } finally {
@@ -109,14 +136,23 @@ export default function EvolutionRunDetail() {
     );
   }
 
-  const fitnessSeries = generations
-    .sort((a, b) => a.index - b.index)
-    .map((g) => g.best_fitness);
+  const sortedGens = [...generations].sort((a, b) => a.index - b.index);
+  const fitnessPoints: FitnessCurvePoint[] = sortedGens.map((g) => ({
+    generation: g.index,
+    fitness: g.best_fitness,
+    llmInvoked: g.llm_invoked,
+  }));
 
   const targetFitness =
     typeof run.stop_conditions_json.target_fitness === 'number'
       ? (run.stop_conditions_json.target_fitness as number)
       : null;
+
+  const injectionDecisions = allDecisions.filter(
+    (d) => d.action === 'inject' || (d.agent_type === 'llm' && d.action === 'inject'),
+  );
+
+  const validateDecision = allDecisions.find((d) => d.action === 'validate');
 
   return (
     <div className="container mx-auto px-4 py-8 space-y-6">
@@ -128,67 +164,65 @@ export default function EvolutionRunDetail() {
         Back to runs
       </Link>
 
-      {/* Header card */}
-      <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-5">
-        <div className="flex items-start justify-between mb-3">
-          <div>
-            <div className="flex items-center gap-3">
-              <h1 className="font-mono text-base text-slate-900 dark:text-slate-100">
-                {run.id}
-              </h1>
-              <StatusBadge status={run.status} />
-            </div>
-            <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
-              {run.instrument} · {run.granularity} · created{' '}
-              {new Date(run.created_at).toLocaleString()}
-            </p>
+      {/* ── 1. Hero ────────────────────────────────────────────────── */}
+      <RunHero
+        run={run}
+        sortedGens={sortedGens}
+        onStop={async () => {
+          if (
+            !confirm(
+              'Stop this run? The orchestrator will finish the current step and exit.',
+            )
+          )
+            return;
+          try {
+            await stopEvolutionRun(run.id);
+            await fetchAll();
+          } catch (err) {
+            alert(err instanceof Error ? err.message : 'Failed to stop run');
+          }
+        }}
+      />
+
+      {/* ── 2. Outcome banner ──────────────────────────────────────── */}
+      <OutcomeBanner run={run} validateDecision={validateDecision} />
+
+      {/* ── 3. Narrative ───────────────────────────────────────────── */}
+      <Section title="What happened in this run">
+        <RunNarrative
+          run={run}
+          generations={sortedGens}
+          decisions={allDecisions}
+        />
+      </Section>
+
+      {/* ── 4. Fitness chart ───────────────────────────────────────── */}
+      <Section title="Best Fitness by Generation">
+        <FitnessCurveChart points={fitnessPoints} target={targetFitness} />
+      </Section>
+
+      {/* ── 5. Generations table ───────────────────────────────────── */}
+      <Section title="Generations">
+        <GenerationsTable generations={sortedGens} />
+      </Section>
+
+      {/* ── 6. LLM activity ────────────────────────────────────────── */}
+      {injectionDecisions.length > 0 && (
+        <Section
+          title={`LLM Activity (${injectionDecisions.length} injection${
+            injectionDecisions.length === 1 ? '' : 's'
+          })`}
+          subtitle="What the strategy-proposing LLM did at each scheduled injection point."
+        >
+          <div className="space-y-3">
+            {injectionDecisions.map((d) => (
+              <LlmInjectionCard key={d.id} decision={d} />
+            ))}
           </div>
-          {(run.status === 'running' || run.status === 'queued') && (
-            <button
-              onClick={async () => {
-                if (
-                  !confirm(
-                    'Stop this run? The orchestrator will finish the current step and exit.',
-                  )
-                ) {
-                  return;
-                }
-                try {
-                  await stopEvolutionRun(run.id);
-                  await fetchAll();
-                } catch (err) {
-                  alert(
-                    err instanceof Error
-                      ? err.message
-                      : 'Failed to stop run',
-                  );
-                }
-              }}
-              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md bg-amber-100 hover:bg-amber-200 dark:bg-amber-900/40 dark:hover:bg-amber-900/60 text-amber-800 dark:text-amber-300 text-sm"
-            >
-              <Square className="w-4 h-4" />
-              Stop
-            </button>
-          )}
-        </div>
+        </Section>
+      )}
 
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-          <Stat label="Generation" value={String(run.current_generation)} />
-          <Stat label="Best genome" value={run.best_genome_id ?? '—'} mono />
-          <Stat label="LLM cost" value={formatLlmCost(run.llm_cost_usd)} />
-          <Stat label="Stop reason" value={run.stop_reason ?? '—'} />
-        </div>
-      </div>
-
-      {/* Fitness curve */}
-      <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-5">
-        <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100 mb-3">
-          Best Fitness by Generation
-        </h2>
-        <FitnessCurveChart values={fitnessSeries} target={targetFitness} />
-      </div>
-
-      {/* Best genome shortcut */}
+      {/* ── 7. Best-genome shortcut ────────────────────────────────── */}
       {run.best_genome_id && (
         <Link
           to={`/evolution/${run.id}/genomes/${run.best_genome_id}`}
@@ -198,12 +232,11 @@ export default function EvolutionRunDetail() {
         </Link>
       )}
 
-      {/* Decision log */}
-      <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-5">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-            Decision Log
-          </h2>
+      {/* ── 8. Decision log (raw) ──────────────────────────────────── */}
+      <Section
+        title="Raw decision log"
+        subtitle="Audit trail of every agent action, in order."
+        action={
           <select
             value={agentFilter}
             onChange={(e) => {
@@ -218,8 +251,8 @@ export default function EvolutionRunDetail() {
               </option>
             ))}
           </select>
-        </div>
-
+        }
+      >
         {decisions.length === 0 ? (
           <div className="text-sm text-slate-500 dark:text-slate-400 italic py-4">
             No decisions yet.
@@ -256,13 +289,348 @@ export default function EvolutionRunDetail() {
             </div>
           </div>
         )}
+      </Section>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Hero — plain-English run summary
+// ─────────────────────────────────────────────────────────────────────
+
+function RunHero({
+  run,
+  sortedGens,
+  onStop,
+}: {
+  run: EvolutionRun;
+  sortedGens: Generation[];
+  onStop: () => void | Promise<void>;
+}) {
+  const cfg = (run.config_json ?? {}) as Record<string, unknown>;
+  const popSize = typeof cfg.population_size === 'number' ? cfg.population_size : null;
+  const dataYears = typeof cfg.data_years === 'number' ? cfg.data_years : null;
+  const llmBudget = typeof cfg.llm_budget_usd === 'number' ? cfg.llm_budget_usd : null;
+  const stopConds = (run.stop_conditions_json ?? {}) as Record<string, unknown>;
+  const maxGens =
+    typeof stopConds.max_generations === 'number' ? stopConds.max_generations : null;
+
+  const duration = useMemo(() => {
+    if (!run.started_at) return null;
+    const start = new Date(run.started_at).getTime();
+    const end = run.completed_at ? new Date(run.completed_at).getTime() : Date.now();
+    const secs = Math.floor((end - start) / 1000);
+    if (secs < 60) return `${secs}s`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+    return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+  }, [run.started_at, run.completed_at]);
+
+  const summarySentence = useMemo(() => {
+    const parts: string[] = [];
+    parts.push(`${run.instrument} ${run.granularity}`);
+    if (dataYears) parts.push(`${dataYears}y of history`);
+    const popPart = popSize ? `${popSize}-genome population` : null;
+    const genPart = maxGens ? `${maxGens} generation budget` : null;
+    if (popPart && genPart) parts.push(`${popPart} × ${genPart}`);
+    else if (popPart) parts.push(popPart);
+    else if (genPart) parts.push(genPart);
+    if (llmBudget != null) parts.push(`$${llmBudget.toFixed(2)} LLM budget`);
+    return parts.join(' · ');
+  }, [run, dataYears, popSize, maxGens, llmBudget]);
+
+  return (
+    <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-5">
+      <div className="flex items-start justify-between gap-4 mb-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-3 flex-wrap">
+            <h1 className="font-mono text-base text-slate-900 dark:text-slate-100 truncate">
+              {run.id}
+            </h1>
+            <StatusBadge status={run.status} />
+          </div>
+          <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
+            {summarySentence}
+          </p>
+        </div>
+        {(run.status === 'running' || run.status === 'queued') && (
+          <button
+            onClick={onStop}
+            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md bg-amber-100 hover:bg-amber-200 dark:bg-amber-900/40 dark:hover:bg-amber-900/60 text-amber-800 dark:text-amber-300 text-sm shrink-0"
+          >
+            <Square className="w-4 h-4" />
+            Stop
+          </button>
+        )}
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+        <Stat
+          label="Current gen"
+          value={
+            sortedGens.length > 0
+              ? `${sortedGens.length}${maxGens ? ` / ${maxGens}` : ''}`
+              : '0'
+          }
+        />
+        <Stat label="Duration" value={duration ?? '—'} />
+        <Stat label="LLM cost" value={formatLlmCost(run.llm_cost_usd)} />
+        <Stat label="Stop reason" value={run.stop_reason ?? '—'} />
       </div>
     </div>
   );
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Sub-components
+// Outcome banner — ✓/✗/⚠ + diagnostic
+// ─────────────────────────────────────────────────────────────────────
+
+function OutcomeBanner({
+  run,
+  validateDecision,
+}: {
+  run: EvolutionRun;
+  validateDecision: DecisionLogEntry | undefined;
+}) {
+  let icon: React.ReactNode;
+  let title: string;
+  let detail: React.ReactNode;
+  let toneClass: string;
+
+  if (run.status === 'running' || run.status === 'queued') {
+    icon = <Loader2 className="w-5 h-5 animate-spin" />;
+    title = run.status === 'queued' ? 'Queued — waiting to start' : 'Run in progress';
+    detail = (
+      <span className="text-slate-500 dark:text-slate-400">
+        Polling for updates every 5s.
+      </span>
+    );
+    toneClass =
+      'border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/40 text-slate-700 dark:text-slate-300';
+  } else if (run.status === 'failed' || run.status === 'stopped') {
+    icon = <AlertTriangle className="w-5 h-5" />;
+    title =
+      run.status === 'failed'
+        ? 'Run failed before completion'
+        : 'Run was stopped';
+    detail = (
+      <span>
+        {run.stop_reason ? (
+          <>
+            Reason: <span className="font-mono">{run.stop_reason}</span>
+          </>
+        ) : (
+          'No stop reason recorded.'
+        )}
+      </span>
+    );
+    toneClass =
+      'border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 text-amber-800 dark:text-amber-300';
+  } else {
+    // status === 'completed'
+    const outputs = (validateDecision?.outputs_json ?? {}) as Record<string, unknown>;
+    const passed = Boolean(outputs.validator_passed);
+    const failures = Array.isArray(outputs.validation_failures)
+      ? (outputs.validation_failures as string[])
+      : [];
+
+    if (passed) {
+      icon = <CheckCircle2 className="w-5 h-5" />;
+      title = 'Found a validated genome — ready for human review';
+      detail = (
+        <span>
+          The run-best genome passed Gate B on the held-out OOS fold.{' '}
+          {run.best_genome_id && (
+            <Link
+              to={`/evolution/${run.id}/genomes/${run.best_genome_id}`}
+              className="underline font-semibold"
+            >
+              Inspect →
+            </Link>
+          )}
+        </span>
+      );
+      toneClass =
+        'border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-900/20 text-emerald-800 dark:text-emerald-300';
+    } else if (validateDecision) {
+      icon = <XCircle className="w-5 h-5" />;
+      title = 'No genome cleared Gate B';
+      detail = (
+        <span>
+          {failures.length > 0 ? (
+            <>
+              Best genome failed validation:{' '}
+              <span className="font-mono text-xs">
+                {failures.slice(0, 2).join(' · ')}
+              </span>
+              {failures.length > 2 && (
+                <span className="text-slate-500"> · +{failures.length - 2} more</span>
+              )}
+            </>
+          ) : (
+            'No genome passed the walk-forward validator.'
+          )}
+        </span>
+      );
+      toneClass =
+        'border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-900/20 text-rose-800 dark:text-rose-300';
+    } else {
+      icon = <AlertTriangle className="w-5 h-5" />;
+      title = 'Run completed but no validator decision recorded';
+      detail = (
+        <span>
+          The orchestrator finished without running walk-forward validation —
+          this usually means the best-genome lookup returned nothing.
+        </span>
+      );
+      toneClass =
+        'border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 text-amber-800 dark:text-amber-300';
+    }
+  }
+
+  return (
+    <div className={`rounded-lg border p-4 flex items-start gap-3 ${toneClass}`}>
+      <div className="shrink-0 mt-0.5">{icon}</div>
+      <div className="min-w-0">
+        <p className="font-semibold text-sm">{title}</p>
+        <p className="text-sm mt-0.5">{detail}</p>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Generations table — index + fitness + Δ + LLM badge + duration
+// ─────────────────────────────────────────────────────────────────────
+
+function GenerationsTable({ generations }: { generations: Generation[] }) {
+  if (generations.length === 0) {
+    return (
+      <p className="text-sm text-slate-500 dark:text-slate-400 italic">
+        No generations completed yet.
+      </p>
+    );
+  }
+  let lastFitness: number | null = null;
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-left text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400 border-b border-slate-200 dark:border-slate-700">
+            <th className="py-2 pr-3">Gen</th>
+            <th className="py-2 pr-3">Best fitness</th>
+            <th className="py-2 pr-3">Δ vs prev</th>
+            <th className="py-2 pr-3">LLM</th>
+            <th className="py-2 pr-3">Duration</th>
+            <th className="py-2 pr-3">Completed</th>
+          </tr>
+        </thead>
+        <tbody>
+          {generations.map((g) => {
+            const fitness = g.best_fitness;
+            const delta =
+              fitness != null && lastFitness != null
+                ? fitness - lastFitness
+                : null;
+            const deltaTone =
+              delta == null
+                ? 'text-slate-400'
+                : delta > 0.01
+                  ? 'text-emerald-600 dark:text-emerald-400'
+                  : delta < -0.01
+                    ? 'text-rose-600 dark:text-rose-400'
+                    : 'text-slate-500';
+            const durationSecs =
+              g.started_at && g.completed_at
+                ? Math.max(
+                    0,
+                    Math.round(
+                      (new Date(g.completed_at).getTime() -
+                        new Date(g.started_at).getTime()) /
+                        1000,
+                    ),
+                  )
+                : null;
+            const row = (
+              <tr
+                key={g.id}
+                className="border-b border-slate-100 dark:border-slate-700/50 last:border-0"
+              >
+                <td className="py-2 pr-3 font-mono text-slate-700 dark:text-slate-300">
+                  {g.index}
+                </td>
+                <td className="py-2 pr-3 font-mono">
+                  {fitness != null ? fitness.toFixed(4) : '—'}
+                </td>
+                <td className={`py-2 pr-3 font-mono ${deltaTone}`}>
+                  {delta == null
+                    ? '—'
+                    : `${delta > 0 ? '+' : ''}${delta.toFixed(4)}`}
+                </td>
+                <td className="py-2 pr-3">
+                  {g.llm_invoked ? (
+                    <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300 text-xs font-medium uppercase tracking-wide">
+                      LLM
+                    </span>
+                  ) : (
+                    <span className="text-slate-300 dark:text-slate-600">—</span>
+                  )}
+                </td>
+                <td className="py-2 pr-3 text-slate-600 dark:text-slate-400 font-mono text-xs">
+                  {durationSecs != null ? `${durationSecs}s` : '—'}
+                </td>
+                <td className="py-2 pr-3 text-slate-500 dark:text-slate-400 font-mono text-xs">
+                  {g.completed_at
+                    ? new Date(g.completed_at).toLocaleTimeString()
+                    : '—'}
+                </td>
+              </tr>
+            );
+            if (fitness != null) lastFitness = fitness;
+            return row;
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Generic section wrapper
+// ─────────────────────────────────────────────────────────────────────
+
+function Section({
+  title,
+  subtitle,
+  action,
+  children,
+}: {
+  title: string;
+  subtitle?: string;
+  action?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-5">
+      <div className="flex items-start justify-between gap-2 mb-3">
+        <div>
+          <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+            {title}
+          </h2>
+          {subtitle && (
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+              {subtitle}
+            </p>
+          )}
+        </div>
+        {action}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Sub-components (carryover from previous page)
 // ─────────────────────────────────────────────────────────────────────
 
 function Stat({
@@ -292,7 +660,7 @@ const AGENT_BADGE_COLORS: Record<string, string> = {
   orchestrator:
     'bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300',
   ga: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300',
-  llm: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
+  llm: 'bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300',
   validator:
     'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300',
 };
