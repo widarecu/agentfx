@@ -104,6 +104,44 @@ class TestInitializePopulation:
         with pytest.raises(ValueError, match="at least one seed"):
             initialize_population([], size=10, rng=rng, mutate_fn=mutate_spec)
 
+    def test_run_id_assigns_seed_ids_and_mutation_parent_ids(self) -> None:
+        """With run_id provided, seeds get persister-style IDs and each
+        mutated copy carries the seed's ID as its parent. This is what
+        makes the gen-0 lineage visible in the portal."""
+        rng = Random(7)
+        pop = initialize_population(
+            SEED_SPECS,
+            size=10,
+            rng=rng,
+            mutate_fn=mutate_spec,
+            run_id="evorun_test_abc",
+        )
+        seeds = [g for g in pop if g.origin == GenomeOrigin.SEED]
+        # Seeds get pre-assigned IDs matching the persister's format
+        assert seeds[0].id == "genome_gen_evorun_test_abc_000_000"
+        assert seeds[1].id == "genome_gen_evorun_test_abc_000_001"
+        assert seeds[2].id == "genome_gen_evorun_test_abc_000_002"
+        seed_id_set = {g.id for g in seeds}
+
+        # Every mutation references one of the seed IDs as its parent
+        mutations = [g for g in pop if g.origin == GenomeOrigin.MUTATION]
+        assert len(mutations) == 7
+        for m in mutations:
+            assert len(m.parent_ids) == 1
+            assert m.parent_ids[0] in seed_id_set
+
+    def test_no_run_id_keeps_legacy_empty_parent_ids(self) -> None:
+        """Without run_id (test/legacy path), seeds have no IDs and
+        mutations have empty parent_ids — preserves the prior behaviour
+        for code paths that don't need lineage tracking."""
+        rng = Random(8)
+        pop = initialize_population(SEED_SPECS, size=10, rng=rng, mutate_fn=mutate_spec)
+        for g in pop:
+            if g.origin == GenomeOrigin.SEED:
+                assert g.id is None
+            else:
+                assert g.parent_ids == []
+
     def test_reproducible_with_same_seed(self) -> None:
         # Same RNG seed → same population structure
         rng_a = Random(99)

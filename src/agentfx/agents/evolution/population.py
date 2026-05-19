@@ -95,6 +95,7 @@ def initialize_population(
     rng: Random,
     *,
     mutate_fn,
+    run_id: str | None = None,
 ) -> Population:
     """Construct generation 0.
 
@@ -102,6 +103,15 @@ def initialize_population(
     population with mutated copies of randomly-chosen seeds. This gives the
     GA known-good priors plus locally-varied starting points — better than
     random initialization, which often produces uninteresting strategies.
+
+    Lineage tracking: when `run_id` is provided, we pre-assign deterministic
+    IDs to the seed genomes (matching the persister's
+    `generate_genome_id(generation_id, index)` convention — the seeds are
+    indices 0..N-1 of gen 0) and record those IDs as `parent_ids` on each
+    mutated copy. This lets the portal show "this mutation came from MA
+    crossover seed" without an extra DB round-trip. With `run_id=None`
+    (unit tests that don't care about lineage), mutations have empty
+    parent_ids — matching the legacy behaviour.
 
     Args:
         seeds: Initial well-known strategies (typically MA / RSI / Donchian
@@ -112,6 +122,9 @@ def initialize_population(
             rather than imported here to avoid a circular import with
             `ga.py`. Pass `agentfx.agents.evolution.ga.mutate_spec` in the
             normal case.
+        run_id: Run identifier used to pre-compute the seeds' eventual
+            persister IDs. Required for mutated copies to carry correct
+            `parent_ids`; safe to omit in tests.
 
     Returns:
         Population at generation_index=0 with `size` genomes.
@@ -123,14 +136,34 @@ def initialize_population(
             f"population size ({size}) must be >= number of seeds ({len(seeds)})"
         )
 
+    # Pre-compute the seeds' eventual persister IDs so mutated copies can
+    # record their lineage. The persister assigns
+    # `genome_{gen_id}_{index_in_gen:03d}` where the first N indices are
+    # the N seeds in insertion order — see
+    # `agentfx.api.services.evolution.SqlAlchemyPersister.save_generation`.
+    seed_ids: list[str | None]
+    if run_id is not None:
+        gen0_id = f"gen_{run_id}_000"
+        seed_ids = [f"genome_{gen0_id}_{i:03d}" for i in range(len(seeds))]
+    else:
+        seed_ids = [None] * len(seeds)
+
     genomes: list[Genome] = []
-    for seed_spec in seeds:
-        genomes.append(Genome(spec=seed_spec, origin=GenomeOrigin.SEED))
+    for i, seed_spec in enumerate(seeds):
+        genomes.append(Genome(spec=seed_spec, origin=GenomeOrigin.SEED, id=seed_ids[i]))
 
     while len(genomes) < size:
-        parent_spec = rng.choice(seeds)
+        parent_idx = rng.randrange(len(seeds))
+        parent_spec = seeds[parent_idx]
         mutated = mutate_fn(parent_spec, rng)
-        genomes.append(Genome(spec=mutated, origin=GenomeOrigin.MUTATION))
+        parent_ids = [seed_ids[parent_idx]] if seed_ids[parent_idx] is not None else []
+        genomes.append(
+            Genome(
+                spec=mutated,
+                origin=GenomeOrigin.MUTATION,
+                parent_ids=parent_ids,
+            )
+        )
 
     return Population(generation_index=0, genomes=genomes)
 

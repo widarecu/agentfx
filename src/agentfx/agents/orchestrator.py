@@ -322,11 +322,16 @@ class OrchestratorAgent(BaseAgent):
         )
 
         # ── Gen 0 ────────────────────────────────────────────────────
+        # Pass run_id so the seeds get pre-assigned IDs and mutated copies
+        # record correct parent_ids — without this, gen-0 mutations appear
+        # parentless in the portal and the LineageExplainer can't show
+        # which seed each variant came from.
         population = initialize_population(
             seeds=self._seed_specs,
             size=self.config.population_size,
             rng=self._rng,
             mutate_fn=mutate_spec,
+            run_id=self.run_id,
         )
         self.persister.log_decision(
             self.run_id,
