@@ -27,6 +27,14 @@ _prev_env = os.environ.get("ENVIRONMENT")
 os.environ["ENVIRONMENT"] = "test"
 os.environ["TESTING"] = "true"
 
+# Test-correctness invariant: ingestion worker MUST be off during pytest.
+# When enabled, `TestClient(app)` triggers FastAPI lifespan startup → OANDA
+# backfill → 60s teardown timeouts that hang the test session. This is
+# enforced in code (not in .env.test) so a developer can't accidentally
+# flip it on for the test path while keeping Docker behaviour separate.
+# See CLAUDE.md → "Ingestion toggle: three-surface model".
+os.environ["INGESTION_ENABLED"] = "false"
+
 # Warn if we had to override an incorrect environment setting
 # This helps developers identify when they're not using the correct test command
 if _prev_env and _prev_env != "test":

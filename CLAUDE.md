@@ -94,11 +94,29 @@ For E2E, ensure the Docker test ports are free (`docker compose --profile test d
 lsof -i :5433 -i :8001 -i :5174
 ```
 
-**Required setting in `.env.test` (gitignored, per-dev):**
+### Ingestion toggle: three-surface model
+
+`INGESTION_ENABLED` (and its companion `BACKFILL_DAYS`) live on three independent execution surfaces with one source of truth each — there is **no shared file** between them. This is the architectural rule; if you find yourself wanting to set ingestion config in two places, you've taken a wrong turn.
+
+| # | Surface | What runs | Source of truth | Value |
+|---|---------|-----------|-----------------|-------|
+| 1 | **Pytest** (host) | `make test-unit` / `make test-integration` / `make e2e` host-side | [tests/conftest.py](tests/conftest.py) — `os.environ["INGESTION_ENABLED"] = "false"` set at module load, before any settings import | always `false` (invariant — TestClient lifespan hangs on backfill otherwise) |
+| 2 | **Local Docker test profile** | `backend-test` container | [docker-compose.yml](docker-compose.yml) `environment:` block with `${INGESTION_ENABLED:-false}` substitution | default `false`; opt-in `true` via shell or `make docker-up PROFILE=test INGESTION_ENABLED=true BACKFILL_DAYS=365` |
+| 3 | **Railway** | Production / staging container | Railway service-variables dashboard | dashboard-set (typically `true` in prod, with full `BACKFILL_DAYS`) |
+
+Why this matters: each surface has different correctness requirements (pytest must never backfill; E2E must be deterministic; production must ingest live). Funnelling all three through the same `.env.test` file forced a shared name with conflicting needs — that's the trap we're avoiding here.
+
+**Practical commands:**
+
+```bash
+# E2E (default — ingestion off, synthetic candles)
+make docker-up PROFILE=test
+
+# Acceptance/exploratory (ingestion on, real OANDA backfill)
+make docker-up PROFILE=test INGESTION_ENABLED=true BACKFILL_DAYS=365
 ```
-INGESTION_ENABLED=false
-```
-Pytest reads `.env.test` directly via Pydantic Settings; with the worker enabled, `TestClient(app)` triggers FastAPI lifespan startup → OANDA backfill → 60-second teardown timeouts. The integration suite has a session-scope autouse fixture in [tests/integration/conftest.py](tests/integration/conftest.py) that pre-seeds candles for tests that previously relied on the worker, so disabling it locally is safe.
+
+`.env.test` deliberately does **not** contain `INGESTION_ENABLED` — putting it there shadows surface 2 and re-creates the very confusion this model eliminates.
 
 ### Running Unit Tests
 

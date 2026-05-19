@@ -93,10 +93,21 @@ services:
       # Override for Docker networking
       DATABASE_URL: postgresql://test_user:test_password@postgres-test:5432/agentfx_test
       BACKEND_CORS_ORIGINS: http://localhost:5174,http://localhost:8001
-      # Disable the ingestion worker for E2E. Tests pre-seed deterministic
-      # candle data via scripts/seed_test_candles.py; running OANDA backfill
-      # in parallel makes timeframe-availability tests timing-dependent.
-      INGESTION_ENABLED: "false"
+      # Ingestion worker toggle for the test profile. Defaults to "false"
+      # because the E2E suite pre-seeds deterministic candle data via
+      # scripts/seed_test_candles.py — running OANDA backfill in parallel
+      # makes timeframe-availability tests timing-dependent.
+      #
+      # For acceptance/exploratory runs that need real OANDA data, set
+      # INGESTION_ENABLED=true in the shell before `make docker-up
+      # PROFILE=test` (or `make docker-up PROFILE=test INGESTION_ENABLED=true`).
+      # See CLAUDE.md → "Running an acceptance/exploratory test session"
+      # for the full flow.
+      INGESTION_ENABLED: "${INGESTION_ENABLED:-false}"
+      # Same parameterisation for backfill window — defaults to 7 days
+      # for the E2E flow; set to a larger value (e.g. 365) for acceptance
+      # runs that need a year+ of history.
+      BACKFILL_DAYS: "${BACKFILL_DAYS:-7}"
     volumes:
       # Bind-mount scripts/ so `docker compose exec backend-test python scripts/seed_test_data.py`
       # works without shipping test-only seed scripts in the production image.
