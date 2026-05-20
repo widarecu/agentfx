@@ -359,6 +359,18 @@ export default function GenomeBacktest() {
   }, [sharpe, maxDd, hitRate, trades.length]);
   const passesGateB = gateBFailures.length === 0;
 
+  // The genome's validation folds already include the OOS fold computed
+  // by the validator at run time. We don't need to re-run anything — just
+  // surface those numbers next to the training-window numbers so the
+  // user can see the divergence directly (a 60-percentage-point drop in
+  // hit rate from training to OOS is the canonical overfitting signature
+  // and what Gate B is designed to catch).
+  const oosFold = useMemo(
+    () =>
+      genome?.validation_folds.find((f) => f.is_oos) ?? null,
+    [genome],
+  );
+
   // ── Early returns now that all hooks have fired ─────────────────────
   if (loading) {
     return (
@@ -419,8 +431,18 @@ export default function GenomeBacktest() {
               <span className="font-mono">
                 {backtest.data_range_end.slice(0, 10)}
               </span>
-              {' · '}
-              <span className="italic">training window only (folds 0..K-2)</span>
+            </p>
+            <div className="mt-2 inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-300 text-xs font-semibold">
+              <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
+              Training window (folds 0..K-2)
+            </div>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5 max-w-3xl">
+              The metrics below are computed on the <strong>training</strong>{' '}
+              data — the same window the GA's fitness was evaluated against.
+              The <strong>OOS held-out fold</strong> (the data the GA never
+              saw, which Gate B verdicts are based on) is shown separately
+              below the primary tiles; a big gap between the two means the
+              strategy overfit the training data.
             </p>
           </div>
           <div className="flex items-center gap-1.5 text-xs">
@@ -522,6 +544,70 @@ export default function GenomeBacktest() {
           thresholdLine="Gross Profit / Loss"
         />
       </div>
+
+      {/* ── Training vs OOS side-by-side ── */}
+      {oosFold && (
+        <section className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-4">
+          <div className="flex items-start justify-between gap-3 mb-3 flex-wrap">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                Training vs OOS — overfit check
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 max-w-2xl">
+                Big gaps mean the strategy memorised the training data and
+                won't generalise. Gate B is evaluated on the OOS column —
+                that's what gates promotion to paper/live trading. If
+                training and OOS are far apart, the strategy isn't trustworthy
+                regardless of how good the training numbers look.
+              </p>
+            </div>
+            <div className="text-xs text-slate-500 dark:text-slate-400 inline-flex items-center gap-2 shrink-0">
+              <span className="inline-flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
+                Training
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                OOS (fold {oosFold.fold_index})
+              </span>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-3 text-sm">
+            <ComparePair
+              label="Sharpe"
+              training={sharpe}
+              oos={oosFold.sharpe}
+              format={(v) => formatSharpe(v)}
+              threshold={GATE_B_THRESHOLDS.SHARPE_MIN}
+              direction="gte"
+            />
+            <ComparePair
+              label="Max DD"
+              training={maxDd}
+              oos={oosFold.max_drawdown}
+              format={(v) => formatPercent(v ?? 0)}
+              threshold={GATE_B_THRESHOLDS.MAX_DRAWDOWN}
+              direction="lte"
+            />
+            <ComparePair
+              label="Hit Rate"
+              training={hitRate}
+              oos={oosFold.hit_rate}
+              format={(v) => formatPercent(v ?? 0)}
+              threshold={GATE_B_THRESHOLDS.HIT_RATE_MIN}
+              direction="gte"
+            />
+            <ComparePair
+              label="Trades"
+              training={trades.length}
+              oos={oosFold.n_trades}
+              format={(v) => String(v ?? 0)}
+              threshold={GATE_B_THRESHOLDS.MIN_TRADES}
+              direction="gte"
+            />
+          </div>
+        </section>
+      )}
 
       {/* ── Financing Breakdown (only meaningful in $ mode) ── */}
       {viewMode === 'dollars' && (
@@ -786,6 +872,77 @@ function BreakdownItem({
         {formatDollars(dollars)}
       </div>
       <div className="text-xs text-slate-400">{formatPips(pips)} pips</div>
+    </div>
+  );
+}
+
+function ComparePair({
+  label,
+  training,
+  oos,
+  format,
+  threshold,
+  direction,
+}: {
+  label: string;
+  training: number | null | undefined;
+  oos: number | null | undefined;
+  format: (v: number | null | undefined) => string;
+  threshold: number;
+  direction: 'gte' | 'lte';
+}) {
+  const trainPasses =
+    training == null
+      ? null
+      : direction === 'gte'
+        ? training >= threshold
+        : training <= threshold;
+  const oosPasses =
+    oos == null
+      ? null
+      : direction === 'gte'
+        ? oos >= threshold
+        : oos <= threshold;
+
+  return (
+    <div>
+      <div className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">
+        {label}
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <div>
+          <div className="text-[10px] uppercase text-blue-600 dark:text-blue-400 font-semibold tracking-wide">
+            Training
+          </div>
+          <div
+            className={`font-mono text-base ${
+              trainPasses === true
+                ? 'text-emerald-600 dark:text-emerald-400'
+                : trainPasses === false
+                  ? 'text-rose-600 dark:text-rose-400'
+                  : 'text-slate-900 dark:text-slate-100'
+            }`}
+          >
+            {format(training)}
+          </div>
+        </div>
+        <div>
+          <div className="text-[10px] uppercase text-amber-600 dark:text-amber-400 font-semibold tracking-wide">
+            OOS
+          </div>
+          <div
+            className={`font-mono text-base ${
+              oosPasses === true
+                ? 'text-emerald-600 dark:text-emerald-400'
+                : oosPasses === false
+                  ? 'text-rose-600 dark:text-rose-400'
+                  : 'text-slate-900 dark:text-slate-100'
+            }`}
+          >
+            {format(oos)}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
