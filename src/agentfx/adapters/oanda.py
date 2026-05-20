@@ -158,3 +158,60 @@ class OandaClient:
             "short_rate": float(short_rate_raw),
             "fetched_at": datetime.now(UTC),
         }
+
+    def get_instrument_spread(self, instrument: str) -> dict:
+        """Snapshot the current bid/ask spread for an instrument.
+
+        Calls GET /v3/accounts/{accountID}/pricing?instruments={instrument}
+        and returns the spread (ask − bid) converted to pips. This is the
+        actual cost OANDA is charging *at the moment of this call*; for a
+        more representative "typical" value, call during liquid hours
+        (London/NY overlap is ideal) or sample multiple times and take
+        the median.
+
+        Pip size is inferred from the instrument symbol: 0.01 for JPY
+        crosses, 0.0001 otherwise — matches the convention in
+        `services/backtest.py:pip_size_for_pair`.
+
+        Raises OandaError if the market is closed (no prices available)
+        or the response is malformed.
+
+        Returns:
+            dict with keys:
+              - spread_pips: float
+              - bid: float (closing bid at snapshot)
+              - ask: float (closing ask at snapshot)
+              - fetched_at: datetime in UTC
+        """
+        if not self.account_id:
+            raise OandaError("OANDA_ACCOUNT_ID is not set")
+        oanda_instrument = to_oanda_instrument(instrument)
+        params = {"instruments": oanda_instrument}
+        path = f"/accounts/{self.account_id}/pricing"
+        data = self._request("GET", path, params)
+        prices = data.get("prices", [])
+        if not prices:
+            raise OandaError(f"OANDA returned no pricing for {oanda_instrument}")
+        price = prices[0]
+        if not price.get("tradeable", True):
+            raise OandaError(
+                f"{oanda_instrument} not tradeable right now "
+                "(likely closed market) — re-run during liquid hours"
+            )
+        bids = price.get("bids") or []
+        asks = price.get("asks") or []
+        if not bids or not asks:
+            raise OandaError(
+                f"OANDA pricing response missing bids/asks for {oanda_instrument}"
+            )
+        # OANDA returns price ladders; take the top-of-book (best bid, best ask).
+        best_bid = float(bids[0]["price"])
+        best_ask = float(asks[0]["price"])
+        pip_size = 0.01 if oanda_instrument.endswith("_JPY") else 0.0001
+        spread_pips = (best_ask - best_bid) / pip_size
+        return {
+            "spread_pips": float(spread_pips),
+            "bid": best_bid,
+            "ask": best_ask,
+            "fetched_at": datetime.now(UTC),
+        }

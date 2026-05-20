@@ -1,0 +1,22 @@
+# Static typical-spread fallback for pairs where OANDA's pricing endpoint
+# isn't reachable at seed time (closed market on weekends, network blip,
+# practice-account quirks). Values are typical OANDA practice-account
+# spreads in pips for the London/NY-overlap session, sourced from OANDA's
+# published "Forex Trading Spreads" page (https://www.oanda.com/forex-trading/
+# spreads/) and verified against pricing snapshots in dev.
+#
+# These are FALLBACKS only — the seed script always tries the live
+# pricing endpoint first and only falls back to this file on error. The
+# seed timestamp is recorded on the row so callers can spot stale data.
+#
+# Refresh policy: re-snapshot when OANDA changes published spreads
+# materially or when adding a new pair to the supported set.
+#
+# Last refreshed: 2026-05-20 from OANDA Practice account snapshots.
+spread_fallback:
+  EUR_USD: 0.6
+  GBP_USD: 1.1
+  USD_JPY: 0.7
+  USD_CHF: 1.1
+  AUD_USD: 0.8
+  USD_CAD: 1.5

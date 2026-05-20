@@ -72,10 +72,12 @@ function mapTrade(t: Record<string, unknown>): Trade {
     exitPrice: t.exit_price as number,
     pips: (t.pips as number) ?? 0,
     spreadCostPips: (t.spread_cost_pips as number) ?? 0,
+    slippageCostPips: (t.slippage_cost_pips as number) ?? 0,
     swapCostPips: (t.swap_cost_pips as number) ?? 0,
     netPips: (t.net_pips as number) ?? 0,
     grossPnlDollars: (t.gross_pnl_dollars as number) ?? 0,
     spreadCostDollars: (t.spread_cost_dollars as number) ?? 0,
+    slippageCostDollars: (t.slippage_cost_dollars as number) ?? 0,
     swapCostDollars: (t.swap_cost_dollars as number) ?? 0,
     netPnlDollars: (t.net_pnl_dollars as number) ?? 0,
     durationMinutes: (t.duration_minutes as number) ?? 0,
@@ -240,11 +242,16 @@ export default function GenomeBacktest() {
       (s, t) => s + (t.spreadCostPips ?? 0),
       0,
     );
+    const totalSlippageCostPips = trades.reduce(
+      (s, t) => s + (t.slippageCostPips ?? 0),
+      0,
+    );
     const totalSwapCostPips = trades.reduce(
       (s, t) => s + (t.swapCostPips ?? 0),
       0,
     );
-    const totalCostPips = totalSpreadCostPips + totalSwapCostPips;
+    const totalCostPips =
+      totalSpreadCostPips + totalSlippageCostPips + totalSwapCostPips;
     const netPips = totalPips - totalCostPips;
     const grossPnlDollars = trades.reduce(
       (s, t) => s + (t.grossPnlDollars ?? 0),
@@ -254,12 +261,19 @@ export default function GenomeBacktest() {
       (s, t) => s + (t.spreadCostDollars ?? 0),
       0,
     );
+    const totalSlippageCostDollars = trades.reduce(
+      (s, t) => s + (t.slippageCostDollars ?? 0),
+      0,
+    );
     const totalSwapCostDollars = trades.reduce(
       (s, t) => s + (t.swapCostDollars ?? 0),
       0,
     );
     const netPnlDollars =
-      grossPnlDollars - totalSpreadCostDollars - totalSwapCostDollars;
+      grossPnlDollars
+      - totalSpreadCostDollars
+      - totalSlippageCostDollars
+      - totalSwapCostDollars;
 
     const wins = trades.filter((t) => (t.pips ?? 0) > 0);
     const losses = trades.filter((t) => (t.pips ?? 0) < 0);
@@ -332,6 +346,7 @@ export default function GenomeBacktest() {
     return {
       totalPips,
       totalSpreadCostPips,
+      totalSlippageCostPips,
       totalSwapCostPips,
       totalCostPips,
       netPips,
@@ -339,6 +354,7 @@ export default function GenomeBacktest() {
       avgNetPipsPerTrade: trades.length > 0 ? netPips / trades.length : 0,
       grossPnlDollars,
       totalSpreadCostDollars,
+      totalSlippageCostDollars,
       totalSwapCostDollars,
       netPnlDollars,
       avgPnlPerTradeDollars:
@@ -590,10 +606,10 @@ export default function GenomeBacktest() {
             Cost breakdown
           </h3>
           <span className="text-xs text-slate-500 dark:text-slate-400">
-            Gross → Spread → Swap → Net
+            Gross → Spread → Slippage → Swap → Net
           </span>
         </div>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
           <BreakdownItem
             label="Gross P&L"
             dollars={ext.grossPnlDollars}
@@ -604,6 +620,12 @@ export default function GenomeBacktest() {
             label="Spread cost"
             dollars={-Math.abs(ext.totalSpreadCostDollars)}
             pips={-Math.abs(ext.totalSpreadCostPips)}
+            tone="bad"
+          />
+          <BreakdownItem
+            label="Slippage cost"
+            dollars={-Math.abs(ext.totalSlippageCostDollars)}
+            pips={-Math.abs(ext.totalSlippageCostPips)}
             tone="bad"
           />
           <BreakdownItem

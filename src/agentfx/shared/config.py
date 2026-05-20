@@ -100,7 +100,13 @@ def backtest_default_spread_pips() -> float:
 
 
 def backtest_default_slippage_pips() -> float:
-    return env_float("BACKTEST_SLIPPAGE_PIPS", 0.5) or 0.5
+    # 0.1 pip/side is a conservative non-zero buffer for execution
+    # friction on liquid majors during normal hours. OANDA itself does
+    # not "charge" slippage — it is execution variance, not a fee —
+    # so this default models a realistic execution-quality bound rather
+    # than a billing line item. Override via BACKTEST_SLIPPAGE_PIPS for
+    # exotic pairs or news-window stress tests.
+    return env_float("BACKTEST_SLIPPAGE_PIPS", 0.1) or 0.1
 
 
 def policy_default_max_abs_position() -> int:

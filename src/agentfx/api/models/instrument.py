@@ -40,6 +40,14 @@ class Instrument(Base):
     financing_short_rate = Column(Float, nullable=True)
     financing_updated_at = Column(DateTime(timezone=True), nullable=True)
 
+    # Typical OANDA spread in pips, snapshotted from the pricing endpoint
+    # at seed time (mid bid/ask differential). Used by the backtest cost
+    # model as the per-pair default when no explicit spread_pips is given.
+    # Null means "not yet refreshed" — backtest falls back to the global
+    # default with a warning.
+    typical_spread_pips = Column(Float, nullable=True)
+    typical_spread_updated_at = Column(DateTime(timezone=True), nullable=True)
+
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

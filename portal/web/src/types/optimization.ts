@@ -96,15 +96,17 @@ export interface Trade {
   // Results without financing (raw strategy performance)
   pips: number; // P&L in pips (1 pip = 0.0001 for most pairs, 0.01 for JPY pairs)
   // Financing/costs
-  spreadCostPips: number; // Spread cost in pips (charged on entry)
+  spreadCostPips: number; // OANDA spread paid once over the round trip
+  slippageCostPips: number; // Execution slippage on entry + exit (2 × per-side)
   swapCostPips: number; // Overnight financing cost in pips (cumulative)
   // Results with financing (real-world P&L)
-  netPips: number; // pips - spreadCostPips - swapCostPips
+  netPips: number; // pips - spreadCostPips - slippageCostPips - swapCostPips
   // Dollar values (based on position size)
   grossPnlDollars: number; // P&L in dollars without costs
   spreadCostDollars: number;
+  slippageCostDollars: number;
   swapCostDollars: number;
-  netPnlDollars: number; // grossPnlDollars - spreadCostDollars - swapCostDollars
+  netPnlDollars: number; // grossPnlDollars - spreadCostDollars - slippageCostDollars - swapCostDollars
   // Metadata
   durationMinutes: number;
   positionSize: number; // Units (e.g., 10000 = 0.1 lot)

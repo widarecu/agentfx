@@ -266,6 +266,41 @@ def _lookup_financing_rates(instrument: str) -> tuple[float | None, float | None
             pass
 
 
+def _lookup_typical_spread(instrument: str) -> float | None:
+    """Read the per-pair typical spread (pips) cached on the instruments row.
+
+    Returns the spread in pips, or None if the row is missing, the seed
+    has not run yet, or the database is unreachable. A None result lets
+    the caller fall back to a global default with a warning.
+    """
+    try:
+        from agentfx.api.core.database import SessionLocal
+        from agentfx.api.models.instrument import Instrument
+    except Exception as e:  # pragma: no cover - import guard
+        logger.debug("Cannot import DB layer for spread lookup: %s", e)
+        return None
+
+    try:
+        db = SessionLocal()
+    except Exception as e:
+        logger.debug("Could not open DB session for spread lookup: %s", e)
+        return None
+
+    try:
+        row = db.query(Instrument).filter(Instrument.symbol == instrument).first()
+        if row is None or row.typical_spread_pips is None:
+            return None
+        return float(row.typical_spread_pips)
+    except Exception as e:
+        logger.debug("Spread lookup failed for %s: %s", instrument, e)
+        return None
+    finally:
+        try:
+            db.close()
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+
 def run_backtest_from_db(
     instrument: str,
     granularity: str = "M1",
@@ -273,8 +308,8 @@ def run_backtest_from_db(
     end: datetime | None = None,
     strategy_name: str = "ma",
     strategy_params: dict | None = None,
-    spread_pips: float = 0.5,
-    slippage_pips_per_side: float = 0.5,
+    spread_pips: float | None = None,
+    slippage_pips_per_side: float = 0.1,
     max_abs_position: int = 1,
     max_trades_per_hour: int = 60,
     daily_loss_threshold: float = 0.02,
@@ -315,6 +350,22 @@ def run_backtest_from_db(
             - trades: Individual trades (if capture_signals=True)
     """
     strategy_params = strategy_params or {}
+
+    # Resolve per-pair typical spread when caller didn't pin a value.
+    # OANDA's actual cost varies by pair (EUR_USD ~0.6 pips, USD_CAD ~1.5
+    # pips); seeded by scripts/seed_instruments.py from live pricing.
+    if spread_pips is None:
+        looked_up = _lookup_typical_spread(instrument)
+        if looked_up is None:
+            logger.warning(
+                "No typical_spread_pips on instruments row for %s — "
+                "defaulting to 0.5 pips. Run scripts/seed_instruments.py "
+                "--refresh-spreads to populate.",
+                instrument,
+            )
+            spread_pips = 0.5
+        else:
+            spread_pips = looked_up
 
     # Load data from database
     df = load_price_df_from_db(
@@ -448,14 +499,22 @@ def run_backtest_from_db(
                         pips = price_diff / pip_size
                         gross_pnl = pips * pip_size * position_size
 
-                        # Spread and swap costs.
+                        # Spread, slippage and swap costs per round trip.
+                        # The `rets` series above charges (spread_pips + 2 *
+                        # slippage_pips_per_side) at each signal-change bar; to
+                        # keep the per-trade ledger consistent with what Sharpe
+                        # sees, we attribute the same total to each closed
+                        # trade. Slippage is execution friction (entry + exit
+                        # = 2 sides), spread is the OANDA fee paid once over
+                        # the round trip.
                         # Swap is the sum of per-bar overnight financing
                         # returns inside the trade window (entry, exit],
                         # converted to pips using entry price as reference.
                         # Sign-flipped because swap_ret > 0 means the position
-                        # gained, while swap_cost_pips uses cost convention
+                        # gained, while *_cost_pips uses cost convention
                         # (positive = cost subtracted from net_pips).
                         spread_cost_pips = spread_pips
+                        slippage_cost_pips = 2.0 * slippage_pips_per_side
                         trade_swap_ret = float(
                             swap_ret.loc[
                                 (swap_ret.index > entry_time)
@@ -463,7 +522,12 @@ def run_backtest_from_db(
                             ].sum()
                         )
                         swap_cost_pips = -trade_swap_ret * entry_price / pip_size
-                        net_pips = pips - spread_cost_pips - swap_cost_pips
+                        net_pips = (
+                            pips
+                            - spread_cost_pips
+                            - slippage_cost_pips
+                            - swap_cost_pips
+                        )
 
                         trade_list.append(
                             {
@@ -475,10 +539,14 @@ def run_backtest_from_db(
                                 "exit_price": exit_price,
                                 "pips": pips,
                                 "spread_cost_pips": spread_cost_pips,
+                                "slippage_cost_pips": slippage_cost_pips,
                                 "swap_cost_pips": swap_cost_pips,
                                 "net_pips": net_pips,
                                 "gross_pnl_dollars": gross_pnl,
                                 "spread_cost_dollars": spread_cost_pips
+                                * pip_size
+                                * position_size,
+                                "slippage_cost_dollars": slippage_cost_pips
                                 * pip_size
                                 * position_size,
                                 "swap_cost_dollars": swap_cost_pips
@@ -570,12 +638,16 @@ def run_backtest_from_db(
             # Pips-based extended metrics
             total_pips_val = sum(t["pips"] for t in trade_list)
             total_spread = sum(t["spread_cost_pips"] for t in trade_list)
+            total_slippage = sum(t["slippage_cost_pips"] for t in trade_list)
             total_swap = sum(t["swap_cost_pips"] for t in trade_list)
             metrics["total_pips"] = total_pips_val
             metrics["avg_pips_per_trade"] = total_pips_val / len(trade_list)
             metrics["total_spread_cost_pips"] = total_spread
+            metrics["total_slippage_cost_pips"] = total_slippage
             metrics["total_swap_cost_pips"] = total_swap
-            metrics["net_pips"] = total_pips_val - total_spread - total_swap
+            metrics["net_pips"] = (
+                total_pips_val - total_spread - total_slippage - total_swap
+            )
 
             # Dollar-based extended metrics
             metrics["gross_pnl_dollars"] = sum(
@@ -583,6 +655,9 @@ def run_backtest_from_db(
             )
             metrics["total_spread_cost_dollars"] = sum(
                 t["spread_cost_dollars"] for t in trade_list
+            )
+            metrics["total_slippage_cost_dollars"] = sum(
+                t["slippage_cost_dollars"] for t in trade_list
             )
             metrics["total_swap_cost_dollars"] = sum(
                 t["swap_cost_dollars"] for t in trade_list
@@ -696,8 +771,8 @@ def run_backtest(
     start_days: int | None = None,
     strategy_name: str = "ma",
     strategy_params: dict | None = None,
-    spread_pips: float = 0.5,
-    slippage_pips_per_side: float = 0.5,
+    spread_pips: float | None = None,
+    slippage_pips_per_side: float = 0.1,
     max_abs_position: int = 1,
     max_trades_per_hour: int = 60,
     daily_loss_threshold: float = 0.02,
@@ -705,6 +780,17 @@ def run_backtest(
     db_path: str | None = None,
 ) -> dict:
     strategy_params = strategy_params or {}
+    if spread_pips is None:
+        looked_up = _lookup_typical_spread(pair)
+        if looked_up is None:
+            logger.warning(
+                "No typical_spread_pips for %s — defaulting to 0.5 pips. "
+                "Run scripts/seed_instruments.py --refresh-spreads to populate.",
+                pair,
+            )
+            spread_pips = 0.5
+        else:
+            spread_pips = looked_up
     end = datetime.now(UTC).replace(second=0, microsecond=0)
     start = end - timedelta(days=start_days) if start_days else None
     df = load_price_df(data_root, pair, start=start, end=end)
@@ -786,8 +872,8 @@ def backtest_pairs(
     start_days: int | None = None,
     strategy_name: str = "ma",
     strategy_params: dict | None = None,
-    spread_pips: float = 0.5,
-    slippage_pips_per_side: float = 0.5,
+    spread_pips: float | None = None,
+    slippage_pips_per_side: float = 0.1,
     max_abs_position: int = 1,
     max_trades_per_hour: int = 60,
     daily_loss_threshold: float = 0.02,
