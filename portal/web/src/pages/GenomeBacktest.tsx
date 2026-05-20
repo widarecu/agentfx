@@ -17,7 +17,20 @@
 
 import React, { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Loader2, AlertTriangle, BarChart3 } from 'lucide-react';
+import {
+  AlertTriangle,
+  ArrowLeft,
+  BarChart3,
+  Calculator,
+  Coins,
+  DollarSign,
+  Hash,
+  Loader2,
+  Target,
+  TrendingDown,
+  TrendingUp,
+  XCircle,
+} from 'lucide-react';
 
 import StrategyChart from '../components/StrategyChart';
 import TradesTable from '../components/TradesTable';
@@ -34,6 +47,13 @@ import type {
   MetricsViewMode,
   Trade,
   TradeSignal,
+} from '../types/optimization';
+import {
+  GATE_B_THRESHOLDS,
+  formatDollars,
+  formatPercent,
+  formatPips,
+  formatSharpe,
 } from '../types/optimization';
 
 function authHeaders(): HeadersInit {
@@ -197,6 +217,149 @@ export default function GenomeBacktest() {
     [genome, candles],
   );
 
+  // Read primary metrics safely (backtest may be null on first render).
+  const sharpe = backtest?.metrics.sharpe ?? 0;
+  const maxDd =
+    backtest?.metrics.max_drawdown ?? backtest?.metrics.mdd ?? 0;
+  const hitRate = backtest?.metrics.hit_rate ?? 0;
+
+  // Extended metrics derived from the trades array — same shape as
+  // `optimizationApi.computeExtendedMetrics`, just computed inline here
+  // so we don't import the OptimizationApi class. Plus profit factor
+  // and max consecutive losses (neither comes back in the backtest
+  // metrics dict; both are useful for judging strategy quality).
+  //
+  // IMPORTANT: this and the gateBFailures memo below must live *above*
+  // any early returns in this component. React requires the same number
+  // of hooks to fire on every render — moving them below `if (loading)
+  // return ...` triggers the "Rendered more hooks than during the
+  // previous render" runtime error the first time loading flips false.
+  const ext = useMemo(() => {
+    const totalPips = trades.reduce((s, t) => s + (t.pips ?? 0), 0);
+    const totalSpreadCostPips = trades.reduce(
+      (s, t) => s + (t.spreadCostPips ?? 0),
+      0,
+    );
+    const totalSwapCostPips = trades.reduce(
+      (s, t) => s + (t.swapCostPips ?? 0),
+      0,
+    );
+    const totalCostPips = totalSpreadCostPips + totalSwapCostPips;
+    const netPips = totalPips - totalCostPips;
+    const grossPnlDollars = trades.reduce(
+      (s, t) => s + (t.grossPnlDollars ?? 0),
+      0,
+    );
+    const totalSpreadCostDollars = trades.reduce(
+      (s, t) => s + (t.spreadCostDollars ?? 0),
+      0,
+    );
+    const totalSwapCostDollars = trades.reduce(
+      (s, t) => s + (t.swapCostDollars ?? 0),
+      0,
+    );
+    const netPnlDollars =
+      grossPnlDollars - totalSpreadCostDollars - totalSwapCostDollars;
+
+    const wins = trades.filter((t) => (t.pips ?? 0) > 0);
+    const losses = trades.filter((t) => (t.pips ?? 0) < 0);
+    const avgWinPips =
+      wins.length > 0
+        ? wins.reduce((s, t) => s + (t.pips ?? 0), 0) / wins.length
+        : 0;
+    const avgLossPips =
+      losses.length > 0
+        ? losses.reduce((s, t) => s + (t.pips ?? 0), 0) / losses.length
+        : 0;
+    const avgWinDollars =
+      wins.length > 0
+        ? wins.reduce((s, t) => s + (t.netPnlDollars ?? 0), 0) / wins.length
+        : 0;
+    const avgLossDollars =
+      losses.length > 0
+        ? losses.reduce((s, t) => s + (t.netPnlDollars ?? 0), 0) / losses.length
+        : 0;
+
+    const grossProfit = wins.reduce((s, t) => s + (t.grossPnlDollars ?? 0), 0);
+    const grossLoss = Math.abs(
+      losses.reduce((s, t) => s + (t.grossPnlDollars ?? 0), 0),
+    );
+    const profitFactor =
+      grossLoss > 0
+        ? grossProfit / grossLoss
+        : grossProfit > 0
+          ? Infinity
+          : 0;
+
+    // Max consecutive losses — longest streak of losing trades by entry order.
+    const ordered = [...trades].sort(
+      (a, b) =>
+        new Date(a.entryTimestamp).getTime() -
+        new Date(b.entryTimestamp).getTime(),
+    );
+    let maxConsec = 0;
+    let curr = 0;
+    for (const t of ordered) {
+      if ((t.pips ?? 0) < 0) {
+        curr += 1;
+        if (curr > maxConsec) maxConsec = curr;
+      } else {
+        curr = 0;
+      }
+    }
+
+    return {
+      totalPips,
+      totalSpreadCostPips,
+      totalSwapCostPips,
+      totalCostPips,
+      netPips,
+      avgPipsPerTrade: trades.length > 0 ? totalPips / trades.length : 0,
+      avgNetPipsPerTrade: trades.length > 0 ? netPips / trades.length : 0,
+      grossPnlDollars,
+      totalSpreadCostDollars,
+      totalSwapCostDollars,
+      netPnlDollars,
+      avgPnlPerTradeDollars:
+        trades.length > 0 ? netPnlDollars / trades.length : 0,
+      avgWinPips,
+      avgLossPips,
+      avgWinDollars,
+      avgLossDollars,
+      profitFactor,
+      maxConsecLosses: maxConsec,
+    };
+  }, [trades]);
+
+  // Gate B failure list — same checks the validator runs on the OOS fold,
+  // applied here to the training-window backtest. Surfaces the *specific*
+  // thresholds breached rather than just "Gate B Fail" so the user can
+  // see which dimensions need work.
+  const gateBFailures = useMemo<string[]>(() => {
+    const out: string[] = [];
+    if (sharpe < GATE_B_THRESHOLDS.SHARPE_MIN) {
+      out.push(`Sharpe ${sharpe.toFixed(2)} < ${GATE_B_THRESHOLDS.SHARPE_MIN}`);
+    }
+    if (maxDd > GATE_B_THRESHOLDS.MAX_DRAWDOWN) {
+      out.push(
+        `Max DD ${formatPercent(maxDd)} > ${formatPercent(GATE_B_THRESHOLDS.MAX_DRAWDOWN)}`,
+      );
+    }
+    if (hitRate < GATE_B_THRESHOLDS.HIT_RATE_MIN) {
+      out.push(
+        `Hit Rate ${formatPercent(hitRate)} < ${formatPercent(GATE_B_THRESHOLDS.HIT_RATE_MIN)}`,
+      );
+    }
+    if (trades.length < GATE_B_THRESHOLDS.MIN_TRADES) {
+      out.push(
+        `Trade Count ${trades.length} < ${GATE_B_THRESHOLDS.MIN_TRADES}`,
+      );
+    }
+    return out;
+  }, [sharpe, maxDd, hitRate, trades.length]);
+  const passesGateB = gateBFailures.length === 0;
+
+  // ── Early returns now that all hooks have fired ─────────────────────
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -221,11 +384,6 @@ export default function GenomeBacktest() {
       </div>
     );
   }
-
-  const sharpe = backtest.metrics.sharpe;
-  const maxDd = backtest.metrics.max_drawdown ?? backtest.metrics.mdd;
-  const hitRate = backtest.metrics.hit_rate;
-  const totalReturn = backtest.metrics.total_return;
 
   return (
     <div className="container mx-auto px-4 py-8 space-y-5">
@@ -289,36 +447,197 @@ export default function GenomeBacktest() {
           </div>
         </div>
 
-        <div className="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm">
-          <Metric
-            label="Sharpe"
-            value={fmtNum(sharpe, 3)}
-            tone={sharpe != null && sharpe >= 1 ? 'good' : 'bad'}
-          />
-          <Metric
-            label="Max DD"
-            value={fmtPct(maxDd)}
-            tone={maxDd != null && maxDd <= 0.1 ? 'good' : 'bad'}
-          />
-          <Metric
-            label="Hit rate"
-            value={fmtPct(hitRate)}
-            tone={hitRate != null && hitRate >= 0.48 ? 'good' : 'bad'}
-          />
-          <Metric label="Trades" value={String(trades.length)} />
-          <Metric
-            label="Total return"
-            value={fmtPct(totalReturn)}
-            tone={
-              totalReturn == null
-                ? 'neutral'
-                : totalReturn > 0
-                  ? 'good'
-                  : 'bad'
-            }
-          />
-        </div>
       </div>
+
+      {/* ── Performance Summary: 6 primary metrics, Gate B-coloured ── */}
+      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+        <MetricCard
+          icon={<TrendingUp className="w-4 h-4 text-slate-400" />}
+          label="Sharpe"
+          value={formatSharpe(sharpe)}
+          tone={sharpe >= GATE_B_THRESHOLDS.SHARPE_MIN ? 'good' : 'bad'}
+          thresholdLine={`Threshold: >= ${GATE_B_THRESHOLDS.SHARPE_MIN}`}
+        />
+        <MetricCard
+          icon={
+            viewMode === 'pips' ? (
+              <Coins className="w-4 h-4 text-slate-400" />
+            ) : (
+              <DollarSign className="w-4 h-4 text-slate-400" />
+            )
+          }
+          label={viewMode === 'pips' ? 'Total P&L' : 'Net P&L'}
+          value={
+            viewMode === 'pips'
+              ? `${formatPips(ext.totalPips)} pips`
+              : formatDollars(ext.netPnlDollars)
+          }
+          tone={
+            (viewMode === 'pips' ? ext.totalPips : ext.netPnlDollars) >= 0
+              ? 'good'
+              : 'bad'
+          }
+          thresholdLine={
+            viewMode === 'pips'
+              ? 'Raw strategy performance'
+              : 'After spread & swap costs'
+          }
+        />
+        <MetricCard
+          icon={<TrendingDown className="w-4 h-4 text-slate-400" />}
+          label="Max DD"
+          value={formatPercent(maxDd)}
+          tone={maxDd <= GATE_B_THRESHOLDS.MAX_DRAWDOWN ? 'good' : 'bad'}
+          thresholdLine={`Threshold: <= ${formatPercent(GATE_B_THRESHOLDS.MAX_DRAWDOWN)}`}
+        />
+        <MetricCard
+          icon={<Target className="w-4 h-4 text-slate-400" />}
+          label="Hit Rate"
+          value={formatPercent(hitRate)}
+          tone={hitRate >= GATE_B_THRESHOLDS.HIT_RATE_MIN ? 'good' : 'bad'}
+          thresholdLine={`Threshold: >= ${formatPercent(GATE_B_THRESHOLDS.HIT_RATE_MIN)}`}
+        />
+        <MetricCard
+          icon={<Hash className="w-4 h-4 text-slate-400" />}
+          label="Trades"
+          value={String(trades.length)}
+          tone={trades.length >= GATE_B_THRESHOLDS.MIN_TRADES ? 'good' : 'bad'}
+          thresholdLine={`Threshold: >= ${GATE_B_THRESHOLDS.MIN_TRADES}`}
+        />
+        <MetricCard
+          icon={<BarChart3 className="w-4 h-4 text-slate-400" />}
+          label="Profit Factor"
+          value={
+            Number.isFinite(ext.profitFactor)
+              ? ext.profitFactor.toFixed(2)
+              : '∞'
+          }
+          tone={
+            ext.profitFactor >= 1.5
+              ? 'good'
+              : ext.profitFactor >= 1
+                ? 'neutral'
+                : 'bad'
+          }
+          thresholdLine="Gross Profit / Loss"
+        />
+      </div>
+
+      {/* ── Financing Breakdown (only meaningful in $ mode) ── */}
+      {viewMode === 'dollars' && (
+        <section className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-4">
+          <div className="flex items-center gap-2 mb-4">
+            <Calculator className="w-5 h-5 text-slate-400" />
+            <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+              Financing Breakdown
+            </h3>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm">
+            <BreakdownItem
+              label="Gross P&L"
+              dollars={ext.grossPnlDollars}
+              pips={ext.totalPips}
+              tone={ext.grossPnlDollars >= 0 ? 'good' : 'bad'}
+            />
+            <BreakdownItem
+              label="Spread Cost"
+              dollars={-ext.totalSpreadCostDollars}
+              pips={-ext.totalSpreadCostPips}
+              tone="cost"
+            />
+            <BreakdownItem
+              label="Swap/Interest"
+              dollars={-ext.totalSwapCostDollars}
+              pips={-ext.totalSwapCostPips}
+              tone="cost"
+            />
+            <BreakdownItem
+              label="Total Costs"
+              dollars={-(ext.totalSpreadCostDollars + ext.totalSwapCostDollars)}
+              pips={-ext.totalCostPips}
+              tone="cost"
+            />
+            <div className="bg-slate-50 dark:bg-slate-700/50 rounded-lg p-2 -m-2">
+              <BreakdownItem
+                label="Net P&L"
+                dollars={ext.netPnlDollars}
+                pips={ext.netPips}
+                tone={ext.netPnlDollars >= 0 ? 'good' : 'bad'}
+                bold
+              />
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* ── Secondary metrics row ── */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <SecondaryMetric
+          label="Avg Win"
+          value={
+            viewMode === 'pips'
+              ? `+${ext.avgWinPips.toFixed(1)} pips`
+              : formatDollars(ext.avgWinDollars)
+          }
+          tone="good"
+        />
+        <SecondaryMetric
+          label="Avg Loss"
+          value={
+            viewMode === 'pips'
+              ? `${ext.avgLossPips.toFixed(1)} pips`
+              : formatDollars(ext.avgLossDollars)
+          }
+          tone="bad"
+        />
+        <SecondaryMetric
+          label="Avg P&L per Trade"
+          value={
+            viewMode === 'pips'
+              ? `${formatPips(ext.avgPipsPerTrade)} pips`
+              : formatDollars(ext.avgPnlPerTradeDollars)
+          }
+          tone={
+            (viewMode === 'pips' ? ext.avgPipsPerTrade : ext.avgPnlPerTradeDollars) >= 0
+              ? 'good'
+              : 'bad'
+          }
+        />
+        <SecondaryMetric
+          label="Max Consec. Losses"
+          value={String(ext.maxConsecLosses)}
+          tone="neutral"
+        />
+      </div>
+
+      {/* ── Gate B Failures (when any) ── */}
+      {!passesGateB && (
+        <div className="rounded-lg border border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-900/20 p-4">
+          <div className="flex items-start gap-3">
+            <XCircle className="w-5 h-5 text-rose-600 dark:text-rose-400 mt-0.5 shrink-0" />
+            <div>
+              <h3 className="font-medium text-rose-800 dark:text-rose-300">
+                Gate B Validation Failed
+              </h3>
+              <ul className="mt-2 space-y-1">
+                {gateBFailures.map((failure, idx) => (
+                  <li
+                    key={idx}
+                    className="text-sm text-rose-700 dark:text-rose-400"
+                  >
+                    {failure}
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-2 text-xs text-rose-600/80 dark:text-rose-400/80 italic">
+                Evaluated on this backtest's training window. The validator's
+                Gate-B verdict (shown on the genome page) is evaluated on the
+                held-out OOS fold and may differ.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Chart */}
       <section className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-4">
@@ -401,42 +720,91 @@ export default function GenomeBacktest() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Sub-components
+// Sub-components — mirror the trial-detail page so the two views feel
+// consistent without sharing literal JSX.
 // ─────────────────────────────────────────────────────────────────────
 
-function Metric({
+type Tone = 'good' | 'bad' | 'neutral' | 'cost';
+
+const TONE_CLASS: Record<Tone, string> = {
+  good: 'text-emerald-600 dark:text-emerald-400',
+  bad: 'text-rose-600 dark:text-rose-400',
+  cost: 'text-amber-600 dark:text-amber-400',
+  neutral: 'text-slate-900 dark:text-slate-100',
+};
+
+function MetricCard({
+  icon,
+  label,
+  value,
+  tone = 'neutral',
+  thresholdLine,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  tone?: Tone;
+  thresholdLine?: string;
+}) {
+  return (
+    <div className="bg-white dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-700 p-4">
+      <div className="flex items-center gap-2 mb-2">
+        {icon}
+        <span className="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wide">
+          {label}
+        </span>
+      </div>
+      <div className={`text-2xl font-bold font-mono ${TONE_CLASS[tone]}`}>
+        {value}
+      </div>
+      {thresholdLine && (
+        <div className="text-xs text-slate-400 mt-1">{thresholdLine}</div>
+      )}
+    </div>
+  );
+}
+
+function BreakdownItem({
+  label,
+  dollars,
+  pips,
+  tone = 'neutral',
+  bold = false,
+}: {
+  label: string;
+  dollars: number;
+  pips: number;
+  tone?: Tone;
+  bold?: boolean;
+}) {
+  return (
+    <div>
+      <div className="text-slate-500 dark:text-slate-400">{label}</div>
+      <div
+        className={`text-lg font-mono ${bold ? 'font-bold' : 'font-semibold'} ${TONE_CLASS[tone]}`}
+      >
+        {formatDollars(dollars)}
+      </div>
+      <div className="text-xs text-slate-400">{formatPips(pips)} pips</div>
+    </div>
+  );
+}
+
+function SecondaryMetric({
   label,
   value,
   tone = 'neutral',
 }: {
   label: string;
   value: string;
-  tone?: 'good' | 'bad' | 'neutral';
+  tone?: Tone;
 }) {
-  const valueClass =
-    tone === 'good'
-      ? 'text-emerald-700 dark:text-emerald-400'
-      : tone === 'bad'
-        ? 'text-rose-700 dark:text-rose-400'
-        : 'text-slate-900 dark:text-slate-100';
   return (
-    <div>
-      <div className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
-        {label}
-      </div>
-      <div className={`mt-0.5 text-sm font-mono font-semibold ${valueClass}`}>
+    <div className="bg-slate-50 dark:bg-slate-800/50 rounded-lg p-3">
+      <div className="text-xs text-slate-500 dark:text-slate-400">{label}</div>
+      <div className={`text-lg font-mono font-semibold ${TONE_CLASS[tone]}`}>
         {value}
       </div>
     </div>
   );
-}
-
-function fmtNum(v: number | null | undefined, digits = 2): string {
-  if (v == null || !Number.isFinite(v)) return '—';
-  return v.toFixed(digits);
-}
-
-function fmtPct(v: number | null | undefined): string {
-  if (v == null || !Number.isFinite(v)) return '—';
-  return `${(v * 100).toFixed(2)}%`;
 }
