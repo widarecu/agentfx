@@ -291,6 +291,27 @@ export default function GenomeBacktest() {
           ? Infinity
           : 0;
 
+    // Net profit factor: same ratio but re-classifying trades by net
+    // (post-cost) outcome, so a +2 pip gross trade that paid 1 pip in
+    // spread+swap counts as a +1 win, while a +0.4 pip trade that paid
+    // 1 pip becomes a -0.6 loss. This is the version a trader actually
+    // cares about — "did the strategy make money after costs?"
+    const netWins = trades.filter((t) => (t.netPnlDollars ?? 0) > 0);
+    const netLosses = trades.filter((t) => (t.netPnlDollars ?? 0) < 0);
+    const netProfit = netWins.reduce(
+      (s, t) => s + (t.netPnlDollars ?? 0),
+      0,
+    );
+    const netLossAbs = Math.abs(
+      netLosses.reduce((s, t) => s + (t.netPnlDollars ?? 0), 0),
+    );
+    const netProfitFactor =
+      netLossAbs > 0
+        ? netProfit / netLossAbs
+        : netProfit > 0
+          ? Infinity
+          : 0;
+
     // Max consecutive losses — longest streak of losing trades by entry order.
     const ordered = [...trades].sort(
       (a, b) =>
@@ -327,6 +348,7 @@ export default function GenomeBacktest() {
       avgWinDollars,
       avgLossDollars,
       profitFactor,
+      netProfitFactor,
       maxConsecLosses: maxConsec,
     };
   }, [trades]);
@@ -488,21 +510,27 @@ export default function GenomeBacktest() {
               <DollarSign className="w-4 h-4 text-slate-400" />
             )
           }
-          label={viewMode === 'pips' ? 'Total P&L' : 'Net P&L'}
+          label="Net P&L"
           value={
             viewMode === 'pips'
-              ? `${formatPips(ext.totalPips)} pips`
+              ? `${formatPips(ext.netPips)} pips`
               : formatDollars(ext.netPnlDollars)
           }
           tone={
-            (viewMode === 'pips' ? ext.totalPips : ext.netPnlDollars) >= 0
+            (viewMode === 'pips' ? ext.netPips : ext.netPnlDollars) >= 0
               ? 'good'
               : 'bad'
           }
           thresholdLine={
             viewMode === 'pips'
-              ? 'Raw strategy performance'
-              : 'After spread & swap costs'
+              ? `Gross ${formatPips(ext.totalPips)} − costs ${formatPips(
+                  ext.totalCostPips,
+                )} pips`
+              : `Gross ${formatDollars(
+                  ext.grossPnlDollars,
+                )} − costs ${formatDollars(
+                  ext.totalSpreadCostDollars + ext.totalSwapCostDollars,
+                )}`
           }
         />
         <MetricCard
@@ -535,15 +563,64 @@ export default function GenomeBacktest() {
               : '∞'
           }
           tone={
-            ext.profitFactor >= 1.5
+            ext.netProfitFactor >= 1.5
               ? 'good'
-              : ext.profitFactor >= 1
+              : ext.netProfitFactor >= 1
                 ? 'neutral'
                 : 'bad'
           }
-          thresholdLine="Gross Profit / Loss"
+          thresholdLine={`Gross — net = ${
+            Number.isFinite(ext.netProfitFactor)
+              ? ext.netProfitFactor.toFixed(2)
+              : '∞'
+          }`}
         />
       </div>
+
+      {/* ── Cost breakdown strip ── */}
+      {/*
+        Makes the gross→net journey explicit. Sharpe and Max DD are
+        computed on net returns (post-spread/swap) while Total/Profit
+        Factor tiles historically displayed gross — surfacing the cost
+        bite here prevents the "+2000 pips but Sharpe -11" confusion.
+      */}
+      <section className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-4">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+            Cost breakdown
+          </h3>
+          <span className="text-xs text-slate-500 dark:text-slate-400">
+            Gross → Spread → Swap → Net
+          </span>
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <BreakdownItem
+            label="Gross P&L"
+            dollars={ext.grossPnlDollars}
+            pips={ext.totalPips}
+            tone={ext.totalPips >= 0 ? 'good' : 'bad'}
+          />
+          <BreakdownItem
+            label="Spread cost"
+            dollars={-Math.abs(ext.totalSpreadCostDollars)}
+            pips={-Math.abs(ext.totalSpreadCostPips)}
+            tone="bad"
+          />
+          <BreakdownItem
+            label="Swap cost"
+            dollars={-Math.abs(ext.totalSwapCostDollars)}
+            pips={-Math.abs(ext.totalSwapCostPips)}
+            tone="bad"
+          />
+          <BreakdownItem
+            label="Net P&L"
+            dollars={ext.netPnlDollars}
+            pips={ext.netPips}
+            tone={ext.netPips >= 0 ? 'good' : 'bad'}
+            bold
+          />
+        </div>
+      </section>
 
       {/* ── Training vs OOS side-by-side ── */}
       {oosFold && (
@@ -659,7 +736,7 @@ export default function GenomeBacktest() {
       {/* ── Secondary metrics row ── */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <SecondaryMetric
-          label="Avg Win"
+          label="Avg Win (gross)"
           value={
             viewMode === 'pips'
               ? `+${ext.avgWinPips.toFixed(1)} pips`
@@ -668,7 +745,7 @@ export default function GenomeBacktest() {
           tone="good"
         />
         <SecondaryMetric
-          label="Avg Loss"
+          label="Avg Loss (gross)"
           value={
             viewMode === 'pips'
               ? `${ext.avgLossPips.toFixed(1)} pips`
@@ -677,14 +754,16 @@ export default function GenomeBacktest() {
           tone="bad"
         />
         <SecondaryMetric
-          label="Avg P&L per Trade"
+          label="Avg P&L per Trade (net)"
           value={
             viewMode === 'pips'
-              ? `${formatPips(ext.avgPipsPerTrade)} pips`
+              ? `${formatPips(ext.avgNetPipsPerTrade)} pips`
               : formatDollars(ext.avgPnlPerTradeDollars)
           }
           tone={
-            (viewMode === 'pips' ? ext.avgPipsPerTrade : ext.avgPnlPerTradeDollars) >= 0
+            (viewMode === 'pips'
+              ? ext.avgNetPipsPerTrade
+              : ext.avgPnlPerTradeDollars) >= 0
               ? 'good'
               : 'bad'
           }
