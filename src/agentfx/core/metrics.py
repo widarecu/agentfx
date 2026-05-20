@@ -42,6 +42,44 @@ def hit_rate(trade_returns: pd.Series) -> float:
     return float(wins / len(trade_returns))
 
 
+def per_trade_returns(returns: pd.Series, signals: pd.Series) -> pd.Series:
+    """Collapse per-bar returns into one cumulative return per closed trade.
+
+    A "trade" is a contiguous run of bars with the same non-zero signal
+    (e.g. +1, +1, +1 → one long trade; -1, -1 → one short trade). Bars
+    with signal=0 are flat and don't belong to any trade. Returns are
+    compounded multiplicatively within each trade so the result matches
+    (exit_price / entry_price - 1) modulo sign.
+
+    This is the trade-level definition the rest of the system (Gate B's
+    hit-rate threshold, the backtest endpoint's `capture_signals` block,
+    trader UX intuition) assumes. The earlier `summarize()` was computing
+    hit_rate from bar-level returns sampled at signal-flip points, which
+    is a near-meaningless statistic for any opposite-signal-exit
+    strategy. See plan addendum "Hit rate inconsistency between validator
+    folds and re-backtest" for the root cause analysis.
+    """
+    if returns.empty or signals.empty:
+        return pd.Series(dtype=float)
+    s = signals.fillna(0)
+    # New "group" starts each time the signal value changes. Consecutive
+    # bars with the same signal share a group id.
+    group_ids = s.ne(s.shift()).cumsum()
+    in_trade = s != 0
+    if not in_trade.any():
+        return pd.Series(dtype=float)
+    trade_rets = (1.0 + returns[in_trade]).groupby(group_ids[in_trade]).prod() - 1.0
+    # If the final bar of the series is still in a non-zero position,
+    # that group hasn't been closed yet — drop it. Hit rate and trade
+    # count should reflect *realised* P&L only; an open position is not
+    # a closed trade.
+    if s.iloc[-1] != 0:
+        last_group = int(group_ids.iloc[-1])
+        if last_group in trade_rets.index:
+            trade_rets = trade_rets.drop(last_group)
+    return trade_rets
+
+
 def turnover(signals: pd.Series) -> float:
     # Sum of absolute changes in position (per period)
     return float(signals.diff().abs().fillna(0).sum())
@@ -63,9 +101,16 @@ def _cagr(eq: pd.Series) -> float:
 
 def summarize(returns: pd.Series, signals: pd.Series) -> dict[str, float]:
     eq = equity_curve(returns)
-    # Approximate trades when signal changes (position change)
-    trade_mask = signals.diff().fillna(0).ne(0)
-    trade_rets = returns.where(trade_mask).dropna()
+    # Build the closed-trade return series ONCE — every trade-level metric
+    # below derives from it so they all share the same definition. This
+    # was previously two different things: `trade_rets` was per-bar
+    # returns sampled at signal-flip points (a near-useless statistic for
+    # opposite-signal-exit strategies — typically 6-10% even for healthy
+    # mean reverters), while `n_trades` counted position changes (which
+    # double-counts: flat→long→flat is 2 changes for 1 trade). The new
+    # `per_trade_returns` collapses both into the trader-meaningful
+    # "entry-to-exit P&L per closed trade".
+    trade_rets = per_trade_returns(returns, signals)
     mdd_value = max_drawdown(eq)
     return {
         "sharpe": sharpe(returns),
@@ -74,5 +119,5 @@ def summarize(returns: pd.Series, signals: pd.Series) -> dict[str, float]:
         "hit_rate": hit_rate(trade_rets),
         "turnover": turnover(signals),
         "cagr": _cagr(eq),
-        "n_trades": int(trade_mask.sum()),  # Count of position changes (trades)
+        "n_trades": int(len(trade_rets)),  # Count of closed-trade groups
     }

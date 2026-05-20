@@ -11,6 +11,7 @@ from src.agentfx.core.metrics import (
     equity_curve,
     hit_rate,
     max_drawdown,
+    per_trade_returns,
     sharpe,
     summarize,
     turnover,
@@ -145,6 +146,75 @@ class TestHitRate:
 
 
 @pytest.mark.unit
+class TestPerTradeReturns:
+    """Tests for the closed-trade returns aggregation.
+
+    Regression coverage for the hit-rate discrepancy where the same
+    backtest produced 34% (trade-level, from services/backtest.py's
+    capture_signals block) vs 6-10% (bar-level, from the previous
+    summarize() implementation). After the fix, both paths agree because
+    they share this trade-level definition.
+    """
+
+    def test_groups_contiguous_long_then_short_into_two_trades(self):
+        # One long trade (bars 0-2) then one short trade (bars 3-4),
+        # closing at bar 5 (flat).
+        returns = pd.Series([0.01, 0.01, 0.01, -0.02, -0.02, 0.0])
+        signals = pd.Series([1, 1, 1, -1, -1, 0])
+
+        tr = per_trade_returns(returns, signals)
+        assert len(tr) == 2
+        # Long trade: (1.01)^3 - 1 ≈ 0.0303
+        assert tr.iloc[0] == pytest.approx(1.01**3 - 1, rel=1e-3)
+        # Short trade: (0.98)^2 - 1 ≈ -0.0396
+        # NB the sign here comes from the `returns` series itself, which
+        # the backtest engine pre-multiplies by the signal — so a "short"
+        # bar with a -2% return means a 2% loss for the position holder.
+        assert tr.iloc[1] == pytest.approx(0.98**2 - 1, rel=1e-3)
+
+    def test_excludes_open_trade_at_end_of_series(self):
+        # Last bar still in a long position — that trade hasn't closed yet
+        # and should NOT count toward realised hit rate.
+        returns = pd.Series([0.01, 0.01, -0.02, 0.01])
+        signals = pd.Series([1, 1, 1, 1])  # never closes
+
+        tr = per_trade_returns(returns, signals)
+        assert len(tr) == 0  # zero closed trades
+
+    def test_excludes_open_short_at_end(self):
+        # Long trade closes at bar 2 (flat), then short opens at bar 3
+        # and never closes within the window.
+        returns = pd.Series([0.01, 0.01, 0.0, -0.02, -0.02])
+        signals = pd.Series([1, 1, 0, -1, -1])
+
+        tr = per_trade_returns(returns, signals)
+        # Only the long counts; the trailing short is still open.
+        assert len(tr) == 1
+
+    def test_hit_rate_from_trade_groups(self):
+        # Three closed trades: +3%, -2%, +1%. Two winners → 66.7%.
+        # All trades close before the series ends (signals end at 0).
+        returns = pd.Series(
+            [0.01, 0.01, 0.01, 0.0, -0.01, -0.01, 0.0, 0.005, 0.005, 0.0]
+        )
+        signals = pd.Series([1, 1, 1, 0, 1, 1, 0, 1, 1, 0])
+
+        result = summarize(returns, signals)
+        assert result["n_trades"] == 3
+        assert result["hit_rate"] == pytest.approx(2 / 3, rel=1e-3)
+
+    def test_empty_inputs(self):
+        empty = pd.Series([], dtype=float)
+        assert per_trade_returns(empty, empty).empty
+
+    def test_all_flat_signals_yields_zero_trades(self):
+        returns = pd.Series([0.0, 0.0, 0.0])
+        signals = pd.Series([0, 0, 0])
+        tr = per_trade_returns(returns, signals)
+        assert len(tr) == 0
+
+
+@pytest.mark.unit
 class TestTurnover:
     """Tests for turnover calculation."""
 
@@ -189,17 +259,28 @@ class TestSummarize:
             assert key in result, f"Missing key: {key}"
 
     def test_summarize_n_trades_count(self):
-        """Test that n_trades correctly counts signal changes."""
+        """n_trades counts CLOSED trade groups (consecutive same-non-zero-signal
+        runs that end with a signal change), not raw signal changes.
+
+        Sequence [0, 1, 1, -1, 0]:
+          - bar 0: flat
+          - bars 1-2: long position (one trade group, closed when signal
+            flips to -1 at bar 3)
+          - bar 3: short position (one trade group, closed when signal
+            returns to 0 at bar 4)
+          - bar 4: flat
+        → 2 closed trades.
+
+        Pre-fix this returned 3 because it counted signal *changes* including
+        the open-from-flat events. Closed-trade semantics align with what
+        Gate B's `min_trades` threshold was specified against and what the
+        `capture_signals=True` block in services/backtest.py produces.
+        """
         returns = pd.Series([0.001, -0.0005, 0.002, -0.001, 0.001])
-        # Signals: 0->1 (trade), 1->1 (no trade), 1->-1 (trade), -1->0 (trade), 0->1 (trade)
         signals = pd.Series([0, 1, 1, -1, 0])
 
         result = summarize(returns, signals)
-
-        # 4 signal changes = 4 trades (excluding first 0 which has no prior)
-        # Actually: diff gives [NaN, 1, 0, -2, 1] -> ne(0) gives [False, True, False, True, True]
-        # So 3 trades
-        assert result["n_trades"] == 3
+        assert result["n_trades"] == 2
 
     def test_summarize_max_drawdown_alias(self):
         """Test that max_drawdown equals mdd (alias for Gate B compatibility)."""
