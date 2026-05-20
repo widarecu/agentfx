@@ -9,6 +9,7 @@ import pytest
 from src.agentfx.core.metrics import (
     compute_returns,
     equity_curve,
+    extract_closed_trades,
     hit_rate,
     max_drawdown,
     per_trade_returns,
@@ -327,3 +328,90 @@ class TestSummarize:
             assert isinstance(value, (int, float)), (
                 f"{key} is not numeric: {type(value)}"
             )
+
+
+@pytest.mark.unit
+class TestExtractClosedTrades:
+    """Tests for the single-source-of-truth trade walker.
+
+    `extract_closed_trades` is the shared definition of "a trade" used by
+    both `summarize()` (when given close prices) and the
+    `capture_signals=True` block in services/backtest.py. The two code
+    paths used to walk trades independently and disagreed on the hit
+    rate by ~6pp because of a one-bar timing offset; unifying them on
+    this walker is what closed that gap.
+    """
+
+    def test_long_then_short_trades_use_live_execution_timing(self):
+        close = pd.Series([100.0, 101.0, 102.0, 99.0, 98.0, 100.0])
+        signals = pd.Series([0, 1, 1, -1, -1, 0])
+
+        trades = extract_closed_trades(close, signals)
+
+        assert len(trades) == 2
+        # Long: entry at bar 1 (first non-zero), exit at bar 3 (first flip).
+        assert trades[0].direction == "long"
+        assert trades[0].entry_idx == 1
+        assert trades[0].exit_idx == 3
+        assert trades[0].entry_price == 101.0
+        assert trades[0].exit_price == 99.0
+        assert not trades[0].is_win  # long bought 101, sold 99
+        # Short: entry at bar 3 (the flip bar — same close as long's exit),
+        # exit at bar 5 (when signal returns to flat).
+        assert trades[1].direction == "short"
+        assert trades[1].entry_idx == 3
+        assert trades[1].exit_idx == 5
+        assert trades[1].entry_price == 99.0
+        assert trades[1].exit_price == 100.0
+        assert not trades[1].is_win  # short sold 99, covered 100
+
+    def test_open_trade_at_end_not_emitted(self):
+        close = pd.Series([100.0, 101.0, 102.0])
+        signals = pd.Series([0, 1, 1])  # still long at end
+
+        trades = extract_closed_trades(close, signals)
+        assert trades == []
+
+    def test_summarize_with_close_uses_walker(self):
+        """summarize(close=...) is the production path; it must match
+        what extract_closed_trades reports directly."""
+        np.random.seed(123)
+        n = 500
+        close = pd.Series(100 + np.cumsum(np.random.normal(0, 0.3, n)))
+        sig_arr = np.zeros(n, dtype=int)
+        for i in range(0, n, 8):
+            sig_arr[i : i + 4] = 1
+            sig_arr[i + 4 : i + 8] = -1
+        signals = pd.Series(sig_arr)
+        returns = close.pct_change().fillna(0.0) * signals.shift(0).fillna(0)
+
+        trades = extract_closed_trades(close, signals)
+        wins = sum(1 for t in trades if t.is_win)
+        expected_hr = wins / len(trades)
+
+        result = summarize(returns, signals, close=close)
+
+        assert result["n_trades"] == len(trades)
+        assert result["hit_rate"] == pytest.approx(expected_hr, rel=1e-9)
+
+    def test_summarize_close_path_vs_legacy_per_trade_path_can_differ(self):
+        """The `close`-aware path and the legacy `per_trade_returns`
+        fallback can give slightly different numbers because they apply
+        different bar-entry conventions. This is intentional: production
+        callers always pass `close` so they get live-execution semantics;
+        unit-test callers without price data fall back to the
+        no-lookahead `per_trade_returns` definition. Both paths must
+        still produce valid, finite numbers.
+        """
+        close = pd.Series([100.0, 101.0, 99.0, 100.0, 102.0])
+        signals = pd.Series([1, 1, -1, -1, 0])
+        returns = close.pct_change().fillna(0.0) * signals.shift(0).fillna(0)
+
+        r_with_close = summarize(returns, signals, close=close)
+        r_legacy = summarize(returns, signals)
+
+        # Both produce closed-trade counts (not zero, not NaN).
+        assert r_with_close["n_trades"] >= 1
+        assert r_legacy["n_trades"] >= 1
+        assert 0.0 <= r_with_close["hit_rate"] <= 1.0
+        assert 0.0 <= r_legacy["hit_rate"] <= 1.0

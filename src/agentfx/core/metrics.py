@@ -1,7 +1,122 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Literal
+
 import numpy as np
 import pandas as pd
+
+
+@dataclass(frozen=True)
+class ClosedTrade:
+    """A single round-trip trade extracted from a (close, signals) pair.
+
+    The fields here are the *minimum* needed to compute trade-level
+    metrics consistently across every code path (backtest engine,
+    validator, fitness, UI). Downstream code can layer additional
+    information on top (pips, spread/swap costs, dollar P&L, timestamps)
+    — see `services.backtest.run_backtest_from_db` for an example —
+    without forking the trade-walking logic.
+
+    Trade timing follows the LIVE-TRADING convention: a trade enters at
+    the close of the bar where the signal first becomes non-zero (you
+    can't execute at a close that already happened, so the earliest
+    realistic fill is the next bar's close) and exits at the close of
+    the bar where the signal first flips (to opposite direction or to
+    flat). Bars where the position is still open at the end of the
+    series are NOT emitted — they haven't realised P&L yet.
+    """
+
+    entry_idx: int
+    exit_idx: int
+    entry_price: float
+    exit_price: float
+    direction: Literal["long", "short"]
+
+    @property
+    def return_pct(self) -> float:
+        """Per-trade return as a fraction (e.g. 0.01 = +1%). Direction-
+        signed: positive means the trade made money regardless of side."""
+        if self.entry_price == 0:
+            return 0.0
+        raw = (self.exit_price - self.entry_price) / self.entry_price
+        return raw if self.direction == "long" else -raw
+
+    @property
+    def is_win(self) -> bool:
+        return self.return_pct > 0
+
+
+def extract_closed_trades(close: pd.Series, signals: pd.Series) -> list[ClosedTrade]:
+    """Walk a (close, signals) pair and emit one `ClosedTrade` per closed
+    round-trip.
+
+    This is the **single source of truth** for trade walking across the
+    codebase. The validator's per-fold backtest, the GA fitness path, the
+    on-demand backtest detail endpoint, and the trades-table all derive
+    their per-trade information from this iteration so they can never
+    disagree on what "a trade" was.
+
+    Convention (matches live execution semantics):
+        - Entry bar: the first bar where `signals` becomes non-zero
+          coming from zero or from the opposite sign. The entry price
+          is `close[entry_bar]`.
+        - Exit bar: the first bar where `signals` flips to zero or to
+          the opposite sign. The exit price is `close[exit_bar]`.
+        - A flip from +1 to -1 (or -1 to +1) emits BOTH a close on the
+          previous position AND an open on the new one at the same bar.
+        - Positions still open at the end of the series are NOT emitted.
+
+    Args:
+        close: Per-bar close prices, indexed the same as `signals`.
+        signals: Per-bar position series {-1, 0, +1}.
+    """
+    if len(close) != len(signals):
+        raise ValueError("close and signals must have the same length")
+    trades: list[ClosedTrade] = []
+    if len(signals) == 0:
+        return trades
+
+    s = signals.fillna(0).astype(int).to_numpy()
+    c = close.astype(float).to_numpy()
+
+    prev_signal = 0
+    entry_idx: int | None = None
+    entry_price: float | None = None
+    entry_signal = 0
+
+    for i in range(len(s)):
+        sig = int(s[i])
+        if sig == prev_signal:
+            continue
+
+        # Close the existing position if any
+        if prev_signal != 0 and entry_idx is not None and entry_price is not None:
+            direction: Literal["long", "short"] = (
+                "long" if entry_signal > 0 else "short"
+            )
+            trades.append(
+                ClosedTrade(
+                    entry_idx=entry_idx,
+                    exit_idx=i,
+                    entry_price=entry_price,
+                    exit_price=float(c[i]),
+                    direction=direction,
+                )
+            )
+            entry_idx = None
+            entry_price = None
+
+        # Open a new position if the new signal is non-zero (covers both
+        # flat→position and position→opposite flips).
+        if sig != 0:
+            entry_idx = i
+            entry_price = float(c[i])
+            entry_signal = sig
+
+        prev_signal = sig
+
+    return trades
 
 
 def compute_returns(close: pd.Series) -> pd.Series:
@@ -99,25 +214,48 @@ def _cagr(eq: pd.Series) -> float:
     return float(eq.iloc[-1] ** (1.0 / years) - 1.0)
 
 
-def summarize(returns: pd.Series, signals: pd.Series) -> dict[str, float]:
+def summarize(
+    returns: pd.Series,
+    signals: pd.Series,
+    *,
+    close: pd.Series | None = None,
+) -> dict[str, float]:
+    """Aggregate metrics for a backtest run.
+
+    Trade-level fields (`hit_rate`, `n_trades`) are computed via
+    `extract_closed_trades(close, signals)` when `close` is supplied —
+    the same trade walker the `capture_signals=True` block uses, so the
+    two code paths can never disagree on what a "trade" is.
+
+    When `close` is omitted (legacy callers / unit tests that don't
+    have price data handy), trade-level fields fall back to
+    `per_trade_returns(returns, signals)`. That fallback uses the
+    no-lookahead convention (entry one bar before the signal first
+    appears) and produces slightly different numbers — fine for tests,
+    but production paths should always pass `close`.
+    """
     eq = equity_curve(returns)
-    # Build the closed-trade return series ONCE — every trade-level metric
-    # below derives from it so they all share the same definition. This
-    # was previously two different things: `trade_rets` was per-bar
-    # returns sampled at signal-flip points (a near-useless statistic for
-    # opposite-signal-exit strategies — typically 6-10% even for healthy
-    # mean reverters), while `n_trades` counted position changes (which
-    # double-counts: flat→long→flat is 2 changes for 1 trade). The new
-    # `per_trade_returns` collapses both into the trader-meaningful
-    # "entry-to-exit P&L per closed trade".
-    trade_rets = per_trade_returns(returns, signals)
     mdd_value = max_drawdown(eq)
+
+    if close is not None:
+        trades = extract_closed_trades(close, signals)
+        n = len(trades)
+        if n == 0:
+            hr = 0.0
+        else:
+            wins = sum(1 for t in trades if t.is_win)
+            hr = wins / n
+    else:
+        trade_rets = per_trade_returns(returns, signals)
+        n = len(trade_rets)
+        hr = hit_rate(trade_rets)
+
     return {
         "sharpe": sharpe(returns),
         "mdd": mdd_value,
         "max_drawdown": mdd_value,  # Alias for Gate B compatibility
-        "hit_rate": hit_rate(trade_rets),
+        "hit_rate": hr,
         "turnover": turnover(signals),
         "cagr": _cagr(eq),
-        "n_trades": int(len(trade_rets)),  # Count of closed-trade groups
+        "n_trades": int(n),
     }

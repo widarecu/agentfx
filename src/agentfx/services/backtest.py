@@ -357,7 +357,7 @@ def run_backtest_from_db(
     swap_ret = compute_swap_returns(df, signals, long_rate, short_rate)
     rets = rets + swap_ret
 
-    metrics = summarize(rets, signals)
+    metrics = summarize(rets, signals, close=df["close"])
 
     result: dict[str, Any] = {
         "pair": instrument,
@@ -542,8 +542,9 @@ def run_backtest_from_db(
                 (sum(losses) / len(losses)) * pip_size if losses else 0.0
             )
             metrics["profit_factor"] = sum(wins) / abs(sum(losses)) if losses else 0.0
-            metrics["n_trades"] = len(trade_list)
-            metrics["hit_rate"] = len(wins) / len(trade_list)
+            # n_trades and hit_rate are already produced by summarize() via the
+            # shared extract_closed_trades walker, so we do NOT overwrite them
+            # here — the two paths would otherwise compete on the same field.
 
             # Max consecutive losses
             max_consec = 0
@@ -739,7 +740,7 @@ def run_backtest(
     swap_ret = compute_swap_returns(df, signals, long_rate, short_rate)
     rets = rets + swap_ret
 
-    metrics = summarize(rets, signals)
+    metrics = summarize(rets, signals, close=df["close"])
     result = {
         "pair": pair,
         "start": df.index.min().isoformat() if len(df) else None,
