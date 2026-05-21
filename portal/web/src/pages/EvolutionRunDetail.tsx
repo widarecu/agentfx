@@ -38,8 +38,10 @@ import LlmInjectionCard from '../components/LlmInjectionCard';
 import {
   formatLlmCost,
   getEvolutionRun,
+  getGenome,
   listDecisions,
   listGenerations,
+  listRunGenomes,
   stopEvolutionRun,
 } from '../services/evolutionApi';
 import { StatusBadge } from './EvolutionRuns';
@@ -47,6 +49,7 @@ import type {
   DecisionLogEntry,
   EvolutionRun,
   Generation,
+  StrategyGenome,
 } from '../types/evolution';
 
 const AGENT_FILTER_OPTIONS = ['all', 'orchestrator', 'ga', 'llm', 'validator'];
@@ -62,6 +65,7 @@ export default function EvolutionRunDetail() {
   const [decisionTotal, setDecisionTotal] = useState(0);
   const [decisionPage, setDecisionPage] = useState(1);
   const [agentFilter, setAgentFilter] = useState<string>('all');
+  const [llmGenomes, setLlmGenomes] = useState<StrategyGenome[]>([]);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -90,6 +94,30 @@ export default function EvolutionRunDetail() {
       setDecisions(decisionsData.items);
       setDecisionTotal(decisionsData.total);
       setAllDecisions(allDecisionsData.items);
+
+      // Fetch full DSL + reasoning for every LLM-origin genome in the run so
+      // the LLM injection cards can render each proposal in detail. The
+      // summary endpoint omits dsl_json/llm_reasoning to keep the
+      // lineage-tree payload light, so we drill in here. Typical run has
+      // ≤ 10 LLM-origin genomes so the fan-out is bounded.
+      try {
+        const llmList = await listRunGenomes(runId, {
+          origin: 'llm',
+          limit: 200,
+        });
+        if (llmList.items.length > 0) {
+          const detailed = await Promise.all(
+            llmList.items.map((g) => getGenome(runId, g.id)),
+          );
+          setLlmGenomes(detailed);
+        } else {
+          setLlmGenomes([]);
+        }
+      } catch {
+        // Don't fail the whole page just because we couldn't enrich the
+        // LLM cards — they degrade to count-only display.
+        setLlmGenomes([]);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load run');
     } finally {
@@ -226,9 +254,28 @@ export default function EvolutionRunDetail() {
           subtitle="What the strategy-proposing LLM did at each scheduled injection point."
         >
           <div className="space-y-3">
-            {injectionDecisions.map((d) => (
-              <LlmInjectionCard key={d.id} decision={d} />
-            ))}
+            {injectionDecisions.map((d) => {
+              const proposals = llmGenomes.filter(
+                (g) => g.generation_id === d.generation_id,
+              );
+              // Incumbent = best fitness one generation back (the elite the
+              // LLM is trying to beat). Gen 0 has no incumbent.
+              const proposalsGenIdx = proposals[0]?.generation_index ?? null;
+              const incumbent =
+                proposalsGenIdx != null && proposalsGenIdx > 0
+                  ? (sortedGens.find((g) => g.index === proposalsGenIdx - 1)
+                      ?.best_fitness ?? null)
+                  : null;
+              return (
+                <LlmInjectionCard
+                  key={d.id}
+                  decision={d}
+                  runId={runId ?? ''}
+                  proposals={proposals}
+                  incumbentFitness={incumbent}
+                />
+              );
+            })}
           </div>
         </Section>
       )}
