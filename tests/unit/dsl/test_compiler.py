@@ -192,32 +192,51 @@ class TestDSLCompletenessGate:
             check_names=False,
         )
 
-    def test_rsi_mean_reversion_seed_matches_classic(self) -> None:
+    def test_rsi_mean_reversion_seed_entries_match_classic(self) -> None:
+        """Compiled-DSL RSI MR enters on the same bars as classic RSI MR.
+
+        DSL now enforces the exit block (stop/target/max_hold/opposite),
+        so once entered the DSL holds the position until an exit triggers
+        — classic RSI MR instead goes flat the moment `rsi` returns to
+        the normal band. The two diverge on hold duration but the
+        ENTRY points are identical because the DSL's `raw_pos` is built
+        from the same indicator predicate.
+
+        This is the correct relationship for an exit-enforcing strategy
+        ABC: at every bar where classic enters long/short, the DSL
+        agrees in direction; DSL may *additionally* stay in beyond
+        that bar (which is the whole point of the new exit walker).
+        """
         df = _make_synthetic_df(500, seed=13)
         compiled = compile_spec(RSI_MEAN_REVERSION_SEED)
         classic = RSIMeanReversion(window=14, lower=30.0, upper=70.0)
 
-        compiled_sig = compiled.generate_signals(df)
-        classic_sig = classic.generate_signals(df)
+        compiled_sig = compiled.generate_signals(df).astype(int)
+        classic_sig = classic.generate_signals(df).astype(int)
 
-        pd.testing.assert_series_equal(
-            compiled_sig.astype(int),
-            classic_sig.astype(int),
-            check_names=False,
+        # At every bar where classic is non-zero, compiled is the same
+        # direction (or compiled is non-zero from an earlier entry that
+        # the classic missed — also OK).
+        classic_active = classic_sig != 0
+        # Where classic is active, compiled must agree in direction.
+        assert (compiled_sig[classic_active] == classic_sig[classic_active]).all(), (
+            "compiled disagrees in direction with classic at a bar classic is active"
         )
 
-    def test_donchian_breakout_seed_matches_classic(self) -> None:
+    def test_donchian_breakout_seed_entries_match_classic(self) -> None:
+        """Same relationship as RSI: DSL enters on the same bars as
+        classic, then may hold longer until exits fire.
+        """
         df = _make_synthetic_df(500, seed=17)
         compiled = compile_spec(DONCHIAN_BREAKOUT_SEED)
         classic = DonchianBreakout(window=20)
 
-        compiled_sig = compiled.generate_signals(df)
-        classic_sig = classic.generate_signals(df)
+        compiled_sig = compiled.generate_signals(df).astype(int)
+        classic_sig = classic.generate_signals(df).astype(int)
 
-        pd.testing.assert_series_equal(
-            compiled_sig.astype(int),
-            classic_sig.astype(int),
-            check_names=False,
+        classic_active = classic_sig != 0
+        assert (compiled_sig[classic_active] == classic_sig[classic_active]).all(), (
+            "compiled disagrees in direction with classic at a bar classic is active"
         )
 
     def test_ma_crossover_seed_with_custom_params_matches_classic(self) -> None:
@@ -232,6 +251,221 @@ class TestDSLCompletenessGate:
             compiled_sig.astype(int),
             classic_sig.astype(int),
             check_names=False,
+        )
+
+
+class TestExitEnforcement:
+    """The compiler now enforces the exit block. Each test wires a
+    controlled entry condition that fires once, then drives close-price
+    movement to verify each exit path independently.
+    """
+
+    def _spec_long_entry(
+        self,
+        *,
+        stop_pips: int,
+        target_pips: int,
+        max_hold_bars: int,
+        opposite_signal: bool = True,
+    ) -> StrategySpec:
+        """Long entry when close > 1.0 (always true on our synthetic data),
+        short entry never. Exits are the variable under test.
+        """
+        return StrategySpec(
+            entry=EntryConditions(
+                long=Comparison(lhs=_ind("sma", 5), cmp=">", rhs=0.0),
+            ),
+            exit=ExitRules(
+                stop_pips=stop_pips,
+                target_pips=target_pips,
+                max_hold_bars=max_hold_bars,
+                opposite_signal=opposite_signal,
+            ),
+            size=SizeRules(risk_pct=0.005),
+        )
+
+    def _df_with_drop_then_recover(self) -> pd.DataFrame:
+        """Synthetic series: enters at ~1.10, drops 15 pips, then recovers.
+        Lets us hit a 10-pip stop cleanly.
+        """
+        idx = pd.date_range("2024-01-01", periods=50, freq="min", tz="UTC")
+        # 10 flat bars (long entry condition has time to fire), then drop 15
+        # pips over 5 bars, then back up.
+        closes = (
+            [1.1000] * 10 + [1.0997, 1.0993, 1.0990, 1.0987, 1.0985] + [1.1000] * 35
+        )
+        df = pd.DataFrame(
+            {
+                "open": closes,
+                "high": [c + 0.0001 for c in closes],
+                "low": [c - 0.0001 for c in closes],
+                "close": closes,
+                "volume": [1] * 50,
+            },
+            index=idx,
+        )
+        return df
+
+    def _longest_run(self, sig: pd.Series, value: int) -> int:
+        run = best = 0
+        for v in sig:
+            if int(v) == value:
+                run += 1
+                best = max(best, run)
+            else:
+                run = 0
+        return best
+
+    def test_stop_pips_fires(self) -> None:
+        spec = self._spec_long_entry(stop_pips=10, target_pips=50, max_hold_bars=240)
+        strat = compile_spec(spec, pip_size=0.0001)
+        df = self._df_with_drop_then_recover()
+        sig = strat.generate_signals(df)
+
+        # Entry at bar 1 (sma uses min_periods=1; long_sig is true from
+        # bar 0, shifts to bar 1). entry_close = close[1] = 1.1000.
+        # The stop=10 pips is crossed at bar 12 where close=1.0990
+        # (-10 pips). The walker emits signal=0 at exactly that bar
+        # (the trade closes there; bar 13 may re-enter since the entry
+        # condition still holds — no cool-down in the grammar).
+        assert sig.iloc[12] == 0, (
+            f"stop_pips=10 should fire at bar 12 where close drops to "
+            f"-10 pips; got signal[12]={sig.iloc[12]}"
+        )
+
+    def test_target_pips_fires(self) -> None:
+        # Long entry, close climbs above entry to trigger the 10-pip target.
+        # Grammar requires stop_pips < target_pips; use stop=5, target=10.
+        idx = pd.date_range("2024-01-01", periods=40, freq="min", tz="UTC")
+        closes = [1.1000] * 10 + [1.1003, 1.1006, 1.1009, 1.1012] + [1.1020] * 26
+        df = pd.DataFrame(
+            {
+                "open": closes,
+                "high": [c + 0.0001 for c in closes],
+                "low": [c - 0.0001 for c in closes],
+                "close": closes,
+                "volume": [1] * 40,
+            },
+            index=idx,
+        )
+        spec = self._spec_long_entry(stop_pips=5, target_pips=10, max_hold_bars=240)
+        strat = compile_spec(spec, pip_size=0.0001)
+        sig = strat.generate_signals(df)
+
+        # Target = +10 pips. From entry close 1.1000, close hits 1.1012 at
+        # bar 13. The walker should mark that bar (or earlier) as a forced 0
+        # because the close crossed +10 pips.
+        assert sig.iloc[13] == 0, (
+            f"target_pips=10 should fire when close crosses +10 pips; "
+            f"got signal[13]={sig.iloc[13]}"
+        )
+
+    def test_max_hold_bars_caps_each_trade(self) -> None:
+        # Flat data so neither stop nor target fires; only max_hold can exit.
+        # Each non-zero run is bounded by max_hold_bars (the walker may
+        # re-enter on the very next bar if the entry condition still
+        # holds — that's correct behaviour, no cool-down in the grammar).
+        idx = pd.date_range("2024-01-01", periods=50, freq="min", tz="UTC")
+        closes = [1.1000] * 50
+        df = pd.DataFrame(
+            {
+                "open": closes,
+                "high": closes,
+                "low": closes,
+                "close": closes,
+                "volume": [1] * 50,
+            },
+            index=idx,
+        )
+        spec = self._spec_long_entry(stop_pips=50, target_pips=100, max_hold_bars=5)
+        strat = compile_spec(spec, pip_size=0.0001)
+        sig = strat.generate_signals(df)
+
+        longest_run = self._longest_run(sig, 1)
+        # max_hold_bars=5 means a trade closes once it's been open 5 bars.
+        # Allow up to max_hold_bars + 1 for the inclusive boundary.
+        assert longest_run <= 6, (
+            f"max_hold_bars=5 should cap each long trade ≤ 6 bars; got "
+            f"longest_run={longest_run}"
+        )
+
+    def test_opposite_signal_flips_position(self) -> None:
+        # Entry condition: long when close > sma(5), short when close < sma(5).
+        # In a sharp reversal this triggers an opposite-signal flip from +1 to -1.
+        idx = pd.date_range("2024-01-01", periods=40, freq="min", tz="UTC")
+        closes = list(np.linspace(1.1000, 1.1020, 20)) + list(
+            np.linspace(1.1020, 1.1000, 20)
+        )
+        df = pd.DataFrame(
+            {
+                "open": closes,
+                "high": [c + 0.0001 for c in closes],
+                "low": [c - 0.0001 for c in closes],
+                "close": closes,
+                "volume": [1] * 40,
+            },
+            index=idx,
+        )
+        spec = StrategySpec(
+            entry=EntryConditions(
+                long=Comparison(lhs=_ind("close"), cmp=">", rhs=_ind("sma", 5)),
+                short=Comparison(lhs=_ind("close"), cmp="<", rhs=_ind("sma", 5)),
+            ),
+            exit=ExitRules(
+                stop_pips=100,
+                target_pips=200,
+                max_hold_bars=240,
+                opposite_signal=True,
+            ),
+            size=SizeRules(risk_pct=0.005),
+        )
+        strat = compile_spec(spec, pip_size=0.0001)
+        sig = strat.generate_signals(df)
+
+        # Both +1 and -1 should appear somewhere — the flip happened.
+        assert (sig == 1).any() and (sig == -1).any(), (
+            f"expected an opposite-signal flip; got values {set(sig.unique())}"
+        )
+
+    def test_opposite_signal_disabled_holds_through(self) -> None:
+        # Same setup as above but opposite_signal=False — position should
+        # NOT flip; the long ride should hold until stop/target/max_hold.
+        idx = pd.date_range("2024-01-01", periods=40, freq="min", tz="UTC")
+        closes = list(np.linspace(1.1000, 1.1020, 20)) + list(
+            np.linspace(1.1020, 1.1000, 20)
+        )
+        df = pd.DataFrame(
+            {
+                "open": closes,
+                "high": [c + 0.0001 for c in closes],
+                "low": [c - 0.0001 for c in closes],
+                "close": closes,
+                "volume": [1] * 40,
+            },
+            index=idx,
+        )
+        spec = StrategySpec(
+            entry=EntryConditions(
+                long=Comparison(lhs=_ind("close"), cmp=">", rhs=_ind("sma", 5)),
+                short=Comparison(lhs=_ind("close"), cmp="<", rhs=_ind("sma", 5)),
+            ),
+            exit=ExitRules(
+                stop_pips=100,
+                target_pips=200,
+                max_hold_bars=240,
+                opposite_signal=False,
+            ),
+            size=SizeRules(risk_pct=0.005),
+        )
+        strat = compile_spec(spec, pip_size=0.0001)
+        sig = strat.generate_signals(df)
+
+        # With opposite_signal disabled, no -1 should appear — the trade
+        # rides the round trip without flipping. Stop/target/max_hold are
+        # generous enough not to fire on a 20-pip move.
+        assert (sig == -1).sum() == 0, (
+            f"opposite_signal=False must not allow flips; got "
+            f"{(sig == -1).sum()} short bars"
         )
 
 

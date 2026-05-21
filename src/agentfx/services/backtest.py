@@ -375,8 +375,16 @@ def run_backtest_from_db(
         end=end,
     )
 
-    # Create strategy and generate signals
-    strat = make_strategy(strategy_name, **strategy_params)
+    # Pip size for the instrument — needed for both cost application and
+    # DSL strategies (their stop/target are in pips).
+    def pip_size_for_pair(p: str) -> float:
+        return 0.01 if p.upper().endswith("JPY") or "_JPY" in p.upper() else 0.0001
+
+    pip_size = pip_size_for_pair(instrument)
+
+    # Create strategy and generate signals — DSL strategies need pip_size
+    # for the stop/target/max_hold exit walker; classic ones ignore it.
+    strat = make_strategy(strategy_name, pip_size=pip_size, **strategy_params)
     raw_signals = strat.generate_signals(df)
 
     # Apply policies
@@ -389,19 +397,12 @@ def run_backtest_from_db(
     signals = presult.adjusted_signals
     rets = compute_returns(df["close"]) * signals.shift(0).fillna(0)
 
-    # Apply transaction costs on signal changes
-    def pip_size_for_pair(p: str) -> float:
-        return 0.01 if p.upper().endswith("JPY") or "_JPY" in p.upper() else 0.0001
-
     total_pips = spread_pips + 2.0 * slippage_pips_per_side
     if total_pips > 0:
         trade_points = signals.diff().fillna(0).ne(0)
-        pip_size = pip_size_for_pair(instrument)
         cost_ret = (-total_pips * pip_size) / df["close"]
         cost_ret = cost_ret.where(trade_points, other=0.0)
         rets = rets + cost_ret
-    else:
-        pip_size = pip_size_for_pair(instrument)
 
     # Apply OANDA overnight financing (swap) costs.
     long_rate, short_rate = _lookup_financing_rates(instrument)
@@ -439,7 +440,6 @@ def run_backtest_from_db(
 
     # Capture signals and trades for visualization
     if capture_signals:
-        pip_size = pip_size_for_pair(instrument)
         signal_list = []
         trade_list = []
         trade_id = 0
@@ -749,7 +749,12 @@ def make_strategy(name: str, **kwargs) -> Strategy:
             raise ValueError(
                 f"'spec' must be StrategySpec or dict, got {type(spec_data).__name__}"
             )
-        return compile_spec(spec)
+        # pip_size required for stop/target enforcement. Caller (the
+        # backtest engine) passes the instrument-correct value;
+        # default of 0.0001 covers majors when the caller hasn't
+        # threaded it through.
+        pip_size = float(kwargs.get("pip_size", 0.0001))
+        return compile_spec(spec, pip_size=pip_size)
     if n in ("ma", "mac", "ma_crossover", "macrossover"):
         return MACrossover(
             fast=int(kwargs.get("fast", 20)), slow=int(kwargs.get("slow", 50))
@@ -794,7 +799,13 @@ def run_backtest(
     end = datetime.now(UTC).replace(second=0, microsecond=0)
     start = end - timedelta(days=start_days) if start_days else None
     df = load_price_df(data_root, pair, start=start, end=end)
-    strat = make_strategy(strategy_name, **strategy_params)
+
+    def pip_size_for_pair(p: str) -> float:
+        return 0.01 if p.upper().endswith("JPY") else 0.0001
+
+    pip_size = pip_size_for_pair(pair)
+
+    strat = make_strategy(strategy_name, pip_size=pip_size, **strategy_params)
     raw_signals = strat.generate_signals(df)
     # Apply policies
     pconf = PolicyConfig(
@@ -809,13 +820,10 @@ def run_backtest(
     # Apply transaction costs on signal changes (approximate):
     # total cost per execution in pips = spread + 2*slippage (enter or exit)
     # convert pips to fractional return by pip_size / price
-    def pip_size_for_pair(p: str) -> float:
-        return 0.01 if p.upper().endswith("JPY") else 0.0001
 
     total_pips = spread_pips + 2.0 * slippage_pips_per_side
     if total_pips > 0:
         trade_points = signals.diff().fillna(0).ne(0)
-        pip_size = pip_size_for_pair(pair)
         # Cost return at trade points
         cost_ret = (-total_pips * pip_size) / df["close"]
         cost_ret = cost_ret.where(trade_points, other=0.0)
