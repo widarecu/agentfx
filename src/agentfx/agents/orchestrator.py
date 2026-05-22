@@ -114,6 +114,13 @@ class OrchestratorConfig:
     spread_pips: float | None = None  # None = use default
     leverage: int = 30  # 30:1 OANDA retail default, 50:1 opt-in
 
+    # Gen-0 seeding strategy. The canonical SEED_SPECS are always
+    # included; these flags layer additional starting points on top.
+    use_prior_winners: bool = True
+    n_prior_winners: int = 3  # top-K genomes from completed matching runs
+    llm_seed_gen0: bool = True
+    n_llm_gen0_proposals: int = 5  # how many genomes the LLM seeds gen-0 with
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Persistence Protocol
@@ -180,6 +187,22 @@ class EvolutionStatePersister(Protocol):
         reasoning_text: str | None = None,
         llm_call_id: str | None = None,
     ) -> None: ...
+
+    def find_prior_winners(
+        self,
+        *,
+        instrument: str,
+        granularity: str,
+        limit: int,
+        exclude_run_id: str | None = None,
+    ) -> list[dict]:
+        """Return top-K genomes from completed runs matching the pair/timeframe.
+
+        Each dict has keys: `id`, `dsl_json`, `fitness`,
+        `source_run_id`. Returns an empty list if no prior winners
+        exist or the implementation doesn't support warm-start (tests).
+        """
+        ...
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -253,6 +276,10 @@ class OrchestratorAgent(BaseAgent):
         self._seed_specs = seed_specs or SEED_SPECS
         self._rng = rng or Random(config.rng_seed)
         self._clock = clock
+        # Accumulator for LLM-origin genomes across the run — fed back
+        # into the next LLM call so the model can avoid re-proposing
+        # shapes that already failed.
+        self._all_llm_origin_genomes: list[Genome] = []
 
     @property
     def agent_type(self) -> str:
@@ -323,12 +350,101 @@ class OrchestratorAgent(BaseAgent):
         )
 
         # ── Gen 0 ────────────────────────────────────────────────────
+        # Composite seeding strategy:
+        #   1. Canonical seeds (MA / RSI / Donchian) — always included.
+        #   2. Warm-start: top-K genomes from prior completed runs on
+        #      the same (instrument, granularity). Persists institutional
+        #      memory across runs so we don't re-discover from scratch
+        #      every time.
+        #   3. LLM-seeded proposals: one call with the enriched gen-0
+        #      prompt asking for diverse, cost-aware starting strategies.
+        #   4. Remaining slots: mutated copies of the above pool.
+        # Each layer is gated by a config flag so a user can run a
+        # pure-canonical baseline if they want.
+        composite_seeds: list[StrategySpec] = list(self._seed_specs)
+        warm_start_count = 0
+        llm_seed_count = 0
+
+        if self.config.use_prior_winners and self.config.n_prior_winners > 0:
+            try:
+                prior = self.persister.find_prior_winners(
+                    instrument=self.config.instrument,
+                    granularity=self.config.granularity,
+                    limit=self.config.n_prior_winners,
+                    exclude_run_id=self.run_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "warm-start lookup failed (%s); proceeding with canonical "
+                    "seeds only.",
+                    e,
+                )
+                prior = []
+            for row in prior:
+                try:
+                    composite_seeds.append(StrategySpec.model_validate(row["dsl_json"]))
+                    warm_start_count += 1
+                except Exception as e:
+                    logger.warning(
+                        "warm-start spec %s failed validation (%s); skipping.",
+                        row.get("id"),
+                        e,
+                    )
+
+        llm_gen0_proposals: list[Genome] = []
+        if (
+            self.config.llm_seed_gen0
+            and self.llm_injector is not None
+            and self.config.n_llm_gen0_proposals > 0
+        ):
+            result = self.llm_injector.inject(
+                instrument=self.config.instrument,
+                granularity=self.config.granularity,
+                generation_index=0,
+                fitness_history=[],
+                top_genomes=[],
+                n_proposals=self.config.n_llm_gen0_proposals,
+                cost_per_trade_pips=self._cost_per_trade_pips(),
+                is_gen_zero_seeding=True,
+            )
+            self.persister.log_decision(
+                self.run_id,
+                agent_type="llm",
+                action="seed_gen0",
+                generation_index=0,
+                outputs_json={
+                    "n_proposals": len(result.proposals),
+                    "skipped_reason": result.skipped_reason,
+                    "call_cost_usd": result.cost.usd,
+                    "cumulative_cost_usd": self.llm_injector.cost_used_usd,
+                },
+                reasoning_text=(
+                    f"LLM seed of gen 0: {len(result.proposals)} proposals, "
+                    f"${result.cost.usd:.4f} this call."
+                ),
+                llm_call_id=result.call_id,
+            )
+            if result.succeeded:
+                for p in result.proposals:
+                    llm_gen0_proposals.append(
+                        Genome(
+                            spec=p.spec,
+                            origin=GenomeOrigin.LLM,
+                            parent_ids=[],
+                            llm_reasoning=p.reasoning,
+                            llm_call_id=result.call_id,
+                        )
+                    )
+                composite_seeds.extend(g.spec for g in llm_gen0_proposals)
+                self._all_llm_origin_genomes.extend(llm_gen0_proposals)
+                llm_seed_count = len(llm_gen0_proposals)
+
         # Pass run_id so the seeds get pre-assigned IDs and mutated copies
         # record correct parent_ids — without this, gen-0 mutations appear
         # parentless in the portal and the LineageExplainer can't show
         # which seed each variant came from.
         population = initialize_population(
-            seeds=self._seed_specs,
+            seeds=composite_seeds,
             size=self.config.population_size,
             rng=self._rng,
             mutate_fn=mutate_spec,
@@ -340,11 +456,14 @@ class OrchestratorAgent(BaseAgent):
             action="init_population",
             outputs_json={
                 "population_size": len(population),
-                "n_seeds": len(self._seed_specs),
+                "n_canonical_seeds": len(self._seed_specs),
+                "n_warm_start_winners": warm_start_count,
+                "n_llm_gen0_proposals": llm_seed_count,
             },
             reasoning_text=(
-                f"Initialised generation 0 with {len(self._seed_specs)} seed "
-                f"specs and {len(population) - len(self._seed_specs)} mutated copies."
+                f"Initialised generation 0 with {len(self._seed_specs)} canonical "
+                f"seeds + {warm_start_count} prior winners + {llm_seed_count} LLM "
+                f"proposals + {len(population) - len(composite_seeds)} mutated copies."
             ),
         )
 
@@ -573,6 +692,32 @@ class OrchestratorAgent(BaseAgent):
             genome.set_fitness(fitness)
             genome.metrics = metrics
 
+    def _cost_per_trade_pips(self) -> float:
+        """Realistic round-trip cost in pips for the run's instrument.
+
+        Uses the per-pair OANDA spread (from instruments table, or
+        the global env default as fallback) plus 2× slippage per side.
+        Surfaced to the LLM so it knows the minimum edge a strategy
+        needs to be net-profitable on this pair/granularity.
+        """
+        from agentfx.services.backtest import _lookup_typical_spread
+        from agentfx.shared.config import (
+            backtest_default_slippage_pips,
+            backtest_default_spread_pips,
+        )
+
+        if self.config.spread_pips is not None:
+            spread = float(self.config.spread_pips)
+        else:
+            looked_up = _lookup_typical_spread(self.config.instrument)
+            spread = (
+                float(looked_up)
+                if looked_up is not None
+                else backtest_default_spread_pips()
+            )
+        slippage_per_side = backtest_default_slippage_pips()
+        return spread + 2.0 * slippage_per_side
+
     def _inject_llm_proposals(
         self,
         population: Population,
@@ -586,13 +731,22 @@ class OrchestratorAgent(BaseAgent):
         if self.llm_injector is None:
             return None
 
-        # Top-10 by fitness as context for the LLM
+        # Top-10 by fitness as context for the LLM. Carry the per-genome
+        # metric breakdown so the model can diagnose what's specifically
+        # failing on the incumbents (low hit rate? cost drag? drawdown?).
         evaluated = sorted(
             (g for g in population.genomes if g.has_fitness()),
             key=lambda g: g.fitness_value,
             reverse=True,
         )
-        top_10 = [(g.spec, g.fitness_value) for g in evaluated[:10]]
+        top_10 = [(g.spec, g.fitness_value, g.metrics) for g in evaluated[:10]]
+
+        # Prior LLM proposals across all generations — surfaced so the
+        # LLM doesn't re-propose shapes it already tried and failed.
+        prior_llm = [
+            (g.spec, g.fitness_value if g.has_fitness() else None, g.metrics)
+            for g in self._all_llm_origin_genomes
+        ]
 
         result: InjectionResult = self.llm_injector.inject(
             instrument=self.config.instrument,
@@ -601,6 +755,8 @@ class OrchestratorAgent(BaseAgent):
             fitness_history=best_fitness_history,
             top_genomes=top_10,
             n_proposals=self.config.n_llm_proposals,
+            cost_per_trade_pips=self._cost_per_trade_pips(),
+            prior_llm_proposals=prior_llm if prior_llm else None,
         )
 
         self.persister.log_decision(
@@ -634,8 +790,7 @@ class OrchestratorAgent(BaseAgent):
         population.genomes.sort(
             key=lambda g: (g.fitness_value if g.has_fitness() else float("-inf"))
         )
-        # Drop the bottom-K, append the new proposals.
-        population.genomes = population.genomes[n_replace:] + [
+        new_proposals = [
             Genome(
                 spec=p.spec,
                 origin=GenomeOrigin.LLM,
@@ -645,6 +800,10 @@ class OrchestratorAgent(BaseAgent):
             )
             for p in result.proposals[:n_replace]
         ]
+        # Drop the bottom-K, append the new proposals.
+        population.genomes = population.genomes[n_replace:] + new_proposals
+        # Track for future LLM calls so the model sees its own history.
+        self._all_llm_origin_genomes.extend(new_proposals)
 
         return result.call_id
 

@@ -262,8 +262,13 @@ class LLMHypothesisInjector:
         granularity: str,
         generation_index: int,
         fitness_history: list[float],
-        top_genomes: list[tuple[StrategySpec, float | None]],
+        top_genomes: list[tuple[StrategySpec, float | None, dict | None]],
         n_proposals: int = 5,
+        cost_per_trade_pips: float | None = None,
+        prior_llm_proposals: (
+            list[tuple[StrategySpec, float | None, dict | None]] | None
+        ) = None,
+        is_gen_zero_seeding: bool = False,
     ) -> InjectionResult:
         """Request `n_proposals` novel genomes from the LLM.
 
@@ -271,6 +276,12 @@ class LLMHypothesisInjector:
         per-run budget would be exceeded or the call fails. The
         orchestrator should treat both as "no LLM injection this
         generation" and continue.
+
+        The extra context fields (`cost_per_trade_pips`,
+        `prior_llm_proposals`, `is_gen_zero_seeding`) enrich the user
+        prompt so the model can diagnose what's failing and avoid
+        repeating shapes that already lost. See
+        `prompts.build_user_prompt` for the rendering.
         """
         call_id = uuid.uuid4().hex
         empty_cost = LLMCallCost(0, 0, 0, 0, 0.0)
@@ -297,6 +308,9 @@ class LLMHypothesisInjector:
             fitness_history=fitness_history,
             top_genomes=top_genomes,
             n_proposals=n_proposals,
+            cost_per_trade_pips=cost_per_trade_pips,
+            prior_llm_proposals=prior_llm_proposals,
+            is_gen_zero_seeding=is_gen_zero_seeding,
         )
 
         try:

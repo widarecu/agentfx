@@ -146,6 +146,19 @@ class MockPersister:
             )
         )
 
+    def find_prior_winners(
+        self,
+        *,
+        instrument: str,
+        granularity: str,
+        limit: int,
+        exclude_run_id: str | None = None,
+    ) -> list[dict]:
+        # MockPersister has no cross-run history; warm-start always
+        # returns empty here. Tests that exercise warm-start should
+        # subclass and override.
+        return []
+
 
 class FixedFitnessFn:
     """Deterministic compute_fitness mock.
@@ -570,6 +583,9 @@ class TestLLMInjection:
 
     def test_injection_called_every_n_generations(self) -> None:
         # llm_injection_every_n=3, max_generations=7 → injects at gen 3, 6
+        # llm_seed_gen0 is disabled here so this test focuses on the
+        # mid-run injection cadence; the seed-gen-0 path has its own
+        # coverage below.
         injector = _build_mock_llm_injector()
         config = OrchestratorConfig(
             instrument="EUR_USD",
@@ -577,6 +593,7 @@ class TestLLMInjection:
             llm_injection_every_n=3,
             n_validation_folds=4,
             rng_seed=42,
+            llm_seed_gen0=False,
         )
         orchestrator, persister = _build_orchestrator(
             llm_injector=injector,

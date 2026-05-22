@@ -69,6 +69,63 @@ def get_run(db: Session, run_id: str) -> models.EvolutionRun | None:
     )
 
 
+def find_prior_winners(
+    db: Session,
+    *,
+    instrument: str,
+    granularity: str,
+    limit: int = 3,
+    exclude_run_id: str | None = None,
+) -> list[dict]:
+    """Top-K genomes (by fitness) from completed runs on the same pair/timeframe.
+
+    Used by the orchestrator's gen-0 seeding to warm-start a new run
+    with the best surviving strategies from prior runs against the
+    same instrument/granularity. The "completed" status guard avoids
+    pulling genomes from runs that crashed mid-evaluation. The
+    exclude_run_id parameter prevents a re-started run from importing
+    its own genomes.
+
+    Returns a list of {id, dsl_json, fitness, source_run_id} dicts —
+    callers compile dsl_json via StrategySpec.model_validate for the
+    GA's population.
+    """
+    q = (
+        db.query(
+            models.StrategyGenome.id,
+            models.StrategyGenome.dsl_json,
+            models.StrategyGenome.fitness,
+            models.Generation.run_id,
+        )
+        .join(
+            models.Generation,
+            models.StrategyGenome.generation_id == models.Generation.id,
+        )
+        .join(
+            models.EvolutionRun,
+            models.Generation.run_id == models.EvolutionRun.id,
+        )
+        .filter(
+            models.EvolutionRun.instrument == instrument,
+            models.EvolutionRun.granularity == granularity,
+            models.EvolutionRun.status == "completed",
+            models.StrategyGenome.fitness.isnot(None),
+        )
+    )
+    if exclude_run_id is not None:
+        q = q.filter(models.Generation.run_id != exclude_run_id)
+    rows = q.order_by(desc(models.StrategyGenome.fitness)).limit(limit).all()
+    return [
+        {
+            "id": row.id,
+            "dsl_json": row.dsl_json,
+            "fitness": float(row.fitness) if row.fitness is not None else None,
+            "source_run_id": row.run_id,
+        }
+        for row in rows
+    ]
+
+
 def list_runs(
     db: Session,
     *,
@@ -569,6 +626,26 @@ class SqlAlchemyPersister:
         )
         self.db.add(row)
         self.db.commit()
+
+    # ── find_prior_winners ──────────────────────────────────────────
+
+    def find_prior_winners(
+        self,
+        *,
+        instrument: str,
+        granularity: str,
+        limit: int,
+        exclude_run_id: str | None = None,
+    ) -> list[dict]:
+        """Thin wrapper around the module-level helper so the
+        orchestrator can warm-start via its Persister Protocol."""
+        return find_prior_winners(
+            self.db,
+            instrument=instrument,
+            granularity=granularity,
+            limit=limit,
+            exclude_run_id=exclude_run_id,
+        )
 
 
 __all__ = [

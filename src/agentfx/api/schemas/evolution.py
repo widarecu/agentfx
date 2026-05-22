@@ -81,6 +81,11 @@ class OrchestratorConfigSchema(BaseModel):
     # use the extra leverage to amplify dollar P&L without changing
     # its risk-per-trade % budget.
     leverage: int = Field(default=30, ge=1, le=100)
+    # Gen-0 seeding layers — see OrchestratorConfig docstring.
+    use_prior_winners: bool = True
+    n_prior_winners: int = Field(default=3, ge=0, le=20)
+    llm_seed_gen0: bool = True
+    n_llm_gen0_proposals: int = Field(default=5, ge=0, le=10)
 
 
 # ─────────────────────────────────────────────────────────────────────────

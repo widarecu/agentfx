@@ -518,7 +518,9 @@ class TestUserPromptBuilder:
         )
         assert "INSTRUMENT: EUR_USD M1" in prompt
         assert "GENERATION: 10" in prompt
-        assert "TOP 3 GENOMES:" in prompt
+        # Enriched prompt now annotates the top-genomes section with
+        # the metric-breakdown qualifier; check for the stable prefix.
+        assert "TOP 3 GENOMES" in prompt
         assert "5 fresh strategies" in prompt
         # Fitness values appear
         assert "1.250" in prompt

@@ -35,6 +35,11 @@ export interface OrchestratorConfig {
   spread_pips: number | null;
   /** OANDA retail leverage on majors: 30:1 default, 50:1 opt-in. */
   leverage: number;
+  /** Gen-0 seeding controls — see backend OrchestratorConfig. */
+  use_prior_winners?: boolean;
+  n_prior_winners?: number;
+  llm_seed_gen0?: boolean;
+  n_llm_gen0_proposals?: number;
 }
 
 // ─────────────────────────────────────────────────────────────────────

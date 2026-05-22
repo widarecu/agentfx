@@ -237,13 +237,40 @@ regime", "fitness has plateaued for 3 generations, try a tighter stop".
 # ─────────────────────────────────────────────────────────────────────────
 
 
+def _format_metrics_line(metrics: dict | None) -> str:
+    """One-line metric breakdown for a single genome. Helps the LLM
+    diagnose *why* a genome is failing instead of seeing just Sharpe."""
+    if not metrics:
+        return "no metrics"
+    parts: list[str] = []
+    if "sharpe" in metrics and metrics["sharpe"] is not None:
+        parts.append(f"Sharpe {float(metrics['sharpe']):.2f}")
+    if "max_drawdown" in metrics and metrics["max_drawdown"] is not None:
+        parts.append(f"MaxDD {float(metrics['max_drawdown']) * 100:.1f}%")
+    if "hit_rate" in metrics and metrics["hit_rate"] is not None:
+        parts.append(f"hit {float(metrics['hit_rate']) * 100:.1f}%")
+    if "n_trades" in metrics and metrics["n_trades"] is not None:
+        parts.append(f"{int(metrics['n_trades'])} trades")
+    if "avg_pips_per_trade" in metrics and metrics["avg_pips_per_trade"] is not None:
+        parts.append(f"{float(metrics['avg_pips_per_trade']):+.2f} avg-pips/trade")
+    if "net_pips" in metrics and metrics["net_pips"] is not None:
+        parts.append(f"net {float(metrics['net_pips']):+.0f} pips")
+    return ", ".join(parts) if parts else "no metrics"
+
+
 def build_user_prompt(
     instrument: str,
     granularity: str,
     generation_index: int,
     fitness_history: list[float],
-    top_genomes: list[tuple[StrategySpec, float | None]],
+    top_genomes: list[tuple[StrategySpec, float | None, dict | None]],
     n_proposals: int,
+    *,
+    cost_per_trade_pips: float | None = None,
+    prior_llm_proposals: (
+        list[tuple[StrategySpec, float | None, dict | None]] | None
+    ) = None,
+    is_gen_zero_seeding: bool = False,
 ) -> str:
     """Render the per-call user prompt.
 
@@ -252,8 +279,23 @@ def build_user_prompt(
         granularity: e.g. "M1"
         generation_index: 0-based current generation number
         fitness_history: best-fitness per generation, oldest-first
-        top_genomes: list of (spec, fitness) tuples for the current top-K
+        top_genomes: list of (spec, fitness, metrics) tuples for the
+            current top-K. The metrics dict — when supplied — surfaces
+            hit_rate / max_dd / n_trades / avg_pips_per_trade per
+            genome so the LLM can diagnose *why* it's failing.
         n_proposals: how many genomes to propose
+        cost_per_trade_pips: realistic round-trip cost in pips for the
+            (instrument, granularity) at the current cost model. Lets
+            the LLM see that a 5-pip-stop strategy needs > 5 pips of
+            edge per trade to break even.
+        prior_llm_proposals: same shape as top_genomes, listing this
+            run's earlier LLM-origin genomes and how they scored.
+            Prevents the LLM from re-proposing the same shape that
+            already failed.
+        is_gen_zero_seeding: when True, the prompt frames the call as
+            "propose the *initial* population for a brand-new run" —
+            no incumbents, no fitness history, focus on diverse shapes
+            tuned to the cost model.
     """
     fitness_line = (
         ", ".join(f"{f:.3f}" if f is not None else "—" for f in fitness_history[-6:])
@@ -261,24 +303,89 @@ def build_user_prompt(
         else "—"
     )
 
+    def _unpack(row):
+        # Accept (spec, fitness) for backwards compatibility with older
+        # callers (and the public unit-test surface); the new orchestrator
+        # path passes (spec, fitness, metrics) so the prompt can render
+        # the per-elite metric breakdown.
+        if len(row) == 3:
+            return row[0], row[1], row[2]
+        return row[0], row[1], None
+
     top_lines = []
-    for i, (spec, fitness) in enumerate(top_genomes, start=1):
+    for i, row in enumerate(top_genomes, start=1):
+        spec, fitness, metrics = _unpack(row)
         fit_str = f"{fitness:.3f}" if fitness is not None else "n/a"
-        # Compact JSON representation
         spec_json = json.dumps(spec.model_dump(mode="json"), separators=(",", ":"))
-        top_lines.append(f"#{i} (Sharpe {fit_str}): {spec_json}")
+        metrics_str = _format_metrics_line(metrics)
+        top_lines.append(f"#{i} (Sharpe {fit_str}) [{metrics_str}]: {spec_json}")
     top_block = "\n".join(top_lines) if top_lines else "(none yet — generation 0)"
+
+    cost_block = ""
+    if cost_per_trade_pips is not None:
+        cost_block = (
+            f"\nCOST MODEL: round-trip cost is ~{cost_per_trade_pips:.2f} pips per "
+            f"trade (typical OANDA spread + slippage on this pair/granularity).\n"
+            f"A strategy needs > {cost_per_trade_pips:.2f} pips of average edge per "
+            f"trade to be net-profitable. Strategies that flip frequently on M1 "
+            f"tend to bleed to this cost; favour wider edges + selective entries.\n"
+        )
+
+    prior_block = ""
+    if prior_llm_proposals:
+        prior_lines = []
+        for row in prior_llm_proposals:
+            spec, fitness, metrics = _unpack(row)
+            fit_str = f"{fitness:.3f}" if fitness is not None else "n/a"
+            spec_json = json.dumps(spec.model_dump(mode="json"), separators=(",", ":"))
+            metrics_str = _format_metrics_line(metrics)
+            prior_lines.append(f"  Sharpe {fit_str} [{metrics_str}]: {spec_json}")
+        prior_block = (
+            "\nYOUR PRIOR PROPOSALS IN THIS RUN (and how they scored — "
+            "avoid repeating shapes that already failed):\n"
+            + "\n".join(prior_lines)
+            + "\n"
+        )
+
+    exit_note = (
+        "\nNOTE ON EXITS: stop_pips / target_pips / max_hold_bars / "
+        "opposite_signal in the exit block are now enforced — your choices "
+        "directly govern when each trade closes. Tight stops on a noisy "
+        "timeframe = trades stopped out before the thesis plays out. Wide "
+        "stops = each loss is large. Match exit budget to entry signal "
+        "robustness.\n"
+    )
+
+    if is_gen_zero_seeding:
+        return f"""\
+INSTRUMENT: {instrument} {granularity}
+GENERATION: 0 (initial population seeding)
+{cost_block}{exit_note}
+This is a brand-new evolutionary search — no incumbent genomes yet. The
+GA will be seeded with three canonical strategies (MA crossover, RSI
+mean-reversion, Donchian breakout) plus your proposals. Your job is to
+add {n_proposals} *structurally diverse* starting points that are
+tuned to the cost model above. Cover regimes the canonical seeds miss
+(e.g. volatility-filtered breakouts, multi-indicator confluence,
+asymmetric long/short logic) and pick exit budgets that give each
+strategy a fair chance to express its thesis without bleeding to spread.
+
+Return {n_proposals} genomes as a JSON object matching the response
+schema (a `genomes` array of `{{spec, reasoning}}` objects)."""
 
     return f"""\
 INSTRUMENT: {instrument} {granularity}
 GENERATION: {generation_index}
 FITNESS TRAJECTORY (last 6 generations, OOS Sharpe): {fitness_line}
-
-CURRENT TOP {len(top_genomes)} GENOMES:
+{cost_block}{exit_note}
+CURRENT TOP {len(top_genomes)} GENOMES (with metric breakdown):
 {top_block}
-
+{prior_block}
 Propose exactly {n_proposals} fresh strategies, each with a brief reasoning.
-Make them structurally dissimilar to the genomes above and to one another.
+Make them structurally dissimilar to the genomes above, to your prior
+proposals, and to one another. Use the metric breakdown to target what's
+*specifically* failing in the incumbents (e.g. low hit-rate → propose a
+more selective entry; huge n_trades + cost drag → propose wider holds).
 Return them as a JSON object matching the response schema (a `genomes`
 array of `{{spec, reasoning}}` objects)."""
 
