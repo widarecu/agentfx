@@ -470,9 +470,31 @@ export default function GenomeBacktest() {
                 {backtest.data_range_end.slice(0, 10)}
               </span>
             </p>
-            <div className="mt-2 inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-300 text-xs font-semibold">
-              <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
-              Training window (folds 0..K-2)
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-300 text-xs font-semibold">
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
+                Training window (folds 0..K-2)
+              </span>
+              {backtest.sizing && (
+                <span
+                  className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-violet-100 dark:bg-violet-900/40 text-violet-800 dark:text-violet-300 text-xs font-semibold"
+                  title={
+                    backtest.sizing.is_dsl_risk_sized
+                      ? "Each trade is sized to risk the DSL's risk_pct % of account on its stop. Notional capped at leverage × balance."
+                      : 'Fixed position size from the run config (classic strategy path).'
+                  }
+                >
+                  ${backtest.sizing.account_balance.toLocaleString()} {backtest.sizing.account_currency}
+                  {' · '}
+                  {backtest.sizing.leverage}:1
+                  {backtest.sizing.is_dsl_risk_sized && ' · risk-sized'}
+                  {backtest.sizing.leverage_cap_hits > 0 && (
+                    <span className="ml-1 text-amber-700 dark:text-amber-300">
+                      ⚠ {backtest.sizing.leverage_cap_hits} cap hits
+                    </span>
+                  )}
+                </span>
+              )}
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5 max-w-3xl">
               The metrics below are computed on the <strong>training</strong>{' '}

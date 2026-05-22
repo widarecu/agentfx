@@ -267,7 +267,11 @@ interface CreateRunBody {
   instrument: string;
   granularity: string;
   data_years: number;
-  config?: { population_size: number; rng_seed: number };
+  config?: {
+    population_size: number;
+    rng_seed: number;
+    leverage?: number;
+  };
   stop_conditions?: { max_generations: number; target_fitness: number };
   llm_budget_usd?: number;
 }
@@ -290,6 +294,7 @@ function CreateRunModal({
   const [maxGenerations, setMaxGenerations] = useState(30);
   const [targetFitness, setTargetFitness] = useState(1.5);
   const [llmBudgetUsd, setLlmBudgetUsd] = useState(5.0);
+  const [leverage, setLeverage] = useState<30 | 50>(30);
 
   return (
     <div
@@ -318,7 +323,11 @@ function CreateRunModal({
               instrument,
               granularity,
               data_years: dataYears,
-              config: { population_size: populationSize, rng_seed: 42 },
+              config: {
+                population_size: populationSize,
+                rng_seed: 42,
+                leverage,
+              },
               stop_conditions: {
                 max_generations: maxGenerations,
                 target_fitness: targetFitness,
@@ -398,16 +407,33 @@ function CreateRunModal({
             </Field>
           </div>
 
-          <Field label="LLM budget (USD)" hint="Hard cap for hypothesis injection cost">
-            <input
-              type="number"
-              step="0.5"
-              min={0}
-              value={llmBudgetUsd}
-              onChange={(e) => setLlmBudgetUsd(Number(e.target.value))}
-              className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
-            />
-          </Field>
+          <div className="grid grid-cols-2 gap-4">
+            <Field label="LLM budget (USD)" hint="Hard cap for hypothesis injection cost">
+              <input
+                type="number"
+                step="0.5"
+                min={0}
+                value={llmBudgetUsd}
+                onChange={(e) => setLlmBudgetUsd(Number(e.target.value))}
+                className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
+              />
+            </Field>
+            <Field
+              label="Leverage"
+              hint="OANDA retail cap (30 or 50)"
+            >
+              <select
+                value={leverage}
+                onChange={(e) =>
+                  setLeverage(Number(e.target.value) as 30 | 50)
+                }
+                className="form-select w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
+              >
+                <option value={30}>30:1</option>
+                <option value={50}>50:1</option>
+              </select>
+            </Field>
+          </div>
 
           {error && (
             <div className="px-3 py-2 rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-xs text-red-700 dark:text-red-300">

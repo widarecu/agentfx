@@ -75,6 +75,12 @@ class OrchestratorConfigSchema(BaseModel):
     account_balance: float = Field(default=10000.0, gt=0)
     position_size: int = Field(default=10000, gt=0)
     spread_pips: float | None = None
+    # OANDA retail margin allows 30:1 on majors, 50:1 in some
+    # jurisdictions. Higher leverage = larger position sizes for the
+    # same risk_pct + stop combination, so a tight-stop strategy can
+    # use the extra leverage to amplify dollar P&L without changing
+    # its risk-per-trade % budget.
+    leverage: int = Field(default=30, ge=1, le=100)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -255,6 +261,7 @@ class GenomeBacktestResult(BaseModel):
     metrics: dict[str, Any]
     trades: list[dict[str, Any]]
     signals: list[dict[str, Any]]
+    sizing: dict[str, Any] | None = None
 
 
 # ─────────────────────────────────────────────────────────────────────────

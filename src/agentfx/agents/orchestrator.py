@@ -112,6 +112,7 @@ class OrchestratorConfig:
     account_balance: float = 10000.0
     position_size: int = 10000
     spread_pips: float | None = None  # None = use default
+    leverage: int = 30  # 30:1 OANDA retail default, 50:1 opt-in
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -551,6 +552,7 @@ class OrchestratorAgent(BaseAgent):
         backtest_kwargs: dict[str, Any] = {
             "account_balance": self.config.account_balance,
             "position_size": self.config.position_size,
+            "leverage": self.config.leverage,
         }
         if self.config.spread_pips is not None:
             backtest_kwargs["spread_pips"] = self.config.spread_pips

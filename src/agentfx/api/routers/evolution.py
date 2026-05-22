@@ -337,6 +337,7 @@ def get_genome_backtest(
     backtest_kwargs: dict = {
         "account_balance": float(config_dict.get("account_balance", 10000.0)),
         "position_size": int(config_dict.get("position_size", 10000)),
+        "leverage": int(config_dict.get("leverage", 30)),
     }
     if config_dict.get("spread_pips") is not None:
         backtest_kwargs["spread_pips"] = float(config_dict["spread_pips"])
@@ -362,6 +363,7 @@ def get_genome_backtest(
         metrics=result.get("metrics", {}),
         trades=result.get("trades", []),
         signals=result.get("signals", []),
+        sizing=result.get("sizing"),
     )
 
 

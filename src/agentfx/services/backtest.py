@@ -218,6 +218,105 @@ def compute_swap_returns(
     return swap_ret
 
 
+def _pip_value_usd(instrument: str, close: float) -> float:
+    """USD value of 1 pip per 1 unit of position at the given close.
+
+    For USD-quoted majors (EUR/USD, GBP/USD, AUD/USD) the pip is already
+    in USD and the close price is irrelevant: it's just `pip_size`.
+
+    For USD-base majors (USD/JPY, USD/CHF, USD/CAD) the pip is in the
+    quote currency and converts to USD by dividing by the current close.
+
+    Cross pairs (no USD leg) are not supported in v0.3.0 — they would
+    need a triangulation via a base/USD rate that the v0.3.0 catalogue
+    doesn't expose.
+    """
+    parts = instrument.upper().replace("/", "_").split("_")
+    if len(parts) != 2:
+        raise ValueError(f"unsupported instrument symbol: {instrument}")
+    base, quote = parts
+    pip_in_quote = 0.01 if quote == "JPY" else 0.0001
+    if quote == "USD":
+        return pip_in_quote
+    if base == "USD":
+        if close <= 0:
+            raise ValueError(
+                f"cannot compute pip value for {instrument} at close={close}"
+            )
+        return pip_in_quote / close
+    raise ValueError(
+        f"pip value not supported for cross pair (no USD leg): {instrument}"
+    )
+
+
+def _notional_usd_per_unit(instrument: str, close: float) -> float:
+    """USD notional per 1 unit of position at the given close.
+
+    USD-base pairs (USD/JPY, USD/CHF, USD/CAD): 1 unit = $1.
+    USD-quote pairs (EUR/USD, GBP/USD, AUD/USD): 1 unit = `close` USD
+    (you hold 1 unit of the base ccy worth `close` USD).
+    """
+    base, _ = instrument.upper().replace("/", "_").split("_")
+    return 1.0 if base == "USD" else float(close)
+
+
+def _dsl_position_size(
+    strat: Strategy,
+    instrument: str,
+    entry_close: float,
+    account_balance: float,
+    leverage: int,
+) -> tuple[int, bool]:
+    """Compute the per-trade position size for a DSL strategy.
+
+    Sizing rule (account-currency = USD):
+        risk_usd       = account_balance × spec.size.risk_pct
+        desired_units  = risk_usd / (stop_pips × pip_value_usd_at_entry)
+        notional       = desired_units × notional_usd_per_unit_at_entry
+        if notional > account_balance × leverage:
+            clamp desired_units so notional == leverage cap (with warning)
+
+    Returns (position_units, was_capped). For non-DSL strategies the
+    caller should not invoke this — they keep their static
+    `position_size` argument.
+    """
+    # Local import to avoid a cycle: backtest.py is imported during
+    # `make_strategy` which is itself called above this helper.
+    from agentfx.core.dsl.compiler import CompiledDSLStrategy
+
+    if not isinstance(strat, CompiledDSLStrategy):
+        raise TypeError(
+            f"_dsl_position_size called for non-DSL strategy {type(strat).__name__}"
+        )
+    spec = strat.spec
+    risk_pct = float(spec.size.risk_pct)
+    stop_pips = int(spec.exit.stop_pips)
+    pip_value = _pip_value_usd(instrument, entry_close)
+    notional_per_unit = _notional_usd_per_unit(instrument, entry_close)
+
+    risk_usd = account_balance * risk_pct
+    desired_units = risk_usd / (stop_pips * pip_value)
+    notional = desired_units * notional_per_unit
+    max_notional = account_balance * leverage
+
+    was_capped = False
+    if notional > max_notional:
+        desired_units = max_notional / notional_per_unit
+        was_capped = True
+        logger.warning(
+            "Leverage cap hit on %s @ close=%.5f: notional $%.0f clamped "
+            "to $%.0f (leverage=%d:1, account=$%.0f)",
+            instrument,
+            entry_close,
+            notional,
+            max_notional,
+            leverage,
+            account_balance,
+        )
+    units = max(1, int(round(desired_units)))
+    return units, was_capped
+
+
 def _lookup_financing_rates(instrument: str) -> tuple[float | None, float | None]:
     """Read cached OANDA financing rates for an instrument from the DB.
 
@@ -316,6 +415,7 @@ def run_backtest_from_db(
     capture_signals: bool = False,
     account_balance: float = 10000.0,
     position_size: int = 10000,
+    leverage: int = 30,
 ) -> dict[str, Any]:
     """Run backtest using candle data from PostgreSQL database.
 
@@ -440,9 +540,13 @@ def run_backtest_from_db(
 
     # Capture signals and trades for visualization
     if capture_signals:
+        from agentfx.core.dsl.compiler import CompiledDSLStrategy
+
         signal_list = []
         trade_list = []
         trade_id = 0
+        leverage_cap_hits = 0
+        is_dsl = isinstance(strat, CompiledDSLStrategy)
 
         # Get indicator values based on strategy
         indicator_df = _get_indicator_values(strat, df, strategy_name, strategy_params)
@@ -497,7 +601,29 @@ def run_backtest_from_db(
                         if direction == "short":
                             price_diff = -price_diff
                         pips = price_diff / pip_size
-                        gross_pnl = pips * pip_size * position_size
+
+                        # Per-trade position sizing:
+                        #   - DSL strategies: risk_pct × account_balance, with
+                        #     a leverage cap (clamps notional to leverage × balance).
+                        #   - Classic strategies: fixed `position_size` arg.
+                        # Pip→USD conversion uses the entry close so a 1-pip
+                        # move on USD/JPY at 150 correctly worth less in USD
+                        # than on EUR/USD at 1.10.
+                        if is_dsl:
+                            trade_units, was_capped = _dsl_position_size(
+                                strat,
+                                instrument,
+                                entry_price,
+                                account_balance,
+                                leverage,
+                            )
+                            if was_capped:
+                                leverage_cap_hits += 1
+                        else:
+                            trade_units = int(position_size)
+                        pip_value_usd = _pip_value_usd(instrument, entry_price)
+
+                        gross_pnl = pips * pip_value_usd * trade_units
 
                         # Spread, slippage and swap costs per round trip.
                         # The `rets` series above charges (spread_pips + 2 *
@@ -544,20 +670,22 @@ def run_backtest_from_db(
                                 "net_pips": net_pips,
                                 "gross_pnl_dollars": gross_pnl,
                                 "spread_cost_dollars": spread_cost_pips
-                                * pip_size
-                                * position_size,
+                                * pip_value_usd
+                                * trade_units,
                                 "slippage_cost_dollars": slippage_cost_pips
-                                * pip_size
-                                * position_size,
+                                * pip_value_usd
+                                * trade_units,
                                 "swap_cost_dollars": swap_cost_pips
-                                * pip_size
-                                * position_size,
-                                "net_pnl_dollars": net_pips * pip_size * position_size,
+                                * pip_value_usd
+                                * trade_units,
+                                "net_pnl_dollars": net_pips
+                                * pip_value_usd
+                                * trade_units,
                                 "duration_minutes": (
                                     timestamp - entry_time
                                 ).total_seconds()
                                 / 60,
-                                "position_size": position_size,
+                                "position_size": trade_units,
                             }
                         )
                         trade_id += 1
@@ -597,6 +725,15 @@ def run_backtest_from_db(
 
         result["signals"] = signal_list
         result["trades"] = trade_list
+        # Sizing context for the UI — lets the page show "leverage cap
+        # hit on N trades" and the leverage setting used.
+        result["sizing"] = {
+            "account_balance": account_balance,
+            "account_currency": "USD",
+            "leverage": leverage,
+            "leverage_cap_hits": leverage_cap_hits,
+            "is_dsl_risk_sized": is_dsl,
+        }
 
         # Compute additional metrics from closed trades
         if trade_list:

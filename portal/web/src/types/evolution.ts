@@ -33,6 +33,8 @@ export interface OrchestratorConfig {
   account_balance: number;
   position_size: number;
   spread_pips: number | null;
+  /** OANDA retail leverage on majors: 30:1 default, 50:1 opt-in. */
+  leverage: number;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -199,6 +201,14 @@ export interface StrategyGenomeSummaryList {
  * can be used directly — the snake_case → camelCase mapping happens in
  * the API-client layer, mirroring the trial-detail flow.
  */
+export interface GenomeBacktestSizing {
+  account_balance: number;
+  account_currency: string;
+  leverage: number;
+  leverage_cap_hits: number;
+  is_dsl_risk_sized: boolean;
+}
+
 export interface GenomeBacktestResult {
   run_id: string;
   genome_id: string;
@@ -209,6 +219,7 @@ export interface GenomeBacktestResult {
   metrics: Record<string, number>;
   trades: Record<string, unknown>[];
   signals: Record<string, unknown>[];
+  sizing?: GenomeBacktestSizing;
 }
 
 export interface StrategyGenome {
