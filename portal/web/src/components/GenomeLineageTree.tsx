@@ -37,7 +37,8 @@ interface GenomeLineageTreeProps {
 }
 
 const ORIGIN_FILL: Record<GenomeOrigin, string> = {
-  seed: '#94a3b8', // slate-400
+  seed: '#94a3b8', // slate-400 — canonical MA/RSI/Donchian
+  warm_start: '#f59e0b', // amber-500 — imported from a prior run
   mutation: '#3b82f6', // blue-500
   crossover: '#10b981', // emerald-500
   llm: '#8b5cf6', // violet-500
@@ -45,6 +46,7 @@ const ORIGIN_FILL: Record<GenomeOrigin, string> = {
 
 const ORIGIN_DARK_FILL: Record<GenomeOrigin, string> = {
   seed: '#cbd5e1', // slate-300
+  warm_start: '#fbbf24', // amber-400
   mutation: '#60a5fa', // blue-400
   crossover: '#34d399', // emerald-400
   llm: '#a78bfa', // violet-400
@@ -374,7 +376,8 @@ export default function GenomeLineageTree({
 
 function Legend({ hasBest }: { hasBest: boolean }) {
   const items: Array<{ color: string; label: string }> = [
-    { color: ORIGIN_FILL.seed, label: 'seed' },
+    { color: ORIGIN_FILL.seed, label: 'canonical seed' },
+    { color: ORIGIN_FILL.warm_start, label: 'warm-start' },
     { color: ORIGIN_FILL.mutation, label: 'mutation' },
     { color: ORIGIN_FILL.crossover, label: 'crossover' },
     { color: ORIGIN_FILL.llm, label: 'LLM-proposed' },

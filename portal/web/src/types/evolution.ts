@@ -120,7 +120,12 @@ export interface GenerationListResponse {
 // Strategy genome
 // ─────────────────────────────────────────────────────────────────────
 
-export type GenomeOrigin = 'seed' | 'crossover' | 'mutation' | 'llm';
+export type GenomeOrigin =
+  | 'seed'
+  | 'warm_start'
+  | 'crossover'
+  | 'mutation'
+  | 'llm';
 
 export interface ValidationFold {
   id: string;

@@ -48,6 +48,8 @@ import type {
 
 const ORIGIN_BADGE_COLORS: Record<GenomeOrigin, string> = {
   seed: 'bg-slate-200 text-slate-800 dark:bg-slate-600 dark:text-slate-100',
+  warm_start:
+    'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
   crossover:
     'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300',
   mutation:

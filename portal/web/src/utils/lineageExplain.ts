@@ -22,6 +22,7 @@ import type { DslSpec } from '../types/evolution';
 
 export type OperatorKind =
   | 'seed'
+  | 'warm_start'
   | 'llm'
   | 'crossover'
   | 'mutation-flip-comparator'
@@ -43,11 +44,18 @@ export interface OperatorInfo {
 
 const OPERATOR_INFO: Record<OperatorKind, OperatorInfo> = {
   seed: {
-    label: 'Seed',
+    label: 'Canonical seed',
     description:
       'A hand-coded starter strategy (MA crossover, RSI mean-reversion, or Donchian breakout) re-expressed as DSL. Every run begins with these three.',
     intent:
       'Give the search a known-good starting point so the GA doesn\'t evolve from random noise.',
+  },
+  warm_start: {
+    label: 'Warm-start (prior run)',
+    description:
+      'Imported into gen 0 from a previously completed run on the same instrument and granularity. parent_ids points at the source genome.',
+    intent:
+      'Carry forward the best result the platform has ever found for this pair/timeframe so each run inherits prior search effort instead of starting from scratch.',
   },
   llm: {
     label: 'LLM-proposed',

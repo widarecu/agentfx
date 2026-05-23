@@ -90,7 +90,7 @@ class Population:
 
 
 def initialize_population(
-    seeds: list[StrategySpec],
+    seeds: list[StrategySpec] | list[Genome],
     size: int,
     rng: Random,
     *,
@@ -104,6 +104,14 @@ def initialize_population(
     GA known-good priors plus locally-varied starting points — better than
     random initialization, which often produces uninteresting strategies.
 
+    The `seeds` argument accepts EITHER a list of bare `StrategySpec`s
+    (back-compat — every spec is wrapped as `origin=SEED`) OR a list of
+    pre-built `Genome` objects with the caller's chosen `origin`. The
+    Genome path is what the orchestrator uses for the composite gen-0
+    (canonical seeds + warm-start + LLM-proposed), so each starting
+    point keeps its true origin (`seed` / `warm_start` / `llm`) rather
+    than being flattened to a generic SEED.
+
     Lineage tracking: when `run_id` is provided, we pre-assign deterministic
     IDs to the seed genomes (matching the persister's
     `generate_genome_id(generation_id, index)` convention — the seeds are
@@ -114,8 +122,8 @@ def initialize_population(
     parent_ids — matching the legacy behaviour.
 
     Args:
-        seeds: Initial well-known strategies (typically MA / RSI / Donchian
-            DSL specs from `agentfx.core.dsl.seeds`).
+        seeds: Either a list of `StrategySpec` (all tagged SEED) or a
+            list of pre-built `Genome` (each retains its `origin`).
         size: Total population size for generation 0.
         rng: Random source (passed in for reproducibility).
         mutate_fn: Callable `(spec, rng) -> spec` — kept as a parameter
@@ -131,9 +139,19 @@ def initialize_population(
     """
     if not seeds:
         raise ValueError("at least one seed strategy is required")
-    if size < len(seeds):
+
+    # Normalize to a list of Genome objects. Plain StrategySpecs get the
+    # legacy SEED origin so existing callers (tests) keep working.
+    seed_genomes: list[Genome] = []
+    for s in seeds:
+        if isinstance(s, Genome):
+            seed_genomes.append(s)
+        else:
+            seed_genomes.append(Genome(spec=s, origin=GenomeOrigin.SEED))
+
+    if size < len(seed_genomes):
         raise ValueError(
-            f"population size ({size}) must be >= number of seeds ({len(seeds)})"
+            f"population size ({size}) must be >= number of seeds ({len(seed_genomes)})"
         )
 
     # Pre-compute the seeds' eventual persister IDs so mutated copies can
@@ -141,22 +159,19 @@ def initialize_population(
     # `genome_{gen_id}_{index_in_gen:03d}` where the first N indices are
     # the N seeds in insertion order — see
     # `agentfx.api.services.evolution.SqlAlchemyPersister.save_generation`.
-    seed_ids: list[str | None]
     if run_id is not None:
         gen0_id = f"gen_{run_id}_000"
-        seed_ids = [f"genome_{gen0_id}_{i:03d}" for i in range(len(seeds))]
-    else:
-        seed_ids = [None] * len(seeds)
+        for i, g in enumerate(seed_genomes):
+            if g.id is None:
+                g.id = f"genome_{gen0_id}_{i:03d}"
 
-    genomes: list[Genome] = []
-    for i, seed_spec in enumerate(seeds):
-        genomes.append(Genome(spec=seed_spec, origin=GenomeOrigin.SEED, id=seed_ids[i]))
+    genomes: list[Genome] = list(seed_genomes)
 
     while len(genomes) < size:
-        parent_idx = rng.randrange(len(seeds))
-        parent_spec = seeds[parent_idx]
-        mutated = mutate_fn(parent_spec, rng)
-        parent_ids = [seed_ids[parent_idx]] if seed_ids[parent_idx] is not None else []
+        parent_idx = rng.randrange(len(seed_genomes))
+        parent = seed_genomes[parent_idx]
+        mutated = mutate_fn(parent.spec, rng)
+        parent_ids = [parent.id] if parent.id is not None else []
         genomes.append(
             Genome(
                 spec=mutated,

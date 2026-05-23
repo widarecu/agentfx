@@ -22,7 +22,13 @@ export interface FitnessCurvePoint {
   /** Did the LLM inject proposals at the *start* of this generation? */
   llmInvoked?: boolean;
   /** Origin of the best genome at this generation (for tooltip context). */
-  bestGenomeOrigin?: 'seed' | 'mutation' | 'crossover' | 'llm' | null;
+  bestGenomeOrigin?:
+    | 'seed'
+    | 'warm_start'
+    | 'mutation'
+    | 'crossover'
+    | 'llm'
+    | null;
 }
 
 interface FitnessCurveChartProps {
@@ -39,7 +45,8 @@ interface FitnessCurveChartProps {
 const PADDING = { top: 24, right: 16, bottom: 32, left: 44 };
 
 const ORIGIN_LABELS: Record<NonNullable<FitnessCurvePoint['bestGenomeOrigin']>, string> = {
-  seed: 'seed',
+  seed: 'canonical seed',
+  warm_start: 'warm-start',
   mutation: 'mutation',
   crossover: 'crossover',
   llm: 'LLM-proposed',

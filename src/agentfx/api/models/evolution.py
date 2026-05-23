@@ -57,10 +57,11 @@ class EvolutionRunStatus(str, Enum):
 class GenomeOrigin(str, Enum):
     """How a genome came to exist in its generation."""
 
-    SEED = "seed"  # gen-0 seed (MA/RSI/Donchian DSL)
+    SEED = "seed"  # gen-0 canonical seed (MA/RSI/Donchian DSL)
+    WARM_START = "warm_start"  # gen-0 import from a prior completed run
     CROSSOVER = "crossover"  # GA crossover of two parents
     MUTATION = "mutation"  # GA mutation of a single parent
-    LLM = "llm"  # LLM hypothesis injection (US-005)
+    LLM = "llm"  # LLM proposal (gen-0 seed or mid-run injection)
 
 
 class AgentType(str, Enum):

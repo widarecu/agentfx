@@ -361,7 +361,14 @@ class OrchestratorAgent(BaseAgent):
         #   4. Remaining slots: mutated copies of the above pool.
         # Each layer is gated by a config flag so a user can run a
         # pure-canonical baseline if they want.
-        composite_seeds: list[StrategySpec] = list(self._seed_specs)
+        # Build typed Genome objects with the correct origin per layer so
+        # the lineage tree / origin filters can distinguish canonical /
+        # warm-start / LLM gen-0 / mutated. initialize_population accepts
+        # pre-built Genome objects and preserves their origin — only the
+        # mutated fill becomes GenomeOrigin.MUTATION.
+        composite_seed_genomes: list[Genome] = [
+            Genome(spec=s, origin=GenomeOrigin.SEED) for s in self._seed_specs
+        ]
         warm_start_count = 0
         llm_seed_count = 0
 
@@ -382,7 +389,14 @@ class OrchestratorAgent(BaseAgent):
                 prior = []
             for row in prior:
                 try:
-                    composite_seeds.append(StrategySpec.model_validate(row["dsl_json"]))
+                    spec = StrategySpec.model_validate(row["dsl_json"])
+                    composite_seed_genomes.append(
+                        Genome(
+                            spec=spec,
+                            origin=GenomeOrigin.WARM_START,
+                            parent_ids=[row["id"]] if row.get("id") else [],
+                        )
+                    )
                     warm_start_count += 1
                 except Exception as e:
                     logger.warning(
@@ -435,7 +449,7 @@ class OrchestratorAgent(BaseAgent):
                             llm_call_id=result.call_id,
                         )
                     )
-                composite_seeds.extend(g.spec for g in llm_gen0_proposals)
+                composite_seed_genomes.extend(llm_gen0_proposals)
                 self._all_llm_origin_genomes.extend(llm_gen0_proposals)
                 llm_seed_count = len(llm_gen0_proposals)
 
@@ -444,7 +458,7 @@ class OrchestratorAgent(BaseAgent):
         # parentless in the portal and the LineageExplainer can't show
         # which seed each variant came from.
         population = initialize_population(
-            seeds=composite_seeds,
+            seeds=composite_seed_genomes,
             size=self.config.population_size,
             rng=self._rng,
             mutate_fn=mutate_spec,
@@ -463,7 +477,8 @@ class OrchestratorAgent(BaseAgent):
             reasoning_text=(
                 f"Initialised generation 0 with {len(self._seed_specs)} canonical "
                 f"seeds + {warm_start_count} prior winners + {llm_seed_count} LLM "
-                f"proposals + {len(population) - len(composite_seeds)} mutated copies."
+                f"proposals + "
+                f"{len(population) - len(composite_seed_genomes)} mutated copies."
             ),
         )
 

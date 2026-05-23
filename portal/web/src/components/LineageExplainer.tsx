@@ -60,6 +60,25 @@ export default function LineageExplainer({
     );
   }
 
+  if (origin === 'warm_start') {
+    const info = getOperatorInfo('warm_start');
+    const sourceRunId =
+      genome.parent_ids && genome.parent_ids.length > 0
+        ? genome.parent_ids[0]
+        : null;
+    return (
+      <ExplainerCard tone="amber" label={info.label}>
+        <Description info={info} />
+        {sourceRunId && (
+          <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+            Source genome:{' '}
+            <span className="font-mono">{sourceRunId}</span>
+          </p>
+        )}
+      </ExplainerCard>
+    );
+  }
+
   if (origin === 'llm') {
     const info = getOperatorInfo('llm');
     return (
@@ -259,7 +278,7 @@ function MutationExplainer({
 // Building blocks
 // ─────────────────────────────────────────────────────────────────────
 
-type Tone = 'slate' | 'violet' | 'emerald' | 'blue';
+type Tone = 'slate' | 'violet' | 'emerald' | 'blue' | 'amber';
 
 const TONE_CLASSES: Record<Tone, { bg: string; border: string; label: string }> = {
   slate: {
@@ -281,6 +300,11 @@ const TONE_CLASSES: Record<Tone, { bg: string; border: string; label: string }> 
     bg: 'bg-blue-50 dark:bg-blue-900/15',
     border: 'border-blue-200 dark:border-blue-900',
     label: 'text-blue-700 dark:text-blue-400',
+  },
+  amber: {
+    bg: 'bg-amber-50 dark:bg-amber-900/15',
+    border: 'border-amber-200 dark:border-amber-900',
+    label: 'text-amber-700 dark:text-amber-400',
   },
 };
 
