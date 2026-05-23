@@ -92,6 +92,11 @@ def _validate_entry(entry: EntryConditions) -> None:
         _walk_condition(entry.long, _visit_comparison)
     if entry.short is not None:
         _walk_condition(entry.short, _visit_comparison)
+    # Degenerate `long == short` specs are rejected at the Pydantic
+    # grammar layer (see EntryConditions._long_and_short_must_differ)
+    # so the GA mutate/crossover retry loop can find a different
+    # operator. By the time we reach the compiler, this has already
+    # been enforced.
 
 
 # ─────────────────────────────────────────────────────────────────────────

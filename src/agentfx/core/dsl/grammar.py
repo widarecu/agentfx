@@ -118,6 +118,23 @@ class EntryConditions(BaseModel):
             raise ValueError("entry must specify at least one of long or short")
         return self
 
+    @model_validator(mode="after")
+    def _long_and_short_must_differ(self) -> EntryConditions:
+        # Degenerate spec: when long_condition == short_condition the
+        # backtest emits long_sig - short_sig == 0 on every bar, so the
+        # strategy never enters a trade. These leak in via GA mutations
+        # that swap one branch's indicator/comparator to match the
+        # other side. Reject at grammar level so the GA's
+        # `try/except ValidationError` paths in mutate_spec /
+        # crossover_specs retry with a different operator instead of
+        # producing a guaranteed zero-trade genome.
+        if self.long is not None and self.short is not None and self.long == self.short:
+            raise ValueError(
+                "long entry condition is identical to short — the resulting "
+                "position series is identically zero (no trades)."
+            )
+        return self
+
 
 class ExitRules(BaseModel):
     """Exit rules. Recorded in the spec; enforcement is a v0.4.0 backtest engine

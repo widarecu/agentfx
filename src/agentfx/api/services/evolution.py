@@ -86,35 +86,71 @@ def find_prior_winners(
     exclude_run_id parameter prevents a re-started run from importing
     its own genomes.
 
+    Filter strategy (most-to-least preferred):
+      1. validator_passed = TRUE — genomes that cleared Gate B on OOS;
+         these are the gold standard for inheritance.
+      2. fitness > 0 — at least a positive Sharpe on training; not
+         brilliant but not garbage either.
+      3. Skip fitness ≤ −50 (zero-trade penalty floor is -100; legacy
+         degenerate genomes with fitness=0.0 from the pre-penalty era
+         are also skipped because they re-compute as -100 today).
+
+    If tier 1 returns < limit, top up with tier 2. If both are empty,
+    return [] and the orchestrator falls back to canonical seeds only
+    (logged so the user knows warm-start was skipped).
+
     Returns a list of {id, dsl_json, fitness, source_run_id} dicts —
     callers compile dsl_json via StrategySpec.model_validate for the
     GA's population.
     """
-    q = (
-        db.query(
-            models.StrategyGenome.id,
-            models.StrategyGenome.dsl_json,
-            models.StrategyGenome.fitness,
-            models.Generation.run_id,
-        )
-        .join(
-            models.Generation,
-            models.StrategyGenome.generation_id == models.Generation.id,
-        )
-        .join(
-            models.EvolutionRun,
-            models.Generation.run_id == models.EvolutionRun.id,
-        )
-        .filter(
-            models.EvolutionRun.instrument == instrument,
-            models.EvolutionRun.granularity == granularity,
-            models.EvolutionRun.status == "completed",
-            models.StrategyGenome.fitness.isnot(None),
-        )
-    )
+    base_filters = [
+        models.EvolutionRun.instrument == instrument,
+        models.EvolutionRun.granularity == granularity,
+        models.EvolutionRun.status == "completed",
+        models.StrategyGenome.fitness.isnot(None),
+    ]
     if exclude_run_id is not None:
-        q = q.filter(models.Generation.run_id != exclude_run_id)
-    rows = q.order_by(desc(models.StrategyGenome.fitness)).limit(limit).all()
+        base_filters.append(models.Generation.run_id != exclude_run_id)
+
+    def _query(extra_filters: list):
+        return (
+            db.query(
+                models.StrategyGenome.id,
+                models.StrategyGenome.dsl_json,
+                models.StrategyGenome.fitness,
+                models.Generation.run_id,
+            )
+            .join(
+                models.Generation,
+                models.StrategyGenome.generation_id == models.Generation.id,
+            )
+            .join(
+                models.EvolutionRun,
+                models.Generation.run_id == models.EvolutionRun.id,
+            )
+            .filter(*(base_filters + extra_filters))
+            .order_by(desc(models.StrategyGenome.fitness))
+            .limit(limit)
+        )
+
+    # Tier 1: genomes that passed validation (Gate B on OOS).
+    tier1 = _query([models.StrategyGenome.validator_passed.is_(True)]).all()
+    rows = list(tier1)
+
+    # Tier 2: genomes with positive training fitness (real Sharpe > 0,
+    # not the zero-trade penalty floor of −100 nor the legacy
+    # fitness=0.0 degenerate cases that re-compute as -100 today).
+    # Top up to `limit` if tier 1 didn't fill.
+    if len(rows) < limit:
+        tier2_filters = [models.StrategyGenome.fitness > 0]
+        seen = {r.id for r in rows}
+        if seen:
+            tier2_filters.append(models.StrategyGenome.id.notin_(seen))
+        for r in _query(tier2_filters).all():
+            rows.append(r)
+            if len(rows) >= limit:
+                break
+
     return [
         {
             "id": row.id,
