@@ -255,6 +255,8 @@ def _format_metrics_line(metrics: dict | None) -> str:
         parts.append(f"{float(metrics['avg_pips_per_trade']):+.2f} avg-pips/trade")
     if "net_pips" in metrics and metrics["net_pips"] is not None:
         parts.append(f"net {float(metrics['net_pips']):+.0f} pips")
+    if "cagr" in metrics and metrics["cagr"] is not None:
+        parts.append(f"CAGR {float(metrics['cagr']) * 100:+.1f}%/yr")
     return ", ".join(parts) if parts else "no metrics"
 
 
@@ -271,6 +273,7 @@ def build_user_prompt(
         list[tuple[StrategySpec, float | None, dict | None]] | None
     ) = None,
     is_gen_zero_seeding: bool = False,
+    min_cagr_target: float | None = None,
 ) -> str:
     """Render the per-call user prompt.
 
@@ -331,6 +334,16 @@ def build_user_prompt(
             f"tend to bleed to this cost; favour wider edges + selective entries.\n"
         )
 
+    cagr_block = ""
+    if min_cagr_target is not None:
+        cagr_block = (
+            f"\nPROFIT TARGET: this run's Gate B requires a net CAGR "
+            f"≥ {min_cagr_target * 100:.1f}%/year (after spread + swap, "
+            f"on the held-out OOS fold). Strategies that backtest profitable "
+            f"but only ~5%/year won't validate. Aim for proposals whose edge "
+            f"per trade × expected annual trade count clears that bar.\n"
+        )
+
     prior_block = ""
     if prior_llm_proposals:
         prior_lines = []
@@ -356,11 +369,13 @@ def build_user_prompt(
         "robustness.\n"
     )
 
+    framing_blocks = f"{cost_block}{cagr_block}{exit_note}"
+
     if is_gen_zero_seeding:
         return f"""\
 INSTRUMENT: {instrument} {granularity}
 GENERATION: 0 (initial population seeding)
-{cost_block}{exit_note}
+{framing_blocks}
 This is a brand-new evolutionary search — no incumbent genomes yet. The
 GA will be seeded with three canonical strategies (MA crossover, RSI
 mean-reversion, Donchian breakout) plus your proposals. Your job is to
@@ -377,7 +392,7 @@ schema (a `genomes` array of `{{spec, reasoning}}` objects)."""
 INSTRUMENT: {instrument} {granularity}
 GENERATION: {generation_index}
 FITNESS TRAJECTORY (last 6 generations, OOS Sharpe): {fitness_line}
-{cost_block}{exit_note}
+{framing_blocks}
 CURRENT TOP {len(top_genomes)} GENOMES (with metric breakdown):
 {top_block}
 {prior_block}

@@ -22,12 +22,13 @@ from agentfx.core.dsl.seeds import (
 
 
 def _gate_passing_metrics(sharpe: float = 1.5) -> dict:
-    """Metrics that pass Gate B (Sharpe>=1.0, MDD<=10%, hit_rate>=48%, n_trades>=300)."""
+    """Metrics that pass Gate B (Sharpe>=1.0, MDD<=10%, hit_rate>=48%, n_trades>=300, cagr>=15%)."""
     return {
         "sharpe": sharpe,
         "max_drawdown": 0.05,
         "hit_rate": 0.55,
         "n_trades": 500,
+        "cagr": 0.20,
     }
 
 
@@ -38,6 +39,7 @@ def _gate_failing_metrics(sharpe: float = 1.5) -> dict:
         "max_drawdown": 0.05,
         "hit_rate": 0.55,
         "n_trades": 100,
+        "cagr": 0.20,
     }
 
 
@@ -266,6 +268,7 @@ class TestComputeFitness:
             "max_drawdown": 0.05,
             "hit_rate": 0.55,
             "n_trades": 500,
+            "cagr": 0.20,
             "total_return": 0.32,
             "profit_factor": 2.1,
             "extra_field": "preserved",

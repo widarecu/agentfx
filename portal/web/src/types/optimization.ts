@@ -3,12 +3,16 @@
  * These define the data structures for optimization jobs, trials, and visualization.
  */
 
-// Gate B threshold constants for validation
+// Gate B threshold constants for validation. Mirrors the backend
+// defaults in src/agentfx/core/gates.py; per-run overrides flow
+// through the run's config_json and are read from the run detail
+// rather than this constant.
 export const GATE_B_THRESHOLDS = {
   SHARPE_MIN: 1.0,
   MAX_DRAWDOWN: 0.10, // 10%
   HIT_RATE_MIN: 0.48, // 48%
   MIN_TRADES: 300,
+  MIN_CAGR: 0.15, // 15% net annualised return per year
 } as const;
 
 // Strategy types supported by the optimizer

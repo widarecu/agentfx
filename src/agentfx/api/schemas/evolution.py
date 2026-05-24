@@ -86,6 +86,9 @@ class OrchestratorConfigSchema(BaseModel):
     n_prior_winners: int = Field(default=3, ge=0, le=20)
     llm_seed_gen0: bool = True
     n_llm_gen0_proposals: int = Field(default=5, ge=0, le=10)
+    # Gate B override: minimum net annualised return (CAGR) for the OOS
+    # fold. Default 0.15 = 15% per year after spread + swap.
+    min_cagr_pct: float = Field(default=0.15, ge=-1.0, le=10.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -185,6 +188,7 @@ class ValidationFoldPublic(BaseSchema):
     max_drawdown: float | None = None
     hit_rate: float | None = None
     n_trades: int | None = None
+    cagr: float | None = None
     passed_gate_b: bool
 
 

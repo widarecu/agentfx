@@ -23,6 +23,7 @@ const GATE_B = {
   maxDrawdown: 0.1, // 10%
   hitRateMin: 0.48, // 48%
   minTrades: 300,
+  minCagr: 0.15, // 15% net per year
 };
 
 interface WalkForwardFoldTableProps {
@@ -107,6 +108,12 @@ export default function WalkForwardFoldTable({
               >
                 Trades (≥ {GATE_B.minTrades})
               </th>
+              <th
+                className="px-3 py-2 text-right font-medium"
+                title={`Gate B threshold ≥ ${(GATE_B.minCagr * 100).toFixed(0)}%`}
+              >
+                CAGR (≥ {(GATE_B.minCagr * 100).toFixed(0)}%/yr)
+              </th>
               <th className="px-3 py-2 text-center font-medium">Gate B</th>
             </tr>
           </thead>
@@ -128,6 +135,8 @@ export default function WalkForwardFoldTable({
                 f.hit_rate != null ? f.hit_rate >= GATE_B.hitRateMin : null;
               const tradesPasses =
                 f.n_trades != null ? f.n_trades >= GATE_B.minTrades : null;
+              const cagrPasses =
+                f.cagr != null ? f.cagr >= GATE_B.minCagr : null;
 
               return (
                 <tr key={f.id} className={oosClass}>
@@ -204,6 +213,21 @@ export default function WalkForwardFoldTable({
                     }
                   >
                     {f.n_trades ?? '—'}
+                  </td>
+                  <td
+                    className={`px-3 py-2 text-right font-mono ${metricCellClass(cagrPasses)}`}
+                    title={
+                      cagrPasses != null && f.cagr != null
+                        ? gateTooltip(
+                            'CAGR',
+                            `≥ ${(GATE_B.minCagr * 100).toFixed(0)}%`,
+                            cagrPasses,
+                            `${((f.cagr - GATE_B.minCagr) * 100).toFixed(1)}pp vs threshold`,
+                          )
+                        : 'CAGR — no data'
+                    }
+                  >
+                    {formatPct(f.cagr)}
                   </td>
                   <td className="px-3 py-2 text-center">
                     {f.passed_gate_b ? (

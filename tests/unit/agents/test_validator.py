@@ -32,6 +32,7 @@ def _passing_metrics(sharpe: float = 1.5) -> dict:
         "max_drawdown": 0.05,
         "hit_rate": 0.55,
         "n_trades": 500,
+        "cagr": 0.20,  # 20% net annualised — above the 15% Gate B floor
     }
 
 
@@ -42,6 +43,7 @@ def _failing_metrics(sharpe: float = 0.3) -> dict:
         "max_drawdown": 0.05,
         "hit_rate": 0.55,
         "n_trades": 100,  # < 300 required
+        "cagr": 0.20,
     }
 
 

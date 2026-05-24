@@ -157,6 +157,7 @@ def _apply_penalties(
     candidate: StrategySpec | None,
     elite_specs: list[StrategySpec] | None,
     diversity_threshold: int,
+    gate_b_overrides: dict[str, float] | None = None,
 ) -> float:
     """Apply Gate B and diversity penalties to a raw fitness value.
 
@@ -195,7 +196,7 @@ def _apply_penalties(
         fitness -= breach * DRAWDOWN_BREACH_PENALTY_SCALE
 
     # 3. Gate B dilution: halve positive fitness if any threshold breached.
-    passes_gate_b, _ = evaluate_gate_b(metrics)
+    passes_gate_b, _ = evaluate_gate_b(metrics, overrides=gate_b_overrides)
     if not passes_gate_b and fitness > 0:
         fitness = fitness * GATE_B_FAILURE_DILUTION
 
@@ -220,6 +221,7 @@ def compute_fitness(
     backtest_fn: BacktestFn | None = None,
     elite_specs: list[StrategySpec] | None = None,
     diversity_threshold: int = 2,
+    gate_b_overrides: dict[str, float] | None = None,
     **backtest_kwargs: Any,
 ) -> tuple[float, dict[str, Any]]:
     """Run the backtest for a genome and compute its fitness.
@@ -271,6 +273,7 @@ def compute_fitness(
         candidate=spec,
         elite_specs=elite_specs,
         diversity_threshold=diversity_threshold,
+        gate_b_overrides=gate_b_overrides,
     )
 
     return fitness, metrics

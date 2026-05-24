@@ -273,6 +273,7 @@ class ValidationFold(Base):
     max_drawdown = Column(Float, nullable=True)
     hit_rate = Column(Float, nullable=True)
     n_trades = Column(Integer, nullable=True)
+    cagr = Column(Float, nullable=True)  # net annualised return
     passed_gate_b = Column(Boolean, nullable=False)
 
     created_at = Column(

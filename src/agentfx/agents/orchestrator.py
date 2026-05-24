@@ -121,6 +121,13 @@ class OrchestratorConfig:
     llm_seed_gen0: bool = True
     n_llm_gen0_proposals: int = 5  # how many genomes the LLM seeds gen-0 with
 
+    # Gate B override: minimum net annualised return (CAGR, after
+    # spread + slippage + swap costs) a genome must hit on the OOS
+    # fold to pass validation. The fitness function also halves
+    # *positive* fitness for genomes that fail Gate B at this
+    # threshold, biasing the GA toward profitable shapes.
+    min_cagr_pct: float = 0.15  # 15% per year by default
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Persistence Protocol
@@ -420,6 +427,7 @@ class OrchestratorAgent(BaseAgent):
                 n_proposals=self.config.n_llm_gen0_proposals,
                 cost_per_trade_pips=self._cost_per_trade_pips(),
                 is_gen_zero_seeding=True,
+                min_cagr_target=self.config.min_cagr_pct,
             )
             self.persister.log_decision(
                 self.run_id,
@@ -702,6 +710,7 @@ class OrchestratorAgent(BaseAgent):
                 start=train_start,
                 end=train_end,
                 elite_specs=elite_specs,
+                gate_b_overrides={"min_cagr": self.config.min_cagr_pct},
                 **backtest_kwargs,
             )
             genome.set_fitness(fitness)
@@ -772,6 +781,7 @@ class OrchestratorAgent(BaseAgent):
             n_proposals=self.config.n_llm_proposals,
             cost_per_trade_pips=self._cost_per_trade_pips(),
             prior_llm_proposals=prior_llm if prior_llm else None,
+            min_cagr_target=self.config.min_cagr_pct,
         )
 
         self.persister.log_decision(
@@ -876,6 +886,7 @@ class OrchestratorAgent(BaseAgent):
                 granularity=self.config.granularity,
                 start=self.data_window[0],
                 end=self.data_window[1],
+                gate_b_overrides={"min_cagr": self.config.min_cagr_pct},
             )
         except Exception:  # noqa: BLE001
             logger.exception("validator crashed for genome %s", best_genome_overall.id)

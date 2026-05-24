@@ -225,6 +225,7 @@ export default function GenomeBacktest() {
   const maxDd =
     backtest?.metrics.max_drawdown ?? backtest?.metrics.mdd ?? 0;
   const hitRate = backtest?.metrics.hit_rate ?? 0;
+  const cagr = backtest?.metrics.cagr ?? 0;
 
   // Extended metrics derived from the trades array — same shape as
   // `optimizationApi.computeExtendedMetrics`, just computed inline here
@@ -394,8 +395,13 @@ export default function GenomeBacktest() {
         `Trade Count ${trades.length} < ${GATE_B_THRESHOLDS.MIN_TRADES}`,
       );
     }
+    if (cagr < GATE_B_THRESHOLDS.MIN_CAGR) {
+      out.push(
+        `CAGR ${formatPercent(cagr)} < ${formatPercent(GATE_B_THRESHOLDS.MIN_CAGR)}`,
+      );
+    }
     return out;
-  }, [sharpe, maxDd, hitRate, trades.length]);
+  }, [sharpe, maxDd, hitRate, trades.length, cagr]);
   const passesGateB = gateBFailures.length === 0;
 
   // The genome's validation folds already include the OOS fold computed
@@ -614,6 +620,13 @@ export default function GenomeBacktest() {
               : '∞'
           }`}
         />
+        <MetricCard
+          icon={<TrendingUp className="w-4 h-4 text-slate-400" />}
+          label="CAGR (net/yr)"
+          value={formatPercent(cagr)}
+          tone={cagr >= GATE_B_THRESHOLDS.MIN_CAGR ? 'good' : 'bad'}
+          thresholdLine={`Floor: >= ${formatPercent(GATE_B_THRESHOLDS.MIN_CAGR)}`}
+        />
       </div>
 
       {/* ── Cost breakdown strip ── */}
@@ -725,6 +738,14 @@ export default function GenomeBacktest() {
               oos={oosFold.n_trades}
               format={(v) => String(v ?? 0)}
               threshold={GATE_B_THRESHOLDS.MIN_TRADES}
+              direction="gte"
+            />
+            <ComparePair
+              label="CAGR"
+              training={cagr}
+              oos={oosFold.cagr}
+              format={(v) => formatPercent(v ?? 0)}
+              threshold={GATE_B_THRESHOLDS.MIN_CAGR}
               direction="gte"
             />
           </div>

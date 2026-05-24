@@ -12,6 +12,7 @@ class TestEvaluateGateB:
             "max_drawdown": 0.05,
             "hit_rate": 0.55,
             "n_trades": 500,
+            "cagr": 0.20,
         }
         passes, failures = evaluate_gate_b(metrics)
         assert passes is True
@@ -24,6 +25,7 @@ class TestEvaluateGateB:
             "max_drawdown": GATE_B_THRESHOLDS["max_drawdown"],
             "hit_rate": GATE_B_THRESHOLDS["hit_rate_min"],
             "n_trades": GATE_B_THRESHOLDS["min_trades"],
+            "cagr": GATE_B_THRESHOLDS["min_cagr"],
         }
         passes, failures = evaluate_gate_b(metrics)
         assert passes is True
@@ -79,16 +81,33 @@ class TestEvaluateGateB:
             "max_drawdown": 0.20,
             "hit_rate": 0.30,
             "n_trades": 50,
+            "cagr": 0.05,
         }
         passes, failures = evaluate_gate_b(metrics)
         assert passes is False
-        assert len(failures) == 4  # all four thresholds breached
+        assert len(failures) == 5  # all five thresholds breached
 
     def test_missing_metrics_treated_as_failure(self) -> None:
         # Missing keys should default to failing values, not crash
         passes, failures = evaluate_gate_b({})
         assert passes is False
-        assert len(failures) == 4  # all four thresholds breached via defaults
+        assert len(failures) == 5  # all five thresholds breached via defaults
+
+    def test_per_call_override_relaxes_min_cagr(self) -> None:
+        # A profitable-but-not-15% strategy passes when min_cagr is
+        # relaxed via the per-call override (e.g. a run-config knob).
+        metrics = {
+            "sharpe": 1.5,
+            "max_drawdown": 0.05,
+            "hit_rate": 0.55,
+            "n_trades": 500,
+            "cagr": 0.08,  # 8% — below the 15% default
+        }
+        passes_default, _ = evaluate_gate_b(metrics)
+        assert passes_default is False  # 8% < 15% default
+
+        passes_relaxed, _ = evaluate_gate_b(metrics, overrides={"min_cagr": 0.05})
+        assert passes_relaxed is True  # 8% > 5% override
 
 
 class TestThresholdConstants:
@@ -100,6 +119,7 @@ class TestThresholdConstants:
         assert GATE_B_THRESHOLDS["max_drawdown"] == 0.10
         assert GATE_B_THRESHOLDS["hit_rate_min"] == 0.48
         assert GATE_B_THRESHOLDS["min_trades"] == 300
+        assert GATE_B_THRESHOLDS["min_cagr"] == 0.15
 
 
 class TestBackwardCompatibilityImport:

@@ -40,6 +40,8 @@ export interface OrchestratorConfig {
   n_prior_winners?: number;
   llm_seed_gen0?: boolean;
   n_llm_gen0_proposals?: number;
+  /** Gate B override: min net CAGR per year (default 0.15 = 15%). */
+  min_cagr_pct?: number;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -137,6 +139,7 @@ export interface ValidationFold {
   max_drawdown: number | null;
   hit_rate: number | null;
   n_trades: number | null;
+  cagr: number | null;
   passed_gate_b: boolean;
 }
 

@@ -153,6 +153,7 @@ class ValidatorAgent(BaseAgent):
         start: datetime,
         end: datetime,
         backtest_fn: BacktestFn | None = None,
+        gate_b_overrides: dict[str, float] | None = None,
         **backtest_kwargs: Any,
     ) -> ValidationResult:
         """Validate a single genome. The lower-level entry — returns a
@@ -179,7 +180,7 @@ class ValidatorAgent(BaseAgent):
                 **backtest_kwargs,
             )
             metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
-            passed, failures = evaluate_gate_b(metrics)
+            passed, failures = evaluate_gate_b(metrics, overrides=gate_b_overrides)
             fold_evaluations.append(
                 FoldEvaluation(
                     fold=fold,

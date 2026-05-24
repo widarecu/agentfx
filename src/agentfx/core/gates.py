@@ -19,10 +19,15 @@ GATE_B_THRESHOLDS: dict[str, float] = {
     "max_drawdown": 0.10,  # 10%
     "hit_rate_min": 0.48,  # 48%
     "min_trades": 300,
+    "min_cagr": 0.15,  # 15% net annualised return after spread + swap costs
 }
 
 
-def evaluate_gate_b(metrics: dict) -> tuple[bool, list[str]]:
+def evaluate_gate_b(
+    metrics: dict,
+    *,
+    overrides: dict[str, float] | None = None,
+) -> tuple[bool, list[str]]:
     """Evaluate whether the given metrics pass all Gate B thresholds.
 
     Args:
@@ -31,34 +36,48 @@ def evaluate_gate_b(metrics: dict) -> tuple[bool, list[str]]:
             - "max_drawdown": Max drawdown as a fraction (default 1.0 if missing)
             - "hit_rate": Win rate as a fraction (default 0 if missing)
             - "n_trades": Trade count (default 0 if missing)
+            - "cagr": Net annualised return as a fraction (default -1.0
+              if missing — treats absence as definitely-below-floor)
+        overrides: Optional per-run threshold overrides. Keys not present
+            fall back to the module-level GATE_B_THRESHOLDS. Used by the
+            orchestrator/validator to honour per-run config knobs such as
+            min_cagr_pct without mutating the global default.
 
     Returns:
         Tuple of (passes: bool, failures: list[str] of human-readable reasons).
         `passes` is True iff all thresholds are met. `failures` is empty when
         passes is True, otherwise contains one message per breached threshold.
     """
+    thresholds = {**GATE_B_THRESHOLDS, **overrides} if overrides else GATE_B_THRESHOLDS
     failures: list[str] = []
 
     sharpe = metrics.get("sharpe", 0)
-    if sharpe < GATE_B_THRESHOLDS["sharpe_min"]:
-        failures.append(f"Sharpe {sharpe:.2f} < {GATE_B_THRESHOLDS['sharpe_min']}")
+    if sharpe < thresholds["sharpe_min"]:
+        failures.append(f"Sharpe {sharpe:.2f} < {thresholds['sharpe_min']}")
 
     max_dd = metrics.get("max_drawdown", 1.0)
-    if max_dd > GATE_B_THRESHOLDS["max_drawdown"]:
+    if max_dd > thresholds["max_drawdown"]:
         failures.append(
-            f"Max DD {max_dd * 100:.1f}% > {GATE_B_THRESHOLDS['max_drawdown'] * 100}%"
+            f"Max DD {abs(max_dd) * 100:.1f}% > cap {thresholds['max_drawdown'] * 100:.0f}%"
         )
 
     hit_rate = metrics.get("hit_rate", 0)
-    if hit_rate < GATE_B_THRESHOLDS["hit_rate_min"]:
+    if hit_rate < thresholds["hit_rate_min"]:
         failures.append(
-            f"Hit Rate {hit_rate * 100:.1f}% < {GATE_B_THRESHOLDS['hit_rate_min'] * 100}%"
+            f"Hit Rate {hit_rate * 100:.1f}% < {thresholds['hit_rate_min'] * 100}%"
         )
 
     trade_count = metrics.get("n_trades", 0)
-    if trade_count < GATE_B_THRESHOLDS["min_trades"]:
+    if trade_count < thresholds["min_trades"]:
+        failures.append(f"Trade Count {trade_count} < {thresholds['min_trades']}")
+
+    # CAGR is the net annualised return of the rets-based equity curve
+    # (already includes spread + slippage + swap costs). The default
+    # value of -1.0 makes a missing metric fail by construction.
+    cagr = metrics.get("cagr", -1.0)
+    if cagr < thresholds["min_cagr"]:
         failures.append(
-            f"Trade Count {trade_count} < {GATE_B_THRESHOLDS['min_trades']}"
+            f"CAGR {cagr * 100:+.1f}% < {thresholds['min_cagr'] * 100:.0f}%"
         )
 
     return len(failures) == 0, failures

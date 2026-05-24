@@ -601,6 +601,7 @@ class SqlAlchemyPersister:
                 max_drawdown=fe.metrics.get("max_drawdown"),
                 hit_rate=fe.metrics.get("hit_rate"),
                 n_trades=fe.metrics.get("n_trades"),
+                cagr=fe.metrics.get("cagr"),
                 passed_gate_b=fe.passed_gate_b,
             )
             self.db.add(row)

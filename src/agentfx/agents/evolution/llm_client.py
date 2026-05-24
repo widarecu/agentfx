@@ -269,6 +269,7 @@ class LLMHypothesisInjector:
             list[tuple[StrategySpec, float | None, dict | None]] | None
         ) = None,
         is_gen_zero_seeding: bool = False,
+        min_cagr_target: float | None = None,
     ) -> InjectionResult:
         """Request `n_proposals` novel genomes from the LLM.
 
@@ -311,6 +312,7 @@ class LLMHypothesisInjector:
             cost_per_trade_pips=cost_per_trade_pips,
             prior_llm_proposals=prior_llm_proposals,
             is_gen_zero_seeding=is_gen_zero_seeding,
+            min_cagr_target=min_cagr_target,
         )
 
         try:

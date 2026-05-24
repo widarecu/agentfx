@@ -271,6 +271,7 @@ interface CreateRunBody {
     population_size: number;
     rng_seed: number;
     leverage?: number;
+    min_cagr_pct?: number;
   };
   stop_conditions?: { max_generations: number; target_fitness: number };
   llm_budget_usd?: number;
@@ -295,6 +296,7 @@ function CreateRunModal({
   const [targetFitness, setTargetFitness] = useState(1.5);
   const [llmBudgetUsd, setLlmBudgetUsd] = useState(5.0);
   const [leverage, setLeverage] = useState<30 | 50>(30);
+  const [minCagrPct, setMinCagrPct] = useState(15); // % per year — Gate B floor
 
   return (
     <div
@@ -327,6 +329,7 @@ function CreateRunModal({
                 population_size: populationSize,
                 rng_seed: 42,
                 leverage,
+                min_cagr_pct: minCagrPct / 100,
               },
               stop_conditions: {
                 max_generations: maxGenerations,
@@ -434,6 +437,21 @@ function CreateRunModal({
               </select>
             </Field>
           </div>
+
+          <Field
+            label="Min CAGR (%/year)"
+            hint="Gate B floor for net annualised return on the OOS fold"
+          >
+            <input
+              type="number"
+              step="1"
+              min={-100}
+              max={1000}
+              value={minCagrPct}
+              onChange={(e) => setMinCagrPct(Number(e.target.value))}
+              className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
+            />
+          </Field>
 
           {error && (
             <div className="px-3 py-2 rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-xs text-red-700 dark:text-red-300">
