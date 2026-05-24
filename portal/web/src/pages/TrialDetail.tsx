@@ -30,6 +30,7 @@ import {
   TrialDetailData,
   MetricsViewMode,
   formatPercent,
+  formatPercentMagnitude,
   formatSharpe,
   formatPips,
   formatDollars,
@@ -319,10 +320,10 @@ export default function TrialDetail() {
                 : 'text-red-600 dark:text-red-400'
             }`}
           >
-            {formatPercent(metrics.maxDrawdown)}
+            {formatPercentMagnitude(metrics.maxDrawdown)}
           </div>
           <div className="text-xs text-slate-400 mt-1">
-            Threshold: {'<='} {formatPercent(GATE_B_THRESHOLDS.MAX_DRAWDOWN)}
+            Cap: {formatPercentMagnitude(GATE_B_THRESHOLDS.MAX_DRAWDOWN)}
           </div>
         </div>
 

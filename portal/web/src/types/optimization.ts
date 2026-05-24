@@ -185,7 +185,9 @@ export function evaluateGateB(metrics: TrialMetrics): { passes: boolean; failure
   }
 
   if (metrics.maxDrawdown > GATE_B_THRESHOLDS.MAX_DRAWDOWN) {
-    failures.push(`Max DD ${(metrics.maxDrawdown * 100).toFixed(1)}% > ${GATE_B_THRESHOLDS.MAX_DRAWDOWN * 100}%`);
+    failures.push(
+      `Max DD ${(Math.abs(metrics.maxDrawdown) * 100).toFixed(1)}% > ${GATE_B_THRESHOLDS.MAX_DRAWDOWN * 100}%`,
+    );
   }
 
   if (metrics.hitRate < GATE_B_THRESHOLDS.HIT_RATE_MIN) {
@@ -205,6 +207,17 @@ export function evaluateGateB(metrics: TrialMetrics): { passes: boolean; failure
 // Format helpers
 export function formatPercent(value: number, decimals: number = 1): string {
   return `${(value * 100).toFixed(decimals)}%`;
+}
+
+/**
+ * Render a metric as a positive-magnitude percentage. Used for inherently
+ * negative metrics like Max Drawdown where the minus sign carries no
+ * information (a drawdown is a loss by definition) and the negative-vs-
+ * positive-threshold comparison reads as a contradiction. "MaxDD 3.8%,
+ * cap 10%" matches how traders describe these values verbally.
+ */
+export function formatPercentMagnitude(value: number, decimals: number = 1): string {
+  return `${(Math.abs(value) * 100).toFixed(decimals)}%`;
 }
 
 export function formatSharpe(value: number | null | undefined): string {

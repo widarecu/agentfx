@@ -12,7 +12,12 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
 import { CheckCircle, XCircle, TrendingUp, BarChart3, Target, Hash, Eye } from 'lucide-react';
-import { OptimizationTrial, formatPercent, formatSharpe } from '../types/optimization';
+import {
+  OptimizationTrial,
+  formatPercent,
+  formatPercentMagnitude,
+  formatSharpe,
+} from '../types/optimization';
 
 interface MetricsCardProps {
   trial: OptimizationTrial;
@@ -124,7 +129,7 @@ export default function MetricsCard({ trial, rank, jobId }: MetricsCardProps) {
                 : 'text-red-600 dark:text-red-400'
             }`}
           >
-            {formatPercent(metrics.maxDrawdown)}
+            {formatPercentMagnitude(metrics.maxDrawdown)}
           </div>
         </div>
 

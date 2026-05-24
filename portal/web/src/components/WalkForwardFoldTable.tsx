@@ -39,6 +39,11 @@ function formatPct(v: number | null | undefined): string {
   return `${(v * 100).toFixed(1)}%`;
 }
 
+function formatPctMagnitude(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v)) return '—';
+  return `${(Math.abs(v) * 100).toFixed(1)}%`;
+}
+
 const PASS_CLS =
   'text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-900/15';
 const FAIL_CLS =
@@ -86,9 +91,9 @@ export default function WalkForwardFoldTable({
               </th>
               <th
                 className="px-3 py-2 text-right font-medium"
-                title={`Gate B threshold ≤ ${(GATE_B.maxDrawdown * 100).toFixed(0)}%`}
+                title={`Gate B cap ${(GATE_B.maxDrawdown * 100).toFixed(0)}% (magnitude)`}
               >
-                Max DD (≤ {(GATE_B.maxDrawdown * 100).toFixed(0)}%)
+                Max DD (cap {(GATE_B.maxDrawdown * 100).toFixed(0)}%)
               </th>
               <th
                 className="px-3 py-2 text-right font-medium"
@@ -158,14 +163,17 @@ export default function WalkForwardFoldTable({
                       ddPasses != null && f.max_drawdown != null
                         ? gateTooltip(
                             'Max DD',
-                            `≤ ${(GATE_B.maxDrawdown * 100).toFixed(0)}%`,
+                            `cap ${(GATE_B.maxDrawdown * 100).toFixed(0)}%`,
                             ddPasses,
-                            `${((f.max_drawdown - GATE_B.maxDrawdown) * 100).toFixed(1)}pp vs threshold`,
+                            `${(
+                              (Math.abs(f.max_drawdown) - GATE_B.maxDrawdown) *
+                              100
+                            ).toFixed(1)}pp vs cap`,
                           )
                         : 'Max DD — no data'
                     }
                   >
-                    {formatPct(f.max_drawdown)}
+                    {formatPctMagnitude(f.max_drawdown)}
                   </td>
                   <td
                     className={`px-3 py-2 text-right font-mono ${metricCellClass(hitPasses)}`}

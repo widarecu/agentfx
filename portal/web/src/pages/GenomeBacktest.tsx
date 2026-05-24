@@ -52,6 +52,7 @@ import {
   GATE_B_THRESHOLDS,
   formatDollars,
   formatPercent,
+  formatPercentMagnitude,
   formatPips,
   formatSharpe,
 } from '../types/optimization';
@@ -380,7 +381,7 @@ export default function GenomeBacktest() {
     }
     if (maxDd > GATE_B_THRESHOLDS.MAX_DRAWDOWN) {
       out.push(
-        `Max DD ${formatPercent(maxDd)} > ${formatPercent(GATE_B_THRESHOLDS.MAX_DRAWDOWN)}`,
+        `Max DD ${formatPercentMagnitude(maxDd)} > cap ${formatPercentMagnitude(GATE_B_THRESHOLDS.MAX_DRAWDOWN)}`,
       );
     }
     if (hitRate < GATE_B_THRESHOLDS.HIT_RATE_MIN) {
@@ -574,9 +575,9 @@ export default function GenomeBacktest() {
         <MetricCard
           icon={<TrendingDown className="w-4 h-4 text-slate-400" />}
           label="Max DD"
-          value={formatPercent(maxDd)}
+          value={formatPercentMagnitude(maxDd)}
           tone={maxDd <= GATE_B_THRESHOLDS.MAX_DRAWDOWN ? 'good' : 'bad'}
-          thresholdLine={`Threshold: <= ${formatPercent(GATE_B_THRESHOLDS.MAX_DRAWDOWN)}`}
+          thresholdLine={`Cap: ${formatPercentMagnitude(GATE_B_THRESHOLDS.MAX_DRAWDOWN)}`}
         />
         <MetricCard
           icon={<Target className="w-4 h-4 text-slate-400" />}
@@ -706,7 +707,7 @@ export default function GenomeBacktest() {
               label="Max DD"
               training={maxDd}
               oos={oosFold.max_drawdown}
-              format={(v) => formatPercent(v ?? 0)}
+              format={(v) => formatPercentMagnitude(v ?? 0)}
               threshold={GATE_B_THRESHOLDS.MAX_DRAWDOWN}
               direction="lte"
             />

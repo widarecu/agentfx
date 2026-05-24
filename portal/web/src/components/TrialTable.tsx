@@ -18,7 +18,12 @@ import {
   Eye,
   ChevronsUpDown,
 } from 'lucide-react';
-import { OptimizationTrial, formatPercent, formatSharpe } from '../types/optimization';
+import {
+  OptimizationTrial,
+  formatPercent,
+  formatPercentMagnitude,
+  formatSharpe,
+} from '../types/optimization';
 
 type SortKey =
   | 'sharpe'
@@ -214,7 +219,7 @@ export default function TrialTable({ trials, jobId, onTrialClick }: TrialTablePr
                         : 'text-red-600 dark:text-red-400'
                     }`}
                   >
-                    {formatPercent(trial.metrics.maxDrawdown)}
+                    {formatPercentMagnitude(trial.metrics.maxDrawdown)}
                   </span>
                 </td>
 
