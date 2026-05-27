@@ -140,10 +140,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Install Railway CLI
-        run: |
-          curl -fsSL https://railway.app/install.sh | sh
-          railway --version
+        # `curl https://railway.app/install.sh | sh` fails on ubuntu-latest
+        # because /bin/sh is dash, but the script uses bash-specific
+        # ${var} substitution on line 145 — exit code 2 even though the
+        # binary actually lands. The official npm package is the
+        # canonical, shell-portable alternative.
+        run: npm install --global @railway/cli
 
       - name: Deploy to Railway
         run: railway up --detach --service agentfx
