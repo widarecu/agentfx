@@ -276,6 +276,13 @@ def _dsl_position_size(
         if notional > account_balance × leverage:
             clamp desired_units so notional == leverage cap (with warning)
 
+    ``account_balance`` is the running balance at the moment the trade is
+    opened, not the static starting capital — the caller (the trade loop
+    in ``run_backtest_from_db``) compounds it by adding each closed
+    trade's net P&L. That keeps the per-trade dollar ledger consistent
+    with the rets-based equity curve, which already compounds via
+    ``cumprod``.
+
     Returns (position_units, was_capped). For non-DSL strategies the
     caller should not invoke this — they keep their static
     `position_size` argument.
@@ -548,6 +555,16 @@ def run_backtest_from_db(
         leverage_cap_hits = 0
         is_dsl = isinstance(strat, CompiledDSLStrategy)
 
+        # Compounded sizing: position size on each new DSL trade is computed
+        # against the running balance (starting balance + sum of realised
+        # net P&L from prior closed trades), not the static starting capital.
+        # Matches what a real OANDA account does — profits grow the next
+        # trade's risk capital, losses shrink it. The rets-based equity
+        # curve already compounds; this keeps the per-trade dollar ledger
+        # consistent with that assumption.
+        current_balance = float(account_balance)
+        peak_balance = current_balance
+
         # Get indicator values based on strategy
         indicator_df = _get_indicator_values(strat, df, strategy_name, strategy_params)
 
@@ -610,11 +627,17 @@ def run_backtest_from_db(
                         # move on USD/JPY at 150 correctly worth less in USD
                         # than on EUR/USD at 1.10.
                         if is_dsl:
+                            # Pass the *running* balance, not the starting
+                            # one — this is what makes sizing compound with
+                            # realised P&L. Floor at 0 to keep the helper's
+                            # arithmetic well-defined on a busted account;
+                            # _dsl_position_size already enforces units >= 1.
+                            sizing_balance = max(current_balance, 0.0)
                             trade_units, was_capped = _dsl_position_size(
                                 strat,
                                 instrument,
                                 entry_price,
-                                account_balance,
+                                sizing_balance,
                                 leverage,
                             )
                             if was_capped:
@@ -655,6 +678,7 @@ def run_backtest_from_db(
                             - swap_cost_pips
                         )
 
+                        net_pnl_dollars = net_pips * pip_value_usd * trade_units
                         trade_list.append(
                             {
                                 "id": f"trade_{trade_id}",
@@ -678,16 +702,17 @@ def run_backtest_from_db(
                                 "swap_cost_dollars": swap_cost_pips
                                 * pip_value_usd
                                 * trade_units,
-                                "net_pnl_dollars": net_pips
-                                * pip_value_usd
-                                * trade_units,
+                                "net_pnl_dollars": net_pnl_dollars,
                                 "duration_minutes": (
                                     timestamp - entry_time
                                 ).total_seconds()
                                 / 60,
                                 "position_size": trade_units,
+                                "balance_after": current_balance + net_pnl_dollars,
                             }
                         )
+                        current_balance += net_pnl_dollars
+                        peak_balance = max(peak_balance, current_balance)
                         trade_id += 1
 
                     # If flipping to a new position, open the new entry
@@ -729,6 +754,10 @@ def run_backtest_from_db(
         # hit on N trades" and the leverage setting used.
         result["sizing"] = {
             "account_balance": account_balance,
+            "starting_balance": float(account_balance),
+            "ending_balance": current_balance,
+            "peak_balance": peak_balance,
+            "compounded": is_dsl,
             "account_currency": "USD",
             "leverage": leverage,
             "leverage_cap_hits": leverage_cap_hits,
