@@ -64,6 +64,13 @@ def _build_orchestrator(
             llm_injection_every_n=99,  # disabled for these tests
             n_validation_folds=4,
             rng_seed=rng_seed,
+            # Pipeline tests focus on the GA loop's basic functioning,
+            # not gen-0 seeding strategy. Disable warm-start and LLM
+            # gen-0 seeding so the population is deterministic
+            # (canonical seeds only) regardless of prior runs the test
+            # DB may have accumulated.
+            use_prior_winners=False,
+            llm_seed_gen0=False,
         ),
         stop_conditions=StopConditions(
             max_generations=max_generations,

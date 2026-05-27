@@ -62,6 +62,12 @@ def _build_orchestrator(
             llm_injection_every_n=99,
             n_validation_folds=4,
             rng_seed=42,
+            # Stop-condition tests don't care about gen-0 seeding —
+            # they care about WHEN the loop halts. Disable warm-start
+            # and LLM gen-0 seeding so the test is deterministic
+            # regardless of prior runs in the shared test DB.
+            use_prior_winners=False,
+            llm_seed_gen0=False,
         ),
         stop_conditions=stop_conditions,
         data_window=(
@@ -185,6 +191,11 @@ class TestStopConditions:
                 max_generations=30,
                 max_wall_clock_seconds=600,
                 target_fitness=1.5,
+                # target_reached is opt-in (default off) since
+                # training-fitness early-stop routinely sacrifices
+                # robustness. This test explicitly opts in to verify
+                # the trigger still fires when the user wants it.
+                enable_target_fitness_stop=True,
                 no_improvement_generations=99,
             ),
             fitness_value=2.0,
