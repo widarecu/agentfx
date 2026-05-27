@@ -68,7 +68,7 @@ def apply_resource_limits(limits: ResourceLimits) -> None:
         )
         resource.setrlimit(resource.RLIMIT_AS, (new_soft, hard))
         logger.info("set RLIMIT_AS soft=%d hard=%d", new_soft, hard)
-    except (ValueError, OSError, resource.error) as e:  # noqa: PERF203
+    except (ValueError, OSError) as e:  # noqa: PERF203
         # On some platforms RLIMIT_AS isn't enforceable — log and continue.
         # The CPU cap below is a sufficient backstop on its own.
         logger.warning("failed to set RLIMIT_AS: %s", e)
@@ -83,7 +83,7 @@ def apply_resource_limits(limits: ResourceLimits) -> None:
         )
         resource.setrlimit(resource.RLIMIT_CPU, (new_soft, hard))
         logger.info("set RLIMIT_CPU soft=%d hard=%d", new_soft, hard)
-    except (ValueError, OSError, resource.error) as e:
+    except (ValueError, OSError) as e:
         logger.warning("failed to set RLIMIT_CPU: %s", e)
 
 
