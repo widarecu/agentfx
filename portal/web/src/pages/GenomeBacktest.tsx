@@ -487,7 +487,7 @@ export default function GenomeBacktest() {
                   className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-violet-100 dark:bg-violet-900/40 text-violet-800 dark:text-violet-300 text-xs font-semibold"
                   title={
                     backtest.sizing.is_dsl_risk_sized
-                      ? "Each trade is sized to risk the DSL's risk_pct % of account on its stop. Notional capped at leverage × balance."
+                      ? "Each trade is sized to risk the DSL's risk_pct % of account on its stop. Notional capped at leverage × balance. Position size compounds with realised P&L — wins grow the next trade, losses shrink it."
                       : 'Fixed position size from the run config (classic strategy path).'
                   }
                 >
@@ -495,6 +495,7 @@ export default function GenomeBacktest() {
                   {' · '}
                   {backtest.sizing.leverage}:1
                   {backtest.sizing.is_dsl_risk_sized && ' · risk-sized'}
+                  {backtest.sizing.compounded && ' · compounded'}
                   {backtest.sizing.leverage_cap_hits > 0 && (
                     <span className="ml-1 text-amber-700 dark:text-amber-300">
                       ⚠ {backtest.sizing.leverage_cap_hits} cap hits
@@ -502,6 +503,36 @@ export default function GenomeBacktest() {
                   )}
                 </span>
               )}
+              {backtest.sizing?.starting_balance != null &&
+                backtest.sizing.ending_balance != null && (
+                  (() => {
+                    const start = backtest.sizing.starting_balance!;
+                    const end = backtest.sizing.ending_balance!;
+                    const peak = backtest.sizing.peak_balance ?? end;
+                    const growth = start > 0 ? (end - start) / start : 0;
+                    const up = end >= start;
+                    const toneCls = up
+                      ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-300'
+                      : 'bg-rose-100 dark:bg-rose-900/40 text-rose-800 dark:text-rose-300';
+                    return (
+                      <span
+                        className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-semibold ${toneCls}`}
+                        title={`Compounded ledger: started $${start.toLocaleString()}, ended $${end.toLocaleString(undefined, { maximumFractionDigits: 0 })}, peaked at $${peak.toLocaleString(undefined, { maximumFractionDigits: 0 })}. Each trade's position size was computed against the running balance.`}
+                      >
+                        ${start.toLocaleString()} →{' '}
+                        ${end.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                        {' '}
+                        ({up ? '+' : ''}
+                        {(growth * 100).toFixed(1)}%)
+                        {peak > end && (
+                          <span className="ml-1 opacity-70">
+                            peak ${peak.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                          </span>
+                        )}
+                      </span>
+                    );
+                  })()
+                )}
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5 max-w-3xl">
               The metrics below are computed on the <strong>training</strong>{' '}
@@ -538,7 +569,26 @@ export default function GenomeBacktest() {
 
       </div>
 
-      {/* ── Performance Summary: 6 primary metrics, Gate B-coloured ── */}
+      {/* ── Performance Summary: 6 primary metrics, Gate B-coloured ──
+        All tiles in this grid are computed on the TRAINING window
+        (folds 0..K-2 concatenated) — the same data the GA's fitness was
+        evaluated against. The section header below makes that scope
+        explicit on every page load, so a reader who scrolls straight to
+        a tile doesn't confuse it with the OOS value shown in the
+        "Training vs OOS" section further down. CAGR in particular has
+        an OOS counterpart and used to look like two contradictory
+        readings of the same metric. */}
+      <div className="flex items-center justify-between gap-3 -mb-2">
+        <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-200 flex items-center gap-2">
+          <span className="inline-block px-1.5 py-0.5 text-[10px] uppercase tracking-wide rounded bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-300 font-semibold">
+            Training
+          </span>
+          Training-window metrics — what the GA's fitness saw
+        </h3>
+        <span className="text-xs text-slate-500 dark:text-slate-400 italic">
+          OOS counterparts in the "Training vs OOS" section below
+        </span>
+      </div>
       <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
         <MetricCard
           icon={<TrendingUp className="w-4 h-4 text-slate-400" />}
@@ -622,10 +672,10 @@ export default function GenomeBacktest() {
         />
         <MetricCard
           icon={<TrendingUp className="w-4 h-4 text-slate-400" />}
-          label="CAGR (net/yr)"
+          label="CAGR (training, net/yr)"
           value={formatPercent(cagr)}
           tone={cagr >= GATE_B_THRESHOLDS.MIN_CAGR ? 'good' : 'bad'}
-          thresholdLine={`Floor: >= ${formatPercent(GATE_B_THRESHOLDS.MIN_CAGR)}`}
+          thresholdLine={`Floor: >= ${formatPercent(GATE_B_THRESHOLDS.MIN_CAGR)} (OOS gates promotion)`}
         />
       </div>
 
