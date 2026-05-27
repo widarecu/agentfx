@@ -259,6 +259,10 @@ def _build_orchestrator(
             llm_injection_every_n=3,
             n_validation_folds=4,
             rng_seed=42,
+            # Default to 1 so the legacy single-validator-call contract
+            # the existing tests assert still holds. Tests that exercise
+            # top-K validation override this explicitly.
+            top_n_to_validate=1,
         ),
         stop_conditions=stop_conditions
         or StopConditions(
@@ -471,8 +475,9 @@ class TestStopConditions:
         # Generations completed: gen 0, 1, 2 → 3 persisted
         assert len(persister.generations) == 3
 
-    def test_target_fitness_stops_loop(self) -> None:
-        # Fitness is 2.0 from gen 0 — target 1.5 trips immediately
+    def test_target_fitness_stops_loop_when_opt_in_enabled(self) -> None:
+        # Fitness is 2.0 from gen 0 — target 1.5 trips immediately, but
+        # ONLY because enable_target_fitness_stop=True is opted in.
         fitness_fn = FixedFitnessFn([2.0])
         orchestrator, persister = _build_orchestrator(
             fitness_fn=fitness_fn,
@@ -480,6 +485,7 @@ class TestStopConditions:
                 max_generations=30,
                 max_wall_clock_seconds=86400,
                 target_fitness=1.5,
+                enable_target_fitness_stop=True,
                 no_improvement_generations=99,
             ),
         )
@@ -488,6 +494,33 @@ class TestStopConditions:
         assert summary.stop_reason == "target_reached"
         # Should stop at gen 0
         assert len(persister.generations) == 1
+
+    def test_target_fitness_default_off_does_not_early_stop(self) -> None:
+        # Same scenario as above but with the default opt-in flag (False).
+        # The loop must NOT early-stop on training fitness; it should
+        # run all generations until max_generations (or no_improvement)
+        # fires. This pins the new default behaviour — flipping it back
+        # to True silently would re-introduce the regression where the
+        # GA threw away later-generation candidates.
+        fitness_fn = FixedFitnessFn([2.0])
+        orchestrator, persister = _build_orchestrator(
+            fitness_fn=fitness_fn,
+            stop_conditions=StopConditions(
+                max_generations=3,
+                max_wall_clock_seconds=86400,
+                target_fitness=1.5,
+                # enable_target_fitness_stop defaults to False
+                no_improvement_generations=99,
+            ),
+        )
+        summary = orchestrator.run_loop()
+
+        assert summary.stop_reason != "target_reached", (
+            "Default opt-in is False — target_fitness should be IGNORED, "
+            "not honoured. The loop should exhaust max_generations instead."
+        )
+        assert summary.stop_reason == "max_generations"
+        assert len(persister.generations) == 3
 
     def test_wall_clock_stops_loop(self) -> None:
         # Clock advances 100s per tick — wall clock budget 50 → stops fast.
@@ -733,6 +766,99 @@ class TestValidation:
         orchestrator, _ = _build_orchestrator(validator=validator)
         summary = orchestrator.run_loop()
         assert summary.validated_count == 1
+
+    def test_top_k_validation_runs_k_distinct_validations(self) -> None:
+        """When top_n_to_validate=5, validator must be called up to 5 times
+        — once per unique top-K genome by training fitness — and each
+        result must be persisted under its own genome_id. This is the
+        guard against the regression where only the run-best was
+        validated (and a more-robust gen-5 #3 was silently discarded)."""
+        validator = _make_validator_returning(validator_passed=True)
+        config = OrchestratorConfig(
+            instrument="EUR_USD",
+            granularity="M1",
+            population_size=10,
+            llm_injection_every_n=99,  # disable LLM injection in test
+            n_validation_folds=4,
+            rng_seed=42,
+            top_n_to_validate=5,
+        )
+        # Varied fitness so the hall of fame has clear ordering and not
+        # all genomes hash to the same spec (FixedFitnessFn cycles).
+        fitness_fn = FixedFitnessFn([1.0, 2.0, 3.0, 4.0, 5.0, 1.5, 2.5, 3.5, 4.5, 5.5])
+        orchestrator, persister = _build_orchestrator(
+            validator=validator,
+            fitness_fn=fitness_fn,
+            config=config,
+            stop_conditions=StopConditions(
+                max_generations=2,
+                max_wall_clock_seconds=86400,
+                target_fitness=999.0,
+                no_improvement_generations=99,
+            ),
+        )
+        orchestrator.run_loop()
+
+        # Up to K validator calls (≤ hall-of-fame size). The mock's
+        # spec is always MA_CROSSOVER_SEED — what matters is that
+        # validator.validate was called multiple times AND each call
+        # produced a save_validation entry.
+        assert validator.validate.call_count >= 2, (
+            f"Expected top-K to invoke validator at least twice for "
+            f"top_n_to_validate=5; got {validator.validate.call_count}"
+        )
+        assert len(persister.validations) == validator.validate.call_count, (
+            "Each validator call must produce exactly one save_validation"
+        )
+        # Each persisted validation must reference a genome_id (i.e. the
+        # save_generation IDs flowed correctly into top-K selection).
+        for v in persister.validations:
+            assert v["genome_id"], "genome_id missing on validation row"
+
+    def test_top_k_dedupes_elite_carryovers(self) -> None:
+        """An elite genome that survives multiple generations must be
+        validated exactly once, not once per generation it appears in.
+        The hall of fame is keyed by spec content so re-appearances
+        collapse."""
+        validator = _make_validator_returning(validator_passed=True)
+        # All genomes get the same fitness, so the elite carries
+        # unchanged. With population_size=10 and top_n=5, after 3
+        # generations the hall of fame should still have ≤ 10 unique
+        # specs even though 30 genome-instances were saved.
+        config = OrchestratorConfig(
+            instrument="EUR_USD",
+            granularity="M1",
+            population_size=10,
+            llm_injection_every_n=99,
+            n_validation_folds=4,
+            rng_seed=42,
+            top_n_to_validate=5,
+        )
+        orchestrator, persister = _build_orchestrator(
+            validator=validator,
+            fitness_fn=FixedFitnessFn([1.0]),
+            config=config,
+            stop_conditions=StopConditions(
+                max_generations=3,
+                max_wall_clock_seconds=86400,
+                target_fitness=999.0,
+                no_improvement_generations=99,
+            ),
+        )
+        orchestrator.run_loop()
+
+        # Hall of fame size must be ≤ total distinct genomes encountered,
+        # which is much smaller than (population × generations) thanks
+        # to elite carryover dedup.
+        hof = orchestrator._hall_of_fame  # noqa: SLF001
+        total_genome_instances_persisted = sum(
+            len(g.genomes) for g in persister.generations
+        )
+        assert len(hof) < total_genome_instances_persisted, (
+            f"Hall of fame ({len(hof)}) should be smaller than "
+            f"total persisted instances ({total_genome_instances_persisted}) "
+            f"thanks to elite-carryover dedup."
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────

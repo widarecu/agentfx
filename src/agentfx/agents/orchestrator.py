@@ -74,9 +74,13 @@ class StopConditions:
     - `target_fitness` is checked against the *best training fitness* seen
       in-loop (not OOS Sharpe — OOS isn't evaluated until validation at
       end-of-run). It's an early-stop signal: "we found something
-      promising on training, stop and validate." US-003 calls this
-      `target_oos_sharpe` aspirationally; mechanically it's a training-
-      fitness threshold.
+      promising on training, stop and validate." It is **opt-in** via
+      ``enable_target_fitness_stop``; by default we exhaust
+      ``max_generations`` (or ``no_improvement``) instead. The default
+      was flipped because training fitness is GA-biased toward overfit
+      shapes — stopping early on training fitness routinely yielded runs
+      where the run-best then failed OOS Gate B, throwing away compute
+      that could have found a more robust candidate.
     - `llm_budget_exhausted` is implicit — the LLM injector's
       `cost_remaining_usd` is checked when injection is scheduled; an
       empty `InjectionResult` is treated as a stop reason if budget hit
@@ -86,6 +90,7 @@ class StopConditions:
     max_generations: int = 30
     max_wall_clock_seconds: int = 6 * 3600  # 6h
     target_fitness: float = 1.5
+    enable_target_fitness_stop: bool = False
     no_improvement_generations: int = 5
 
 
@@ -287,6 +292,15 @@ class OrchestratorAgent(BaseAgent):
         # into the next LLM call so the model can avoid re-proposing
         # shapes that already failed.
         self._all_llm_origin_genomes: list[Genome] = []
+
+        # Hall of fame: every distinct genome that has been evaluated
+        # this run, keyed by canonical spec JSON so elite carry-overs
+        # don't get duplicated. Used by `_validate_top_genomes` to pick
+        # the top-K by training fitness for end-of-run validation —
+        # otherwise we'd only validate the single run-best and miss the
+        # cases where the gen-5 #3 genome OOS-passes when the gen-0
+        # elite doesn't.
+        self._hall_of_fame: dict[str, Genome] = {}
 
     @property
     def agent_type(self) -> str:
@@ -523,6 +537,10 @@ class OrchestratorAgent(BaseAgent):
                 llm_call_id=pending_llm_call_id,
                 best_fitness=best_fitness_in_gen,
             )
+            # After save_generation IDs are assigned; record into the
+            # cross-generation hall of fame for top-K validation at
+            # end-of-run.
+            self._record_evaluated(population)
             # Consume the pending flag — the next save_generation starts
             # fresh.
             pending_llm_invoked = False
@@ -669,6 +687,32 @@ class OrchestratorAgent(BaseAgent):
             k=self.config.n_validation_folds,
         )
         return training_window(folds)
+
+    def _record_evaluated(self, population: Population) -> None:
+        """Stash this generation's genomes in the hall-of-fame, keyed by
+        canonical spec JSON so elite carry-overs aren't duplicated.
+
+        Must be called *after* ``save_generation`` so genome IDs are
+        already assigned — the validator needs a stable ID to persist
+        validation folds against.
+        """
+        for g in population.genomes:
+            if not g.has_fitness() or g.id is None:
+                continue
+            key = g.spec.model_dump_json()
+            existing = self._hall_of_fame.get(key)
+            if existing is None or g.fitness_value > existing.fitness_value:
+                self._hall_of_fame[key] = g
+
+    def _top_k_by_fitness(self, k: int) -> list[Genome]:
+        """Return the top-K unique genomes from the hall of fame, sorted
+        by descending fitness. K is clamped to the hall size."""
+        ranked = sorted(
+            self._hall_of_fame.values(),
+            key=lambda g: g.fitness_value,
+            reverse=True,
+        )
+        return ranked[: max(0, k)]
 
     def _evaluate_population_fitness(
         self,
@@ -847,9 +891,13 @@ class OrchestratorAgent(BaseAgent):
         if elapsed >= self.stop_conditions.max_wall_clock_seconds:
             return _StopDecision(True, "max_wall_clock")
 
-        # 3. Target fitness reached
-        if best_fitness_history and (
-            best_fitness_history[-1] >= self.stop_conditions.target_fitness
+        # 3. Target fitness reached (opt-in only — default off because
+        # training-fitness early-stop routinely sacrifices a more robust
+        # candidate the GA would have found in later generations).
+        if (
+            self.stop_conditions.enable_target_fitness_stop
+            and best_fitness_history
+            and best_fitness_history[-1] >= self.stop_conditions.target_fitness
         ):
             return _StopDecision(True, "target_reached")
 
@@ -869,56 +917,113 @@ class OrchestratorAgent(BaseAgent):
         return _StopDecision(False)
 
     def _validate_top_genomes(self, best_genome_overall: Genome | None) -> int:
-        """Run the validator on the top-K by fitness and persist results.
-        Returns the count of genomes that passed validation.
+        """Run the validator on the top-K genomes by training fitness and
+        persist each result. Returns the count of genomes that passed
+        validation.
 
-        For v1 we validate just the run-best (`best_genome_overall`).
-        Top-K validation is a v0.4.0 enhancement — the v1 priority is
-        proving the loop produces *one* validated genome per run.
+        K = ``config.top_n_to_validate``. Genomes are drawn from the
+        cross-generation hall of fame (deduped by spec content), so an
+        elite carried across many generations is validated exactly once.
+
+        Why top-K instead of just run-best: training fitness is
+        GA-biased toward overfit shapes, so the single run-best
+        frequently fails OOS. Validating top-K surfaces the genome that
+        actually *generalises* — which may not be the one with the
+        highest training fitness. Each validator call is one extra
+        backtest pass per genome, but we already paid for the GA's
+        thousands of evaluations; spending K more to actually find a
+        promotable candidate is a strict improvement on throwing away
+        the run when the #1 fails OOS.
+
+        Falls back to ``[best_genome_overall]`` if the hall of fame is
+        empty (defensive — should not happen on a normal run, but the
+        old single-best contract is preserved).
         """
-        if best_genome_overall is None or best_genome_overall.id is None:
-            return 0
+        k = max(1, int(self.config.top_n_to_validate))
+        top_k = self._top_k_by_fitness(k)
 
-        try:
-            result = self.validator.validate(
-                spec=best_genome_overall.spec,
-                instrument=self.config.instrument,
-                granularity=self.config.granularity,
-                start=self.data_window[0],
-                end=self.data_window[1],
-                gate_b_overrides={"min_cagr": self.config.min_cagr_pct},
+        if not top_k and best_genome_overall is not None:
+            # Defensive fallback — hall of fame should always contain
+            # the run-best, but if something pathological cleared it,
+            # at least validate the run-best so the old contract holds.
+            top_k = [best_genome_overall]
+
+        passed = 0
+        for rank, genome in enumerate(top_k, start=1):
+            if genome.id is None:
+                logger.warning(
+                    "skipping validation for genome with no ID at rank %d "
+                    "(should have been assigned by save_generation)",
+                    rank,
+                )
+                continue
+
+            try:
+                # Validator backtests must pay the *same* spread the GA's
+                # fitness paid — otherwise the OOS verdict is being
+                # judged at a different cost level than training. Pass
+                # config.spread_pips through if pinned; otherwise the
+                # backtest's live lookup applies, which means the
+                # validator could drift from the GA. The runner pins
+                # `config.spread_pips` at run-start (resolved live or
+                # user-provided) precisely so we never hit the drift
+                # case here.
+                validator_kwargs: dict[str, Any] = {
+                    "account_balance": self.config.account_balance,
+                    "leverage": self.config.leverage,
+                }
+                if self.config.spread_pips is not None:
+                    validator_kwargs["spread_pips"] = self.config.spread_pips
+                result = self.validator.validate(
+                    spec=genome.spec,
+                    instrument=self.config.instrument,
+                    granularity=self.config.granularity,
+                    start=self.data_window[0],
+                    end=self.data_window[1],
+                    gate_b_overrides={"min_cagr": self.config.min_cagr_pct},
+                    **validator_kwargs,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "validator crashed for genome %s (rank %d/%d)",
+                    genome.id,
+                    rank,
+                    len(top_k),
+                )
+                continue
+
+            self.persister.save_validation(
+                genome.id,
+                folds=result.folds,
+                validator_passed=result.validator_passed,
+                validation_failures=result.validation_failures,
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("validator crashed for genome %s", best_genome_overall.id)
-            return 0
+            oos_eval = result.oos_evaluation
+            self.persister.log_decision(
+                self.run_id,
+                agent_type="validator",
+                action="validate",
+                outputs_json={
+                    "genome_id": genome.id,
+                    "rank_by_training_fitness": rank,
+                    "training_fitness": genome.fitness_value,
+                    "validator_passed": result.validator_passed,
+                    "oos_sharpe": oos_eval.metrics.get("sharpe"),
+                    "oos_max_drawdown": oos_eval.metrics.get("max_drawdown"),
+                    "oos_n_trades": oos_eval.metrics.get("n_trades"),
+                    "validation_failures": result.validation_failures,
+                },
+                reasoning_text=(
+                    f"Walk-forward validation on genome {genome.id} "
+                    f"(rank {rank}/{len(top_k)} by training fitness): "
+                    f"{'passed' if result.validator_passed else 'failed'} "
+                    f"on OOS fold (Sharpe={oos_eval.metrics.get('sharpe', '?')})."
+                ),
+            )
+            if result.validator_passed:
+                passed += 1
 
-        self.persister.save_validation(
-            best_genome_overall.id,
-            folds=result.folds,
-            validator_passed=result.validator_passed,
-            validation_failures=result.validation_failures,
-        )
-        oos_eval = result.oos_evaluation
-        self.persister.log_decision(
-            self.run_id,
-            agent_type="validator",
-            action="validate",
-            outputs_json={
-                "genome_id": best_genome_overall.id,
-                "validator_passed": result.validator_passed,
-                "oos_sharpe": oos_eval.metrics.get("sharpe"),
-                "oos_max_drawdown": oos_eval.metrics.get("max_drawdown"),
-                "oos_n_trades": oos_eval.metrics.get("n_trades"),
-                "validation_failures": result.validation_failures,
-            },
-            reasoning_text=(
-                f"Walk-forward validation on genome {best_genome_overall.id}: "
-                f"{'passed' if result.validator_passed else 'failed'} "
-                f"on OOS fold (Sharpe={oos_eval.metrics.get('sharpe', '?')})."
-            ),
-        )
-
-        return 1 if result.validator_passed else 0
+        return passed
 
 
 __all__ = [
