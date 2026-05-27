@@ -104,11 +104,17 @@ test.describe('Evolution Runs Page', () => {
     await login(page, TRADER_EMAIL, TRADER_PASSWORD);
     await page.goto('/evolution', { waitUntil: 'networkidle' });
     // Either the empty state or the runs table renders. Both are
-    // acceptable; we just want the page not to error.
-    const emptyOrTable = page.locator(
-      'text=/No evolution runs yet/i, th:has-text("Run ID")'
-    );
-    await expect(emptyOrTable.first()).toBeVisible({ timeout: 10000 });
+    // acceptable; we just want the page not to error. The previous
+    // comma-separated locator was a SyntaxError trap — Playwright's
+    // text= engine treats `,` as a RegExp flag separator, so the test
+    // only "passed" when the empty-state branch happened to be true
+    // (because the table branch raised before assertion). Use
+    // Locator.or() to actually accept both states.
+    const emptyState = page.getByText(/No evolution runs yet/i);
+    const tableHeader = page.locator('th', { hasText: 'Run ID' });
+    await expect(emptyState.or(tableHeader).first()).toBeVisible({
+      timeout: 10000,
+    });
   });
 });
 
