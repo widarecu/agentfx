@@ -584,3 +584,227 @@ class TestListDecisions:
         items, total = evolution_service.list_decisions(db, run.id, skip=3, limit=2)
         assert total == 10
         assert len(items) == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# find_prior_winners — tiered warm-start candidate selection
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestFindPriorWinners:
+    """The three-tier filter: validator_passed → fitness>0 → fitness>-50.
+
+    Tier 3 is the load-bearing addition. Without it, a run whose best
+    genome is net-negative produces zero warm-start candidates for the
+    next run — even though that run is the latest, most-relevant signal
+    in the DB. Hard search spaces (M1 majors at realistic spreads)
+    routinely look like that for several iterations before the GA finds
+    a profitable shape; throwing those signals away resets progress
+    every time.
+    """
+
+    def _make_completed_run(
+        self,
+        db: Session,
+        *,
+        instrument: str = "EUR_USD",
+        granularity: str = "M1",
+    ) -> models.EvolutionRun:
+        run = evolution_service.create_run(
+            db,
+            schemas.EvolutionRunCreate(instrument=instrument, granularity=granularity),
+        )
+        run.status = models.EvolutionRunStatus.COMPLETED
+        db.commit()
+        return run
+
+    def _seed_genome(
+        self,
+        db: Session,
+        *,
+        run: models.EvolutionRun,
+        fitness: float,
+        validator_passed: bool | None = None,
+        gen_index: int = 0,
+        idx: int = 0,
+        dsl_json: dict | None = None,
+    ) -> models.StrategyGenome:
+        """Seed a genome. When `dsl_json` is None we generate a unique
+        per-`idx` spec by perturbing MA_CROSSOVER_SEED's fast-window —
+        otherwise dedup collapses all per-idx rows into one slot."""
+        gen_id = f"{run.id}_gen_{gen_index:03d}"
+        existing = db.get(models.Generation, gen_id)
+        if existing is None:
+            db.add(models.Generation(id=gen_id, run_id=run.id, index=gen_index))
+            db.commit()
+        genome_id = f"genome_{run.id}_{gen_index:03d}_{idx:03d}"
+        from agentfx.api.models import GenomeOrigin
+
+        if dsl_json is None:
+            # Each idx gets a structurally-distinct DSL by varying the
+            # fast SMA window — otherwise the dedup-by-spec logic
+            # collapses them into one slot.
+            spec = MA_CROSSOVER_SEED.model_dump(mode="json")
+            spec["entry"]["long"]["lhs"]["args"] = [10.0 + idx]
+            spec["entry"]["short"]["lhs"]["args"] = [10.0 + idx]
+            dsl_json = spec
+
+        db.add(
+            models.StrategyGenome(
+                id=genome_id,
+                generation_id=gen_id,
+                dsl_json=dsl_json,
+                origin=GenomeOrigin.SEED,
+                fitness=fitness,
+                validator_passed=validator_passed,
+            )
+        )
+        db.commit()
+        return db.get(models.StrategyGenome, genome_id)
+
+    def test_tier3_carries_forward_when_all_runs_are_net_negative(
+        self, db: Session
+    ) -> None:
+        """The regression the user hit: run completes with best fitness
+        −0.38 (no positives, no validation passes). Next run's warm-start
+        must still pick it up — otherwise GA progress is silently
+        discarded every run."""
+        run = self._make_completed_run(db)
+        # Three negative-but-non-degenerate genomes
+        self._seed_genome(db, run=run, fitness=-0.38, idx=0)
+        self._seed_genome(db, run=run, fitness=-0.51, idx=1)
+        self._seed_genome(db, run=run, fitness=-2.10, idx=2)
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        assert len(rows) == 3, (
+            "Tier 3 must carry forward net-negative genomes; got "
+            f"{len(rows)} candidates for a run with no positives and no "
+            f"validator passes."
+        )
+        # Top-by-fitness ordering preserved even in tier 3
+        assert rows[0]["fitness"] == pytest.approx(-0.38)
+        assert rows[1]["fitness"] == pytest.approx(-0.51)
+        assert rows[2]["fitness"] == pytest.approx(-2.10)
+
+    def test_tier3_excludes_degenerate_zero_trade_penalty(self, db: Session) -> None:
+        """Zero-trade genomes get fitness=−100 from the hard penalty.
+        These must NEVER warm-start a future run — they're degenerate by
+        construction (long == short condition, etc.)."""
+        run = self._make_completed_run(db)
+        self._seed_genome(db, run=run, fitness=-100.0, idx=0)  # zero-trade
+        self._seed_genome(db, run=run, fitness=-95.5, idx=1)  # legacy float wobble
+        self._seed_genome(db, run=run, fitness=-49.9, idx=2)  # right at the edge
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        # Only the -49.9 genome qualifies; the others are below the -50 floor
+        assert len(rows) == 1
+        assert rows[0]["fitness"] == pytest.approx(-49.9)
+
+    def test_tier_ordering_validator_passed_wins_over_higher_fitness(
+        self, db: Session
+    ) -> None:
+        """Tier 1 (validator_passed) must beat tier 2 even when the
+        positive genome has higher raw fitness — generalisation > training."""
+        run = self._make_completed_run(db)
+        self._seed_genome(db, run=run, fitness=0.5, validator_passed=True, idx=0)
+        self._seed_genome(db, run=run, fitness=10.0, validator_passed=False, idx=1)
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=1
+        )
+        assert len(rows) == 1
+        assert rows[0]["fitness"] == pytest.approx(0.5)
+
+    def test_tier2_used_when_no_validator_passes(self, db: Session) -> None:
+        run = self._make_completed_run(db)
+        self._seed_genome(db, run=run, fitness=0.3, idx=0)
+        self._seed_genome(db, run=run, fitness=-0.5, idx=1)
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=2
+        )
+        # Tier 2 fills with the positive; tier 3 then tops up with the negative
+        assert len(rows) == 2
+        assert rows[0]["fitness"] == pytest.approx(0.3)
+        assert rows[1]["fitness"] == pytest.approx(-0.5)
+
+    def test_excludes_running_or_failed_runs(self, db: Session) -> None:
+        run = self._make_completed_run(db)
+        run.status = models.EvolutionRunStatus.RUNNING  # demote
+        db.commit()
+        self._seed_genome(db, run=run, fitness=0.5, idx=0)
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        assert rows == []
+
+    def test_empty_db_returns_empty(self, db: Session) -> None:
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        assert rows == []
+
+    def test_dedupes_by_spec_content_so_one_elite_doesnt_fill_all_slots(
+        self, db: Session
+    ) -> None:
+        """The user's incident: a prior run's elite genome was carried
+        across generations 5, 6, 7. The warm-start query returned 3
+        rows with the SAME dsl_json, so all three warm-start slots in
+        the next run got identical specs — population collapsed to a
+        monoculture, crossover-of-clones produced clones, GA stuck."""
+        run = self._make_completed_run(db)
+        # Same canonical spec replicated three times (simulating the
+        # elite carried across 3 generations of a prior run).
+        for i in range(3):
+            self._seed_genome(db, run=run, fitness=-0.09, gen_index=i, idx=0)
+        # A second, structurally-different spec at lower fitness.
+        from agentfx.api.models import GenomeOrigin
+
+        gen_id = f"{run.id}_gen_other"
+        db.add(models.Generation(id=gen_id, run_id=run.id, index=10))
+        db.commit()
+        db.add(
+            models.StrategyGenome(
+                id="genome_diff_spec",
+                generation_id=gen_id,
+                # Different DSL → not deduped against the elite
+                dsl_json=RSI_MEAN_REVERSION_SEED.model_dump(mode="json"),
+                origin=GenomeOrigin.SEED,
+                fitness=-0.50,
+            )
+        )
+        db.commit()
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        assert len(rows) == 2, (
+            f"Expected 2 unique specs (one elite-cluster + one diff "
+            f"spec); got {len(rows)} which means dedup didn't fire."
+        )
+        # First slot = the higher-fitness elite (one copy, not three)
+        assert rows[0]["fitness"] == pytest.approx(-0.09)
+        # Second slot = the structurally-different lower-fitness spec
+        assert rows[1]["fitness"] == pytest.approx(-0.50)
+
+    def test_dedup_preserves_highest_fitness_representative(self, db: Session) -> None:
+        """When the same spec appears multiple times at different
+        fitnesses (e.g. elite scored under different generations'
+        diversity penalties), dedup keeps the highest-fitness instance
+        as the representative."""
+        run = self._make_completed_run(db)
+        self._seed_genome(db, run=run, fitness=-2.0, gen_index=0, idx=0)
+        self._seed_genome(db, run=run, fitness=-0.5, gen_index=1, idx=0)
+        self._seed_genome(db, run=run, fitness=-1.0, gen_index=2, idx=0)
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        # Only one unique spec → exactly one row → highest fitness wins
+        assert len(rows) == 1
+        assert rows[0]["fitness"] == pytest.approx(-0.5)

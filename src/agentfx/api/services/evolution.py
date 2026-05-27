@@ -86,18 +86,24 @@ def find_prior_winners(
     exclude_run_id parameter prevents a re-started run from importing
     its own genomes.
 
-    Filter strategy (most-to-least preferred):
+    Filter strategy (most-to-least preferred), top up across tiers
+    until we have `limit` candidates:
       1. validator_passed = TRUE — genomes that cleared Gate B on OOS;
-         these are the gold standard for inheritance.
+         the gold standard for inheritance.
       2. fitness > 0 — at least a positive Sharpe on training; not
          brilliant but not garbage either.
-      3. Skip fitness ≤ −50 (zero-trade penalty floor is -100; legacy
-         degenerate genomes with fitness=0.0 from the pre-penalty era
-         are also skipped because they re-compute as -100 today).
+      3. fitness > -50 — non-degenerate. Carries over the best of a
+         run even when nothing crossed zero. Hard search spaces (M1
+         majors at realistic spreads) routinely produce runs whose
+         best is still net-negative for several iterations; without
+         this tier the next run starts from canonical seeds alone and
+         all the GA progress is thrown away. The −50 floor excludes
+         the zero-trade hard penalty (−100) and the per-trade
+         shortfall floor (~−10 to −20), so only "real losing" genomes
+         qualify — not degenerate ones.
 
-    If tier 1 returns < limit, top up with tier 2. If both are empty,
-    return [] and the orchestrator falls back to canonical seeds only
-    (logged so the user knows warm-start was skipped).
+    If all three tiers are empty (e.g. fresh DB), return [] and the
+    orchestrator falls back to canonical seeds only.
 
     Returns a list of {id, dsl_json, fitness, source_run_id} dicts —
     callers compile dsl_json via StrategySpec.model_validate for the
@@ -113,6 +119,14 @@ def find_prior_winners(
         base_filters.append(models.Generation.run_id != exclude_run_id)
 
     def _query(extra_filters: list):
+        # Pull a wider pool than `limit` so the Python-side dedupe below
+        # has room to drop duplicates without exhausting candidates.
+        # Elite genomes carried across many generations of a prior run
+        # all share the same dsl_json — without this padding the top-K
+        # by fitness can be K copies of the same spec. 20× the limit is
+        # generous: real population sizes are ≤ 30, so even a fully-
+        # carryover-dominated prior run can't produce more than ~30
+        # duplicates per generation, and we usually want only 3–5.
         return (
             db.query(
                 models.StrategyGenome.id,
@@ -130,26 +144,63 @@ def find_prior_winners(
             )
             .filter(*(base_filters + extra_filters))
             .order_by(desc(models.StrategyGenome.fitness))
-            .limit(limit)
+            .limit(max(limit * 20, 100))
         )
 
+    def _spec_key(dsl_json: Any) -> str:
+        """Canonical key for dedup. JSON columns can come back as either
+        a string (older Postgres drivers) or already-parsed dict
+        (psycopg2 JSON adapter); we normalise both to a sorted-keys
+        string so byte-identical specs collide regardless of map order."""
+        import json
+
+        if isinstance(dsl_json, str):
+            try:
+                obj = json.loads(dsl_json)
+            except (TypeError, ValueError):
+                return dsl_json
+        else:
+            obj = dsl_json
+        return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+    rows: list = []
+    seen_specs: set[str] = set()  # canonical DSL keys we've already added
+
+    def _add_until_full(candidates) -> None:
+        """Append `candidates` into `rows`, skipping any whose canonical
+        spec we've already seen. Order is preserved (highest fitness
+        first within the candidate list), so the strongest representative
+        of each unique spec wins its slot — and elite genomes carried
+        across many generations of a prior run only consume ONE slot,
+        not K."""
+        for r in candidates:
+            if len(rows) >= limit:
+                return
+            key = _spec_key(r.dsl_json)
+            if key in seen_specs:
+                continue
+            seen_specs.add(key)
+            rows.append(r)
+
     # Tier 1: genomes that passed validation (Gate B on OOS).
-    tier1 = _query([models.StrategyGenome.validator_passed.is_(True)]).all()
-    rows = list(tier1)
+    _add_until_full(_query([models.StrategyGenome.validator_passed.is_(True)]).all())
 
     # Tier 2: genomes with positive training fitness (real Sharpe > 0,
     # not the zero-trade penalty floor of −100 nor the legacy
     # fitness=0.0 degenerate cases that re-compute as -100 today).
     # Top up to `limit` if tier 1 didn't fill.
     if len(rows) < limit:
-        tier2_filters = [models.StrategyGenome.fitness > 0]
-        seen = {r.id for r in rows}
-        if seen:
-            tier2_filters.append(models.StrategyGenome.id.notin_(seen))
-        for r in _query(tier2_filters).all():
-            rows.append(r)
-            if len(rows) >= limit:
-                break
+        _add_until_full(_query([models.StrategyGenome.fitness > 0]).all())
+
+    # Tier 3: best of the best, even if negative. Carries the GA's
+    # actual progress forward when a run completes without any
+    # positive-fitness genomes (the typical case on hard search
+    # spaces like M1 majors at realistic spreads). The −50 floor
+    # excludes degenerate genomes (zero-trade penalty −100) and the
+    # trade-shortfall floor (~−10 to −20), so we only keep "real
+    # losing" strategies, never broken ones.
+    if len(rows) < limit:
+        _add_until_full(_query([models.StrategyGenome.fitness > -50]).all())
 
     return [
         {
