@@ -26,7 +26,7 @@ interface TradesTableProps {
   pair: string;
 }
 
-type SortField = 'entryTimestamp' | 'direction' | 'pips' | 'netPips' | 'durationMinutes' | 'spreadCostPips' | 'swapCostPips';
+type SortField = 'entryTimestamp' | 'direction' | 'pips' | 'netPips' | 'durationMinutes' | 'spreadCostPips' | 'swapCostPips' | 'positionSize';
 type SortDirection = 'asc' | 'desc';
 
 const PAGE_SIZE = 50;
@@ -188,6 +188,16 @@ export default function TradesTable({ trades, viewMode, pair }: TradesTableProps
               </th>
               <th
                 className="px-3 py-2 text-right font-medium text-slate-600 dark:text-slate-400 cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-700/50"
+                onClick={() => handleSort('positionSize')}
+                title="Order size for this trade, in units of base currency"
+              >
+                <div className="flex items-center justify-end gap-1">
+                  Size
+                  <SortIcon field="positionSize" />
+                </div>
+              </th>
+              <th
+                className="px-3 py-2 text-right font-medium text-slate-600 dark:text-slate-400 cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-700/50"
                 onClick={() => handleSort('pips')}
               >
                 <div className="flex items-center justify-end gap-1">
@@ -270,6 +280,9 @@ export default function TradesTable({ trades, viewMode, pair }: TradesTableProps
                 <td className="px-3 py-2 text-right text-slate-700 dark:text-slate-300 font-mono text-xs">
                   {formatPrice(trade.exitPrice)}
                 </td>
+                <td className="px-3 py-2 text-right text-slate-700 dark:text-slate-300 font-mono text-xs">
+                  {(trade.positionSize ?? 0).toLocaleString()}
+                </td>
                 <td className="px-3 py-2 text-right font-mono text-xs">
                   <span
                     className={
@@ -340,16 +353,32 @@ export default function TradesTable({ trades, viewMode, pair }: TradesTableProps
       )}
 
       {/* Footer note */}
-      <p className="text-xs text-slate-500 dark:text-slate-400">
-        {viewMode === 'pips' ? (
-          <>Showing raw P&L in pips without transaction costs. Switch to "With Financing" to see net results.</>
-        ) : (
-          <>
-            Net P&L includes spread ({trades[0]?.spreadCostPips || 0.8} pips) and overnight swap costs.
-            Position size: {(trades[0]?.positionSize || 10000).toLocaleString()} units (0.1 lot).
-          </>
-        )}
-      </p>
+      {(() => {
+        const sizes = trades
+          .map((t) => t.positionSize ?? 0)
+          .filter((s) => s > 0);
+        const minSize = sizes.length ? Math.min(...sizes) : 0;
+        const maxSize = sizes.length ? Math.max(...sizes) : 0;
+        const sizeLabel =
+          minSize === maxSize
+            ? `${minSize.toLocaleString()} units`
+            : `${minSize.toLocaleString()}–${maxSize.toLocaleString()} units (varies with entry close, sized to risk per trade)`;
+        return (
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            {viewMode === 'pips' ? (
+              <>
+                Showing raw P&L in pips without transaction costs. Switch to
+                "Dollars" to see net results. Order size: {sizeLabel}.
+              </>
+            ) : (
+              <>
+                Net P&L includes spread ({trades[0]?.spreadCostPips || 0.8}{' '}
+                pips) and overnight swap costs. Order size: {sizeLabel}.
+              </>
+            )}
+          </p>
+        );
+      })()}
     </div>
   );
 }

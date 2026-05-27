@@ -221,12 +221,15 @@ class TestOptimizerPipelineBasics:
         """Test Gate B threshold evaluation logic."""
         from src.agentfx.agents.optimizer import evaluate_gate_b
 
-        # All passing metrics
+        # All passing metrics — includes `cagr` because Gate B grew a
+        # min_cagr threshold (default 15%/yr) in a606ce4. Missing the
+        # field used to default to -1.0 and silently fail this assertion.
         passing_metrics = {
             "sharpe": 1.5,
             "max_drawdown": 0.05,
             "hit_rate": 0.55,
             "n_trades": 500,
+            "cagr": 0.20,
         }
         passes, failures = evaluate_gate_b(passing_metrics)
         assert passes is True
@@ -238,21 +241,23 @@ class TestOptimizerPipelineBasics:
             "max_drawdown": 0.05,
             "hit_rate": 0.55,
             "n_trades": 500,
+            "cagr": 0.20,
         }
         passes, failures = evaluate_gate_b(failing_metrics)
         assert passes is False
         assert any("Sharpe" in f for f in failures)
 
-        # Multiple failures
+        # Multiple failures across all 5 thresholds
         all_failing_metrics = {
             "sharpe": 0.5,
             "max_drawdown": 0.15,  # Above 10%
             "hit_rate": 0.40,  # Below 48%
             "n_trades": 100,  # Below 300
+            "cagr": 0.05,  # Below 15%
         }
         passes, failures = evaluate_gate_b(all_failing_metrics)
         assert passes is False
-        assert len(failures) == 4
+        assert len(failures) == 5
 
     def test_parameter_normalization(self):
         """Test parameter normalization and denormalization."""

@@ -169,13 +169,24 @@ start-all:
 
 # --- Docker Development ---
 # Run the full stack in Docker (same image as Railway)
-# Usage: make docker-up PROFILE=dev   # Development stack (ports 8000/5173/5432)
-#        make docker-up PROFILE=test  # Test stack (ports 8001/5174/5433, ingestion off)
+#
+# Usage:
+#   make docker-up PROFILE=dev    # Development stack (ports 8000/5173/5432)
+#   make docker-up PROFILE=test   # Test stack (ports 8001/5174/5433, ingestion OFF — E2E default)
+#   make docker-up PROFILE=test INGESTION_ENABLED=true BACKFILL_DAYS=365
+#                                 # Acceptance/exploratory stack with real OANDA backfill
+#
 # Credentials loaded from .env.development / .env.test automatically.
+# The INGESTION_ENABLED / BACKFILL_DAYS toggles are read by docker-compose.yml
+# via ${VAR:-default} substitution, so the same compose file serves both
+# E2E (off, default) and acceptance/exploratory runs (on, opt-in) — no
+# hardcoded values.
 PROFILE?=dev
+INGESTION_ENABLED?=false
+BACKFILL_DAYS?=7
 
 docker-up:
-	docker compose --profile $(PROFILE) up --build -d
+	INGESTION_ENABLED=$(INGESTION_ENABLED) BACKFILL_DAYS=$(BACKFILL_DAYS) docker compose --profile $(PROFILE) up --build -d
 
 docker-down:
 	docker compose --profile $(PROFILE) down
@@ -190,7 +201,7 @@ docker-restart:
 	docker compose restart $(if $(filter test,$(PROFILE)),backend-test,backend)
 
 docker-rebuild:
-	docker compose --profile $(PROFILE) up --build -d $(if $(filter test,$(PROFILE)),backend-test,backend)
+	INGESTION_ENABLED=$(INGESTION_ENABLED) BACKFILL_DAYS=$(BACKFILL_DAYS) docker compose --profile $(PROFILE) up --build -d $(if $(filter test,$(PROFILE)),backend-test,backend)
 
 # --- E2E Testing ---
 # Run full E2E test suite (starts servers, runs tests, cleans up)

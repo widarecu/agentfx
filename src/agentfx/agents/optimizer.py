@@ -17,53 +17,15 @@ from typing import Any
 import numpy as np
 
 from agentfx.agents.base import AgentResult, BaseAgent
+
+# Re-export Gate B symbols (PEP 484 explicit re-export via `as`-alias) so v0.2.0
+# callers that imported them from agentfx.agents.optimizer continue to work.
+# Canonical location is now agentfx.core.gates.
+from agentfx.core.gates import GATE_B_THRESHOLDS as GATE_B_THRESHOLDS  # noqa: PLC0414
+from agentfx.core.gates import evaluate_gate_b as evaluate_gate_b  # noqa: PLC0414
 from agentfx.services.backtest import run_backtest, run_backtest_from_db
 
 logger = logging.getLogger(__name__)
-
-# Gate B thresholds for strategy validation
-GATE_B_THRESHOLDS = {
-    "sharpe_min": 1.0,
-    "max_drawdown": 0.10,  # 10%
-    "hit_rate_min": 0.48,  # 48%
-    "min_trades": 300,
-}
-
-
-def evaluate_gate_b(metrics: dict) -> tuple[bool, list[str]]:
-    """Evaluate if metrics pass Gate B thresholds.
-
-    Args:
-        metrics: Performance metrics from backtest
-
-    Returns:
-        Tuple of (passes: bool, failures: list of failure messages)
-    """
-    failures = []
-
-    sharpe = metrics.get("sharpe", 0)
-    if sharpe < GATE_B_THRESHOLDS["sharpe_min"]:
-        failures.append(f"Sharpe {sharpe:.2f} < {GATE_B_THRESHOLDS['sharpe_min']}")
-
-    max_dd = metrics.get("max_drawdown", 1.0)
-    if max_dd > GATE_B_THRESHOLDS["max_drawdown"]:
-        failures.append(
-            f"Max DD {max_dd * 100:.1f}% > {GATE_B_THRESHOLDS['max_drawdown'] * 100}%"
-        )
-
-    hit_rate = metrics.get("hit_rate", 0)
-    if hit_rate < GATE_B_THRESHOLDS["hit_rate_min"]:
-        failures.append(
-            f"Hit Rate {hit_rate * 100:.1f}% < {GATE_B_THRESHOLDS['hit_rate_min'] * 100}%"
-        )
-
-    trade_count = metrics.get("n_trades", 0)
-    if trade_count < GATE_B_THRESHOLDS["min_trades"]:
-        failures.append(
-            f"Trade Count {trade_count} < {GATE_B_THRESHOLDS['min_trades']}"
-        )
-
-    return len(failures) == 0, failures
 
 
 class OptimizerAgent(BaseAgent):

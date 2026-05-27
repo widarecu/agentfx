@@ -1,147 +1,276 @@
+"""Validator agent — walk-forward + Gate B on held-out OOS fold.
+
+The orchestrator calls this agent on the top-K genomes after the
+generation loop completes. The validator runs each genome on every fold
+(records metrics for the audit trail) but **only the OOS fold's metrics
+gate promotion** — Gate B is enforced on the held-out final fold the GA
+never saw during fitness evaluation.
+
+The integrity guarantee: the GA's fitness function (in
+`agents.evolution.fitness`) operates on `training_window(folds)`, and
+this validator operates on `oos_window(folds)`. They never overlap, by
+construction. Tests in `tests/unit/core/test_validation.py` enforce the
+non-overlap.
+
+See `planning/requirements/US-004-walk-forward-validation.md` for the full
+contract.
 """
-Validation Agent
 
-Validates strategies against Gate B thresholds using walk-forward testing.
+from __future__ import annotations
 
-See: planning/requirements/US-003 (to be created)
-
-Gate B Thresholds (from MVP_CONSTRAINTS.md):
-- Sharpe ratio >= 1.0
-- Max drawdown <= 10%
-- Hit rate >= 48%
-- Minimum 300 trades in out-of-sample period
-"""
-
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 
 from agentfx.agents.base import AgentResult, BaseAgent
+from agentfx.core.dsl import StrategySpec
+from agentfx.core.gates import evaluate_gate_b
+from agentfx.core.validation import (
+    WalkForwardFold,
+    make_walk_forward_folds,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class BacktestFn(Protocol):
+    """Shape the validator's backtest dependency must satisfy. Production
+    uses `agentfx.services.backtest.run_backtest_from_db`; tests inject a
+    mock."""
+
+    def __call__(
+        self,
+        instrument: str,
+        granularity: str,
+        start: datetime | None,
+        end: datetime | None,
+        strategy_name: str,
+        strategy_params: dict | None,
+        **extra: Any,
+    ) -> dict[str, Any]: ...
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Result types
+# ─────────────────────────────────────────────────────────────────────────
 
 
 @dataclass
-class GateBThresholds:
-    """Gate B validation thresholds."""
+class FoldEvaluation:
+    """Metrics for one genome on one fold.
 
-    min_sharpe: float = 1.0
-    max_drawdown: float = 0.10  # 10%
-    min_hit_rate: float = 0.48  # 48%
-    min_trades: int = 300
-    min_oos_days: int = 180  # 6 months
+    Persisted as a `validation_fold` row by the orchestrator (see
+    `api/models/evolution.py`).
+    """
+
+    fold: WalkForwardFold
+    metrics: dict[str, Any]
+    passed_gate_b: bool
+    gate_b_failures: list[str]
+
+    @property
+    def is_oos(self) -> bool:
+        return self.fold.is_oos
+
+
+@dataclass
+class ValidationResult:
+    """The output of validating one genome against a walk-forward split."""
+
+    spec: StrategySpec
+    folds: list[FoldEvaluation]
+    validator_passed: bool  # True iff Gate B passes on the OOS fold
+    validation_failures: list[str] = field(default_factory=list)
+
+    @property
+    def oos_evaluation(self) -> FoldEvaluation:
+        """The held-out fold's evaluation — the one Gate B is enforced on."""
+        for fold_eval in self.folds:
+            if fold_eval.is_oos:
+                return fold_eval
+        raise RuntimeError("ValidationResult has no OOS fold — should be impossible")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Validator agent
+# ─────────────────────────────────────────────────────────────────────────
 
 
 class ValidatorAgent(BaseAgent):
+    """Walk-forward validator that enforces Gate B on the held-out OOS fold.
+
+    Replaces the v0.2.0-era stub. Now consumes a `StrategySpec` (the v0.3.0
+    DSL genome) — not the legacy named-strategy pair, though the underlying
+    backtest dispatch path supports both.
+
+    The agent does **not** evolve, optimize, or mutate. It only judges:
+
+    1. Split the requested window into K folds via `make_walk_forward_folds`.
+    2. Run the genome's backtest on each fold (yes, including the training
+       folds — those metrics are recorded for the audit trail in
+       `validation_fold` rows; they don't gate promotion).
+    3. Apply Gate B (`evaluate_gate_b` from `core/gates.py`) on the OOS
+       fold's metrics. The genome passes iff Gate B passes there.
     """
-    Validator agent that runs walk-forward validation with Gate B enforcement.
 
-    Validates a strategy configuration against thresholds before
-    allowing promotion to paper trading.
-
-    Usage:
-        agent = ValidatorAgent()
-        result = agent.run(
-            strategy="ma",
-            pair="EURUSD",
-            params={"fast": 10, "slow": 50},
-            data_root="/path/to/data",
-        )
-    """
-
-    def __init__(self, thresholds: GateBThresholds | None = None, **kwargs):
+    def __init__(
+        self,
+        backtest_fn: BacktestFn | None = None,
+        k: int = 4,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
-        self.thresholds = thresholds or GateBThresholds()
+        self.k = int(k)
+        if self.k < 2:
+            raise ValueError(f"k must be >= 2 (got {self.k})")
+        self._backtest_fn = backtest_fn  # lazy default in run()
 
     @property
     def agent_type(self) -> str:
         return "validator"
 
     def validate_inputs(self, **kwargs) -> tuple[bool, list[str]]:
-        """Validate validation inputs."""
-        errors = []
-
-        if "strategy" not in kwargs:
-            errors.append("strategy is required")
-        if "pair" not in kwargs:
-            errors.append("pair is required")
-        if "params" not in kwargs:
-            errors.append("params is required")
-        if "data_root" not in kwargs:
-            errors.append("data_root is required")
-
+        errors: list[str] = []
+        for required in ("spec", "instrument", "start", "end"):
+            if kwargs.get(required) is None:
+                errors.append(f"{required} is required")
+        spec = kwargs.get("spec")
+        if spec is not None and not isinstance(spec, StrategySpec):
+            errors.append(
+                f"spec must be a StrategySpec instance, got {type(spec).__name__}"
+            )
         return len(errors) == 0, errors
 
-    def _check_thresholds(self, metrics: dict[str, Any]) -> tuple[bool, list[str]]:
-        """Check if metrics pass Gate B thresholds."""
-        failures = []
+    # ── Main entry ──────────────────────────────────────────────────
 
-        sharpe = metrics.get("sharpe", 0)
-        if sharpe < self.thresholds.min_sharpe:
-            failures.append(
-                f"Sharpe {sharpe:.2f} < {self.thresholds.min_sharpe} (required)"
-            )
-
-        max_dd = abs(metrics.get("max_drawdown", 1.0))
-        if max_dd > self.thresholds.max_drawdown:
-            failures.append(
-                f"Max drawdown {max_dd:.1%} > {self.thresholds.max_drawdown:.1%} (limit)"
-            )
-
-        hit_rate = metrics.get("hit_rate", 0)
-        if hit_rate < self.thresholds.min_hit_rate:
-            failures.append(
-                f"Hit rate {hit_rate:.1%} < {self.thresholds.min_hit_rate:.1%} (required)"
-            )
-
-        trade_count = metrics.get("trade_count", 0)
-        if trade_count < self.thresholds.min_trades:
-            failures.append(
-                f"Trade count {trade_count} < {self.thresholds.min_trades} (required)"
-            )
-
-        return len(failures) == 0, failures
-
-    def run(
+    def validate(
         self,
-        strategy: str,
-        pair: str,
-        params: dict[str, Any],
-        data_root: str,
-        **kwargs,
-    ) -> AgentResult:
-        """
-        Run walk-forward validation with Gate B checks.
+        spec: StrategySpec,
+        *,
+        instrument: str,
+        granularity: str = "M1",
+        start: datetime,
+        end: datetime,
+        backtest_fn: BacktestFn | None = None,
+        gate_b_overrides: dict[str, float] | None = None,
+        **backtest_kwargs: Any,
+    ) -> ValidationResult:
+        """Validate a single genome. The lower-level entry — returns a
+        typed `ValidationResult` rather than the framework `AgentResult`.
 
-        Args:
-            strategy: Strategy name
-            pair: Currency pair
-            params: Strategy parameters
-            data_root: Path to market data
-
-        Returns:
-            AgentResult with pass/fail status and threshold checks
+        The orchestrator generally uses `validate(...)` directly; the
+        framework `run(...)` wrapper exists for parity with the BaseAgent
+        contract (and for callers that want a uniform AgentResult).
         """
+        fn = backtest_fn or self._backtest_fn or _default_backtest_fn
+
+        folds = make_walk_forward_folds(start=start, end=end, k=self.k)
+        spec_params = {"spec": spec.model_dump(mode="json")}
+
+        fold_evaluations: list[FoldEvaluation] = []
+        for fold in folds:
+            result = fn(
+                instrument=instrument,
+                granularity=granularity,
+                start=fold.start,
+                end=fold.end,
+                strategy_name="dsl",
+                strategy_params=spec_params,
+                **backtest_kwargs,
+            )
+            metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
+            passed, failures = evaluate_gate_b(metrics, overrides=gate_b_overrides)
+            fold_evaluations.append(
+                FoldEvaluation(
+                    fold=fold,
+                    metrics=metrics,
+                    passed_gate_b=passed,
+                    gate_b_failures=failures,
+                )
+            )
+
+        # Gate B is ENFORCED on the OOS fold only. Training-fold Gate B
+        # results are informational (recorded for the audit trail).
+        oos_eval = next(fe for fe in fold_evaluations if fe.is_oos)
+
+        return ValidationResult(
+            spec=spec,
+            folds=fold_evaluations,
+            validator_passed=oos_eval.passed_gate_b,
+            validation_failures=oos_eval.gate_b_failures,
+        )
+
+    def run(self, **kwargs) -> AgentResult:
+        """BaseAgent contract entry point — wraps `validate(...)` in an
+        AgentResult."""
         self.started_at = datetime.utcnow()
 
-        # Validate inputs
-        is_valid, errors = self.validate_inputs(
-            strategy=strategy,
-            pair=pair,
-            params=params,
-            data_root=data_root,
-        )
+        is_valid, errors = self.validate_inputs(**kwargs)
         if not is_valid:
             return self._create_result("failed", {}, errors)
 
-        # TODO: Implement walk-forward validation
-        # For now, return placeholder result
-        outputs = {
-            "strategy": strategy,
-            "pair": pair,
-            "params": params,
-            "validation_type": "walk_forward",
-            "gate_b_pass": False,
-            "threshold_checks": [],
-            "message": "Validator agent not yet implemented",
-        }
+        try:
+            result = self.validate(
+                spec=kwargs["spec"],
+                instrument=kwargs["instrument"],
+                granularity=kwargs.get("granularity", "M1"),
+                start=kwargs["start"],
+                end=kwargs["end"],
+                backtest_fn=kwargs.get("backtest_fn"),
+                **{
+                    k: v
+                    for k, v in kwargs.items()
+                    if k
+                    not in (
+                        "spec",
+                        "instrument",
+                        "granularity",
+                        "start",
+                        "end",
+                        "backtest_fn",
+                    )
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("validator crashed")
+            return self._create_result("failed", {}, [str(e)])
 
-        return self._create_result("failed", outputs, ["Not yet implemented"])
+        outputs = {
+            "validator_passed": result.validator_passed,
+            "validation_failures": result.validation_failures,
+            "fold_metrics": [
+                {
+                    "fold_index": fe.fold.index,
+                    "fold_start": fe.fold.start.isoformat(),
+                    "fold_end": fe.fold.end.isoformat(),
+                    "is_oos": fe.is_oos,
+                    "metrics": fe.metrics,
+                    "passed_gate_b": fe.passed_gate_b,
+                }
+                for fe in result.folds
+            ],
+        }
+        return self._create_result(
+            "success" if result.validator_passed else "partial",
+            outputs,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Default backtest function (lazy import to keep test paths clean)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _default_backtest_fn(**kwargs: Any) -> dict[str, Any]:
+    from agentfx.services.backtest import run_backtest_from_db
+
+    return run_backtest_from_db(**kwargs)
+
+
+__all__ = [
+    "BacktestFn",
+    "FoldEvaluation",
+    "ValidationResult",
+    "ValidatorAgent",
+]

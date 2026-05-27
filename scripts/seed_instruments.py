@@ -104,6 +104,24 @@ _FALLBACK_PATH = (
     Path(__file__).resolve().parent.parent / "config" / "financing_fallback.yaml"
 )
 
+_SPREAD_FALLBACK_PATH = (
+    Path(__file__).resolve().parent.parent / "config" / "spread_fallback.yaml"
+)
+
+
+def _load_spread_fallback() -> dict[str, float]:
+    """Load static typical-spread fallbacks keyed by symbol (pips)."""
+    try:
+        with _SPREAD_FALLBACK_PATH.open() as f:
+            data = yaml.safe_load(f) or {}
+        return data.get("spread_fallback", {}) or {}
+    except FileNotFoundError:
+        logger.warning(f"Spread fallback file not found at {_SPREAD_FALLBACK_PATH}")
+        return {}
+    except Exception as e:
+        logger.warning(f"Could not parse {_SPREAD_FALLBACK_PATH}: {e}")
+        return {}
+
 
 def _load_financing_fallback() -> dict[str, dict[str, float]]:
     """Load the static fallback rates keyed by symbol.
@@ -214,6 +232,103 @@ def refresh_financing_rates() -> dict[str, int]:
     }
 
 
+def refresh_typical_spreads() -> dict[str, int]:
+    """Snapshot OANDA's live bid/ask spread per supported instrument.
+
+    Mirrors the financing-rate refresh pattern: tries the live pricing
+    endpoint first, falls back to config/spread_fallback.yaml on error
+    (closed market, network issue, untradeable instrument). The DB row's
+    `typical_spread_updated_at` records when the snapshot was taken so
+    callers can detect stale data.
+
+    Returns:
+        Dictionary with counts: refreshed, fallback_used, failed, skipped.
+    """
+    if not settings.OANDA_API_KEY or not settings.OANDA_ACCOUNT_ID:
+        logger.warning(
+            "OANDA_API_KEY or OANDA_ACCOUNT_ID not set — skipping spread refresh."
+        )
+        return {
+            "refreshed": 0,
+            "fallback_used": 0,
+            "failed": 0,
+            "skipped": len(SUPPORTED_INSTRUMENTS),
+        }
+
+    try:
+        client = OandaClient()
+    except OandaError as e:
+        logger.warning(f"Could not initialise OandaClient: {e}")
+        return {
+            "refreshed": 0,
+            "fallback_used": 0,
+            "failed": len(SUPPORTED_INSTRUMENTS),
+            "skipped": 0,
+        }
+
+    fallback_table = _load_spread_fallback()
+
+    db = SessionLocal()
+    refreshed = 0
+    fallback_used = 0
+    failed = 0
+    skipped = 0
+
+    try:
+        for instr_data in SUPPORTED_INSTRUMENTS:
+            symbol = instr_data["symbol"]
+            row = db.query(Instrument).filter(Instrument.symbol == symbol).first()
+            if row is None:
+                logger.warning(
+                    f"{symbol}: no row in instruments table — run seed first."
+                )
+                skipped += 1
+                continue
+
+            spread_pips: float | None = None
+            fetched_at = datetime.now(UTC)
+            try:
+                snap = client.get_instrument_spread(symbol)
+                spread_pips = float(snap["spread_pips"])
+                fetched_at = snap.get("fetched_at", fetched_at)
+                logger.info(
+                    f"{symbol}: live spread = {spread_pips:.3f} pips "
+                    f"(bid={snap['bid']}, ask={snap['ask']})"
+                )
+            except OandaError as e:
+                # Live snapshot failed (likely closed market) — try fallback.
+                if symbol in fallback_table:
+                    spread_pips = float(fallback_table[symbol])
+                    logger.warning(
+                        f"{symbol}: live spread fetch failed ({e}); "
+                        f"using published fallback = {spread_pips:.3f} pips"
+                    )
+                    fallback_used += 1
+                else:
+                    logger.warning(
+                        f"{symbol}: live spread fetch failed and no fallback "
+                        f"available ({e})"
+                    )
+                    failed += 1
+                    continue
+
+            row.typical_spread_pips = spread_pips
+            row.typical_spread_updated_at = fetched_at
+            refreshed += 1
+
+        db.commit()
+
+    finally:
+        db.close()
+
+    return {
+        "refreshed": refreshed,
+        "fallback_used": fallback_used,
+        "failed": failed,
+        "skipped": skipped,
+    }
+
+
 def main():
     """Main entry point for the instrument seeder."""
     parser = argparse.ArgumentParser(
@@ -229,6 +344,16 @@ def main():
         action="store_true",
         help="Seed metadata only; do not call OANDA for financing rates.",
     )
+    parser.add_argument(
+        "--refresh-spreads",
+        action="store_true",
+        help="Skip metadata seed; only refresh typical-spread snapshots.",
+    )
+    parser.add_argument(
+        "--skip-spreads",
+        action="store_true",
+        help="Seed metadata only; do not snapshot OANDA spreads.",
+    )
     args = parser.parse_args()
 
     logger.info("=" * 60)
@@ -238,7 +363,7 @@ def main():
     logger.info(f"Database URL: {settings.DATABASE_URL[:50]}...")
     logger.info("")
 
-    if not args.refresh_financing:
+    if not args.refresh_financing and not args.refresh_spreads:
         logger.info("Step 1: seeding instrument metadata")
         results = seed_instruments()
         logger.info("")
@@ -247,7 +372,7 @@ def main():
         logger.info(f"  Skipped: {results['skipped']} instruments (already exist)")
         logger.info("")
 
-    if not args.skip_financing:
+    if not args.skip_financing and not args.refresh_spreads:
         logger.info("Step 2: refreshing OANDA financing rates")
         fin_results = refresh_financing_rates()
         logger.info("")
@@ -258,6 +383,17 @@ def main():
         )
         logger.info(f"  Failed:        {fin_results['failed']} instruments")
         logger.info(f"  Skipped:       {fin_results['skipped']} instruments")
+        logger.info("")
+
+    if not args.skip_spreads and not args.refresh_financing:
+        logger.info("Step 3: snapshotting OANDA typical spreads")
+        sp_results = refresh_typical_spreads()
+        logger.info("")
+        logger.info("Spread Summary")
+        logger.info(f"  Refreshed:     {sp_results['refreshed']} instruments")
+        logger.info(f"  Fallback used: {sp_results['fallback_used']} instruments")
+        logger.info(f"  Failed:        {sp_results['failed']} instruments")
+        logger.info(f"  Skipped:       {sp_results['skipped']} instruments")
     logger.info("=" * 60)
 
     return 0

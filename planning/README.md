@@ -100,13 +100,24 @@ requirements/       → Executable user stories
 | [US-012](requirements/US-012-remove-broken-rundetail.md) | Remove broken RunDetail navigation | DONE |
 | [TECH-010](requirements/TECH-010-fix-test-infrastructure.md) | Fix test infrastructure | DONE |
 
-### v0.2.0 Requirements (Planned)
+### v0.2.0 Requirements (Functionally complete)
 
 | Requirement | Description | Status |
 |-------------|-------------|--------|
-| [US-013](requirements/US-013-websocket-streaming.md) | Real-time WebSocket streaming (deferred from v0.1.0) | TODO |
-| [US-001](requirements/US-001-optimization-runs.md) | Create and run optimization jobs | TODO |
-| [US-002](requirements/US-002-view-optimization.md) | View optimization results | TODO |
+| [US-013](requirements/US-013-websocket-streaming.md) | Real-time WebSocket streaming (deferred from v0.1.0) | DEFERRED |
+| [US-001](requirements/US-001-optimization-runs.md) | Create and run optimization jobs | DONE |
+| [US-002](requirements/US-002-view-optimization.md) | View optimization results | DONE |
+| [US-015](requirements/US-015-visualization.md) | Strategy visualization (candlestick + signals + indicators) | DONE |
+
+### v0.3.0 Requirements (Autonomous Strategy Loop — in progress)
+
+| Requirement | Description | Status |
+|-------------|-------------|--------|
+| [US-003](requirements/US-003-evolution-run-lifecycle.md) | Evolution run lifecycle (start, schedule, stop conditions, crash recovery) | TODO |
+| [US-004](requirements/US-004-walk-forward-validation.md) | Walk-forward validation with held-out OOS fold + Gate B | TODO |
+| [US-005](requirements/US-005-llm-hypothesis-injection.md) | LLM-driven hypothesis injection via Anthropic SDK with prompt caching, structured output, budget cap | TODO |
+| [US-006](requirements/US-006-strategy-dsl.md) | Strategy DSL grammar + compiler + indicator catalog + gen-0 seeds | TODO |
+| [US-016](requirements/US-016-evolution-observability.md) | Decision log + evolution-run portal observability (DSL tree renderer, lineage, LLM reasoning) | TODO |
 
 ---
 
@@ -158,11 +169,12 @@ requirements/       → Executable user stories
 | Version | Theme | Status |
 |---------|-------|--------|
 | v0.1.0 | Foundation (Auth, Market Data) | DONE |
-| v0.2.0 | Parameter Optimizer Agent | TODO |
-| v0.3.0 | Validation Agent | TODO |
-| v0.4.0 | Discovery Agent | TODO |
-| v0.5.0 | Orchestrator & Evolution | TODO |
-| v1.0.0 | Production Autonomy | TODO |
+| v0.2.0 | Parameter Optimizer Agent | DONE (functionally complete; pending P2 export, coverage-gate decision) |
+| v0.3.0 | Autonomous Strategy Loop (LLM+GA discovery + walk-forward validation + scheduled orchestrator) | IN PROGRESS |
+| v0.4.0 | Capability Expansion (more indicators, multi-symbol, regime context) | TODO |
+| v0.5.0 | Self-Improvement (cross-run learning, drift detection) | TODO |
+| v0.6.0 | Paper Trading (OANDA Practice with approval gate) | TODO |
+| v1.0.0 | Live Trading + Portfolio | TODO |
 
 ---
 

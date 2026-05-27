@@ -520,10 +520,14 @@ class OptimizationApiService {
     exitPrice: trade.exit_price ?? trade.exitPrice,
     pips: trade.pips,
     spreadCostPips: trade.spread_cost_pips ?? trade.spreadCostPips,
+    slippageCostPips:
+      trade.slippage_cost_pips ?? trade.slippageCostPips ?? 0,
     swapCostPips: trade.swap_cost_pips ?? trade.swapCostPips,
     netPips: trade.net_pips ?? trade.netPips,
     grossPnlDollars: trade.gross_pnl_dollars ?? trade.grossPnlDollars,
     spreadCostDollars: trade.spread_cost_dollars ?? trade.spreadCostDollars,
+    slippageCostDollars:
+      trade.slippage_cost_dollars ?? trade.slippageCostDollars ?? 0,
     swapCostDollars: trade.swap_cost_dollars ?? trade.swapCostDollars,
     netPnlDollars: trade.net_pnl_dollars ?? trade.netPnlDollars,
     durationMinutes: trade.duration_minutes ?? trade.durationMinutes,

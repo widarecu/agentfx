@@ -31,6 +31,7 @@ class TestGateBEvaluation:
             "max_drawdown": 0.05,
             "hit_rate": 0.55,
             "n_trades": 500,
+            "cagr": 0.20,
         }
         passes, failures = evaluate_gate_b(metrics)
         assert passes is True
@@ -43,6 +44,7 @@ class TestGateBEvaluation:
             "max_drawdown": 0.05,
             "hit_rate": 0.55,
             "n_trades": 500,
+            "cagr": 0.20,
         }
         passes, failures = evaluate_gate_b(metrics)
         assert passes is False
@@ -56,6 +58,7 @@ class TestGateBEvaluation:
             "max_drawdown": 0.15,  # Above 10% threshold
             "hit_rate": 0.55,
             "n_trades": 500,
+            "cagr": 0.20,
         }
         passes, failures = evaluate_gate_b(metrics)
         assert passes is False
@@ -69,6 +72,7 @@ class TestGateBEvaluation:
             "max_drawdown": 0.05,
             "hit_rate": 0.40,  # Below 48% threshold
             "n_trades": 500,
+            "cagr": 0.20,
         }
         passes, failures = evaluate_gate_b(metrics)
         assert passes is False
@@ -82,6 +86,7 @@ class TestGateBEvaluation:
             "max_drawdown": 0.05,
             "hit_rate": 0.55,
             "n_trades": 100,  # Below 300 threshold
+            "cagr": 0.20,
         }
         passes, failures = evaluate_gate_b(metrics)
         assert passes is False
@@ -95,10 +100,11 @@ class TestGateBEvaluation:
             "max_drawdown": 0.20,
             "hit_rate": 0.30,
             "n_trades": 50,
+            "cagr": 0.05,
         }
         passes, failures = evaluate_gate_b(metrics)
         assert passes is False
-        assert len(failures) == 4
+        assert len(failures) == 5
 
     def test_handles_missing_metrics_gracefully(self):
         """Test that missing metrics default to failing values."""
@@ -466,6 +472,7 @@ class TestBayesianOptimizerAgentRun:
                 "max_drawdown": 0.05,
                 "hit_rate": 0.55,
                 "n_trades": 500,
+                "cagr": 0.20,
             },
             "signals": [],
             "trades": [],

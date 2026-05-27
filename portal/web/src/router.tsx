@@ -7,6 +7,10 @@ import MarketData from './pages/MarketData'
 import Optimization from './pages/Optimization'
 import OptimizationDetail from './pages/OptimizationDetail'
 import TrialDetail from './pages/TrialDetail'
+import EvolutionRuns from './pages/EvolutionRuns'
+import EvolutionRunDetail from './pages/EvolutionRunDetail'
+import GenomeDetail from './pages/GenomeDetail'
+import GenomeBacktest from './pages/GenomeBacktest'
 import { ProtectedRoute } from './components/ProtectedRoute'
 
 export const router = createBrowserRouter([
@@ -31,6 +35,11 @@ export const router = createBrowserRouter([
       { path: 'optimization', element: <Optimization /> },
       { path: 'optimization/:jobId', element: <OptimizationDetail /> },
       { path: 'optimization/:jobId/trials/:trialId', element: <TrialDetail /> },
+      // v0.3.0 — Autonomous Strategy Evolution
+      { path: 'evolution', element: <EvolutionRuns /> },
+      { path: 'evolution/:runId', element: <EvolutionRunDetail /> },
+      { path: 'evolution/:runId/genomes/:genomeId', element: <GenomeDetail /> },
+      { path: 'evolution/:runId/genomes/:genomeId/backtest', element: <GenomeBacktest /> },
     ],
   },
 ], {

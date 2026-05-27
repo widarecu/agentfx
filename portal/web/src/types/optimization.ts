@@ -3,12 +3,16 @@
  * These define the data structures for optimization jobs, trials, and visualization.
  */
 
-// Gate B threshold constants for validation
+// Gate B threshold constants for validation. Mirrors the backend
+// defaults in src/agentfx/core/gates.py; per-run overrides flow
+// through the run's config_json and are read from the run detail
+// rather than this constant.
 export const GATE_B_THRESHOLDS = {
   SHARPE_MIN: 1.0,
   MAX_DRAWDOWN: 0.10, // 10%
   HIT_RATE_MIN: 0.48, // 48%
   MIN_TRADES: 300,
+  MIN_CAGR: 0.15, // 15% net annualised return per year
 } as const;
 
 // Strategy types supported by the optimizer
@@ -96,15 +100,17 @@ export interface Trade {
   // Results without financing (raw strategy performance)
   pips: number; // P&L in pips (1 pip = 0.0001 for most pairs, 0.01 for JPY pairs)
   // Financing/costs
-  spreadCostPips: number; // Spread cost in pips (charged on entry)
+  spreadCostPips: number; // OANDA spread paid once over the round trip
+  slippageCostPips: number; // Execution slippage on entry + exit (2 × per-side)
   swapCostPips: number; // Overnight financing cost in pips (cumulative)
   // Results with financing (real-world P&L)
-  netPips: number; // pips - spreadCostPips - swapCostPips
+  netPips: number; // pips - spreadCostPips - slippageCostPips - swapCostPips
   // Dollar values (based on position size)
   grossPnlDollars: number; // P&L in dollars without costs
   spreadCostDollars: number;
+  slippageCostDollars: number;
   swapCostDollars: number;
-  netPnlDollars: number; // grossPnlDollars - spreadCostDollars - swapCostDollars
+  netPnlDollars: number; // grossPnlDollars - spreadCostDollars - slippageCostDollars - swapCostDollars
   // Metadata
   durationMinutes: number;
   positionSize: number; // Units (e.g., 10000 = 0.1 lot)
@@ -183,7 +189,9 @@ export function evaluateGateB(metrics: TrialMetrics): { passes: boolean; failure
   }
 
   if (metrics.maxDrawdown > GATE_B_THRESHOLDS.MAX_DRAWDOWN) {
-    failures.push(`Max DD ${(metrics.maxDrawdown * 100).toFixed(1)}% > ${GATE_B_THRESHOLDS.MAX_DRAWDOWN * 100}%`);
+    failures.push(
+      `Max DD ${(Math.abs(metrics.maxDrawdown) * 100).toFixed(1)}% > ${GATE_B_THRESHOLDS.MAX_DRAWDOWN * 100}%`,
+    );
   }
 
   if (metrics.hitRate < GATE_B_THRESHOLDS.HIT_RATE_MIN) {
@@ -203,6 +211,17 @@ export function evaluateGateB(metrics: TrialMetrics): { passes: boolean; failure
 // Format helpers
 export function formatPercent(value: number, decimals: number = 1): string {
   return `${(value * 100).toFixed(decimals)}%`;
+}
+
+/**
+ * Render a metric as a positive-magnitude percentage. Used for inherently
+ * negative metrics like Max Drawdown where the minus sign carries no
+ * information (a drawdown is a loss by definition) and the negative-vs-
+ * positive-threshold comparison reads as a contradiction. "MaxDD 3.8%,
+ * cap 10%" matches how traders describe these values verbally.
+ */
+export function formatPercentMagnitude(value: number, decimals: number = 1): string {
+  return `${(Math.abs(value) * 100).toFixed(decimals)}%`;
 }
 
 export function formatSharpe(value: number | null | undefined): string {

@@ -49,9 +49,10 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 
 ---
 
-## v0.2.0 - Bayesian Parameter Optimizer Agent
+## v0.2.0 - Bayesian Parameter Optimizer Agent (FUNCTIONALLY COMPLETE)
 
 **Theme:** First autonomous capability
+**Status:** All exit criteria met. 604 tests passed (unit + integration + E2E) on 2026-05-04. See BACKLOG.md for caveats (coverage gate, per-pair spread, GP runtime warnings) and pending P2 export.
 
 **Goal:** System can autonomously optimize strategy parameters using Bayesian optimization and identify profitable configurations with interactive visualization.
 
@@ -65,89 +66,113 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 **User Stories:** [US-001](requirements/US-001-optimization-runs.md), [US-002](requirements/US-002-view-optimization.md), [US-015](requirements/US-015-visualization.md)
 
 **Exit Criteria:**
-- [ ] Backtest service reads from PostgreSQL candles table (existing v0.1.0 infrastructure)
-- [ ] Bayesian optimizer runs autonomously (agent determines optimal iteration count)
-- [ ] Top 3 parameter sets identified and ranked by Sharpe
-- [ ] Gate B thresholds displayed (informational, not enforced)
-- [ ] Strategy visualization with candlestick + entry/exit markers + indicators
-- [ ] User can view results in portal
+- [x] Backtest service reads from PostgreSQL candles table (`load_price_df_from_db()`)
+- [x] Bayesian optimizer runs autonomously (`_estimate_iterations(dims) = 10 + 12*dims`)
+- [x] Top 3 parameter sets identified and ranked by Sharpe (`GET /optimization-jobs/{id}/trials/top`)
+- [x] Gate B thresholds displayed (informational, not enforced) — Optimization, OptimizationDetail, TrialDetail pages
+- [x] Strategy visualization with candlestick + entry/exit markers + indicators (`StrategyChart.tsx`)
+- [x] User can view results in portal (routes wired in `router.tsx`, behind `ProtectedRoute`)
 
 ---
 
-## v0.3.0 - Validation Agent
+## v0.3.0 - Autonomous Strategy Loop
 
-**Theme:** Automated quality gates
+**Theme:** First genuinely agentic increment.
 
-**Goal:** System validates strategies against Gate B thresholds before promotion.
+**Goal:** A scheduled closed loop that discovers, evolves, and validates trading strategies without human intervention. Discovery and Validation are absorbed into this milestone — they no longer exist as separate versions.
+
+**Reference:** Full plan at `~/.claude/plans/i-think-we-need-functional-pony.md`.
 
 **Key Capabilities:**
-- Walk-forward validation with out-of-sample holdout
-- Gate B threshold enforcement (Sharpe >= 1.0, MDD <= 10%, Hit Rate >= 48%)
-- Automated pass/fail determination
-- Validation audit trail
+- Strategy DSL v1 (constrained JSON grammar over a 6-indicator catalogue) with a compiler that emits the existing `Strategy` interface
+- Genetic algorithm core (`deap>=1.4` + custom Pydantic-aware mutation/crossover) — population of 30 genomes evolved with tournament-3 selection, 10% elitism, edit-distance diversity penalty
+- LLM-driven hypothesis injection every N=3 generations via the `anthropic>=0.40` SDK with mandatory prompt caching, structured output via tool-use, hard per-run cost cap
+- Walk-forward validator (K=4 folds, final fold withheld from GA) applying Gate B (Sharpe ≥ 1.0, MDD ≤ 10%, Hit Rate ≥ 48%, ≥ 300 trades) on held-out OOS
+- Real Orchestrator that drives the loop autonomously and forks `multiprocessing.Process` per run with `resource.setrlimit()` caps for blast-radius isolation
+- Decision log: every agent step persisted to Postgres with reasoning text, queryable from the portal
+- Modular monolith on one Railway service with a pre-committed `backtest-worker` split point at >6h wall-clock or queue depth >200 sustained
 
-**User Stories:** US-003, US-004 (to be defined)
+**User Stories:** [US-003](requirements/US-003-evolution-run-lifecycle.md), [US-004](requirements/US-004-walk-forward-validation.md), [US-005](requirements/US-005-llm-hypothesis-injection.md), [US-006](requirements/US-006-strategy-dsl.md), [US-016](requirements/US-016-evolution-observability.md)
 
 **Exit Criteria:**
-- [ ] Validator blocks promotion of failing strategies
-- [ ] Validation results stored with metrics
-- [ ] Clear failure reasons provided
+- [ ] Scheduled Railway cron triggers a fresh evolution run nightly
+- [ ] Run completes unattended, hits a stop condition, persists VALIDATED genomes for human review
+- [ ] At least one VALIDATED genome differs structurally from the gen-0 seeds (system actually discovered something)
+- [ ] Decision log lets a reviewer reconstruct *why* each surviving genome was kept
+- [ ] LLM cost stays under per-run budget across 5 consecutive nightly runs
 
 ---
 
-## v0.4.0 - Discovery Agent
+## v0.4.0 - Capability Expansion
 
-**Theme:** Autonomous hypothesis generation
+**Theme:** Grow the discovery surface area now that the loop works.
 
-**Goal:** System proposes new strategy configurations to test.
+**Goal:** Make the autonomous loop find better strategies by enriching what it has to work with — more indicators, more contextual prompts, multi-asset reasoning.
 
 **Key Capabilities:**
-- Strategy template variations (indicator combinations)
-- Guided exploration based on past performance
-- Hypothesis pre-scoring to prune unpromising paths
-
-**User Stories:** US-005, US-006 (to be defined)
+- Expanded DSL: MACD, stochastic, ADX, OBV, ichimoku, time-of-day filters, multi-timeframe references
+- Multi-symbol portfolios within a single evolution run
+- Per-pair configurable spread (carry-over from open memory item)
+- Regime tags as prompt context (volatility quintile, trend strength)
+- Optional Bayesian late-stage refiner — repurpose `BayesianOptimizerAgent` to fine-tune numeric thresholds inside winning genome shapes after GA selection
 
 **Exit Criteria:**
-- [ ] Discovery generates 10+ valid strategy configs
-- [ ] Configs are queued for optimization pipeline
-- [ ] Discovery reasoning is logged
+- [ ] DSL grammar covers ≥ 12 indicators and time-of-day filters
+- [ ] Evolution runs can target a portfolio of 3+ pairs simultaneously
+- [ ] Per-pair spread accuracy verified against historical OANDA spread data
 
 ---
 
-## v0.5.0 - Orchestrator & Evolution
+## v0.5.0 - Self-Improvement
 
-**Theme:** Full autonomous loop
+**Theme:** The platform learns *across* runs, not just *within* runs.
 
-**Goal:** Complete pipeline runs without human intervention. Strategies ready for live trading are surfaced for approval.
+**Goal:** Evolution becomes meta — the system distils what worked into priors and prompts that condition future runs.
 
 **Key Capabilities:**
-- Pipeline coordination: Discover -> Optimize -> Validate
-- Performance drift detection
-- Human approval gate for paper trading promotion
-- Paper trading execution on OANDA Practice
-
-**User Stories:** US-007, US-008, US-009 (to be defined)
+- Real Evolution agent (replacing the v0.3.0-era stub) that distils cross-run patterns into prompt updates and learned DSL priors
+- Drift detection on live-running validated strategies; re-triggers evolution when behaviour drifts from validation distribution
+- LLM prompts include patterns observed across the last K runs, not just the current one
+- Prompt A/B testing infrastructure to measure prompt-quality improvements quantitatively
 
 **Exit Criteria:**
-- [ ] Full pipeline runs autonomously (end-to-end)
-- [ ] Strategies awaiting approval shown in portal
-- [ ] Drift detection triggers re-optimization
-- [ ] Paper trades execute on OANDA Practice
+- [ ] Cross-run hypothesis lineage demonstrably influences new genome proposals
+- [ ] Drift detection successfully triggers re-optimization on a contrived regime shift
+- [ ] Measurable improvement in mean OOS Sharpe across consecutive evolution runs
 
 ---
 
-## v1.0.0 - Production Autonomy
+## v0.6.0 - Paper Trading
 
-**Theme:** Self-sustaining strategy factory
+**Theme:** Promote VALIDATED genomes to OANDA Practice with human approval gate. (Was previously v0.5.0; pushed down a slot by the v0.3.0 reframe.)
 
-**Goal:** Platform continuously discovers and evolves profitable strategies with minimal human oversight.
+**Goal:** Bring real-money-shaped feedback into the loop without risking real money.
 
 **Key Capabilities:**
-- Scheduled discovery runs (daily/weekly)
-- Multi-strategy portfolio management
-- Live trading integration (OANDA Live) with human approval
-- Continuous evolution and adaptation
+- Approval queue portal page — VALIDATED genomes awaiting human sign-off
+- Paper trading service executing approved genomes on OANDA Practice
+- Live performance comparison vs. validation metrics
+- Email/Slack notifications for approval requests
+
+**Exit Criteria:**
+- [ ] Trader role can review a VALIDATED genome and promote it to paper
+- [ ] Paper trading service executes orders on OANDA Practice
+- [ ] Live vs. validation drift visible in portal
+
+---
+
+## v1.0.0 - Live Trading + Portfolio
+
+**Theme:** Self-sustaining strategy factory in production.
+
+**Goal:** Platform continuously discovers, evolves, validates, paper-trades, and (with human approval) live-trades profitable strategies with minimal human oversight.
+
+**Key Capabilities:**
+- Live trading integration (OANDA Live) with second human approval gate (paper → live)
+- Multi-strategy portfolio management with capital allocation across approved genomes
+- Performance monitoring dashboard (live P&L, drift alerts, regime context)
+- Strategy versioning and rollback
+- **Re-evaluate `Temporal` (or similar durable workflow engine)** at this scale per the plan's "Orchestration & scheduling" revisit triggers
 
 **Exit Criteria:**
 - [ ] At least 1 strategy successfully promoted to live trading
@@ -158,10 +183,10 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 
 ## Future Considerations (Post v1.0)
 
-- ML-based strategy discovery (reinforcement learning)
-- Multi-asset support (indices, commodities)
-- Sentiment integration (news, social)
-- Advanced portfolio optimization (Kelly, mean-variance)
+- Reinforcement-learning-based strategy discovery as an alternative engine alongside the LLM+GA loop
+- Multi-asset support beyond FX (indices, commodities, crypto)
+- Sentiment / news / orderbook data integrated as prompt context and DSL inputs
+- Advanced portfolio optimization (Kelly, mean-variance) at the allocation layer
 - Institutional-grade reporting and compliance
 
 ---

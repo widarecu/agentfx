@@ -218,6 +218,112 @@ def compute_swap_returns(
     return swap_ret
 
 
+def _pip_value_usd(instrument: str, close: float) -> float:
+    """USD value of 1 pip per 1 unit of position at the given close.
+
+    For USD-quoted majors (EUR/USD, GBP/USD, AUD/USD) the pip is already
+    in USD and the close price is irrelevant: it's just `pip_size`.
+
+    For USD-base majors (USD/JPY, USD/CHF, USD/CAD) the pip is in the
+    quote currency and converts to USD by dividing by the current close.
+
+    Cross pairs (no USD leg) are not supported in v0.3.0 — they would
+    need a triangulation via a base/USD rate that the v0.3.0 catalogue
+    doesn't expose.
+    """
+    parts = instrument.upper().replace("/", "_").split("_")
+    if len(parts) != 2:
+        raise ValueError(f"unsupported instrument symbol: {instrument}")
+    base, quote = parts
+    pip_in_quote = 0.01 if quote == "JPY" else 0.0001
+    if quote == "USD":
+        return pip_in_quote
+    if base == "USD":
+        if close <= 0:
+            raise ValueError(
+                f"cannot compute pip value for {instrument} at close={close}"
+            )
+        return pip_in_quote / close
+    raise ValueError(
+        f"pip value not supported for cross pair (no USD leg): {instrument}"
+    )
+
+
+def _notional_usd_per_unit(instrument: str, close: float) -> float:
+    """USD notional per 1 unit of position at the given close.
+
+    USD-base pairs (USD/JPY, USD/CHF, USD/CAD): 1 unit = $1.
+    USD-quote pairs (EUR/USD, GBP/USD, AUD/USD): 1 unit = `close` USD
+    (you hold 1 unit of the base ccy worth `close` USD).
+    """
+    base, _ = instrument.upper().replace("/", "_").split("_")
+    return 1.0 if base == "USD" else float(close)
+
+
+def _dsl_position_size(
+    strat: Strategy,
+    instrument: str,
+    entry_close: float,
+    account_balance: float,
+    leverage: int,
+) -> tuple[int, bool]:
+    """Compute the per-trade position size for a DSL strategy.
+
+    Sizing rule (account-currency = USD):
+        risk_usd       = account_balance × spec.size.risk_pct
+        desired_units  = risk_usd / (stop_pips × pip_value_usd_at_entry)
+        notional       = desired_units × notional_usd_per_unit_at_entry
+        if notional > account_balance × leverage:
+            clamp desired_units so notional == leverage cap (with warning)
+
+    ``account_balance`` is the running balance at the moment the trade is
+    opened, not the static starting capital — the caller (the trade loop
+    in ``run_backtest_from_db``) compounds it by adding each closed
+    trade's net P&L. That keeps the per-trade dollar ledger consistent
+    with the rets-based equity curve, which already compounds via
+    ``cumprod``.
+
+    Returns (position_units, was_capped). For non-DSL strategies the
+    caller should not invoke this — they keep their static
+    `position_size` argument.
+    """
+    # Local import to avoid a cycle: backtest.py is imported during
+    # `make_strategy` which is itself called above this helper.
+    from agentfx.core.dsl.compiler import CompiledDSLStrategy
+
+    if not isinstance(strat, CompiledDSLStrategy):
+        raise TypeError(
+            f"_dsl_position_size called for non-DSL strategy {type(strat).__name__}"
+        )
+    spec = strat.spec
+    risk_pct = float(spec.size.risk_pct)
+    stop_pips = int(spec.exit.stop_pips)
+    pip_value = _pip_value_usd(instrument, entry_close)
+    notional_per_unit = _notional_usd_per_unit(instrument, entry_close)
+
+    risk_usd = account_balance * risk_pct
+    desired_units = risk_usd / (stop_pips * pip_value)
+    notional = desired_units * notional_per_unit
+    max_notional = account_balance * leverage
+
+    was_capped = False
+    if notional > max_notional:
+        desired_units = max_notional / notional_per_unit
+        was_capped = True
+        logger.warning(
+            "Leverage cap hit on %s @ close=%.5f: notional $%.0f clamped "
+            "to $%.0f (leverage=%d:1, account=$%.0f)",
+            instrument,
+            entry_close,
+            notional,
+            max_notional,
+            leverage,
+            account_balance,
+        )
+    units = max(1, int(round(desired_units)))
+    return units, was_capped
+
+
 def _lookup_financing_rates(instrument: str) -> tuple[float | None, float | None]:
     """Read cached OANDA financing rates for an instrument from the DB.
 
@@ -266,6 +372,41 @@ def _lookup_financing_rates(instrument: str) -> tuple[float | None, float | None
             pass
 
 
+def _lookup_typical_spread(instrument: str) -> float | None:
+    """Read the per-pair typical spread (pips) cached on the instruments row.
+
+    Returns the spread in pips, or None if the row is missing, the seed
+    has not run yet, or the database is unreachable. A None result lets
+    the caller fall back to a global default with a warning.
+    """
+    try:
+        from agentfx.api.core.database import SessionLocal
+        from agentfx.api.models.instrument import Instrument
+    except Exception as e:  # pragma: no cover - import guard
+        logger.debug("Cannot import DB layer for spread lookup: %s", e)
+        return None
+
+    try:
+        db = SessionLocal()
+    except Exception as e:
+        logger.debug("Could not open DB session for spread lookup: %s", e)
+        return None
+
+    try:
+        row = db.query(Instrument).filter(Instrument.symbol == instrument).first()
+        if row is None or row.typical_spread_pips is None:
+            return None
+        return float(row.typical_spread_pips)
+    except Exception as e:
+        logger.debug("Spread lookup failed for %s: %s", instrument, e)
+        return None
+    finally:
+        try:
+            db.close()
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+
 def run_backtest_from_db(
     instrument: str,
     granularity: str = "M1",
@@ -273,14 +414,15 @@ def run_backtest_from_db(
     end: datetime | None = None,
     strategy_name: str = "ma",
     strategy_params: dict | None = None,
-    spread_pips: float = 0.5,
-    slippage_pips_per_side: float = 0.5,
+    spread_pips: float | None = None,
+    slippage_pips_per_side: float = 0.1,
     max_abs_position: int = 1,
     max_trades_per_hour: int = 60,
     daily_loss_threshold: float = 0.02,
     capture_signals: bool = False,
     account_balance: float = 10000.0,
     position_size: int = 10000,
+    leverage: int = 30,
 ) -> dict[str, Any]:
     """Run backtest using candle data from PostgreSQL database.
 
@@ -316,6 +458,22 @@ def run_backtest_from_db(
     """
     strategy_params = strategy_params or {}
 
+    # Resolve per-pair typical spread when caller didn't pin a value.
+    # OANDA's actual cost varies by pair (EUR_USD ~0.6 pips, USD_CAD ~1.5
+    # pips); seeded by scripts/seed_instruments.py from live pricing.
+    if spread_pips is None:
+        looked_up = _lookup_typical_spread(instrument)
+        if looked_up is None:
+            logger.warning(
+                "No typical_spread_pips on instruments row for %s — "
+                "defaulting to 0.5 pips. Run scripts/seed_instruments.py "
+                "--refresh-spreads to populate.",
+                instrument,
+            )
+            spread_pips = 0.5
+        else:
+            spread_pips = looked_up
+
     # Load data from database
     df = load_price_df_from_db(
         instrument=instrument,
@@ -324,8 +482,16 @@ def run_backtest_from_db(
         end=end,
     )
 
-    # Create strategy and generate signals
-    strat = make_strategy(strategy_name, **strategy_params)
+    # Pip size for the instrument — needed for both cost application and
+    # DSL strategies (their stop/target are in pips).
+    def pip_size_for_pair(p: str) -> float:
+        return 0.01 if p.upper().endswith("JPY") or "_JPY" in p.upper() else 0.0001
+
+    pip_size = pip_size_for_pair(instrument)
+
+    # Create strategy and generate signals — DSL strategies need pip_size
+    # for the stop/target/max_hold exit walker; classic ones ignore it.
+    strat = make_strategy(strategy_name, pip_size=pip_size, **strategy_params)
     raw_signals = strat.generate_signals(df)
 
     # Apply policies
@@ -338,26 +504,19 @@ def run_backtest_from_db(
     signals = presult.adjusted_signals
     rets = compute_returns(df["close"]) * signals.shift(0).fillna(0)
 
-    # Apply transaction costs on signal changes
-    def pip_size_for_pair(p: str) -> float:
-        return 0.01 if p.upper().endswith("JPY") or "_JPY" in p.upper() else 0.0001
-
     total_pips = spread_pips + 2.0 * slippage_pips_per_side
     if total_pips > 0:
         trade_points = signals.diff().fillna(0).ne(0)
-        pip_size = pip_size_for_pair(instrument)
         cost_ret = (-total_pips * pip_size) / df["close"]
         cost_ret = cost_ret.where(trade_points, other=0.0)
         rets = rets + cost_ret
-    else:
-        pip_size = pip_size_for_pair(instrument)
 
     # Apply OANDA overnight financing (swap) costs.
     long_rate, short_rate = _lookup_financing_rates(instrument)
     swap_ret = compute_swap_returns(df, signals, long_rate, short_rate)
     rets = rets + swap_ret
 
-    metrics = summarize(rets, signals)
+    metrics = summarize(rets, signals, close=df["close"])
 
     result: dict[str, Any] = {
         "pair": instrument,
@@ -388,10 +547,23 @@ def run_backtest_from_db(
 
     # Capture signals and trades for visualization
     if capture_signals:
-        pip_size = pip_size_for_pair(instrument)
+        from agentfx.core.dsl.compiler import CompiledDSLStrategy
+
         signal_list = []
         trade_list = []
         trade_id = 0
+        leverage_cap_hits = 0
+        is_dsl = isinstance(strat, CompiledDSLStrategy)
+
+        # Compounded sizing: position size on each new DSL trade is computed
+        # against the running balance (starting balance + sum of realised
+        # net P&L from prior closed trades), not the static starting capital.
+        # Matches what a real OANDA account does — profits grow the next
+        # trade's risk capital, losses shrink it. The rets-based equity
+        # curve already compounds; this keeps the per-trade dollar ledger
+        # consistent with that assumption.
+        current_balance = float(account_balance)
+        peak_balance = current_balance
 
         # Get indicator values based on strategy
         indicator_df = _get_indicator_values(strat, df, strategy_name, strategy_params)
@@ -446,16 +618,52 @@ def run_backtest_from_db(
                         if direction == "short":
                             price_diff = -price_diff
                         pips = price_diff / pip_size
-                        gross_pnl = pips * pip_size * position_size
 
-                        # Spread and swap costs.
+                        # Per-trade position sizing:
+                        #   - DSL strategies: risk_pct × account_balance, with
+                        #     a leverage cap (clamps notional to leverage × balance).
+                        #   - Classic strategies: fixed `position_size` arg.
+                        # Pip→USD conversion uses the entry close so a 1-pip
+                        # move on USD/JPY at 150 correctly worth less in USD
+                        # than on EUR/USD at 1.10.
+                        if is_dsl:
+                            # Pass the *running* balance, not the starting
+                            # one — this is what makes sizing compound with
+                            # realised P&L. Floor at 0 to keep the helper's
+                            # arithmetic well-defined on a busted account;
+                            # _dsl_position_size already enforces units >= 1.
+                            sizing_balance = max(current_balance, 0.0)
+                            trade_units, was_capped = _dsl_position_size(
+                                strat,
+                                instrument,
+                                entry_price,
+                                sizing_balance,
+                                leverage,
+                            )
+                            if was_capped:
+                                leverage_cap_hits += 1
+                        else:
+                            trade_units = int(position_size)
+                        pip_value_usd = _pip_value_usd(instrument, entry_price)
+
+                        gross_pnl = pips * pip_value_usd * trade_units
+
+                        # Spread, slippage and swap costs per round trip.
+                        # The `rets` series above charges (spread_pips + 2 *
+                        # slippage_pips_per_side) at each signal-change bar; to
+                        # keep the per-trade ledger consistent with what Sharpe
+                        # sees, we attribute the same total to each closed
+                        # trade. Slippage is execution friction (entry + exit
+                        # = 2 sides), spread is the OANDA fee paid once over
+                        # the round trip.
                         # Swap is the sum of per-bar overnight financing
                         # returns inside the trade window (entry, exit],
                         # converted to pips using entry price as reference.
                         # Sign-flipped because swap_ret > 0 means the position
-                        # gained, while swap_cost_pips uses cost convention
+                        # gained, while *_cost_pips uses cost convention
                         # (positive = cost subtracted from net_pips).
                         spread_cost_pips = spread_pips
+                        slippage_cost_pips = 2.0 * slippage_pips_per_side
                         trade_swap_ret = float(
                             swap_ret.loc[
                                 (swap_ret.index > entry_time)
@@ -463,8 +671,14 @@ def run_backtest_from_db(
                             ].sum()
                         )
                         swap_cost_pips = -trade_swap_ret * entry_price / pip_size
-                        net_pips = pips - spread_cost_pips - swap_cost_pips
+                        net_pips = (
+                            pips
+                            - spread_cost_pips
+                            - slippage_cost_pips
+                            - swap_cost_pips
+                        )
 
+                        net_pnl_dollars = net_pips * pip_value_usd * trade_units
                         trade_list.append(
                             {
                                 "id": f"trade_{trade_id}",
@@ -475,23 +689,30 @@ def run_backtest_from_db(
                                 "exit_price": exit_price,
                                 "pips": pips,
                                 "spread_cost_pips": spread_cost_pips,
+                                "slippage_cost_pips": slippage_cost_pips,
                                 "swap_cost_pips": swap_cost_pips,
                                 "net_pips": net_pips,
                                 "gross_pnl_dollars": gross_pnl,
                                 "spread_cost_dollars": spread_cost_pips
-                                * pip_size
-                                * position_size,
+                                * pip_value_usd
+                                * trade_units,
+                                "slippage_cost_dollars": slippage_cost_pips
+                                * pip_value_usd
+                                * trade_units,
                                 "swap_cost_dollars": swap_cost_pips
-                                * pip_size
-                                * position_size,
-                                "net_pnl_dollars": net_pips * pip_size * position_size,
+                                * pip_value_usd
+                                * trade_units,
+                                "net_pnl_dollars": net_pnl_dollars,
                                 "duration_minutes": (
                                     timestamp - entry_time
                                 ).total_seconds()
                                 / 60,
-                                "position_size": position_size,
+                                "position_size": trade_units,
+                                "balance_after": current_balance + net_pnl_dollars,
                             }
                         )
+                        current_balance += net_pnl_dollars
+                        peak_balance = max(peak_balance, current_balance)
                         trade_id += 1
 
                     # If flipping to a new position, open the new entry
@@ -529,6 +750,19 @@ def run_backtest_from_db(
 
         result["signals"] = signal_list
         result["trades"] = trade_list
+        # Sizing context for the UI — lets the page show "leverage cap
+        # hit on N trades" and the leverage setting used.
+        result["sizing"] = {
+            "account_balance": account_balance,
+            "starting_balance": float(account_balance),
+            "ending_balance": current_balance,
+            "peak_balance": peak_balance,
+            "compounded": is_dsl,
+            "account_currency": "USD",
+            "leverage": leverage,
+            "leverage_cap_hits": leverage_cap_hits,
+            "is_dsl_risk_sized": is_dsl,
+        }
 
         # Compute additional metrics from closed trades
         if trade_list:
@@ -542,8 +776,9 @@ def run_backtest_from_db(
                 (sum(losses) / len(losses)) * pip_size if losses else 0.0
             )
             metrics["profit_factor"] = sum(wins) / abs(sum(losses)) if losses else 0.0
-            metrics["n_trades"] = len(trade_list)
-            metrics["hit_rate"] = len(wins) / len(trade_list)
+            # n_trades and hit_rate are already produced by summarize() via the
+            # shared extract_closed_trades walker, so we do NOT overwrite them
+            # here — the two paths would otherwise compete on the same field.
 
             # Max consecutive losses
             max_consec = 0
@@ -569,12 +804,16 @@ def run_backtest_from_db(
             # Pips-based extended metrics
             total_pips_val = sum(t["pips"] for t in trade_list)
             total_spread = sum(t["spread_cost_pips"] for t in trade_list)
+            total_slippage = sum(t["slippage_cost_pips"] for t in trade_list)
             total_swap = sum(t["swap_cost_pips"] for t in trade_list)
             metrics["total_pips"] = total_pips_val
             metrics["avg_pips_per_trade"] = total_pips_val / len(trade_list)
             metrics["total_spread_cost_pips"] = total_spread
+            metrics["total_slippage_cost_pips"] = total_slippage
             metrics["total_swap_cost_pips"] = total_swap
-            metrics["net_pips"] = total_pips_val - total_spread - total_swap
+            metrics["net_pips"] = (
+                total_pips_val - total_spread - total_slippage - total_swap
+            )
 
             # Dollar-based extended metrics
             metrics["gross_pnl_dollars"] = sum(
@@ -582,6 +821,9 @@ def run_backtest_from_db(
             )
             metrics["total_spread_cost_dollars"] = sum(
                 t["spread_cost_dollars"] for t in trade_list
+            )
+            metrics["total_slippage_cost_dollars"] = sum(
+                t["slippage_cost_dollars"] for t in trade_list
             )
             metrics["total_swap_cost_dollars"] = sum(
                 t["swap_cost_dollars"] for t in trade_list
@@ -654,6 +896,31 @@ def _get_indicator_values(
 
 def make_strategy(name: str, **kwargs) -> Strategy:
     n = name.lower()
+    if n == "dsl":
+        # DSL dispatch: compile a v0.3.0 StrategySpec into a Strategy.
+        # `spec` may be a StrategySpec instance or its dict form (for callers
+        # that round-trip through JSON, e.g. the optimizer storing genomes).
+        from agentfx.core.dsl import StrategySpec, compile_spec
+
+        spec_data = kwargs.get("spec")
+        if spec_data is None:
+            raise ValueError(
+                "strategy 'dsl' requires a 'spec' kwarg with a StrategySpec or dict"
+            )
+        if isinstance(spec_data, StrategySpec):
+            spec = spec_data
+        elif isinstance(spec_data, dict):
+            spec = StrategySpec.model_validate(spec_data)
+        else:
+            raise ValueError(
+                f"'spec' must be StrategySpec or dict, got {type(spec_data).__name__}"
+            )
+        # pip_size required for stop/target enforcement. Caller (the
+        # backtest engine) passes the instrument-correct value;
+        # default of 0.0001 covers majors when the caller hasn't
+        # threaded it through.
+        pip_size = float(kwargs.get("pip_size", 0.0001))
+        return compile_spec(spec, pip_size=pip_size)
     if n in ("ma", "mac", "ma_crossover", "macrossover"):
         return MACrossover(
             fast=int(kwargs.get("fast", 20)), slow=int(kwargs.get("slow", 50))
@@ -675,8 +942,8 @@ def run_backtest(
     start_days: int | None = None,
     strategy_name: str = "ma",
     strategy_params: dict | None = None,
-    spread_pips: float = 0.5,
-    slippage_pips_per_side: float = 0.5,
+    spread_pips: float | None = None,
+    slippage_pips_per_side: float = 0.1,
     max_abs_position: int = 1,
     max_trades_per_hour: int = 60,
     daily_loss_threshold: float = 0.02,
@@ -684,10 +951,27 @@ def run_backtest(
     db_path: str | None = None,
 ) -> dict:
     strategy_params = strategy_params or {}
+    if spread_pips is None:
+        looked_up = _lookup_typical_spread(pair)
+        if looked_up is None:
+            logger.warning(
+                "No typical_spread_pips for %s — defaulting to 0.5 pips. "
+                "Run scripts/seed_instruments.py --refresh-spreads to populate.",
+                pair,
+            )
+            spread_pips = 0.5
+        else:
+            spread_pips = looked_up
     end = datetime.now(UTC).replace(second=0, microsecond=0)
     start = end - timedelta(days=start_days) if start_days else None
     df = load_price_df(data_root, pair, start=start, end=end)
-    strat = make_strategy(strategy_name, **strategy_params)
+
+    def pip_size_for_pair(p: str) -> float:
+        return 0.01 if p.upper().endswith("JPY") else 0.0001
+
+    pip_size = pip_size_for_pair(pair)
+
+    strat = make_strategy(strategy_name, pip_size=pip_size, **strategy_params)
     raw_signals = strat.generate_signals(df)
     # Apply policies
     pconf = PolicyConfig(
@@ -702,13 +986,10 @@ def run_backtest(
     # Apply transaction costs on signal changes (approximate):
     # total cost per execution in pips = spread + 2*slippage (enter or exit)
     # convert pips to fractional return by pip_size / price
-    def pip_size_for_pair(p: str) -> float:
-        return 0.01 if p.upper().endswith("JPY") else 0.0001
 
     total_pips = spread_pips + 2.0 * slippage_pips_per_side
     if total_pips > 0:
         trade_points = signals.diff().fillna(0).ne(0)
-        pip_size = pip_size_for_pair(pair)
         # Cost return at trade points
         cost_ret = (-total_pips * pip_size) / df["close"]
         cost_ret = cost_ret.where(trade_points, other=0.0)
@@ -719,7 +1000,7 @@ def run_backtest(
     swap_ret = compute_swap_returns(df, signals, long_rate, short_rate)
     rets = rets + swap_ret
 
-    metrics = summarize(rets, signals)
+    metrics = summarize(rets, signals, close=df["close"])
     result = {
         "pair": pair,
         "start": df.index.min().isoformat() if len(df) else None,
@@ -765,8 +1046,8 @@ def backtest_pairs(
     start_days: int | None = None,
     strategy_name: str = "ma",
     strategy_params: dict | None = None,
-    spread_pips: float = 0.5,
-    slippage_pips_per_side: float = 0.5,
+    spread_pips: float | None = None,
+    slippage_pips_per_side: float = 0.1,
     max_abs_position: int = 1,
     max_trades_per_hour: int = 60,
     daily_loss_threshold: float = 0.02,
