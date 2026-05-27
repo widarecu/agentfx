@@ -43,6 +43,21 @@ services:
       # Override DB host for Docker networking (localhost -> postgres service)
       DATABASE_URL: postgresql://agentfx:agentfx@postgres:5432/agentfx_dev
       BACKEND_CORS_ORIGINS: http://localhost:5173,http://localhost:8000
+      # Ingestion knobs: same single-source-of-truth pattern as the
+      # test profile. Defaults shown here mirror the Pydantic defaults
+      # in api/core/config.py so a reader of compose alone sees what
+      # the container will use. Override via shell at `make docker-up`
+      # time (e.g. `INGESTION_ENABLED=false make docker-up PROFILE=dev`
+      # to spin up dev without ingestion). The same vars also exist on
+      # the backend-test service — see CLAUDE.md → "Ingestion toggle:
+      # three-surface model" for the design rationale.
+      INGESTION_ENABLED: "${INGESTION_ENABLED:-true}"
+      # Dev default is 5y (1825) — meaningful local evolution runs need
+      # multi-year history, vs the test profile which defaults to 7d
+      # because E2E pre-seeds deterministic data.
+      BACKFILL_DAYS: "${BACKFILL_DAYS:-1825}"
+      CANDLE_INSTRUMENTS: "${CANDLE_INSTRUMENTS:-EUR_USD,GBP_USD,USD_JPY,AUD_USD,USD_CHF,USD_CAD}"
+      CANDLE_GRANULARITIES: "${CANDLE_GRANULARITIES:-M1,M5,M10,M30,H1,H4,H12,D,W,M}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -108,6 +123,14 @@ services:
       # for the E2E flow; set to a larger value (e.g. 365) for acceptance
       # runs that need a year+ of history.
       BACKFILL_DAYS: "${BACKFILL_DAYS:-7}"
+      # Narrow the backfill scope from the default 6 pairs × 10
+      # granularities (which would run for hours on a fresh DB). When
+      # unset, the ingestion worker uses its built-in defaults from
+      # api/core/config.py. Pass these via shell for targeted backfills:
+      #   CANDLE_INSTRUMENTS=EUR_USD CANDLE_GRANULARITIES=M1 \
+      #     make docker-up PROFILE=test INGESTION_ENABLED=true BACKFILL_DAYS=2190
+      CANDLE_INSTRUMENTS: "${CANDLE_INSTRUMENTS:-EUR_USD,GBP_USD,USD_JPY,AUD_USD,USD_CHF,USD_CAD}"
+      CANDLE_GRANULARITIES: "${CANDLE_GRANULARITIES:-M1,M5,M10,M30,H1,H4,H12,D,W,M}"
     volumes:
       # Bind-mount scripts/ so `docker compose exec backend-test python scripts/seed_test_data.py`
       # works without shipping test-only seed scripts in the production image.

@@ -27,6 +27,11 @@ data/
 # Claude Code plans and settings
 .claude/
 
+# Symlink to portal/web/node_modules used by Playwright. The link target
+# is already ignored above, but git lists the link itself as untracked
+# unless we explicitly silence it.
+tests/e2e/node_modules
+
 # Screenshot artifacts from E2E tests (Playwright captures on failure automatically)
 *.png
 
