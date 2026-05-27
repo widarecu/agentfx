@@ -47,6 +47,11 @@ class StopConditionsSchema(BaseModel):
     max_generations: int = Field(default=30, ge=1, le=200)
     max_wall_clock_seconds: int = Field(default=6 * 3600, ge=60)
     target_fitness: float = Field(default=1.5)
+    # Opt-in: when False (default) the loop ignores target_fitness and
+    # runs until max_generations or no_improvement. Training fitness is
+    # GA-biased toward overfit shapes — stopping early on it routinely
+    # yielded runs whose run-best then failed OOS Gate B.
+    enable_target_fitness_stop: bool = Field(default=False)
     no_improvement_generations: int = Field(default=5, ge=1)
 
 
@@ -102,6 +107,16 @@ class EvolutionRunCreate(BaseModel):
     instrument: str = Field(min_length=1, max_length=10)
     granularity: str = Field(default="M1", max_length=5)
     data_years: int = Field(default=5, ge=1, le=20)
+
+    # Explicit data window. When BOTH are set the worker uses them verbatim
+    # (no `now()` reference, no `data_years` math) — this is what makes a
+    # run reproducible weeks later. When only one or neither is set the
+    # worker falls back to the rolling `(now - data_years, now)` window.
+    # Whatever the inputs, the worker writes the *effective* (clamped)
+    # window back to config_json on run-start so the row stays
+    # self-describing.
+    data_window_start: datetime | None = None
+    data_window_end: datetime | None = None
 
     # Optional overrides — if absent, sensible defaults from the
     # OrchestratorConfigSchema/StopConditionsSchema apply.

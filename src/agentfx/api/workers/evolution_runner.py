@@ -271,6 +271,202 @@ def _clamp_window_to_data(
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Internal: config rehydration
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _build_orchestrator_config(
+    config_dict: dict,
+    *,
+    instrument: str,
+    granularity: str,
+):
+    """Rehydrate an OrchestratorConfig from the persisted JSON blob.
+
+    Every modal-exposed knob MUST be listed here. Missing one means the
+    user-set value is silently ignored and the dataclass default applies
+    — which is exactly what bit us with ``min_cagr_pct`` (the validator
+    kept enforcing 15% no matter what the user typed). When you add a
+    new knob to ``OrchestratorConfig``, add it here too. The test in
+    ``tests/unit/workers/test_evolution_runner.py`` pins the round-trip
+    for the knobs we care about.
+    """
+    from agentfx.agents.orchestrator import OrchestratorConfig
+
+    return OrchestratorConfig(
+        instrument=instrument,
+        granularity=granularity,
+        population_size=int(config_dict.get("population_size", 30)),
+        llm_injection_every_n=int(config_dict.get("llm_injection_every_n", 3)),
+        n_llm_proposals=int(config_dict.get("n_llm_proposals", 5)),
+        n_validation_folds=int(config_dict.get("n_validation_folds", 4)),
+        top_n_to_validate=int(config_dict.get("top_n_to_validate", 5)),
+        crossover_prob=float(config_dict.get("crossover_prob", 0.6)),
+        mutation_prob=float(config_dict.get("mutation_prob", 0.3)),
+        elite_fraction=float(config_dict.get("elite_fraction", 0.10)),
+        tournament_size=int(config_dict.get("tournament_size", 3)),
+        rng_seed=int(config_dict.get("rng_seed", 42)),
+        account_balance=float(config_dict.get("account_balance", 10000.0)),
+        position_size=int(config_dict.get("position_size", 10000)),
+        spread_pips=config_dict.get("spread_pips"),
+        leverage=int(config_dict.get("leverage", 30)),
+        use_prior_winners=bool(config_dict.get("use_prior_winners", True)),
+        n_prior_winners=int(config_dict.get("n_prior_winners", 3)),
+        llm_seed_gen0=bool(config_dict.get("llm_seed_gen0", True)),
+        n_llm_gen0_proposals=int(config_dict.get("n_llm_gen0_proposals", 5)),
+        min_cagr_pct=float(config_dict.get("min_cagr_pct", 0.15)),
+    )
+
+
+class DataWindowNotCoveredError(RuntimeError):
+    """Raised when an explicitly-pinned data window extends outside the
+    candles actually in the DB. Silent clamping is misleading — the
+    user would believe the strategy was evaluated over the requested
+    span while the GA actually trained on a much smaller slice. We
+    fail-fast instead, with a structured ``stop_reason`` the exception
+    handler in ``_subprocess_entry`` picks up and persists on the run
+    row so the portal shows a meaningful failure."""
+
+    stop_reason = "data_window_not_covered"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        requested: tuple[datetime, datetime],
+        available: tuple[datetime, datetime] | None,
+    ) -> None:
+        super().__init__(message)
+        self.requested = requested
+        self.available = available
+
+
+def _was_window_explicitly_pinned(config_dict: dict) -> bool:
+    """True if the user (or any caller) set at least one of the explicit
+    window keys. Distinguishes intentional pinning from the legacy
+    rolling-window mode. We treat *either* key being set as an explicit
+    anchor — partial pins still imply the user has a specific date in
+    mind they don't want silently shifted."""
+    return (
+        config_dict.get("data_window_start") is not None
+        or config_dict.get("data_window_end") is not None
+    )
+
+
+def _assert_window_covered(
+    requested: tuple[datetime, datetime],
+    available: tuple[datetime, datetime] | None,
+) -> None:
+    """Strict variant of ``_clamp_window_to_data``: raise when the
+    requested window isn't fully within the available data range.
+
+    Only call this when the caller pinned the window explicitly — for
+    rolling windows the clamp path is the right behaviour ("give me
+    approximately N years of history"). When the user nailed exact
+    dates, silent shrinkage breaks the experiment."""
+    if available is None:
+        raise DataWindowNotCoveredError(
+            (
+                f"No candle data available; cannot evaluate the pinned window "
+                f"{requested[0].isoformat()} → {requested[1].isoformat()}. "
+                f"Backfill the instrument first or choose a different window."
+            ),
+            requested=requested,
+            available=None,
+        )
+    oldest, newest = available
+    problems: list[str] = []
+    if requested[0] < oldest:
+        gap_days = (oldest - requested[0]).total_seconds() / 86400
+        problems.append(
+            f"start {requested[0].isoformat()} predates the oldest candle "
+            f"{oldest.isoformat()} by {gap_days:.0f} days"
+        )
+    if requested[1] > newest:
+        gap_days = (requested[1] - newest).total_seconds() / 86400
+        problems.append(
+            f"end {requested[1].isoformat()} extends past the newest candle "
+            f"{newest.isoformat()} by {gap_days:.0f} days"
+        )
+    if problems:
+        raise DataWindowNotCoveredError(
+            (
+                "Pinned data window is not fully covered by available candles: "
+                + "; ".join(problems)
+                + ". Pick a window inside "
+                f"{oldest.isoformat()} → {newest.isoformat()} "
+                "or backfill more history."
+            ),
+            requested=requested,
+            available=available,
+        )
+
+
+def _resolve_requested_window(config_dict: dict) -> tuple[datetime, datetime]:
+    """Return the *requested* (pre-clamp) data window for this run.
+
+    Three modes:
+      1. Both `data_window_start` and `data_window_end` present → use
+         them verbatim. This is the reproducible mode — once set, the
+         run uses the SAME window regardless of when it's re-launched
+         (no `now()` reference).
+      2. Only one of start/end present → the other is computed by
+         shifting `data_years * 365` days from the provided anchor.
+      3. Neither present → rolling `(now - data_years, now)` window,
+         the legacy behaviour. The worker will still snapshot the
+         resolved window back to `effective_data_window_*` after
+         clamping, so even the rolling-window case becomes
+         reproducible AFTER the run starts.
+    """
+    data_years = int(config_dict.get("data_years", 5))
+    raw_start = config_dict.get("data_window_start")
+    raw_end = config_dict.get("data_window_end")
+
+    def _parse(v):
+        if v is None:
+            return None
+        if isinstance(v, datetime):
+            return v if v.tzinfo else v.replace(tzinfo=UTC)
+        return datetime.fromisoformat(v).astimezone(UTC)
+
+    start = _parse(raw_start)
+    end = _parse(raw_end)
+
+    if start is not None and end is not None:
+        return start, end
+    if end is not None:
+        return end - timedelta(days=data_years * 365), end
+    if start is not None:
+        return start, start + timedelta(days=data_years * 365)
+
+    now = datetime.now(UTC)
+    return (now - timedelta(days=data_years * 365), now)
+
+
+def _build_stop_conditions(stop_dict: dict):
+    """Rehydrate ``StopConditions`` from the persisted JSON blob.
+
+    Same drop-a-knob-silently-and-default risk as
+    ``_build_orchestrator_config`` — kept symmetric and tested so a new
+    stop condition added to the dataclass also gets wired here. The
+    ``enable_target_fitness_stop`` flag specifically was added after
+    several runs early-stopped on training fitness only to fail OOS; the
+    knob is opt-in default-off so the modal must explicitly toggle it.
+    """
+    from agentfx.agents.orchestrator import StopConditions
+
+    return StopConditions(
+        max_generations=int(stop_dict.get("max_generations", 30)),
+        max_wall_clock_seconds=int(stop_dict.get("max_wall_clock_seconds", 6 * 3600)),
+        target_fitness=float(stop_dict.get("target_fitness", 1.5)),
+        enable_target_fitness_stop=bool(
+            stop_dict.get("enable_target_fitness_stop", False)
+        ),
+        no_improvement_generations=int(stop_dict.get("no_improvement_generations", 5)),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Internal: subprocess entry (runs in the child)
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -320,8 +516,6 @@ def _subprocess_entry(run_id: str) -> None:
     from agentfx.agents.evolution.llm_client import LLMHypothesisInjector
     from agentfx.agents.orchestrator import (
         OrchestratorAgent,
-        OrchestratorConfig,
-        StopConditions,
     )
     from agentfx.agents.validator import ValidatorAgent
     from agentfx.api.core.database import SessionLocal
@@ -338,59 +532,74 @@ def _subprocess_entry(run_id: str) -> None:
         config_dict = run.config_json or {}
         stop_dict = run.stop_conditions_json or {}
 
-        # Build typed configs from the persisted JSON. Unknown keys
-        # are dropped (the dataclasses ignore them).
-        config = OrchestratorConfig(
+        config = _build_orchestrator_config(
+            config_dict,
             instrument=run.instrument,
             granularity=run.granularity,
-            population_size=int(config_dict.get("population_size", 30)),
-            llm_injection_every_n=int(config_dict.get("llm_injection_every_n", 3)),
-            n_llm_proposals=int(config_dict.get("n_llm_proposals", 5)),
-            n_validation_folds=int(config_dict.get("n_validation_folds", 4)),
-            top_n_to_validate=int(config_dict.get("top_n_to_validate", 5)),
-            crossover_prob=float(config_dict.get("crossover_prob", 0.6)),
-            mutation_prob=float(config_dict.get("mutation_prob", 0.3)),
-            elite_fraction=float(config_dict.get("elite_fraction", 0.10)),
-            tournament_size=int(config_dict.get("tournament_size", 3)),
-            rng_seed=int(config_dict.get("rng_seed", 42)),
-            account_balance=float(config_dict.get("account_balance", 10000.0)),
-            position_size=int(config_dict.get("position_size", 10000)),
-            spread_pips=config_dict.get("spread_pips"),
         )
-        stop_conditions = StopConditions(
-            max_generations=int(stop_dict.get("max_generations", 30)),
-            max_wall_clock_seconds=int(
-                stop_dict.get("max_wall_clock_seconds", 6 * 3600)
-            ),
-            target_fitness=float(stop_dict.get("target_fitness", 1.5)),
-            no_improvement_generations=int(
-                stop_dict.get("no_improvement_generations", 5)
-            ),
-        )
+        stop_conditions = _build_stop_conditions(stop_dict)
 
-        data_years = int(config_dict.get("data_years", 5))
-        requested_window = (
-            datetime.now(UTC) - timedelta(days=data_years * 365),
-            datetime.now(UTC),
-        )
-        # Clamp the requested window to what's actually in the DB. The
-        # validator runs K=4 walk-forward folds across this window — if
-        # the oldest fold spans dates with no candles, the per-fold
-        # backtest raises FileNotFoundError and crashes the run. Better
-        # to run validation on a smaller-but-real window than to fail on
-        # data scarcity. Also clamp the end so we don't validate against
-        # the still-incomplete trailing candle.
-        data_window = _clamp_window_to_data(
-            db,
-            instrument=run.instrument,
-            granularity=run.granularity,
-            requested_window=requested_window,
-        )
-        if data_window is None:
-            raise RuntimeError(
-                f"No candle data available for {run.instrument}:{run.granularity}; "
-                f"cannot proceed with evolution run. Backfill the instrument first."
+        requested_window = _resolve_requested_window(config_dict)
+        explicit_pin = _was_window_explicitly_pinned(config_dict)
+
+        # Resolve the available candle range once so we can either
+        # validate strictly (pinned window) or clamp gracefully
+        # (rolling window).
+        from agentfx.api.models import Candle
+
+        oldest_ts_row = (
+            db.query(Candle.timestamp)
+            .filter(
+                Candle.instrument == run.instrument,
+                Candle.timeframe == run.granularity,
             )
+            .order_by(Candle.timestamp.asc())
+            .first()
+        )
+        newest_ts_row = (
+            db.query(Candle.timestamp)
+            .filter(
+                Candle.instrument == run.instrument,
+                Candle.timeframe == run.granularity,
+            )
+            .order_by(Candle.timestamp.desc())
+            .first()
+        )
+        available = None
+        if oldest_ts_row is not None and newest_ts_row is not None:
+            oldest_ts = oldest_ts_row[0]
+            newest_ts = newest_ts_row[0]
+            if oldest_ts.tzinfo is None:
+                oldest_ts = oldest_ts.replace(tzinfo=UTC)
+            if newest_ts.tzinfo is None:
+                newest_ts = newest_ts.replace(tzinfo=UTC)
+            available = (oldest_ts, newest_ts)
+
+        if explicit_pin:
+            # Strict mode: never silently shrink a user-pinned window.
+            # The user has stated an exact experimental range; if we
+            # can't satisfy it, raise and let the run fail with a
+            # clear stop_reason. The exception handler downstream
+            # records `stop_reason='data_window_not_covered'` on the
+            # row so the portal shows a meaningful failure instead of
+            # "completed" against a silently-shrunk slice.
+            _assert_window_covered(requested_window, available)
+            data_window = requested_window
+        else:
+            # Rolling-window: legacy behaviour. The user asked for
+            # "approx N years" — clamping is the right answer when
+            # the DB has less.
+            data_window = _clamp_window_to_data(
+                db,
+                instrument=run.instrument,
+                granularity=run.granularity,
+                requested_window=requested_window,
+            )
+            if data_window is None:
+                raise RuntimeError(
+                    f"No candle data available for {run.instrument}:{run.granularity}; "
+                    f"cannot proceed with evolution run. Backfill the instrument first."
+                )
         logger.info(
             "data window for run %s: requested=%s..%s clamped=%s..%s",
             run_id,
@@ -398,6 +607,62 @@ def _subprocess_entry(run_id: str) -> None:
             requested_window[1].isoformat(),
             data_window[0].isoformat(),
             data_window[1].isoformat(),
+        )
+
+        # Resolve effective spread NOW so the run is reproducible. When
+        # the user pinned spread_pips in the config it's already on
+        # `config`; otherwise the live `instruments.typical_spread_pips`
+        # snapshot at run-start becomes the value. Either way we pin it
+        # on `config` so every backtest in this run pays the same cost,
+        # AND we write it back to config_json so reproducing the run
+        # weeks later (when the live snapshot has drifted) gives the
+        # same numbers.
+        if config.spread_pips is None:
+            from agentfx.services.backtest import _lookup_typical_spread
+
+            looked_up = _lookup_typical_spread(run.instrument)
+            if looked_up is not None:
+                config.spread_pips = float(looked_up)
+                logger.info(
+                    "pinned spread_pips=%.4f for run %s (live snapshot at run-start)",
+                    config.spread_pips,
+                    run_id,
+                )
+            else:
+                logger.warning(
+                    "no typical_spread_pips for %s in instruments table; "
+                    "backtest will fall back to its hardcoded default",
+                    run.instrument,
+                )
+
+        # Snapshot the EFFECTIVE inputs back into config_json so the row
+        # is self-describing. A reader (or a re-run, or the portal)
+        # never has to guess what "now" meant or what the live snapshot
+        # was — those are frozen here.
+        #
+        # CRITICAL: SQLAlchemy's plain JSON column does not auto-detect
+        # dict mutations. Even a full reassignment (`run.config_json =
+        # new_dict`) can be silently skipped on UPDATE if SQLAlchemy
+        # decides the value "didn't change" by identity. `flag_modified`
+        # forces the column into the dirty set so the next commit
+        # always emits an UPDATE. Without this the snapshot block runs
+        # but the row keeps the original config_json — exactly the
+        # silent-no-op the user hit in evorun_20260526_0d89dbe0.
+        from sqlalchemy.orm.attributes import flag_modified
+
+        config_dict["effective_data_window_start"] = data_window[0].isoformat()
+        config_dict["effective_data_window_end"] = data_window[1].isoformat()
+        if config.spread_pips is not None:
+            config_dict["effective_spread_pips"] = float(config.spread_pips)
+        run.config_json = dict(config_dict)
+        flag_modified(run, "config_json")
+        db.commit()
+        logger.info(
+            "snapshotted effective inputs for run %s: window=%s..%s spread=%s",
+            run_id,
+            config_dict["effective_data_window_start"],
+            config_dict["effective_data_window_end"],
+            config_dict.get("effective_spread_pips"),
         )
 
         llm_budget_usd = float(config_dict.get("llm_budget_usd", 5.0))
@@ -439,7 +704,7 @@ def _subprocess_entry(run_id: str) -> None:
             summary.validated_count,
         )
 
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.exception("evolution run %s crashed in child process", run_id)
         # Mark the run failed from inside the child so the DB reflects
         # reality even without parent-side monitoring. The original session
@@ -449,15 +714,28 @@ def _subprocess_entry(run_id: str) -> None:
         # watchdog catches non-zero exits regardless, but this internal
         # handler gives faster visibility in the DB while the parent
         # watchdog is still waiting on proc.join().
+        #
+        # Specific structured exceptions (`DataWindowNotCoveredError`)
+        # carry their own `stop_reason` and a human-readable message —
+        # surface both so the portal shows the actual problem instead
+        # of a generic "process_crashed".
+        specific_reason: str | None = getattr(exc, "stop_reason", None)
+        failure_message: str | None = str(exc) if specific_reason else None
         try:
             db.rollback()
             run = evolution_service.get_run(db, run_id)
             if run is not None:
                 from agentfx.api.models import EvolutionRunStatus
+                from sqlalchemy.orm.attributes import flag_modified
 
                 run.status = EvolutionRunStatus.FAILED
-                run.stop_reason = "process_crashed"
+                run.stop_reason = specific_reason or "process_crashed"
                 run.completed_at = datetime.now(UTC)
+                if failure_message:
+                    cfg = dict(run.config_json or {})
+                    cfg["failure_message"] = failure_message
+                    run.config_json = cfg
+                    flag_modified(run, "config_json")
                 db.commit()
         except Exception:  # noqa: BLE001
             logger.exception(

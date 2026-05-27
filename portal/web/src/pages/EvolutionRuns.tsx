@@ -267,13 +267,22 @@ interface CreateRunBody {
   instrument: string;
   granularity: string;
   data_years: number;
+  /** Explicit window — when both set, worker uses them verbatim and
+   * ignores `data_years`, making the run reproducible. */
+  data_window_start?: string;
+  data_window_end?: string;
   config?: {
     population_size: number;
     rng_seed: number;
     leverage?: number;
     min_cagr_pct?: number;
+    spread_pips?: number | null;
   };
-  stop_conditions?: { max_generations: number; target_fitness: number };
+  stop_conditions?: {
+    max_generations: number;
+    target_fitness: number;
+    enable_target_fitness_stop?: boolean;
+  };
   llm_budget_usd?: number;
 }
 
@@ -294,9 +303,22 @@ function CreateRunModal({
   const [populationSize, setPopulationSize] = useState(30);
   const [maxGenerations, setMaxGenerations] = useState(30);
   const [targetFitness, setTargetFitness] = useState(1.5);
+  const [enableTargetFitnessStop, setEnableTargetFitnessStop] = useState(false);
   const [llmBudgetUsd, setLlmBudgetUsd] = useState(5.0);
   const [leverage, setLeverage] = useState<30 | 50>(30);
   const [minCagrPct, setMinCagrPct] = useState(15); // % per year — Gate B floor
+  // Empty string = "use live OANDA snapshot from instruments table"; a
+  // number = pin that exact spread for the whole run. Pinning makes
+  // results reproducible across container rebuilds (which re-fetch the
+  // live spread and would otherwise silently shift the cost model).
+  const [spreadPipsStr, setSpreadPipsStr] = useState('');
+  // Fixed-date mode: when checked, use explicit start/end and ignore
+  // dataYears. Default off → legacy rolling-window behaviour. Pinning
+  // makes the run inherently reproducible weeks later (no `now()`
+  // reference in the data-window math).
+  const [useFixedDates, setUseFixedDates] = useState(false);
+  const [dataStartStr, setDataStartStr] = useState(''); // YYYY-MM-DD
+  const [dataEndStr, setDataEndStr] = useState(''); // YYYY-MM-DD
 
   return (
     <div
@@ -325,15 +347,32 @@ function CreateRunModal({
               instrument,
               granularity,
               data_years: dataYears,
+              ...(useFixedDates && dataStartStr && dataEndStr
+                ? {
+                    // Send as ISO at UTC midnight — the backend parses
+                    // both `YYYY-MM-DD` and full ISO, but being
+                    // explicit avoids local-tz drift.
+                    data_window_start: `${dataStartStr}T00:00:00Z`,
+                    data_window_end: `${dataEndStr}T00:00:00Z`,
+                  }
+                : {}),
               config: {
                 population_size: populationSize,
                 rng_seed: 42,
                 leverage,
                 min_cagr_pct: minCagrPct / 100,
+                // Only forward when the user explicitly pinned a value;
+                // otherwise let the orchestrator resolve the live DB
+                // snapshot for the instrument.
+                ...(spreadPipsStr.trim() !== '' &&
+                Number.isFinite(Number(spreadPipsStr))
+                  ? { spread_pips: Number(spreadPipsStr) }
+                  : {}),
               },
               stop_conditions: {
                 max_generations: maxGenerations,
                 target_fitness: targetFitness,
+                enable_target_fitness_stop: enableTargetFitnessStop,
               },
               llm_budget_usd: llmBudgetUsd,
             });
@@ -366,14 +405,22 @@ function CreateRunModal({
           </div>
 
           <div className="grid grid-cols-2 gap-4">
-            <Field label="Data years" hint="History to evolve over">
+            <Field
+              label="Data years"
+              hint={
+                useFixedDates
+                  ? 'Ignored — fixed dates take precedence'
+                  : 'History to evolve over (now − N years → now)'
+              }
+            >
               <input
                 type="number"
                 min={1}
                 max={20}
                 value={dataYears}
                 onChange={(e) => setDataYears(Number(e.target.value))}
-                className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
+                disabled={useFixedDates}
+                className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 disabled:opacity-50 disabled:cursor-not-allowed"
               />
             </Field>
             <Field label="Population size" hint="Genomes per generation">
@@ -388,6 +435,49 @@ function CreateRunModal({
             </Field>
           </div>
 
+          <label className="flex items-start gap-2 text-xs cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={useFixedDates}
+              onChange={(e) => setUseFixedDates(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span className="text-slate-700 dark:text-slate-300">
+              <span className="font-semibold">
+                Pin data window to fixed dates
+              </span>
+              <span className="block text-slate-500 dark:text-slate-400 mt-0.5">
+                Off → rolling <code>now − dataYears → now</code> (legacy).
+                On → the exact dates you set below, regardless of when
+                this run launches. Use on for reproducible comparisons
+                between runs.
+              </span>
+            </span>
+          </label>
+
+          {useFixedDates && (
+            <div className="grid grid-cols-2 gap-4">
+              <Field label="Data start" hint="UTC midnight of this date">
+                <input
+                  type="date"
+                  value={dataStartStr}
+                  onChange={(e) => setDataStartStr(e.target.value)}
+                  required={useFixedDates}
+                  className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
+                />
+              </Field>
+              <Field label="Data end" hint="UTC midnight of this date">
+                <input
+                  type="date"
+                  value={dataEndStr}
+                  onChange={(e) => setDataEndStr(e.target.value)}
+                  required={useFixedDates}
+                  className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
+                />
+              </Field>
+            </div>
+          )}
+
           <div className="grid grid-cols-2 gap-4">
             <Field label="Max generations" hint="Hard stop after N">
               <input
@@ -399,16 +489,41 @@ function CreateRunModal({
                 className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
               />
             </Field>
-            <Field label="Target fitness" hint="Early-stop threshold">
+            <Field
+              label="Target fitness"
+              hint="Threshold for opt-in early stop (see checkbox below)"
+            >
               <input
                 type="number"
                 step="0.1"
                 value={targetFitness}
                 onChange={(e) => setTargetFitness(Number(e.target.value))}
-                className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
+                disabled={!enableTargetFitnessStop}
+                className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 disabled:opacity-50 disabled:cursor-not-allowed"
               />
             </Field>
           </div>
+
+          <label className="flex items-start gap-2 text-xs cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={enableTargetFitnessStop}
+              onChange={(e) => setEnableTargetFitnessStop(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span className="text-slate-700 dark:text-slate-300">
+              <span className="font-semibold">
+                Stop early when target fitness is reached
+              </span>
+              <span className="block text-slate-500 dark:text-slate-400 mt-0.5">
+                Off by default. Training fitness is biased toward overfit
+                shapes, so stopping early on it often sacrifices a
+                later-generation candidate that would have OOS-passed.
+                Leave unchecked to exhaust the generation budget and let
+                top-K validation pick the survivor.
+              </span>
+            </span>
+          </label>
 
           <div className="grid grid-cols-2 gap-4">
             <Field label="LLM budget (USD)" hint="Hard cap for hypothesis injection cost">
@@ -438,20 +553,36 @@ function CreateRunModal({
             </Field>
           </div>
 
-          <Field
-            label="Min CAGR (%/year)"
-            hint="Gate B floor for net annualised return on the OOS fold"
-          >
-            <input
-              type="number"
-              step="1"
-              min={-100}
-              max={1000}
-              value={minCagrPct}
-              onChange={(e) => setMinCagrPct(Number(e.target.value))}
-              className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
-            />
-          </Field>
+          <div className="grid grid-cols-2 gap-4">
+            <Field
+              label="Min CAGR (%/year)"
+              hint="Gate B floor for net annualised return on the OOS fold"
+            >
+              <input
+                type="number"
+                step="1"
+                min={-100}
+                max={1000}
+                value={minCagrPct}
+                onChange={(e) => setMinCagrPct(Number(e.target.value))}
+                className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
+              />
+            </Field>
+            <Field
+              label="Spread (pips)"
+              hint="Blank = live OANDA snapshot. Pin a number to make this run reproducible across rebuilds."
+            >
+              <input
+                type="number"
+                step="0.1"
+                min={0}
+                placeholder="(use live snapshot)"
+                value={spreadPipsStr}
+                onChange={(e) => setSpreadPipsStr(e.target.value)}
+                className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
+              />
+            </Field>
+          </div>
 
           {error && (
             <div className="px-3 py-2 rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-xs text-red-700 dark:text-red-300">

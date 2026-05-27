@@ -14,6 +14,12 @@ export interface StopConditions {
   max_generations: number;
   max_wall_clock_seconds: number;
   target_fitness: number;
+  /**
+   * Opt-in: when true, the loop early-stops on training fitness ≥
+   * target_fitness. Default false because training-fitness early-stop
+   * routinely sacrifices a more-robust later-generation candidate.
+   */
+  enable_target_fitness_stop?: boolean;
   no_improvement_generations: number;
 }
 
@@ -60,7 +66,23 @@ export interface EvolutionRun {
   status: EvolutionRunStatus;
   instrument: string;
   granularity: string;
-  config_json: Record<string, unknown> & { data_years?: number; llm_budget_usd?: number };
+  config_json: Record<string, unknown> & {
+    data_years?: number;
+    llm_budget_usd?: number;
+    /** User-requested explicit window, as ISO strings. */
+    data_window_start?: string;
+    data_window_end?: string;
+    /** Effective values pinned by the worker at run-start. Always set
+     * once the run has actually started; used to display "what was
+     * actually used" and to make the run reproducible weeks later. */
+    effective_data_window_start?: string;
+    effective_data_window_end?: string;
+    effective_spread_pips?: number;
+    /** Set by the worker only when the run failed with a structured
+     * reason (e.g. data_window_not_covered). Free-form human message
+     * meant for the portal to surface verbatim. */
+    failure_message?: string;
+  };
   stop_conditions_json: Record<string, unknown>;
   stop_reason: string | null;
   current_generation: number;
@@ -83,6 +105,11 @@ export interface EvolutionRunCreateRequest {
   instrument: string;
   granularity?: string;
   data_years?: number;
+  /** Pin the data window explicitly (ISO strings). When both are set,
+   * the worker uses them verbatim and ignores `data_years`. Makes the
+   * run reproducible regardless of when it's launched. */
+  data_window_start?: string;
+  data_window_end?: string;
   config?: Partial<OrchestratorConfig>;
   stop_conditions?: Partial<StopConditions>;
   llm_budget_usd?: number;
@@ -220,6 +247,18 @@ export interface GenomeBacktestSizing {
   leverage: number;
   leverage_cap_hits: number;
   is_dsl_risk_sized: boolean;
+  /**
+   * Compounded sizing block (added when capture_signals=True). The
+   * `starting_balance` is the initial capital; `ending_balance` is what
+   * the running balance worked down to after every closed trade's net
+   * P&L was applied; `peak_balance` is the high-water mark along the
+   * way. `compounded=true` means subsequent trades were sized against
+   * the running balance, not the static starting capital.
+   */
+  starting_balance?: number;
+  ending_balance?: number;
+  peak_balance?: number;
+  compounded?: boolean;
 }
 
 export interface GenomeBacktestResult {

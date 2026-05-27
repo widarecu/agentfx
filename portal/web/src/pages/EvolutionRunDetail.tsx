@@ -372,6 +372,22 @@ function RunHero({
   const stopConds = (run.stop_conditions_json ?? {}) as Record<string, unknown>;
   const maxGens =
     typeof stopConds.max_generations === 'number' ? stopConds.max_generations : null;
+  // Effective values pinned by the worker at run-start. These are what
+  // the GA + validator actually paid; user inputs above show what was
+  // requested. The two can differ (rolling-window resolution at
+  // run-start, live spread lookup, clamp to available data).
+  const effSpread =
+    typeof cfg.effective_spread_pips === 'number' ? cfg.effective_spread_pips : null;
+  const effWindowStart =
+    typeof cfg.effective_data_window_start === 'string'
+      ? cfg.effective_data_window_start
+      : null;
+  const effWindowEnd =
+    typeof cfg.effective_data_window_end === 'string'
+      ? cfg.effective_data_window_end
+      : null;
+  const minCagrPct =
+    typeof cfg.min_cagr_pct === 'number' ? cfg.min_cagr_pct : null;
 
   const duration = useMemo(() => {
     if (!run.started_at) return null;
@@ -434,6 +450,44 @@ function RunHero({
         <Stat label="LLM cost" value={formatLlmCost(run.llm_cost_usd)} />
         <Stat label="Stop reason" value={run.stop_reason ?? '—'} />
       </div>
+
+      {/* Effective inputs strip — what the GA + validator ACTUALLY paid /
+        evaluated over. Reproducibility-critical: surfacing these here
+        means a reader can tell at a glance why two runs of the "same"
+        spec produced different fitness (spread drift, window shift,
+        threshold change). Hidden when the row was created before the
+        worker started snapshotting these. */}
+      {(effWindowStart || effSpread != null || minCagrPct != null) && (
+        <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-700 flex flex-wrap items-center gap-2 text-xs">
+          <span className="text-slate-500 dark:text-slate-400 font-semibold uppercase tracking-wide">
+            Effective inputs:
+          </span>
+          {effWindowStart && effWindowEnd && (
+            <span
+              className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-blue-50 dark:bg-blue-900/30 text-blue-800 dark:text-blue-300 font-mono"
+              title="The post-clamp data window the GA actually trained on and the validator actually OOS-tested against. Frozen at run-start so re-running won't drift."
+            >
+              data: {effWindowStart.slice(0, 10)} → {effWindowEnd.slice(0, 10)}
+            </span>
+          )}
+          {effSpread != null && (
+            <span
+              className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-violet-50 dark:bg-violet-900/30 text-violet-800 dark:text-violet-300 font-mono"
+              title="Spread (in pips) every backtest in this run paid. Pinned at run-start from either the user-provided value or the live instruments snapshot. Does not drift mid-run."
+            >
+              spread: {effSpread.toFixed(2)} pips
+            </span>
+          )}
+          {minCagrPct != null && (
+            <span
+              className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-900/30 text-emerald-800 dark:text-emerald-300 font-mono"
+              title="Gate B CAGR floor applied to OOS validation in this run."
+            >
+              min CAGR: {(minCagrPct * 100).toFixed(0)}%/yr
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -466,15 +520,34 @@ function OutcomeBanner({
       'border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/40 text-slate-700 dark:text-slate-300';
   } else if (run.status === 'failed' || run.status === 'stopped') {
     icon = <AlertTriangle className="w-5 h-5" />;
+    // Use the structured stop_reason to write a meaningful title where
+    // possible; otherwise fall back to the generic phrasing.
+    const reasonTitles: Record<string, string> = {
+      data_window_not_covered:
+        'Pinned data window is not covered by available candles',
+      process_crashed: 'Run crashed in the worker subprocess',
+    };
     title =
-      run.status === 'failed'
+      (run.stop_reason && reasonTitles[run.stop_reason]) ||
+      (run.status === 'failed'
         ? 'Run failed before completion'
-        : 'Run was stopped';
+        : 'Run was stopped');
+    const failureMessage =
+      typeof (run.config_json as { failure_message?: unknown })?.failure_message ===
+      'string'
+        ? ((run.config_json as { failure_message: string }).failure_message)
+        : null;
     detail = (
       <span>
         {run.stop_reason ? (
           <>
             Reason: <span className="font-mono">{run.stop_reason}</span>
+            {failureMessage && (
+              <>
+                <br />
+                <span className="text-xs mt-1 inline-block">{failureMessage}</span>
+              </>
+            )}
           </>
         ) : (
           'No stop reason recorded.'

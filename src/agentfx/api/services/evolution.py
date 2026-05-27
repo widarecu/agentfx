@@ -213,6 +213,14 @@ def create_run(
     config_dict.setdefault("granularity", create.granularity)
     config_dict["data_years"] = create.data_years
     config_dict["llm_budget_usd"] = create.llm_budget_usd
+    # Optional explicit data window. Stored verbatim as user-requested
+    # input. The worker will write the *effective* (post-clamp) window
+    # into `effective_data_window_start` / `effective_data_window_end`
+    # at run-start so reproductions don't depend on `now()` ever again.
+    if create.data_window_start is not None:
+        config_dict["data_window_start"] = create.data_window_start.isoformat()
+    if create.data_window_end is not None:
+        config_dict["data_window_end"] = create.data_window_end.isoformat()
 
     run = models.EvolutionRun(
         id=generate_run_id(),
