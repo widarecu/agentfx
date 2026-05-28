@@ -154,6 +154,7 @@ def _example_spec_json() -> str:
                 "stop_pips": 15,
                 "target_pips": 30,
                 "max_hold_bars": 240,
+                "min_hold_bars": 10,
                 "opposite_signal": True,
             },
             "size": {"risk_pct": 0.005},
@@ -197,16 +198,25 @@ Specifically (machine-readable bounds):
    expectancy by construction otherwise).
 2. `risk_pct` MUST be in [0.001, 0.005].
 3. `max_hold_bars` MUST be in [1, 2880].
-4. Each comparison MUST reference at least one indicator on lhs or rhs
+4. `min_hold_bars` is OPTIONAL but RECOMMENDED on minute-scale
+   timeframes (M1/M5). MUST be in [0, max_hold_bars - 1]. Default 0
+   matches legacy behaviour where any exit can fire on the very next
+   bar after entry. Set this to 5–30 bars (or higher on M1) to
+   suppress over-trading — every closed trade pays 0.5–1.8 pips of
+   spread depending on pair, so churning ≥5000 trades/year on M1
+   has historically been the dominant failure mode. Mean-reverting
+   genomes can use a smaller value (3–10 bars); trend-followers
+   should use larger (15–60 bars).
+5. Each comparison MUST reference at least one indicator on lhs or rhs
    (no comparing two scalar literals).
-5. `crosses_above` / `crosses_below` MUST be used with at least one
+6. `crosses_above` / `crosses_below` MUST be used with at least one
    indicator side (a series can only cross another series or a level).
-6. RSI ranges 0–100; ATR is in price units; SMA/EMA/BB/Donchian are price
+7. RSI ranges 0–100; ATR is in price units; SMA/EMA/BB/Donchian are price
    levels. Comparing RSI to a price-scale indicator is nonsensical —
    compare RSI to a numeric literal in [0, 100] instead.
-7. Each entry condition is a single comparison (no AND/OR — the GA will
+8. Each entry condition is a single comparison (no AND/OR — the GA will
    compose those later if useful).
-8. Either `entry.long` or `entry.short` MUST be non-null (or both).
+9. Either `entry.long` or `entry.short` MUST be non-null (or both).
 
 # Reasoning
 
@@ -362,11 +372,17 @@ def build_user_prompt(
 
     exit_note = (
         "\nNOTE ON EXITS: stop_pips / target_pips / max_hold_bars / "
-        "opposite_signal in the exit block are now enforced — your choices "
-        "directly govern when each trade closes. Tight stops on a noisy "
-        "timeframe = trades stopped out before the thesis plays out. Wide "
-        "stops = each loss is large. Match exit budget to entry signal "
-        "robustness.\n"
+        "min_hold_bars / opposite_signal in the exit block are all "
+        "enforced — your choices directly govern when each trade "
+        "closes. Tight stops on a noisy timeframe = trades stopped "
+        "out before the thesis plays out. Wide stops = each loss is "
+        "large. Match exit budget to entry signal robustness.\n"
+        "min_hold_bars in particular: on M1, every trade pays 0.5-1.8 "
+        "pips of spread (varies by pair). A genome that flips position "
+        "every couple of bars churns 5000+ trades/year, and the spread "
+        "bleed exceeds any per-trade edge. Set min_hold_bars to a "
+        "value that gives the entry signal time to play out — 5-15 on "
+        "M1 for mean-reversion, 20-60 for trend-following.\n"
     )
 
     framing_blocks = f"{cost_block}{cagr_block}{exit_note}"
