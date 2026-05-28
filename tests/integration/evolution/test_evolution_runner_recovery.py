@@ -106,3 +106,110 @@ class TestSignalRunStop:
         # PID 99999999 is virtually guaranteed not to exist
         result = evolution_runner.signal_run_stop(99_999_999)
         assert result is False
+
+
+class TestWatchdogMarksRunFailed:
+    """The watchdog's DB-update half. Verifies the cross-state flip
+    (running OR queued → failed) that's the safety net for crashed
+    subprocesses. The QUEUED-path test pins the regression that hid
+    evorun_20260527_b02d5a08 — child subprocess died during module
+    import (RLIMIT_AS hit), the row never transitioned out of QUEUED,
+    and the watchdog silently did nothing because it only handled
+    RUNNING rows."""
+
+    def test_running_row_becomes_failed_with_process_crashed(self, db_session):
+        """Mid-run crash: row was RUNNING when subprocess died."""
+        run = _make_run_with_status(
+            db_session, models.EvolutionRunStatus.RUNNING, pid=12345
+        )
+        with patch(
+            "agentfx.api.core.database.SessionLocal",
+            return_value=db_session,
+        ):
+            with patch.object(db_session, "close"):
+                evolution_runner._mark_run_failed_after_crash(run.id, exit_code=-9)
+
+        db_session.refresh(run)
+        assert run.status == models.EvolutionRunStatus.FAILED
+        assert run.stop_reason is not None
+        assert "process_crashed" in run.stop_reason
+        assert "crashed_pre_init" not in run.stop_reason
+        assert "exit_code=-9" in run.stop_reason
+        assert run.completed_at is not None
+
+    def test_queued_row_becomes_failed_with_pre_init_reason(self, db_session):
+        """Pre-init crash: row was QUEUED when subprocess died (e.g.
+        RLIMIT_AS hit during numpy/pandas import on Railway). Without
+        this branch the row sits in `queued` forever with no error."""
+        run = _make_run_with_status(
+            db_session, models.EvolutionRunStatus.QUEUED, pid=67890
+        )
+        with patch(
+            "agentfx.api.core.database.SessionLocal",
+            return_value=db_session,
+        ):
+            with patch.object(db_session, "close"):
+                evolution_runner._mark_run_failed_after_crash(run.id, exit_code=1)
+
+        db_session.refresh(run)
+        assert run.status == models.EvolutionRunStatus.FAILED
+        # Specifically marked as pre-init so the portal banner can
+        # surface "subprocess crashed during boot, not during a run".
+        assert run.stop_reason is not None
+        assert "crashed_pre_init" in run.stop_reason
+        assert "exit_code=1" in run.stop_reason
+        assert run.completed_at is not None
+
+    def test_completed_row_is_not_touched(self, db_session):
+        """Watchdog must NEVER overwrite a terminal state. If the
+        orchestrator marked the run COMPLETED before exiting, that's
+        the truth — even on a non-zero exit (the orchestrator may
+        exit non-zero after marking COMPLETED for unrelated reasons)."""
+        run = _make_run_with_status(db_session, models.EvolutionRunStatus.COMPLETED)
+        original_stop_reason = run.stop_reason
+        original_completed_at = run.completed_at
+
+        with patch(
+            "agentfx.api.core.database.SessionLocal",
+            return_value=db_session,
+        ):
+            with patch.object(db_session, "close"):
+                evolution_runner._mark_run_failed_after_crash(run.id, exit_code=1)
+
+        db_session.refresh(run)
+        assert run.status == models.EvolutionRunStatus.COMPLETED
+        assert run.stop_reason == original_stop_reason
+        assert run.completed_at == original_completed_at
+
+    def test_already_failed_row_is_not_overwritten(self, db_session):
+        """Same idempotency for FAILED rows — the orchestrator may
+        have marked the run FAILED with its own (more informative)
+        stop_reason before exiting non-zero."""
+        run = _make_run_with_status(db_session, models.EvolutionRunStatus.FAILED)
+        run.stop_reason = "data_window_not_covered"
+        db_session.commit()
+
+        with patch(
+            "agentfx.api.core.database.SessionLocal",
+            return_value=db_session,
+        ):
+            with patch.object(db_session, "close"):
+                evolution_runner._mark_run_failed_after_crash(run.id, exit_code=137)
+
+        db_session.refresh(run)
+        assert run.status == models.EvolutionRunStatus.FAILED
+        # The more-specific orchestrator-set reason is preserved.
+        assert run.stop_reason == "data_window_not_covered"
+
+    def test_vanished_row_is_handled_gracefully(self, db_session):
+        """If the run row gets deleted between subprocess exit and
+        watchdog firing, the watchdog must not raise."""
+        with patch(
+            "agentfx.api.core.database.SessionLocal",
+            return_value=db_session,
+        ):
+            with patch.object(db_session, "close"):
+                # Should NOT raise even though the row doesn't exist.
+                evolution_runner._mark_run_failed_after_crash(
+                    "evorun_nonexistent_id", exit_code=1
+                )

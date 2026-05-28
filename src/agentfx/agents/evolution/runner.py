@@ -18,20 +18,49 @@ numerical loop holding the GIL).
 from __future__ import annotations
 
 import logging
+import os
 import resource
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
+
+def _default_max_ram_bytes() -> int:
+    """Resolve the RLIMIT_AS cap, env-configurable via
+    ``EVOLUTION_CHILD_MAX_RAM_GB`` (whole gigabytes).
+
+    Default raised to 6 GiB in 2026-05 after Railway staging hit
+    MemoryError at *module import time* with the previous 2 GiB cap:
+    glibc malloc reserves ~128 MiB of virtual address space per arena,
+    one set of arenas per CPU core. Local Docker Desktop with 2–4 vCPUs
+    stayed under 2 GiB; Railway containers with 8+ vCPUs blew past it
+    just importing numpy + pandas + scipy + sklearn + anthropic before
+    any orchestrator logic ran.
+
+    The cap is on RLIMIT_AS (virtual address space), NOT resident set
+    size, so 6 GiB is well below Railway's 24 GiB plan and still gives
+    a sane backstop for runaway pandas merges.
+    """
+    raw = os.environ.get("EVOLUTION_CHILD_MAX_RAM_GB", "6")
+    try:
+        gb = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "invalid EVOLUTION_CHILD_MAX_RAM_GB=%r; falling back to 6 GiB", raw
+        )
+        gb = 6.0
+    return int(gb * 1024 * 1024 * 1024)
 
 
 @dataclass(frozen=True)
 class ResourceLimits:
     """Per-run resource caps applied inside the child process."""
 
-    # Hard cap on resident set size (address space). 2 GiB default —
-    # enough for 5y of M1 candles + a working population. If the run
-    # legitimately needs more, raise this (NOT the LLM injection budget).
-    max_ram_bytes: int = 2 * 1024 * 1024 * 1024
+    # Hard cap on the child's virtual address space. Default 6 GiB,
+    # configurable via EVOLUTION_CHILD_MAX_RAM_GB. See the helper's
+    # docstring for why 2 GiB (the previous default) was insufficient
+    # on Railway-class boxes.
+    max_ram_bytes: int = field(default_factory=_default_max_ram_bytes)
 
     # Hard cap on total CPU time (seconds). Acts as a backstop against
     # in-Python stop checks failing to fire. Default 6h — matches the

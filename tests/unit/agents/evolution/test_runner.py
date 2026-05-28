@@ -19,10 +19,36 @@ from agentfx.agents.evolution.runner import (
 
 
 class TestResourceLimits:
-    def test_defaults_are_two_gib_and_six_hours(self) -> None:
+    def test_defaults_are_six_gib_and_six_hours(self, monkeypatch) -> None:
+        """Default RLIMIT_AS is 6 GiB. Was 2 GiB historically — too
+        tight for Railway-class boxes whose larger CPU count triggers
+        more glibc malloc arenas at import time, blowing the cap
+        before any orchestrator code runs."""
+        # Clear any env override so we see the code default.
+        monkeypatch.delenv("EVOLUTION_CHILD_MAX_RAM_GB", raising=False)
         limits = ResourceLimits()
-        assert limits.max_ram_bytes == 2 * 1024 * 1024 * 1024
+        assert limits.max_ram_bytes == 6 * 1024 * 1024 * 1024
         assert limits.max_cpu_seconds == 6 * 3600
+
+    def test_env_override(self, monkeypatch) -> None:
+        """Operators can raise/lower the cap without a code change via
+        EVOLUTION_CHILD_MAX_RAM_GB. Fractional values supported so we
+        can pin 1.5 GiB for local tests if a memory leak ever needs to
+        be reproduced under tighter constraints."""
+        monkeypatch.setenv("EVOLUTION_CHILD_MAX_RAM_GB", "10")
+        limits = ResourceLimits()
+        assert limits.max_ram_bytes == 10 * 1024 * 1024 * 1024
+
+        monkeypatch.setenv("EVOLUTION_CHILD_MAX_RAM_GB", "1.5")
+        limits = ResourceLimits()
+        assert limits.max_ram_bytes == int(1.5 * 1024 * 1024 * 1024)
+
+    def test_env_override_invalid_falls_back_to_default(self, monkeypatch) -> None:
+        """Garbage in the env var must not crash the orchestrator —
+        fall back to the 6 GiB default and log a warning."""
+        monkeypatch.setenv("EVOLUTION_CHILD_MAX_RAM_GB", "lots")
+        limits = ResourceLimits()
+        assert limits.max_ram_bytes == 6 * 1024 * 1024 * 1024
 
     def test_custom_limits(self) -> None:
         limits = ResourceLimits(max_ram_bytes=512 * 1024 * 1024, max_cpu_seconds=60)

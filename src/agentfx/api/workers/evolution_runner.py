@@ -76,6 +76,62 @@ def schedule_run(run_id: str) -> None:
     _start_watchdog(run_id, proc)
 
 
+def _mark_run_failed_after_crash(run_id: str, exit_code: int | None) -> None:
+    """DB-update half of the watchdog, isolated for testability.
+
+    Called after the child process exits with a non-zero code. Flips
+    the run row to FAILED — covering BOTH the running-then-crashed
+    case AND the crashed-before-init case (QUEUED row whose
+    subprocess died during module import before transitioning to
+    RUNNING). Without the QUEUED branch, runs whose subprocess hit
+    RLIMIT_AS / missing-import / version-conflict during boot sit
+    silently in `queued` forever with no error trail.
+
+    Idempotent: never overwrites a terminal state (COMPLETED /
+    FAILED / STOPPED). Distinguishes the two crash shapes via the
+    persisted ``stop_reason`` so the portal can surface a specific
+    banner — module-import crashes are very different from mid-run
+    crashes for the operator.
+    """
+    try:
+        from agentfx.api.core.database import SessionLocal
+        from agentfx.api.models import EvolutionRunStatus
+        from agentfx.api.services import evolution as evolution_service
+
+        db = SessionLocal()
+        try:
+            run = evolution_service.get_run(db, run_id)
+            if run is None:
+                logger.warning(
+                    "watchdog: run %s vanished from DB before update", run_id
+                )
+                return
+            if run.status in {
+                EvolutionRunStatus.RUNNING,
+                EvolutionRunStatus.QUEUED,
+            }:
+                pre_init = run.status == EvolutionRunStatus.QUEUED
+                run.status = EvolutionRunStatus.FAILED
+                # Both reasons + " (exit_code=NNN)" must fit in the
+                # `varchar(40)` `stop_reason` column. The shortened
+                # `crashed_pre_init` variant keeps the whole string
+                # well under 40 chars even for negative exit codes.
+                reason = "crashed_pre_init" if pre_init else "process_crashed"
+                run.stop_reason = f"{reason} (exit_code={exit_code})"
+                run.completed_at = datetime.now(UTC)
+                db.commit()
+                logger.error(
+                    "watchdog: marked run %s FAILED (child exit_code=%s, was_in=%s)",
+                    run_id,
+                    exit_code,
+                    "QUEUED" if pre_init else "RUNNING",
+                )
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001
+        logger.exception("watchdog: failed to mark run %s as FAILED", run_id)
+
+
 def _start_watchdog(run_id: str, proc: multiprocessing.Process) -> None:
     """Start a daemon thread that reaps the child and marks the run
     FAILED if the child exits while the DB still says RUNNING."""
@@ -95,37 +151,7 @@ def _start_watchdog(run_id: str, proc: multiprocessing.Process) -> None:
             # Clean exit: the orchestrator marked the run COMPLETED itself.
             return
 
-        # Non-zero exit: only mark FAILED if the orchestrator didn't
-        # already record its own status (FAILED via internal handler, or
-        # STOPPED via explicit stop). Idempotent — never overwrites a
-        # terminal state.
-        try:
-            from agentfx.api.core.database import SessionLocal
-            from agentfx.api.models import EvolutionRunStatus
-            from agentfx.api.services import evolution as evolution_service
-
-            db = SessionLocal()
-            try:
-                run = evolution_service.get_run(db, run_id)
-                if run is None:
-                    logger.warning(
-                        "watchdog: run %s vanished from DB before update", run_id
-                    )
-                    return
-                if run.status == EvolutionRunStatus.RUNNING:
-                    run.status = EvolutionRunStatus.FAILED
-                    run.stop_reason = f"process_crashed (exit_code={exit_code})"
-                    run.completed_at = datetime.now(UTC)
-                    db.commit()
-                    logger.error(
-                        "watchdog: marked run %s FAILED (child exit_code=%s)",
-                        run_id,
-                        exit_code,
-                    )
-            finally:
-                db.close()
-        except Exception:  # noqa: BLE001
-            logger.exception("watchdog: failed to mark run %s as FAILED", run_id)
+        _mark_run_failed_after_crash(run_id, exit_code)
 
     t = threading.Thread(target=_watch, name=f"evorun-watchdog-{run_id}", daemon=True)
     t.start()
