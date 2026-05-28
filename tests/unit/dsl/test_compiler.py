@@ -389,6 +389,91 @@ class TestExitEnforcement:
             f"longest_run={longest_run}"
         )
 
+    def test_min_hold_bars_suppresses_stop_target_and_flip(self) -> None:
+        """Within the min-hold window every exit path is suppressed:
+        stop, target, max-hold, and opposite-flip all skip until the
+        position has been held for at least min_hold_bars."""
+        idx = pd.date_range("2024-01-01", periods=50, freq="min", tz="UTC")
+        # Sharp drop right after entry that WOULD trip a 10-pip stop
+        # by bar 12 if min_hold were 0. We set min_hold=8 so the stop
+        # can't fire until bar 10 at earliest; since the drop reaches
+        # -15 pips at bar 14, the stop fires at min(entry+min_hold,
+        # first_breach) — i.e. signal stays +1 through the min-hold
+        # window even though the market is already past the stop.
+        closes = [1.1000] * 5 + [1.0997, 1.0993, 1.0990, 1.0987, 1.0985] + [1.1000] * 40
+        df = pd.DataFrame(
+            {
+                "open": closes,
+                "high": [c + 0.0001 for c in closes],
+                "low": [c - 0.0001 for c in closes],
+                "close": closes,
+                "volume": [1] * 50,
+            },
+            index=idx,
+        )
+        spec = StrategySpec(
+            entry=EntryConditions(
+                long=Comparison(lhs=_ind("sma", 3), cmp=">", rhs=0.0),
+            ),
+            exit=ExitRules(
+                stop_pips=10,
+                target_pips=50,
+                max_hold_bars=240,
+                min_hold_bars=8,
+                opposite_signal=True,
+            ),
+            size=SizeRules(risk_pct=0.005),
+        )
+        strat = compile_spec(spec, pip_size=0.0001)
+        sig = strat.generate_signals(df)
+
+        # Entry fires at bar 1 (signal shifted from bar 0). Bars 1..8
+        # are inside the min-hold window — signal must stay +1 through
+        # them, even though by bar 9 (close=1.0985, -15 pips) the stop
+        # would have fired without min-hold.
+        for bar in range(1, 9):
+            assert sig.iloc[bar] == 1, (
+                f"min_hold_bars=8 should suppress every exit until "
+                f"bar entry+8; bar {bar} returned {sig.iloc[bar]} "
+                f"(expected +1 inside the hold window)"
+            )
+        # After the min-hold window elapses, the stop is free to fire
+        # at whatever the next stop-breach bar is — the trade does
+        # eventually close.
+        post_hold_zero = (sig.iloc[9:20] == 0).any()
+        assert post_hold_zero, (
+            "after the min-hold window expires the stop should be "
+            "free to fire — no exit observed in bars 9..19"
+        )
+
+    def test_min_hold_zero_is_legacy_behaviour(self) -> None:
+        """min_hold_bars=0 (default) must NOT change anything: the
+        compiler emits the same signal series the pre-min_hold
+        version produced. Locks the field's backward compatibility."""
+        df = self._df_with_drop_then_recover()
+        spec_with = self._spec_long_entry(
+            stop_pips=10, target_pips=50, max_hold_bars=240
+        )
+        spec_explicit_zero = StrategySpec(
+            entry=spec_with.entry,
+            exit=ExitRules(
+                stop_pips=10,
+                target_pips=50,
+                max_hold_bars=240,
+                min_hold_bars=0,  # explicit
+                opposite_signal=True,
+            ),
+            size=spec_with.size,
+        )
+        sig_default = compile_spec(spec_with, pip_size=0.0001).generate_signals(df)
+        sig_explicit = compile_spec(
+            spec_explicit_zero, pip_size=0.0001
+        ).generate_signals(df)
+        assert (sig_default == sig_explicit).all(), (
+            "min_hold_bars=0 must produce identical signals to the "
+            "default; got divergence — backward compat is broken."
+        )
+
     def test_opposite_signal_flips_position(self) -> None:
         # Entry condition: long when close > sma(5), short when close < sma(5).
         # In a sharp reversal this triggers an opposite-signal flip from +1 to -1.

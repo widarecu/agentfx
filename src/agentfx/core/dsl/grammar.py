@@ -137,14 +137,24 @@ class EntryConditions(BaseModel):
 
 
 class ExitRules(BaseModel):
-    """Exit rules. Recorded in the spec; enforcement is a v0.4.0 backtest engine
-    capability. In v1 the compiler emits a per-bar indicator-state position;
-    these fields are forward-looking metadata for the GA.
+    """Exit rules. The compiler walks per-bar position state and enforces
+    every field here — stop / target / max-hold / min-hold / opposite-signal
+    are all live as of v0.4.0.
     """
 
     stop_pips: int = Field(ge=5, le=400)
     target_pips: int = Field(ge=5, le=800)
     max_hold_bars: int = Field(ge=1, le=2880)
+    # Minimum bars a position must stay open before any exit path can
+    # fire (stop / target / opposite-signal). 0 = legacy behaviour
+    # (exits can fire on the entry bar's next tick). Larger values
+    # discourage over-trading on short timeframes — the bleed pattern
+    # we kept hitting on M1 EUR_USD was strategies that churned ~6000
+    # trades/year, each paying 0.7-1.2 pips of spread, so a 55% win
+    # rate still lost net. The GA mutates this and the LLM injection
+    # prompt biases proposals toward non-zero values on minute-scale
+    # timeframes.
+    min_hold_bars: int = Field(default=0, ge=0, le=2880)
     opposite_signal: bool = True
 
     model_config = {"frozen": True}
@@ -154,6 +164,15 @@ class ExitRules(BaseModel):
         if self.stop_pips >= self.target_pips:
             raise ValueError(
                 f"stop_pips ({self.stop_pips}) must be < target_pips ({self.target_pips})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _min_hold_lt_max_hold(self) -> ExitRules:
+        if self.min_hold_bars >= self.max_hold_bars:
+            raise ValueError(
+                f"min_hold_bars ({self.min_hold_bars}) must be < "
+                f"max_hold_bars ({self.max_hold_bars})"
             )
         return self
 

@@ -68,6 +68,48 @@ class TestStrategySpec:
         with pytest.raises(ValidationError):
             ExitRules(stop_pips=10, target_pips=20, max_hold_bars=3000)
 
+    def test_min_hold_bars_default_is_zero_legacy(self) -> None:
+        """min_hold_bars defaults to 0 — preserves legacy behaviour
+        when older specs don't carry the field."""
+        rules = ExitRules(stop_pips=10, target_pips=20, max_hold_bars=100)
+        assert rules.min_hold_bars == 0
+
+    def test_min_hold_bars_bounds(self) -> None:
+        # Negative is rejected
+        with pytest.raises(ValidationError):
+            ExitRules(
+                stop_pips=10,
+                target_pips=20,
+                max_hold_bars=100,
+                min_hold_bars=-1,
+            )
+        # Above the upper bound is rejected
+        with pytest.raises(ValidationError):
+            ExitRules(
+                stop_pips=10,
+                target_pips=20,
+                max_hold_bars=100,
+                min_hold_bars=3000,
+            )
+
+    def test_min_hold_must_be_less_than_max_hold(self) -> None:
+        """Pins the invariant — otherwise an entry can be locked in
+        forever (no exit path could ever fire)."""
+        with pytest.raises(ValidationError, match="must be < .*max_hold_bars"):
+            ExitRules(
+                stop_pips=10,
+                target_pips=20,
+                max_hold_bars=100,
+                min_hold_bars=100,  # equal → invalid
+            )
+        with pytest.raises(ValidationError, match="must be < .*max_hold_bars"):
+            ExitRules(
+                stop_pips=10,
+                target_pips=20,
+                max_hold_bars=100,
+                min_hold_bars=101,  # greater → invalid
+            )
+
 
 class TestComparison:
     def test_indicator_vs_literal_ok(self) -> None:
