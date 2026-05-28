@@ -622,9 +622,21 @@ def _subprocess_entry(run_id: str) -> None:
                 requested_window=requested_window,
             )
             if data_window is None:
-                raise RuntimeError(
-                    f"No candle data available for {run.instrument}:{run.granularity}; "
-                    f"cannot proceed with evolution run. Backfill the instrument first."
+                # No candles at all for this instrument+granularity —
+                # not a process crash, just an unmet precondition. Raise
+                # the structured exception so the downstream handler in
+                # `_subprocess_entry` records `data_window_not_covered`
+                # on the row and surfaces the human-readable message to
+                # the portal via `config_json.failure_message`.
+                raise DataWindowNotCoveredError(
+                    (
+                        f"No candle data available for "
+                        f"{run.instrument}:{run.granularity}. "
+                        f"Backfill the instrument first or pick one "
+                        f"that already has history loaded."
+                    ),
+                    requested=requested_window,
+                    available=None,
                 )
         logger.info(
             "data window for run %s: requested=%s..%s clamped=%s..%s",
