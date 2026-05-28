@@ -44,7 +44,27 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-COMPOSE="docker compose --profile test"
+# ---------------------------------------------------------------------
+# Safety guard: this script wipes its target volume with `down -v` at
+# startup for hermetic E2E. The `test` profile is the only safe target
+# because its data is meant to be ephemeral. Refuse to run against
+# `dev` or `uat` profiles to prevent destroying long-lived backfills
+# and user accounts. See CLAUDE.md → "Environment isolation".
+#
+# History: on 2026-05-27 a `make e2e` invocation against a stack that
+# was being used for acceptance testing wiped 6 years of EUR_USD M1
+# candles + the user's portal account. This guard exists so that can
+# never happen again.
+# ---------------------------------------------------------------------
+TARGET_PROFILE="${E2E_PROFILE:-test}"
+if [ "$TARGET_PROFILE" != "test" ]; then
+    echo "Error: run-e2e-tests.sh refuses to run against profile '$TARGET_PROFILE'."
+    echo "This script wipes its target volume with 'docker compose down -v'."
+    echo "Only the 'test' profile is safe — dev and uat hold long-lived data."
+    echo "See CLAUDE.md → 'Environment isolation'."
+    exit 1
+fi
+COMPOSE="docker compose --profile $TARGET_PROFILE"
 
 cleanup() {
     if [ -n "$KEEP_STACK" ]; then

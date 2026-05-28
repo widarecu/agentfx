@@ -173,17 +173,24 @@ start-all:
 # Usage:
 #   make docker-up PROFILE=dev    # Development stack (ports 8000/5173/5432)
 #   make docker-up PROFILE=test   # Test stack (ports 8001/5174/5433, ingestion OFF — E2E default)
-#   make docker-up PROFILE=test INGESTION_ENABLED=true BACKFILL_DAYS=365
-#                                 # Acceptance/exploratory stack with real OANDA backfill
+#   make docker-up PROFILE=uat    # UAT stack (ports 8002/5175/5434, ingestion ON, 6y backfill default)
 #
-# Credentials loaded from .env.development / .env.test automatically.
+# Credentials loaded from .env.development / .env.test / .env.uat automatically.
 # The INGESTION_ENABLED / BACKFILL_DAYS toggles are read by docker-compose.yml
-# via ${VAR:-default} substitution, so the same compose file serves both
-# E2E (off, default) and acceptance/exploratory runs (on, opt-in) — no
-# hardcoded values.
+# via ${VAR:-default} substitution, so the same compose file serves all
+# profiles with profile-appropriate defaults.
+#
+# Environment isolation rules (see CLAUDE.md → "Environment isolation"):
+#   • test → wiped by `make e2e` every run; never store long-lived data here.
+#   • uat  → long-lived; NEVER run `make e2e` against this profile.
+#            scripts/run-e2e-tests.sh has a guard that refuses to run
+#            anywhere other than the `test` profile.
 PROFILE?=dev
 INGESTION_ENABLED?=false
 BACKFILL_DAYS?=7
+
+# Resolve the right backend service name per profile (used by logs/restart/rebuild).
+BACKEND_SERVICE=$(if $(filter test,$(PROFILE)),backend-test,$(if $(filter uat,$(PROFILE)),backend-uat,backend))
 
 docker-up:
 	INGESTION_ENABLED=$(INGESTION_ENABLED) BACKFILL_DAYS=$(BACKFILL_DAYS) docker compose --profile $(PROFILE) up --build -d
@@ -195,13 +202,13 @@ docker-logs:
 	docker compose --profile $(PROFILE) logs -f
 
 docker-backend-logs:
-	docker compose logs -f $(if $(filter test,$(PROFILE)),backend-test,backend)
+	docker compose logs -f $(BACKEND_SERVICE)
 
 docker-restart:
-	docker compose restart $(if $(filter test,$(PROFILE)),backend-test,backend)
+	docker compose restart $(BACKEND_SERVICE)
 
 docker-rebuild:
-	INGESTION_ENABLED=$(INGESTION_ENABLED) BACKFILL_DAYS=$(BACKFILL_DAYS) docker compose --profile $(PROFILE) up --build -d $(if $(filter test,$(PROFILE)),backend-test,backend)
+	INGESTION_ENABLED=$(INGESTION_ENABLED) BACKFILL_DAYS=$(BACKFILL_DAYS) docker compose --profile $(PROFILE) up --build -d $(BACKEND_SERVICE)
 
 # --- E2E Testing ---
 # Run full E2E test suite (starts servers, runs tests, cleans up)

@@ -19,6 +19,7 @@ def get_env_file() -> str:
         "dev": ".env.development",
         "test": ".env.test",
         "testing": ".env.test",
+        "uat": ".env.uat",
         "staging": ".env.staging",
         "stage": ".env.staging",
         "production": ".env.production",
@@ -54,10 +55,10 @@ class Settings(BaseSettings):
         default="/api/v1", description="API version prefix for all endpoints"
     )
 
-    ENVIRONMENT: Literal["development", "staging", "production", "test"] = Field(
+    ENVIRONMENT: Literal["development", "staging", "production", "test", "uat"] = Field(
         default="development",
         env="ENVIRONMENT",
-        description="Current environment (development/staging/production/test)",
+        description="Current environment (development/staging/production/test/uat)",
     )
 
     DEBUG: bool = Field(

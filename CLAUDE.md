@@ -24,9 +24,10 @@ make install       # Install production dependencies
 make dev           # Install dev dependencies + pre-commit hooks
 
 # Docker development (preferred — matches Railway deployment)
-make docker-up PROFILE=dev   # Start dev stack (backend:8000, frontend:5173, postgres:5432)
-make docker-up PROFILE=test  # Start test stack (backend:8001, frontend:5174, postgres:5433)
-make docker-down PROFILE=dev # Stop dev stack
+make docker-up PROFILE=dev   # Dev stack (backend:8000, frontend:5173, postgres:5432)
+make docker-up PROFILE=test  # Test stack (backend:8001, frontend:5174, postgres:5433) — wiped by `make e2e`
+make docker-up PROFILE=uat   # UAT stack (backend:8002, frontend:5175, postgres:5434) — long-lived, NEVER run e2e here
+make docker-down PROFILE=dev # Stop a stack
 make docker-logs PROFILE=dev # Follow logs
 make docker-rebuild PROFILE=dev # Rebuild and restart backend
 
@@ -39,6 +40,30 @@ make typecheck     # Run mypy on src/
 make backtest PAIRS="AUDUSD,EURUSD" DAYS=2
 make backtest-full PAIRS="AUDUSD,EURUSD" DAYS=2 STRATEGY=ma FAST=20 SLOW=50
 ```
+
+## Environment isolation
+
+There are **three local Docker profiles**, each with its own containers, database volume, and port range. They are deliberately isolated so that running one cannot disturb the data in another. They serve different purposes and have different durability guarantees.
+
+| Profile | Purpose | Backend | Frontend | Postgres (host) | Volume | Durability |
+|---|---|---|---|---|---|---|
+| **dev** | Developer verification (Claude + Wilson when iterating locally) | `:8000` | `:5173` | `:5432` | `postgres_data` | Long-lived; may be wiped on demand for clean rebuilds |
+| **test** | Automated tests and E2E (`make e2e`, `make test-integration`) | `:8001` | `:5174` | `:5433` | `postgres_test_data` | **Ephemeral.** `scripts/run-e2e-tests.sh` wipes this volume with `docker compose down -v` on every E2E run |
+| **uat** | User Acceptance Testing — Wilson's day-to-day exploratory stack | `:8002` | `:5175` | `:5434` | `postgres_uat_data` | **Long-lived.** Holds real OANDA backfills and the user's portal account. Must never be wiped automatically |
+
+### Hard rule: never run `make e2e` against UAT or dev
+
+`make e2e` invokes `scripts/run-e2e-tests.sh`, which begins with `docker compose down -v --remove-orphans` — that destroys the target profile's named volume. The script is **hard-coded** to refuse anything other than `PROFILE=test`; if you ever see yourself reaching for an override, stop and use the right profile instead.
+
+**Historical incident (2026-05-27):** an E2E run executed while the test stack was also serving as a manual acceptance stack — the volume wipe destroyed 6 years of EUR_USD M1 OANDA candles and the user's portal account. The UAT profile and the guard in `run-e2e-tests.sh` exist specifically to make that incident un-repeatable. Do not weaken the guard.
+
+### How to choose a profile
+
+- Manual portal walkthroughs, exploratory evolution runs, looking at real OANDA-backed data the user has loaded → **uat**.
+- Running `make test-integration`, `make e2e`, or anything CI-shaped that needs a fresh DB every time → **test**.
+- Iterating on a backend code change with the full ingestion stack and watching logs → **dev**.
+
+UAT credentials live in `.env.uat`; the file uses an `agentfx_uat` database with a distinct user/password from the other two profiles.
 
 ## Testing
 
@@ -109,16 +134,18 @@ Why this matters: each surface has different correctness requirements (pytest mu
 **Practical commands:**
 
 ```bash
-# E2E (default — ingestion off, synthetic candles)
+# E2E (default — ingestion off, synthetic candles). Test volume gets wiped
+# every `make e2e` run, so don't backfill real data here.
 make docker-up PROFILE=test
 
-# Acceptance/exploratory (ingestion on, real OANDA backfill, all 6 pairs × 10 grans)
-make docker-up PROFILE=test INGESTION_ENABLED=true BACKFILL_DAYS=365
+# Acceptance/exploratory — use the UAT profile (long-lived volume, never
+# touched by `make e2e`). Defaults to ingestion on and 6-year backfill.
+make docker-up PROFILE=uat
 
-# Targeted backfill (just EUR_USD M1, 6 years) — narrow scope to avoid an hour
-# of unnecessary OANDA traffic
+# Targeted UAT backfill (just EUR_USD M1, 6 years) — narrow scope to avoid
+# an hour of unnecessary OANDA traffic
 CANDLE_INSTRUMENTS=EUR_USD CANDLE_GRANULARITIES=M1 \
-  make docker-up PROFILE=test INGESTION_ENABLED=true BACKFILL_DAYS=2190
+  make docker-up PROFILE=uat BACKFILL_DAYS=2190
 ```
 
 `.env.test` and `.env.development` deliberately do **not** contain any of these four variables — putting them there shadows surface 2 and re-creates the very confusion this model eliminates. The Pydantic defaults in [api/core/config.py](src/agentfx/api/core/config.py) are the base; compose's substitution defaults mirror them so a reader of compose alone sees what the container will use.
@@ -422,9 +449,10 @@ Key markers: `@pytest.mark.unit`, `@pytest.mark.integration`, `@pytest.mark.e2e`
 Environment-based config via `.env.{environment}` files:
 - `.env.development` - Local development (loaded by Docker dev profile and venv scripts)
 - `.env.test` - Test environment (loaded by Docker test profile and E2E scripts)
+- `.env.uat` - User acceptance testing (loaded by Docker uat profile — Wilson's long-lived exploratory stack)
 - Railway/Vercel - Environment variables set in platform dashboards, not `.env` files
 
-Set `ENVIRONMENT=development|test|staging|production` to select config file. Pydantic Settings in `src/agentfx/api/core/config.py` loads the matching `.env.{environment}` file. Environment variables override `.env` file values.
+Set `ENVIRONMENT=development|test|uat|staging|production` to select config file. Pydantic Settings in `src/agentfx/api/core/config.py` loads the matching `.env.{environment}` file. Environment variables override `.env` file values.
 
 Key settings:
 - `OANDA_API_KEY`, `OANDA_ACCOUNT_ID` - Broker credentials
