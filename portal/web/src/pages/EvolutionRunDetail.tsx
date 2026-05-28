@@ -378,6 +378,13 @@ function RunHero({
   // run-start, live spread lookup, clamp to available data).
   const effSpread =
     typeof cfg.effective_spread_pips === 'number' ? cfg.effective_spread_pips : null;
+  // v0.4.0+ per-pair dict. Prefer this when present; fall back to
+  // legacy scalar `effective_spread_pips` for older runs.
+  const effSpreadPerPair: Record<string, number> | null =
+    cfg.effective_spread_pips_per_pair &&
+    typeof cfg.effective_spread_pips_per_pair === 'object'
+      ? (cfg.effective_spread_pips_per_pair as Record<string, number>)
+      : null;
   const effWindowStart =
     typeof cfg.effective_data_window_start === 'string'
       ? cfg.effective_data_window_start
@@ -457,7 +464,10 @@ function RunHero({
         spec produced different fitness (spread drift, window shift,
         threshold change). Hidden when the row was created before the
         worker started snapshotting these. */}
-      {(effWindowStart || effSpread != null || minCagrPct != null) && (
+      {(effWindowStart ||
+        effSpread != null ||
+        (effSpreadPerPair != null && Object.keys(effSpreadPerPair).length > 0) ||
+        minCagrPct != null) && (
         <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-700 flex flex-wrap items-center gap-2 text-xs">
           <span className="text-slate-500 dark:text-slate-400 font-semibold uppercase tracking-wide">
             Effective inputs:
@@ -470,14 +480,29 @@ function RunHero({
               data: {effWindowStart.slice(0, 10)} → {effWindowEnd.slice(0, 10)}
             </span>
           )}
-          {effSpread != null && (
+          {effSpreadPerPair != null && Object.keys(effSpreadPerPair).length > 0 ? (
+            // v0.4.0+ per-pair shape. Render one chip per pair so a
+            // reader can see (and audit) exactly what cost model each
+            // backtest paid. Today this is one chip; v0.5.0+ multi-pair
+            // runs will line up several side by side.
+            Object.entries(effSpreadPerPair).map(([pair, spread]) => (
+              <span
+                key={pair}
+                className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-violet-50 dark:bg-violet-900/30 text-violet-800 dark:text-violet-300 font-mono"
+                title={`Spread (in pips) every backtest on ${pair} in this run paid. Pinned at run-start from either the user-provided value or the live instruments snapshot. Does not drift mid-run.`}
+              >
+                {pair} spread: {spread.toFixed(2)} pips
+              </span>
+            ))
+          ) : effSpread != null ? (
+            // Legacy v0.3.0 row without per-pair dict.
             <span
               className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-violet-50 dark:bg-violet-900/30 text-violet-800 dark:text-violet-300 font-mono"
               title="Spread (in pips) every backtest in this run paid. Pinned at run-start from either the user-provided value or the live instruments snapshot. Does not drift mid-run."
             >
               spread: {effSpread.toFixed(2)} pips
             </span>
-          )}
+          ) : null}
           {minCagrPct != null && (
             <span
               className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-900/30 text-emerald-800 dark:text-emerald-300 font-mono"

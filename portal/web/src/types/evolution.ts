@@ -77,7 +77,15 @@ export interface EvolutionRun {
      * actually used" and to make the run reproducible weeks later. */
     effective_data_window_start?: string;
     effective_data_window_end?: string;
+    /** Legacy scalar — single spread for the whole run. Always set for
+     * v0.3.0+ runs that completed snapshotting. v0.4.0 single-pair
+     * runs still set this so portal back-compat isn't lost; the new
+     * per-pair dict is the preferred reader when present. */
     effective_spread_pips?: number;
+    /** v0.4.0+ per-pair spread dict. One entry per instrument the run
+     * evaluates (today: always one; v0.5.0+ multi-symbol runs will
+     * have many). Display this preferentially over the scalar. */
+    effective_spread_pips_per_pair?: Record<string, number>;
     /** Set by the worker only when the run failed with a structured
      * reason (e.g. data_window_not_covered). Free-form human message
      * meant for the portal to surface verbatim. */
@@ -185,6 +193,11 @@ export type DslSpec = {
     stop_pips?: number;
     target_pips?: number;
     max_hold_bars?: number;
+    /** v0.4.0+ — minimum bars a position must hold before any exit
+     * path can fire. Defaults to 0 (legacy behaviour where exits can
+     * fire on the very next bar after entry). Set to non-zero on
+     * minute timeframes to suppress over-trading. */
+    min_hold_bars?: number;
     opposite_signal?: boolean;
   };
   size?: { risk_pct?: number };
