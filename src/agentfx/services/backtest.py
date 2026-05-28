@@ -372,39 +372,59 @@ def _lookup_financing_rates(instrument: str) -> tuple[float | None, float | None
             pass
 
 
-def _lookup_typical_spread(instrument: str) -> float | None:
-    """Read the per-pair typical spread (pips) cached on the instruments row.
+def _lookup_typical_spreads(instruments: list[str]) -> dict[str, float]:
+    """Read the per-pair typical spread (pips) for many instruments in
+    one query. Returns ``{symbol: spread_pips}`` for every instrument
+    whose row has a populated ``typical_spread_pips``. Missing rows /
+    null spreads are simply absent from the returned dict — the caller
+    decides how to handle them (default value, warning, raise).
 
-    Returns the spread in pips, or None if the row is missing, the seed
-    has not run yet, or the database is unreachable. A None result lets
-    the caller fall back to a global default with a warning.
+    This is the v0.4.0 entry point for the per-pair cost model. Today
+    the orchestrator calls it with a single-element list (one pair per
+    run); v0.5.0+ multi-symbol runs will pass the full instrument set
+    so each pair gets its own pinned spread. The function shape is the
+    upgrade — no migration needed when more pairs start coming in.
     """
+    if not instruments:
+        return {}
     try:
         from agentfx.api.core.database import SessionLocal
         from agentfx.api.models.instrument import Instrument
     except Exception as e:  # pragma: no cover - import guard
         logger.debug("Cannot import DB layer for spread lookup: %s", e)
-        return None
+        return {}
 
     try:
         db = SessionLocal()
     except Exception as e:
         logger.debug("Could not open DB session for spread lookup: %s", e)
-        return None
+        return {}
 
     try:
-        row = db.query(Instrument).filter(Instrument.symbol == instrument).first()
-        if row is None or row.typical_spread_pips is None:
-            return None
-        return float(row.typical_spread_pips)
+        rows = (
+            db.query(Instrument.symbol, Instrument.typical_spread_pips)
+            .filter(Instrument.symbol.in_(instruments))
+            .all()
+        )
+        return {symbol: float(spread) for symbol, spread in rows if spread is not None}
     except Exception as e:
-        logger.debug("Spread lookup failed for %s: %s", instrument, e)
-        return None
+        logger.debug("Per-pair spread lookup failed for %s: %s", instruments, e)
+        return {}
     finally:
         try:
             db.close()
         except Exception:  # pragma: no cover - defensive
             pass
+
+
+def _lookup_typical_spread(instrument: str) -> float | None:
+    """Single-pair wrapper around :func:`_lookup_typical_spreads` kept
+    for back-compat with the v0.3.0 call sites in this module. New
+    callers (and v0.4.0+ orchestrator code) should prefer the bulk
+    helper so multi-pair upgrades stay zero-touch.
+    """
+    found = _lookup_typical_spreads([instrument])
+    return found.get(instrument)
 
 
 def run_backtest_from_db(

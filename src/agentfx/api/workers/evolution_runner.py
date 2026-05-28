@@ -635,30 +635,55 @@ def _subprocess_entry(run_id: str) -> None:
             data_window[1].isoformat(),
         )
 
-        # Resolve effective spread NOW so the run is reproducible. When
-        # the user pinned spread_pips in the config it's already on
-        # `config`; otherwise the live `instruments.typical_spread_pips`
-        # snapshot at run-start becomes the value. Either way we pin it
-        # on `config` so every backtest in this run pays the same cost,
-        # AND we write it back to config_json so reproducing the run
-        # weeks later (when the live snapshot has drifted) gives the
-        # same numbers.
-        if config.spread_pips is None:
-            from agentfx.services.backtest import _lookup_typical_spread
+        # Resolve effective spreads NOW so the run is reproducible.
+        # v0.4.0: per-pair dict shape. Today the orchestrator runs
+        # one pair per run, so the dict has a single entry — but the
+        # shape is the upgrade path; v0.5.0+ multi-symbol runs will
+        # fill multiple entries without any further migration.
+        #
+        # Single-pair semantics preserved: `config.spread_pips`
+        # (scalar) is still set so the orchestrator's existing fitness
+        # + validator call paths continue to work unchanged. The dict
+        # is purely additive metadata for now.
+        from agentfx.services.backtest import _lookup_typical_spreads
 
-            looked_up = _lookup_typical_spread(run.instrument)
-            if looked_up is not None:
-                config.spread_pips = float(looked_up)
+        # The instruments this run will evaluate. Today: just one.
+        # Tomorrow: pulled off config.instruments_list or similar.
+        run_instruments = [run.instrument]
+
+        effective_spread_per_pair: dict[str, float] = {}
+        if config.spread_pips is not None:
+            # User pinned a single value via the modal. Apply uniformly
+            # to every instrument this run touches (today: just one).
+            for pair in run_instruments:
+                effective_spread_per_pair[pair] = float(config.spread_pips)
+            logger.info(
+                "pinned spread_pips=%.4f for run %s (user-supplied, applied to %d pair(s))",
+                config.spread_pips,
+                run_id,
+                len(run_instruments),
+            )
+        else:
+            looked_up = _lookup_typical_spreads(run_instruments)
+            effective_spread_per_pair.update(looked_up)
+            missing = [p for p in run_instruments if p not in looked_up]
+            if missing:
+                logger.warning(
+                    "no typical_spread_pips on instruments rows for %s; "
+                    "those backtests will fall back to the hardcoded default",
+                    missing,
+                )
+            # Single-pair back-compat: set scalar from the dict entry
+            # so the orchestrator's existing `config.spread_pips`
+            # readers don't need to change.
+            if run.instrument in effective_spread_per_pair:
+                config.spread_pips = effective_spread_per_pair[run.instrument]
                 logger.info(
-                    "pinned spread_pips=%.4f for run %s (live snapshot at run-start)",
+                    "pinned spread_pips=%.4f for run %s "
+                    "(live snapshot at run-start, %d pair(s))",
                     config.spread_pips,
                     run_id,
-                )
-            else:
-                logger.warning(
-                    "no typical_spread_pips for %s in instruments table; "
-                    "backtest will fall back to its hardcoded default",
-                    run.instrument,
+                    len(effective_spread_per_pair),
                 )
 
         # Snapshot the EFFECTIVE inputs back into config_json so the row
@@ -679,7 +704,18 @@ def _subprocess_entry(run_id: str) -> None:
         config_dict["effective_data_window_start"] = data_window[0].isoformat()
         config_dict["effective_data_window_end"] = data_window[1].isoformat()
         if config.spread_pips is not None:
+            # Legacy scalar — kept for v0.3.0 portal back-compat. Always
+            # equals effective_spread_pips_per_pair[run.instrument]
+            # in v0.4.0 single-pair runs.
             config_dict["effective_spread_pips"] = float(config.spread_pips)
+        if effective_spread_per_pair:
+            # v0.4.0 per-pair shape. One entry today; many entries when
+            # multi-symbol runs ship. The portal reads this preferentially
+            # and falls back to the scalar for older rows.
+            config_dict["effective_spread_pips_per_pair"] = {
+                pair: float(spread)
+                for pair, spread in effective_spread_per_pair.items()
+            }
         run.config_json = dict(config_dict)
         flag_modified(run, "config_json")
         db.commit()
