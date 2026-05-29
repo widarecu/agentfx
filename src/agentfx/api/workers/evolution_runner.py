@@ -444,7 +444,12 @@ def _resolve_requested_window(config_dict: dict) -> tuple[datetime, datetime]:
          clamping, so even the rolling-window case becomes
          reproducible AFTER the run starts.
     """
-    data_years = int(config_dict.get("data_years", 5))
+    # `data_years` may be missing entirely (v0.4.0+ form omits it when
+    # explicit dates are pinned) or persisted as `None` (transient runs
+    # mid-migration). Coerce both to the legacy default so the rolling
+    # fallback paths below still produce a sensible window.
+    raw_data_years = config_dict.get("data_years")
+    data_years = int(raw_data_years) if raw_data_years is not None else 5
     raw_start = config_dict.get("data_window_start")
     raw_end = config_dict.get("data_window_end")
 

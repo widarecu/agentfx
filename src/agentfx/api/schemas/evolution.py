@@ -106,15 +106,20 @@ class EvolutionRunCreate(BaseModel):
 
     instrument: str = Field(min_length=1, max_length=10)
     granularity: str = Field(default="M1", max_length=5)
-    data_years: int = Field(default=5, ge=1, le=20)
+    # `data_years` is back-compat only. The portal form always sends
+    # explicit `data_window_start`/`data_window_end` now (v0.4.0+); the
+    # worker honours those verbatim. Old API clients that still send
+    # `data_years` are routed through the rolling-window fallback in
+    # `_resolve_requested_window`. New code paths should always send
+    # explicit dates instead.
+    data_years: int | None = Field(default=None, ge=1, le=20)
 
     # Explicit data window. When BOTH are set the worker uses them verbatim
-    # (no `now()` reference, no `data_years` math) — this is what makes a
-    # run reproducible weeks later. When only one or neither is set the
-    # worker falls back to the rolling `(now - data_years, now)` window.
-    # Whatever the inputs, the worker writes the *effective* (clamped)
-    # window back to config_json on run-start so the row stays
-    # self-describing.
+    # (no `now()` reference) — this is the v0.4.0+ default. When only one
+    # or neither is set the worker falls back to the legacy rolling
+    # `(now - data_years, now)` window. Whatever the inputs, the worker
+    # writes the *effective* (clamped) window back to config_json on
+    # run-start so the row stays self-describing.
     data_window_start: datetime | None = None
     data_window_end: datetime | None = None
 

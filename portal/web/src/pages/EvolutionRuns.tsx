@@ -266,11 +266,11 @@ export function StatusBadge({ status }: { status: EvolutionRunStatus }) {
 interface CreateRunBody {
   instrument: string;
   granularity: string;
-  data_years: number;
-  /** Explicit window — when both set, worker uses them verbatim and
-   * ignores `data_years`, making the run reproducible. */
-  data_window_start?: string;
-  data_window_end?: string;
+  /** Explicit window (UTC midnight ISO). Always sent by the create
+   * form — the worker uses these verbatim and the run is reproducible
+   * regardless of when it's relaunched. */
+  data_window_start: string;
+  data_window_end: string;
   config?: {
     population_size: number;
     rng_seed: number;
@@ -299,26 +299,35 @@ function CreateRunModal({
 }) {
   const [instrument, setInstrument] = useState(PAIRS[0]);
   const [granularity, setGranularity] = useState('M1');
-  const [dataYears, setDataYears] = useState(5);
-  const [populationSize, setPopulationSize] = useState(30);
-  const [maxGenerations, setMaxGenerations] = useState(30);
-  const [targetFitness, setTargetFitness] = useState(1.5);
+  // Numeric inputs are stored as strings so editing behaves naturally
+  // (clear → type, no leading-zero stickiness, no jump-back-to-min). They
+  // are parsed and validated at submit time. Defaults match the
+  // OrchestratorConfigSchema defaults.
+  const [populationSizeStr, setPopulationSizeStr] = useState('30');
+  const [maxGenerationsStr, setMaxGenerationsStr] = useState('30');
+  const [targetFitnessStr, setTargetFitnessStr] = useState('1.5');
   const [enableTargetFitnessStop, setEnableTargetFitnessStop] = useState(false);
-  const [llmBudgetUsd, setLlmBudgetUsd] = useState(5.0);
+  const [llmBudgetUsdStr, setLlmBudgetUsdStr] = useState('5.0');
   const [leverage, setLeverage] = useState<30 | 50>(30);
-  const [minCagrPct, setMinCagrPct] = useState(15); // % per year — Gate B floor
+  const [minCagrPctStr, setMinCagrPctStr] = useState('15'); // % per year — Gate B floor
   // Empty string = "use live OANDA snapshot from instruments table"; a
   // number = pin that exact spread for the whole run. Pinning makes
   // results reproducible across container rebuilds (which re-fetch the
   // live spread and would otherwise silently shift the cost model).
   const [spreadPipsStr, setSpreadPipsStr] = useState('');
-  // Fixed-date mode: when checked, use explicit start/end and ignore
-  // dataYears. Default off → legacy rolling-window behaviour. Pinning
-  // makes the run inherently reproducible weeks later (no `now()`
-  // reference in the data-window math).
-  const [useFixedDates, setUseFixedDates] = useState(false);
-  const [dataStartStr, setDataStartStr] = useState(''); // YYYY-MM-DD
-  const [dataEndStr, setDataEndStr] = useState(''); // YYYY-MM-DD
+  // Data window is always explicit start + end (UTC midnight). Removed
+  // the legacy "Data years" rolling-window mode in favour of a single,
+  // unambiguous control: by always pinning the window the run is
+  // reproducible weeks later (no `now()` reference in the math) and the
+  // form has one less moving part.
+  const isoToday = new Date().toISOString().slice(0, 10);
+  const isoFiveYearsAgo = new Date(
+    Date.now() - 5 * 365 * 24 * 3600 * 1000,
+  )
+    .toISOString()
+    .slice(0, 10);
+  const [dataStartStr, setDataStartStr] = useState(isoFiveYearsAgo);
+  const [dataEndStr, setDataEndStr] = useState(isoToday);
 
   return (
     <div
@@ -343,19 +352,21 @@ function CreateRunModal({
         <form
           onSubmit={async (e) => {
             e.preventDefault();
+            // Parse + validate numeric strings at submit time. HTML5
+            // `required` + `type="date"` already covers the date fields.
+            const populationSize = Number(populationSizeStr);
+            const maxGenerations = Number(maxGenerationsStr);
+            const targetFitness = Number(targetFitnessStr);
+            const llmBudgetUsd = Number(llmBudgetUsdStr);
+            const minCagrPct = Number(minCagrPctStr);
             await onCreate({
               instrument,
               granularity,
-              data_years: dataYears,
-              ...(useFixedDates && dataStartStr && dataEndStr
-                ? {
-                    // Send as ISO at UTC midnight — the backend parses
-                    // both `YYYY-MM-DD` and full ISO, but being
-                    // explicit avoids local-tz drift.
-                    data_window_start: `${dataStartStr}T00:00:00Z`,
-                    data_window_end: `${dataEndStr}T00:00:00Z`,
-                  }
-                : {}),
+              // Send as ISO at UTC midnight — the backend parses both
+              // `YYYY-MM-DD` and full ISO, but being explicit avoids
+              // local-tz drift.
+              data_window_start: `${dataStartStr}T00:00:00Z`,
+              data_window_end: `${dataEndStr}T00:00:00Z`,
               config: {
                 population_size: populationSize,
                 rng_seed: 42,
@@ -405,102 +416,87 @@ function CreateRunModal({
           </div>
 
           <div className="grid grid-cols-2 gap-4">
-            <Field
-              label="Data years"
-              hint={
-                useFixedDates
-                  ? 'Ignored — fixed dates take precedence'
-                  : 'History to evolve over (now − N years → now)'
-              }
-            >
+            <Field label="Data start" hint="UTC midnight of this date">
               <input
-                type="number"
-                min={1}
-                max={20}
-                value={dataYears}
-                onChange={(e) => setDataYears(Number(e.target.value))}
-                disabled={useFixedDates}
-                className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 disabled:opacity-50 disabled:cursor-not-allowed"
+                type="date"
+                value={dataStartStr}
+                onChange={(e) => setDataStartStr(e.target.value)}
+                max={dataEndStr || undefined}
+                required
+                className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
               />
             </Field>
-            <Field label="Population size" hint="Genomes per generation">
+            <Field label="Data end" hint="UTC midnight of this date">
               <input
-                type="number"
-                min={4}
-                max={200}
-                value={populationSize}
-                onChange={(e) => setPopulationSize(Number(e.target.value))}
+                type="date"
+                value={dataEndStr}
+                onChange={(e) => setDataEndStr(e.target.value)}
+                min={dataStartStr || undefined}
+                required
                 className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
               />
             </Field>
           </div>
 
-          <label className="flex items-start gap-2 text-xs cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={useFixedDates}
-              onChange={(e) => setUseFixedDates(e.target.checked)}
-              className="mt-0.5"
-            />
-            <span className="text-slate-700 dark:text-slate-300">
-              <span className="font-semibold">
-                Pin data window to fixed dates
-              </span>
-              <span className="block text-slate-500 dark:text-slate-400 mt-0.5">
-                Off → rolling <code>now − dataYears → now</code> (legacy).
-                On → the exact dates you set below, regardless of when
-                this run launches. Use on for reproducible comparisons
-                between runs.
-              </span>
-            </span>
-          </label>
-
-          {useFixedDates && (
-            <div className="grid grid-cols-2 gap-4">
-              <Field label="Data start" hint="UTC midnight of this date">
-                <input
-                  type="date"
-                  value={dataStartStr}
-                  onChange={(e) => setDataStartStr(e.target.value)}
-                  required={useFixedDates}
-                  className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
-                />
-              </Field>
-              <Field label="Data end" hint="UTC midnight of this date">
-                <input
-                  type="date"
-                  value={dataEndStr}
-                  onChange={(e) => setDataEndStr(e.target.value)}
-                  required={useFixedDates}
-                  className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
-                />
-              </Field>
-            </div>
-          )}
-
           <div className="grid grid-cols-2 gap-4">
-            <Field label="Max generations" hint="Hard stop after N">
+            <Field
+              label="Population size"
+              hint="Genomes per generation (15–200; must fit all seed strategies)"
+            >
               <input
                 type="number"
-                min={1}
+                inputMode="numeric"
+                min={15}
                 max={200}
-                value={maxGenerations}
-                onChange={(e) => setMaxGenerations(Number(e.target.value))}
+                value={populationSizeStr}
+                onChange={(e) => setPopulationSizeStr(e.target.value)}
+                required
                 className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
               />
             </Field>
+            <Field label="Max generations" hint="Hard stop after N">
+              <input
+                type="number"
+                inputMode="numeric"
+                min={1}
+                max={200}
+                value={maxGenerationsStr}
+                onChange={(e) => setMaxGenerationsStr(e.target.value)}
+                required
+                className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
+              />
+            </Field>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
             <Field
               label="Target fitness"
               hint="Threshold for opt-in early stop (see checkbox below)"
             >
               <input
                 type="number"
+                inputMode="decimal"
                 step="0.1"
-                value={targetFitness}
-                onChange={(e) => setTargetFitness(Number(e.target.value))}
+                value={targetFitnessStr}
+                onChange={(e) => setTargetFitnessStr(e.target.value)}
                 disabled={!enableTargetFitnessStop}
                 className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 disabled:opacity-50 disabled:cursor-not-allowed"
               />
+            </Field>
+            <Field
+              label="Leverage"
+              hint="OANDA retail cap (30 or 50)"
+            >
+              <select
+                value={leverage}
+                onChange={(e) =>
+                  setLeverage(Number(e.target.value) as 30 | 50)
+                }
+                className="form-select w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
+              >
+                <option value={30}>30:1</option>
+                <option value={50}>50:1</option>
+              </select>
             </Field>
           </div>
 
@@ -529,51 +525,41 @@ function CreateRunModal({
             <Field label="LLM budget (USD)" hint="Hard cap for hypothesis injection cost">
               <input
                 type="number"
+                inputMode="decimal"
                 step="0.5"
                 min={0}
-                value={llmBudgetUsd}
-                onChange={(e) => setLlmBudgetUsd(Number(e.target.value))}
+                value={llmBudgetUsdStr}
+                onChange={(e) => setLlmBudgetUsdStr(e.target.value)}
+                required
                 className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
               />
             </Field>
-            <Field
-              label="Leverage"
-              hint="OANDA retail cap (30 or 50)"
-            >
-              <select
-                value={leverage}
-                onChange={(e) =>
-                  setLeverage(Number(e.target.value) as 30 | 50)
-                }
-                className="form-select w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
-              >
-                <option value={30}>30:1</option>
-                <option value={50}>50:1</option>
-              </select>
-            </Field>
-          </div>
-
-          <div className="grid grid-cols-2 gap-4">
             <Field
               label="Min CAGR (%/year)"
               hint="Gate B floor for net annualised return on the OOS fold"
             >
               <input
                 type="number"
+                inputMode="decimal"
                 step="1"
                 min={-100}
                 max={1000}
-                value={minCagrPct}
-                onChange={(e) => setMinCagrPct(Number(e.target.value))}
+                value={minCagrPctStr}
+                onChange={(e) => setMinCagrPctStr(e.target.value)}
+                required
                 className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
               />
             </Field>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
             <Field
               label="Spread (pips)"
               hint="Blank = live OANDA snapshot. Pin a number to make this run reproducible across rebuilds."
             >
               <input
                 type="number"
+                inputMode="decimal"
                 step="0.1"
                 min={0}
                 placeholder="(use live snapshot)"
@@ -582,6 +568,7 @@ function CreateRunModal({
                 className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
               />
             </Field>
+            <div /> {/* spacer to keep grid alignment on the final row */}
           </div>
 
           {error && (
@@ -622,15 +609,21 @@ function Field({
   hint?: string;
   children: React.ReactNode;
 }) {
+  // Reserve enough vertical space for the label + hint to span up to two
+  // lines without pushing the input below it. Without this, fields in
+  // the same grid row whose labels wrap differently (long hint vs short)
+  // end up with their inputs at different y-positions, which looks
+  // misaligned. `min-h-[2.75rem]` (~44px) fits two lines of the 12px /
+  // leading-tight label across typical column widths in the modal.
   return (
-    <label className="block">
-      <div className="text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-        {label}
+    <label className="flex flex-col">
+      <div className="text-xs font-medium text-slate-700 dark:text-slate-300 mb-1 leading-tight min-h-[2.75rem]">
+        <span className="text-slate-700 dark:text-slate-300">{label}</span>
         {hint && (
-          <span className="ml-1 text-slate-400 font-normal">— {hint}</span>
+          <span className="text-slate-400 font-normal"> — {hint}</span>
         )}
       </div>
-      {children}
+      <div className="mt-auto">{children}</div>
     </label>
   );
 }

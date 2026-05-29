@@ -367,7 +367,6 @@ function RunHero({
 }) {
   const cfg = (run.config_json ?? {}) as Record<string, unknown>;
   const popSize = typeof cfg.population_size === 'number' ? cfg.population_size : null;
-  const dataYears = typeof cfg.data_years === 'number' ? cfg.data_years : null;
   const llmBudget = typeof cfg.llm_budget_usd === 'number' ? cfg.llm_budget_usd : null;
   const stopConds = (run.stop_conditions_json ?? {}) as Record<string, unknown>;
   const maxGens =
@@ -406,10 +405,46 @@ function RunHero({
     return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
   }, [run.started_at, run.completed_at]);
 
+  // Prefer the *effective* window pinned by the worker at run-start
+  // (always set on v0.3.0+ runs that completed snapshotting). Fall back
+  // to the user-requested explicit dates, then to the legacy
+  // `data_years` field for ancient runs that pre-date the dates-first
+  // form.
+  const historySpan = useMemo(() => {
+    const startStr =
+      effWindowStart ??
+      (typeof cfg.data_window_start === 'string'
+        ? (cfg.data_window_start as string)
+        : null);
+    const endStr =
+      effWindowEnd ??
+      (typeof cfg.data_window_end === 'string'
+        ? (cfg.data_window_end as string)
+        : null);
+    if (startStr && endStr) {
+      const start = new Date(startStr);
+      const end = new Date(endStr);
+      const days = Math.max(
+        1,
+        Math.round((end.getTime() - start.getTime()) / (24 * 3600 * 1000)),
+      );
+      if (days >= 365) {
+        const years = days / 365;
+        return `${years.toFixed(1).replace(/\.0$/, '')}y of history`;
+      }
+      return `${days}d of history`;
+    }
+    // Ancient-run fallback (no window dates in config_json at all).
+    if (typeof cfg.data_years === 'number') {
+      return `${cfg.data_years}y of history`;
+    }
+    return null;
+  }, [cfg, effWindowStart, effWindowEnd]);
+
   const summarySentence = useMemo(() => {
     const parts: string[] = [];
     parts.push(`${run.instrument} ${run.granularity}`);
-    if (dataYears) parts.push(`${dataYears}y of history`);
+    if (historySpan) parts.push(historySpan);
     const popPart = popSize ? `${popSize}-genome population` : null;
     const genPart = maxGens ? `${maxGens} generation budget` : null;
     if (popPart && genPart) parts.push(`${popPart} × ${genPart}`);
@@ -417,7 +452,7 @@ function RunHero({
     else if (genPart) parts.push(genPart);
     if (llmBudget != null) parts.push(`$${llmBudget.toFixed(2)} LLM budget`);
     return parts.join(' · ');
-  }, [run, dataYears, popSize, maxGens, llmBudget]);
+  }, [run, historySpan, popSize, maxGens, llmBudget]);
 
   return (
     <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-5">

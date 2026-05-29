@@ -307,12 +307,31 @@ def get_genome_backtest(
 
     # Reconstruct the same training window the orchestrator used so the
     # backtest's metrics line up with the displayed `fitness` value.
+    #
+    # Prefer the *effective* window the worker pinned at run-start (set
+    # on every run that completed snapshotting — v0.3.0+). Fall back to
+    # the user-supplied window dates, then to a rolling `data_years`
+    # window for ancient runs that pre-date the dates-first form. Using
+    # the effective dates means the re-run matches the GA's training
+    # window exactly even months later, instead of drifting with `now()`.
     config_dict = run.config_json or {}
-    data_years = int(config_dict.get("data_years", 5))
-    requested_window = (
-        datetime.now(tz=run.created_at.tzinfo) - timedelta(days=data_years * 365),
-        datetime.now(tz=run.created_at.tzinfo),
+    eff_start_raw = config_dict.get("effective_data_window_start") or config_dict.get(
+        "data_window_start"
     )
+    eff_end_raw = config_dict.get("effective_data_window_end") or config_dict.get(
+        "data_window_end"
+    )
+    if eff_start_raw and eff_end_raw:
+        requested_window = (
+            datetime.fromisoformat(eff_start_raw),
+            datetime.fromisoformat(eff_end_raw),
+        )
+    else:
+        data_years = int(config_dict.get("data_years", 5))
+        requested_window = (
+            datetime.now(tz=run.created_at.tzinfo) - timedelta(days=data_years * 365),
+            datetime.now(tz=run.created_at.tzinfo),
+        )
     clamped = _clamp_window_to_data(
         db,
         instrument=run.instrument,
