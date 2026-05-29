@@ -29,6 +29,21 @@ if not hasattr(creator, "FitnessMax"):
     creator.create("FitnessMax", base.Fitness, weights=(1.0,))
 
 
+class InvalidPopulationSizeError(ValueError):
+    """Raised by `initialize_population` when the configured population
+    size is below the number of seed strategies. The portal cares about
+    the structured ``stop_reason`` so the failure shows the actual
+    problem instead of a generic ``process_crashed`` — the runner's
+    exception handler picks up the attribute via ``getattr``.
+
+    Inherits from ``ValueError`` so callers (and the long-standing
+    `test_size_below_seed_count_raises` test) that catch ``ValueError``
+    continue to work unchanged.
+    """
+
+    stop_reason = "invalid_population_size"
+
+
 @dataclass
 class Genome:
     """A single genome in the GA population.
@@ -150,8 +165,16 @@ def initialize_population(
             seed_genomes.append(Genome(spec=s, origin=GenomeOrigin.SEED))
 
     if size < len(seed_genomes):
-        raise ValueError(
-            f"population size ({size}) must be >= number of seeds ({len(seed_genomes)})"
+        # Structured exception so `_subprocess_entry` records this on the
+        # run row as `stop_reason='invalid_population_size'` with a
+        # human-readable `failure_message`, instead of a generic
+        # `process_crashed`. The portal then surfaces the actual problem
+        # to the user the same way it does for `data_window_not_covered`.
+        raise InvalidPopulationSizeError(
+            f"Population size ({size}) is below the seed-strategy count "
+            f"({len(seed_genomes)}). The GA needs to hold every seed in "
+            f"generation 0; pick a population of at least {len(seed_genomes)} "
+            f"(15+ recommended to leave room for mutation and crossover)."
         )
 
     # Pre-compute the seeds' eventual persister IDs so mutated copies can
