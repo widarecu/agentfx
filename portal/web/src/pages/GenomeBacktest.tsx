@@ -40,6 +40,7 @@ import { buildIndicatorsFromDsl } from '../utils/dslIndicators';
 import type {
   EvolutionRun,
   GenomeBacktestResult,
+  GenomeBacktestWindow,
   StrategyGenome,
 } from '../types/evolution';
 import type {
@@ -146,6 +147,14 @@ export default function GenomeBacktest() {
   const navigate = useNavigate();
 
   const [backtest, setBacktest] = useState<GenomeBacktestResult | null>(null);
+  // Independent training-window backtest used ONLY by the "Training vs
+  // OOS" comparison block — held separately from `backtest` (which
+  // tracks whichever tab is active) so the comparison's "Training"
+  // column never reflects OOS data just because the user happened to
+  // switch tabs. Lazily fetched: skip the round-trip when active tab
+  // is already training and `backtest` itself is the right value.
+  const [trainingBacktest, setTrainingBacktest] =
+    useState<GenomeBacktestResult | null>(null);
   const [run, setRun] = useState<EvolutionRun | null>(null);
   // Fetched in parallel with the backtest so we can render the DSL spec's
   // indicators as chart overlays without an extra round-trip later.
@@ -155,6 +164,12 @@ export default function GenomeBacktest() {
   const [candlesLoading, setCandlesLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<MetricsViewMode>('pips');
+  // Which slice of the run's data window the user is viewing. Switching
+  // tabs refetches the backtest endpoint with `?window=<value>` so the
+  // chart, metric tiles, trades, and Gate B failure list all stay
+  // consistent — never a mix of training and OOS data in the same view.
+  const [activeWindow, setActiveWindow] =
+    useState<GenomeBacktestWindow>('training');
 
   useEffect(() => {
     let cancelled = false;
@@ -162,14 +177,28 @@ export default function GenomeBacktest() {
       if (!runId || !genomeId) return;
       setLoading(true);
       setError(null);
+      // Wipe candles between tab switches so the chart never renders an
+      // OOS trade marker on a training candle by accident while the new
+      // window's candles are still in flight.
+      setCandles([]);
       try {
-        const [bt, runData, genomeData] = await Promise.all([
-          getGenomeBacktest(runId, genomeId),
+        // Fetch the active-tab backtest, run/genome metadata, AND the
+        // training-window backtest needed for the always-visible
+        // overfit-check comparison. The training fetch is skipped when
+        // the active tab is already training — `backtest` doubles as
+        // `trainingBacktest` in that case to avoid the round-trip.
+        const needsTrainingFetch = activeWindow !== 'training';
+        const [bt, trainBt, runData, genomeData] = await Promise.all([
+          getGenomeBacktest(runId, genomeId, activeWindow),
+          needsTrainingFetch
+            ? getGenomeBacktest(runId, genomeId, 'training')
+            : Promise.resolve(null),
           getEvolutionRun(runId),
           getGenome(runId, genomeId),
         ]);
         if (cancelled) return;
         setBacktest(bt);
+        setTrainingBacktest(needsTrainingFetch ? trainBt : bt);
         setRun(runData);
         setGenome(genomeData);
         setLoading(false);
@@ -201,7 +230,7 @@ export default function GenomeBacktest() {
     return () => {
       cancelled = true;
     };
-  }, [runId, genomeId]);
+  }, [runId, genomeId, activeWindow]);
 
   const trades = useMemo<Trade[]>(
     () => (backtest ? backtest.trades.map(mapTrade) : []),
@@ -478,10 +507,7 @@ export default function GenomeBacktest() {
               </span>
             </p>
             <div className="mt-2 flex flex-wrap items-center gap-1.5">
-              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-300 text-xs font-semibold">
-                <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
-                Training window (folds 0..K-2)
-              </span>
+              <WindowBadge window={backtest.window} />
               {backtest.sizing && (
                 <span
                   className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-violet-100 dark:bg-violet-900/40 text-violet-800 dark:text-violet-300 text-xs font-semibold"
@@ -517,13 +543,15 @@ export default function GenomeBacktest() {
                     return (
                       <span
                         className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-semibold ${toneCls}`}
-                        title={`Compounded ledger: started $${start.toLocaleString()}, ended $${end.toLocaleString(undefined, { maximumFractionDigits: 0 })}, peaked at $${peak.toLocaleString(undefined, { maximumFractionDigits: 0 })}. Each trade's position size was computed against the running balance.`}
+                        title={`Total return over the slice — what actually happened to the account. Started $${start.toLocaleString()}, ended $${end.toLocaleString(undefined, { maximumFractionDigits: 0 })}, peaked at $${peak.toLocaleString(undefined, { maximumFractionDigits: 0 })}. The CAGR tile below expresses this same return as an annualised rate. Each trade's position size was computed against the running balance.`}
                       >
                         ${start.toLocaleString()} →{' '}
                         ${end.toLocaleString(undefined, { maximumFractionDigits: 0 })}
                         {' '}
-                        ({up ? '+' : ''}
-                        {(growth * 100).toFixed(1)}%)
+                        <span className="opacity-80">
+                          ({up ? '+' : ''}
+                          {(growth * 100).toFixed(1)}% total)
+                        </span>
                         {peak > end && (
                           <span className="ml-1 opacity-70">
                             peak ${peak.toLocaleString(undefined, { maximumFractionDigits: 0 })}
@@ -535,12 +563,25 @@ export default function GenomeBacktest() {
                 )}
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5 max-w-3xl">
-              The metrics below are computed on the <strong>training</strong>{' '}
-              data — the same window the GA's fitness was evaluated against.
-              The <strong>OOS held-out fold</strong> (the data the GA never
-              saw, which Gate B verdicts are based on) is shown separately
-              below the primary tiles; a big gap between the two means the
-              strategy overfit the training data.
+              Switch tabs below to view this genome on a different slice
+              of the data window:{' '}
+              <strong>Training</strong> matches what the GA's fitness saw,{' '}
+              <strong>OOS (held-out)</strong> matches what Gate B was
+              judged on, <strong>Full</strong> backtests the entire
+              window end-to-end. All metrics, the chart, and the trades
+              table re-render together so you're never comparing
+              training trades against OOS metrics by accident.
+            </p>
+            <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1.5 max-w-3xl italic">
+              Each tab here is <strong>one continuous backtest</strong>{' '}
+              over the chosen slice — the account balance compounds
+              across the whole window. The walk-forward fold table on
+              the genome page runs each fold <strong>independently from
+              ${backtest.sizing?.starting_balance != null
+                ? backtest.sizing.starting_balance.toLocaleString()
+                : '10,000'}{' '}
+              starting balance</strong>, so the per-fold numbers there
+              won't sum or average to the tile values below.
             </p>
           </div>
           <div className="flex items-center gap-1.5 text-xs">
@@ -569,25 +610,33 @@ export default function GenomeBacktest() {
 
       </div>
 
-      {/* ── Performance Summary: 6 primary metrics, Gate B-coloured ──
-        All tiles in this grid are computed on the TRAINING window
-        (folds 0..K-2 concatenated) — the same data the GA's fitness was
-        evaluated against. The section header below makes that scope
-        explicit on every page load, so a reader who scrolls straight to
-        a tile doesn't confuse it with the OOS value shown in the
-        "Training vs OOS" section further down. CAGR in particular has
-        an OOS counterpart and used to look like two contradictory
-        readings of the same metric. */}
+      {/* ── Slice tabs (Training | OOS | Full) ──
+        Switching here refetches the backtest endpoint with the new
+        `?window=…` value and refreshes EVERY downstream component
+        together — metrics, chart, trades, Gate B failures. The user
+        cannot end up looking at OOS metrics with a training chart, or
+        vice versa. The Training-vs-OOS comparison section below the
+        tiles stays the same regardless of which tab is open, since
+        it's an inherently between-windows view. */}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <SliceTabs
+          active={activeWindow}
+          onChange={setActiveWindow}
+          disabled={loading}
+        />
+        <span className="text-xs text-slate-500 dark:text-slate-400 italic">
+          Side-by-side comparison appears below the tiles.
+        </span>
+      </div>
+
+      {/* Section header for the metric tiles — describes the slice the
+        user picked above so a reader scrolling straight to a tile knows
+        what they're looking at. */}
       <div className="flex items-center justify-between gap-3 -mb-2">
         <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-200 flex items-center gap-2">
-          <span className="inline-block px-1.5 py-0.5 text-[10px] uppercase tracking-wide rounded bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-300 font-semibold">
-            Training
-          </span>
-          Training-window metrics — what the GA's fitness saw
+          <WindowBadge window={backtest.window} compact />
+          {sectionHeading(backtest.window)}
         </h3>
-        <span className="text-xs text-slate-500 dark:text-slate-400 italic">
-          OOS counterparts in the "Training vs OOS" section below
-        </span>
       </div>
       <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
         <MetricCard
@@ -605,7 +654,7 @@ export default function GenomeBacktest() {
               <DollarSign className="w-4 h-4 text-slate-400" />
             )
           }
-          label="Net P&L"
+          label="Net P&L (window total)"
           value={
             viewMode === 'pips'
               ? `${formatPips(ext.netPips)} pips`
@@ -672,10 +721,14 @@ export default function GenomeBacktest() {
         />
         <MetricCard
           icon={<TrendingUp className="w-4 h-4 text-slate-400" />}
-          label="CAGR (training, net/yr)"
+          label={`CAGR (${WINDOW_STYLE[backtest.window].label.toLowerCase()}, annualised)`}
           value={formatPercent(cagr)}
           tone={cagr >= GATE_B_THRESHOLDS.MIN_CAGR ? 'good' : 'bad'}
-          thresholdLine={`Floor: >= ${formatPercent(GATE_B_THRESHOLDS.MIN_CAGR)} (OOS gates promotion)`}
+          thresholdLine={
+            backtest.window === 'oos'
+              ? `Annualised rate, net of costs. Floor: >= ${formatPercent(GATE_B_THRESHOLDS.MIN_CAGR)} — this is the figure that gates promotion`
+              : `Annualised rate, net of costs. Total return for the window is in the hero above. Floor: >= ${formatPercent(GATE_B_THRESHOLDS.MIN_CAGR)} (OOS gates promotion)`
+          }
         />
       </div>
 
@@ -757,48 +810,65 @@ export default function GenomeBacktest() {
               </span>
             </div>
           </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-3 text-sm">
-            <ComparePair
-              label="Sharpe"
-              training={sharpe}
-              oos={oosFold.sharpe}
-              format={(v) => formatSharpe(v)}
-              threshold={GATE_B_THRESHOLDS.SHARPE_MIN}
-              direction="gte"
-            />
-            <ComparePair
-              label="Max DD"
-              training={maxDd}
-              oos={oosFold.max_drawdown}
-              format={(v) => formatPercentMagnitude(v ?? 0)}
-              threshold={GATE_B_THRESHOLDS.MAX_DRAWDOWN}
-              direction="lte"
-            />
-            <ComparePair
-              label="Hit Rate"
-              training={hitRate}
-              oos={oosFold.hit_rate}
-              format={(v) => formatPercent(v ?? 0)}
-              threshold={GATE_B_THRESHOLDS.HIT_RATE_MIN}
-              direction="gte"
-            />
-            <ComparePair
-              label="Trades"
-              training={trades.length}
-              oos={oosFold.n_trades}
-              format={(v) => String(v ?? 0)}
-              threshold={GATE_B_THRESHOLDS.MIN_TRADES}
-              direction="gte"
-            />
-            <ComparePair
-              label="CAGR"
-              training={cagr}
-              oos={oosFold.cagr}
-              format={(v) => formatPercent(v ?? 0)}
-              threshold={GATE_B_THRESHOLDS.MIN_CAGR}
-              direction="gte"
-            />
-          </div>
+          {(() => {
+            // Source the "Training" column from the dedicated training
+            // backtest, never from `backtest` (which tracks the active
+            // tab) — otherwise OOS-tab viewers would see "Training =
+            // OOS" with both columns showing identical numbers.
+            const tMetrics = trainingBacktest?.metrics ?? {};
+            const tTrades = trainingBacktest?.trades.length ?? null;
+            const tSharpe = (tMetrics.sharpe as number) ?? 0;
+            const tMaxDd =
+              (tMetrics.max_drawdown as number) ??
+              (tMetrics.mdd as number) ??
+              0;
+            const tHitRate = (tMetrics.hit_rate as number) ?? 0;
+            const tCagr = (tMetrics.cagr as number) ?? 0;
+            return (
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-3 text-sm">
+                <ComparePair
+                  label="Sharpe"
+                  training={tSharpe}
+                  oos={oosFold.sharpe}
+                  format={(v) => formatSharpe(v)}
+                  threshold={GATE_B_THRESHOLDS.SHARPE_MIN}
+                  direction="gte"
+                />
+                <ComparePair
+                  label="Max DD"
+                  training={tMaxDd}
+                  oos={oosFold.max_drawdown}
+                  format={(v) => formatPercentMagnitude(v ?? 0)}
+                  threshold={GATE_B_THRESHOLDS.MAX_DRAWDOWN}
+                  direction="lte"
+                />
+                <ComparePair
+                  label="Hit Rate"
+                  training={tHitRate}
+                  oos={oosFold.hit_rate}
+                  format={(v) => formatPercent(v ?? 0)}
+                  threshold={GATE_B_THRESHOLDS.HIT_RATE_MIN}
+                  direction="gte"
+                />
+                <ComparePair
+                  label="Trades"
+                  training={tTrades ?? 0}
+                  oos={oosFold.n_trades}
+                  format={(v) => String(v ?? 0)}
+                  threshold={GATE_B_THRESHOLDS.MIN_TRADES}
+                  direction="gte"
+                />
+                <ComparePair
+                  label="CAGR"
+                  training={tCagr}
+                  oos={oosFold.cagr}
+                  format={(v) => formatPercent(v ?? 0)}
+                  threshold={GATE_B_THRESHOLDS.MIN_CAGR}
+                  direction="gte"
+                />
+              </div>
+            );
+          })()}
         </section>
       )}
 
@@ -911,9 +981,13 @@ export default function GenomeBacktest() {
                 ))}
               </ul>
               <p className="mt-2 text-xs text-rose-600/80 dark:text-rose-400/80 italic">
-                Evaluated on this backtest's training window. The validator's
-                Gate-B verdict (shown on the genome page) is evaluated on the
-                held-out OOS fold and may differ.
+                Evaluated on the{' '}
+                <strong>
+                  {WINDOW_STYLE[backtest.window].label.toLowerCase()}
+                </strong>{' '}
+                slice currently selected. Gate B's authoritative verdict
+                is the OOS row in the comparison table — switch to the
+                OOS tab to see the trades behind it.
               </p>
             </div>
           </div>
@@ -1004,6 +1078,105 @@ export default function GenomeBacktest() {
 // Sub-components — mirror the trial-detail page so the two views feel
 // consistent without sharing literal JSX.
 // ─────────────────────────────────────────────────────────────────────
+
+// Per-window cosmetic styling. Training is blue (matches the run-detail
+// page's existing blue accent), OOS is amber (signals "this is the
+// verdict — pay attention"), Full is slate (utilitarian / neutral).
+const WINDOW_STYLE: Record<
+  GenomeBacktestWindow,
+  { label: string; chip: string; dot: string }
+> = {
+  training: {
+    label: 'Training',
+    chip: 'bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-300',
+    dot: 'bg-blue-500',
+  },
+  oos: {
+    label: 'OOS (held-out)',
+    chip: 'bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300',
+    dot: 'bg-amber-500',
+  },
+  full: {
+    label: 'Full window',
+    chip: 'bg-slate-200 dark:bg-slate-700 text-slate-800 dark:text-slate-200',
+    dot: 'bg-slate-500',
+  },
+};
+
+const WINDOW_SUBLABEL: Record<GenomeBacktestWindow, string> = {
+  training: 'folds 0..K-2 — what the GA fitness saw',
+  oos: 'final fold — what Gate B was judged on',
+  full: 'entire effective data window',
+};
+
+function sectionHeading(w: GenomeBacktestWindow): string {
+  if (w === 'training') return 'Training-window metrics — what the GA fitness saw';
+  if (w === 'oos') return 'OOS-fold metrics — Gate B verdict';
+  return 'Full-window metrics — entire effective data range';
+}
+
+function WindowBadge({
+  window: w,
+  compact = false,
+}: {
+  window: GenomeBacktestWindow;
+  compact?: boolean;
+}) {
+  const style = WINDOW_STYLE[w];
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded ${
+        compact ? 'text-[10px] uppercase tracking-wide' : 'text-xs'
+      } font-semibold ${style.chip}`}
+    >
+      <span className={`w-1.5 h-1.5 rounded-full ${style.dot}`} />
+      {compact ? style.label : `${style.label} — ${WINDOW_SUBLABEL[w]}`}
+    </span>
+  );
+}
+
+function SliceTabs({
+  active,
+  onChange,
+  disabled = false,
+}: {
+  active: GenomeBacktestWindow;
+  onChange: (w: GenomeBacktestWindow) => void;
+  disabled?: boolean;
+}) {
+  const tabs: GenomeBacktestWindow[] = ['training', 'oos', 'full'];
+  return (
+    <div
+      role="tablist"
+      aria-label="Backtest window"
+      className="inline-flex rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-0.5"
+    >
+      {tabs.map((w) => {
+        const style = WINDOW_STYLE[w];
+        const isActive = w === active;
+        return (
+          <button
+            key={w}
+            type="button"
+            role="tab"
+            aria-selected={isActive}
+            disabled={disabled}
+            onClick={() => onChange(w)}
+            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold transition-colors ${
+              isActive
+                ? style.chip
+                : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
+            } ${disabled ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'}`}
+            title={WINDOW_SUBLABEL[w]}
+          >
+            <span className={`w-1.5 h-1.5 rounded-full ${style.dot}`} />
+            {style.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
 
 type Tone = 'good' | 'bad' | 'neutral' | 'cost';
 

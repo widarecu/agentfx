@@ -1,12 +1,25 @@
 # AgentFX Docker Development Stack
 #
 # Usage:
-#   make docker-up PROFILE=dev  # Start dev stack
-#   make docker-up PROFILE=test # Start test stack
+#   make docker-up PROFILE=dev   # Start dev stack
+#   make docker-up PROFILE=test  # Start test stack (volume wiped by `make e2e`)
+#   make docker-up PROFILE=uat   # Start UAT stack (long-lived; NEVER run e2e here)
 #   make docker-down PROFILE=dev
 #   make docker-logs PROFILE=dev
 #
-# Credentials are loaded from .env.development / .env.test automatically.
+# Credentials are loaded from .env.development / .env.test / .env.uat automatically.
+#
+# Environment isolation rules (also in CLAUDE.md):
+#   • dev   — developer verification; ports 8000/5173/5432; long-lived but
+#             may be wiped on demand for clean rebuilds.
+#   • test  — automated/E2E; ports 8001/5174/5433; volume `postgres_test_data`
+#             is destroyed by `scripts/run-e2e-tests.sh` every run.
+#   • uat   — user exploratory testing (Wilson's day-to-day stack);
+#             ports 8002/5175/5434; volume `postgres_uat_data` MUST persist.
+#             NEVER run `make e2e` against UAT — the E2E script wipes
+#             volumes and would destroy 6-year OANDA backfills + user
+#             accounts. A guard in `scripts/run-e2e-tests.sh` refuses
+#             to run unless PROFILE is `test`.
 
 services:
   # ── Development services (--profile dev) ────────────────────────────
@@ -151,6 +164,72 @@ services:
       VITE_API_BASE_URL: http://localhost:8001/api/v1
       VITE_ENVIRONMENT: test
 
+  # ── UAT services (--profile uat) ────────────────────────────────────
+  # User Acceptance Testing — Wilson's long-lived exploratory stack.
+  # The `postgres_uat_data` volume must NEVER be wiped automatically.
+  # The E2E script (scripts/run-e2e-tests.sh) has a guard that refuses
+  # to run against this profile.
+
+  postgres-uat:
+    image: postgres:15-alpine
+    container_name: agentfx-postgres-uat
+    profiles: ["uat"]
+    environment:
+      POSTGRES_USER: uat_user
+      POSTGRES_PASSWORD: uat_password
+      POSTGRES_DB: agentfx_uat
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_uat_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "uat_user", "-d", "agentfx_uat"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend-uat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agentfx-backend-uat
+    profiles: ["uat"]
+    ports:
+      - "8002:8000"
+    env_file:
+      - .env.uat
+    environment:
+      # Override DB host for Docker networking
+      DATABASE_URL: postgresql://uat_user:uat_password@postgres-uat:5432/agentfx_uat
+      BACKEND_CORS_ORIGINS: http://localhost:5175,http://localhost:8002
+      # Ingestion knobs — same three-surface model as dev/test. UAT
+      # default is ingestion ON because this stack exists to hold real
+      # OANDA history for manual exploration; default BACKFILL_DAYS is
+      # 6 years (2190) to match the user's typical evolution-run data
+      # window for EUR_USD M1. Override per-invocation:
+      #   CANDLE_INSTRUMENTS=EUR_USD CANDLE_GRANULARITIES=M1 \
+      #     make docker-up PROFILE=uat BACKFILL_DAYS=2190
+      INGESTION_ENABLED: "${INGESTION_ENABLED:-true}"
+      BACKFILL_DAYS: "${BACKFILL_DAYS:-2190}"
+      CANDLE_INSTRUMENTS: "${CANDLE_INSTRUMENTS:-EUR_USD,GBP_USD,USD_JPY,AUD_USD,USD_CHF,USD_CAD}"
+      CANDLE_GRANULARITIES: "${CANDLE_GRANULARITIES:-M1,M5,M10,M30,H1,H4,H12,D,W,M}"
+    depends_on:
+      postgres-uat:
+        condition: service_healthy
+
+  frontend-uat:
+    build:
+      context: ./portal/web
+      dockerfile: Dockerfile
+    container_name: agentfx-frontend-uat
+    profiles: ["uat"]
+    ports:
+      - "5175:5173"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8002/api/v1
+      VITE_ENVIRONMENT: uat
+
 volumes:
   postgres_data:
   postgres_test_data:
+  postgres_uat_data:

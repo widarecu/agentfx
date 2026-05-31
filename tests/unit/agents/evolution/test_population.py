@@ -96,7 +96,7 @@ class TestInitializePopulation:
 
     def test_size_below_seed_count_raises(self) -> None:
         rng = Random(3)
-        with pytest.raises(ValueError, match="must be >="):
+        with pytest.raises(ValueError, match="below the seed-strategy count"):
             initialize_population(SEED_SPECS, size=2, rng=rng, mutate_fn=mutate_spec)
 
     def test_empty_seeds_raises(self) -> None:

@@ -146,9 +146,10 @@ export async function getGenome(
 export async function getGenomeBacktest(
   runId: string,
   genomeId: string,
+  window: 'training' | 'oos' | 'full' = 'training',
 ): Promise<GenomeBacktestResult> {
   const res = await fetch(
-    `${API_BASE_URL}/evolution-runs/${runId}/genomes/${genomeId}/backtest`,
+    `${API_BASE_URL}/evolution-runs/${runId}/genomes/${genomeId}/backtest?window=${window}`,
     { headers: authHeaders() },
   );
   return handleResponse(res);

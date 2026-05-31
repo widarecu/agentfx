@@ -134,6 +134,12 @@ export default function DslTree({ spec, className = '' }: DslTreeProps) {
               <span className="font-semibold">{exit.max_hold_bars}</span> bars
             </span>
           )}
+          {exit.min_hold_bars !== undefined && exit.min_hold_bars > 0 && (
+            <span>
+              min-hold=
+              <span className="font-semibold">{exit.min_hold_bars}</span> bars
+            </span>
+          )}
           {exit.opposite_signal !== undefined && (
             <span
               className={

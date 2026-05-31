@@ -228,6 +228,53 @@ def _mut_perturb_exit_numeric(spec_dict: dict, rng: Random) -> bool:
     return True
 
 
+def _mut_perturb_min_hold(spec_dict: dict, rng: Random) -> bool:
+    """Mutate ``min_hold_bars``. Gives the GA a knob to escape the
+    over-trading failure mode (M1 strategies churning 6000+ trades/year
+    paid more in spread than they earned in edge). With this mutation
+    in play, lineages that lower their min-hold trade more and bleed
+    more; lineages that raise it trade less and may compound the
+    edge they have.
+
+    Three modes, chosen by rng:
+      * with prob 0.20, "bump from zero" — if currently 0, set to a
+        random value in [3, 15]. Bootstraps the dimension from gen-0
+        seeds that don't carry a non-zero default.
+      * with prob 0.40, multiplicative perturbation by ±25% (similar
+        to the other exit-numeric perturbations).
+      * with prob 0.40, additive perturbation by ±1..±3 bars. Lets
+        small lineages walk the dimension without big jumps.
+
+    Result is always clamped to ``[0, max_hold_bars - 1]`` so the
+    grammar's ``min_hold < max_hold`` validator never fires.
+    """
+    exit_node = spec_dict.get("exit")
+    if not isinstance(exit_node, dict):
+        return False
+    current = exit_node.get("min_hold_bars", 0)
+    if not isinstance(current, int):
+        return False
+    max_hold = exit_node.get("max_hold_bars")
+    if not isinstance(max_hold, int) or max_hold < 2:
+        return False
+    upper = max(0, max_hold - 1)
+
+    roll = rng.random()
+    if roll < 0.20 and current == 0:
+        new_val = rng.randint(3, 15)
+    elif roll < 0.60:
+        factor = rng.uniform(0.75, 1.25)
+        new_val = int(round(current * factor))
+    else:
+        new_val = current + rng.choice([-3, -2, -1, 1, 2, 3])
+
+    new_val = max(0, min(upper, new_val))
+    if new_val == current:
+        return False  # no-op; let the mutation chain try a different kind
+    exit_node["min_hold_bars"] = new_val
+    return True
+
+
 _MUTATIONS: tuple[Callable[[dict, Random], bool], ...] = (
     _mut_flip_comparator,
     _mut_perturb_threshold,
@@ -235,6 +282,7 @@ _MUTATIONS: tuple[Callable[[dict, Random], bool], ...] = (
     _mut_change_window,
     _mut_toggle_opposite_signal,
     _mut_perturb_exit_numeric,
+    _mut_perturb_min_hold,
 )
 
 

@@ -87,6 +87,42 @@ class TestMutateSpec:
                 if cond and "rhs" in cond and isinstance(cond["rhs"], (int, float)):
                     assert cond["rhs"] > 0
 
+    def test_min_hold_mutation_explores_dimension(self) -> None:
+        """Over many mutation attempts at least one lineage must move
+        min_hold_bars away from the seed's 0. Without this we wouldn't
+        actually be using the new exit-rule knob — the dimension would
+        stay frozen at the seed default and the v0.4.0 over-trading
+        fix wouldn't engage."""
+        rng = Random(123)
+        spec = MA_CROSSOVER_SEED
+        assert spec.exit.min_hold_bars == 0, "Seed precondition: starts at 0"
+        seen_nonzero = False
+        # Walk a lineage; each mutation builds on the previous spec so
+        # min-hold can compound across mutations.
+        for _ in range(60):
+            spec = mutate_spec(spec, rng)
+            if spec.exit.min_hold_bars > 0:
+                seen_nonzero = True
+                break
+        assert seen_nonzero, (
+            "min_hold_bars never moved off 0 across 60 mutations on "
+            "MA_CROSSOVER_SEED — the new dimension isn't being explored."
+        )
+
+    def test_min_hold_mutation_respects_max_hold_bound(self) -> None:
+        """Cross-field validator: min_hold must always stay strictly
+        below max_hold. Walk a long lineage and assert the invariant
+        on every step."""
+        rng = Random(7)
+        spec = MA_CROSSOVER_SEED
+        for _ in range(100):
+            spec = mutate_spec(spec, rng)
+            assert spec.exit.min_hold_bars < spec.exit.max_hold_bars, (
+                f"min_hold ({spec.exit.min_hold_bars}) >= max_hold "
+                f"({spec.exit.max_hold_bars}) — grammar invariant breached"
+            )
+            assert spec.exit.min_hold_bars >= 0
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Crossover

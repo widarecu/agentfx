@@ -8,6 +8,7 @@ __pycache__/
 .env
 .env.development
 .env.test
+.env.uat
 .env.staging
 .env.production
 .env.local

@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -106,15 +106,20 @@ class EvolutionRunCreate(BaseModel):
 
     instrument: str = Field(min_length=1, max_length=10)
     granularity: str = Field(default="M1", max_length=5)
-    data_years: int = Field(default=5, ge=1, le=20)
+    # `data_years` is back-compat only. The portal form always sends
+    # explicit `data_window_start`/`data_window_end` now (v0.4.0+); the
+    # worker honours those verbatim. Old API clients that still send
+    # `data_years` are routed through the rolling-window fallback in
+    # `_resolve_requested_window`. New code paths should always send
+    # explicit dates instead.
+    data_years: int | None = Field(default=None, ge=1, le=20)
 
     # Explicit data window. When BOTH are set the worker uses them verbatim
-    # (no `now()` reference, no `data_years` math) — this is what makes a
-    # run reproducible weeks later. When only one or neither is set the
-    # worker falls back to the rolling `(now - data_years, now)` window.
-    # Whatever the inputs, the worker writes the *effective* (clamped)
-    # window back to config_json on run-start so the row stays
-    # self-describing.
+    # (no `now()` reference) — this is the v0.4.0+ default. When only one
+    # or neither is set the worker falls back to the legacy rolling
+    # `(now - data_years, now)` window. Whatever the inputs, the worker
+    # writes the *effective* (clamped) window back to config_json on
+    # run-start so the row stays self-describing.
     data_window_start: datetime | None = None
     data_window_end: datetime | None = None
 
@@ -263,10 +268,15 @@ class GenomeBacktestResult(BaseModel):
     """Full backtest output for a single genome.
 
     Computed on-demand by re-running `services.backtest.run_backtest_from_db`
-    with the genome's DSL spec over the run's training window. Used by the
-    portal's `GenomeBacktest` page to show metrics + trades + per-bar
-    signals at the same level of detail an optimization trial offers, with
-    no per-genome persistence overhead.
+    with the genome's DSL spec over a specific slice of the run's data
+    window — chosen by the `window` query param (``training`` | ``oos`` |
+    ``full``). Used by the portal's `GenomeBacktest` page to show metrics
+    + trades + per-bar signals at the same level of detail an
+    optimization trial offers, with no per-genome persistence overhead.
+
+    The `window` field on the response echoes the requested slice back so
+    the client can tell which view it's rendering (e.g. tab label and
+    "evaluated on …" hero line).
 
     Field shapes for `trades` and `signals` match the existing
     optimization-trial `OptimizationTrade` / `TradeSignal` response shapes
@@ -280,6 +290,12 @@ class GenomeBacktestResult(BaseModel):
     genome_id: str
     instrument: str
     granularity: str
+    # Which slice of the run's data window this result covers. ``training``
+    # = folds 0..K-2 concatenated (matches what the GA's fitness saw).
+    # ``oos`` = the held-out final fold (matches what Gate B was judged on).
+    # ``full`` = the entire effective window, for users who want a single
+    # equity curve across train + OOS — useful for spotting regime shifts.
+    window: Literal["training", "oos", "full"]
     data_range_start: datetime
     data_range_end: datetime
     metrics: dict[str, Any]

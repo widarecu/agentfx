@@ -212,6 +212,7 @@ def _apply_exits(
     stop_pips = exit_rules.stop_pips
     target_pips = exit_rules.target_pips
     max_hold = exit_rules.max_hold_bars
+    min_hold = exit_rules.min_hold_bars
     flip_on_opposite = exit_rules.opposite_signal
 
     for t in range(n):
@@ -220,6 +221,18 @@ def _apply_exits(
             move_pips = (close[t] - entry_close) / pip_size
             if in_position == -1:
                 move_pips = -move_pips
+
+            # Min-hold gate: while the position is younger than
+            # min_hold_bars, no exit path can fire (stop / target /
+            # opposite-flip / max-hold are all suppressed). Bars
+            # younger than the gate hold the existing direction. This
+            # forces the GA to discover strategies that don't churn
+            # every M1 bar; over-trading was the dominant failure mode
+            # on the M1 EUR_USD staging runs.
+            bars_held = t - entry_bar
+            if bars_held < min_hold:
+                final[t] = in_position
+                continue
 
             if move_pips <= -stop_pips:
                 # Stop hit: exit at this bar's close. Signal flips to 0
@@ -231,7 +244,7 @@ def _apply_exits(
                 final[t] = 0
                 in_position = 0
                 continue
-            if (t - entry_bar) >= max_hold:
+            if bars_held >= max_hold:
                 final[t] = 0
                 in_position = 0
                 continue

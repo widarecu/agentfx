@@ -262,7 +262,11 @@ def create_run(
     # Capture the caller-facing fields too so the row is fully self-describing
     config_dict.setdefault("instrument", create.instrument)
     config_dict.setdefault("granularity", create.granularity)
-    config_dict["data_years"] = create.data_years
+    # Only persist `data_years` when the caller actually sent it. The
+    # v0.4.0+ form always pins explicit dates and omits this; the worker's
+    # `_resolve_requested_window` defaults to 5 if it has to fall back.
+    if create.data_years is not None:
+        config_dict["data_years"] = create.data_years
     config_dict["llm_budget_usd"] = create.llm_budget_usd
     # Optional explicit data window. Stored verbatim as user-requested
     # input. The worker will write the *effective* (post-clamp) window

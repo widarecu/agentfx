@@ -17,8 +17,9 @@ US-016-evolution-observability.md for the full contract.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
@@ -27,6 +28,63 @@ from ..services import evolution as evolution_service
 from ..services import user as user_service
 
 router = APIRouter()
+
+
+def _resolve_backtest_slice(
+    *,
+    folds: list,
+    full_window: tuple[datetime, datetime],
+    window: Literal["training", "oos", "full"],
+) -> tuple[datetime, datetime]:
+    """Pick the (start, end) for the on-demand genome backtest.
+
+    Extracted so the slice-dispatch logic has its own focused unit-test
+    surface — the rest of the endpoint is mostly DB/auth/HTTP wiring that
+    is exercised by integration tests when those land.
+    """
+    # Lazy import to keep router import-time light.
+    from agentfx.core.validation import oos_window, training_window
+
+    if window == "training":
+        return training_window(folds)
+    if window == "oos":
+        return oos_window(folds)
+    return full_window
+
+
+def _resolve_pinned_spread_pips(
+    config_dict: dict,
+    instrument: str,
+) -> float | None:
+    """Pick the spread the worker pinned at run-start, NOT the live spread.
+
+    The on-demand backtest endpoint replays each genome at the exact cost
+    model the GA + validator paid; otherwise its Sharpe/CAGR/MDD drift
+    from the persisted walk-forward fold values whenever the live spread
+    has changed between run-completion and re-execution.
+
+    Lookup order mirrors the worker's snapshotting order:
+        1. `effective_spread_pips_per_pair[instrument]` — v0.4.0+ per-pair
+           dict (one entry per instrument the run touched).
+        2. `effective_spread_pips` — legacy scalar (v0.3.0+ single-pair).
+        3. `spread_pips` — the user's original pinned value (often `null`
+           when the user wanted the live snapshot).
+        4. None — caller will let `run_backtest_from_db` re-lookup live,
+           which is *only* correct for runs whose worker never pinned
+           anything (i.e. nothing else above is set).
+    """
+    eff_per_pair = config_dict.get("effective_spread_pips_per_pair") or {}
+    if isinstance(eff_per_pair, dict):
+        pinned = eff_per_pair.get(instrument)
+        if pinned is not None:
+            return float(pinned)
+    legacy = config_dict.get("effective_spread_pips")
+    if legacy is not None:
+        return float(legacy)
+    original = config_dict.get("spread_pips")
+    if original is not None:
+        return float(original)
+    return None
 
 
 def _ensure_trader(current_user: models.User) -> None:
@@ -270,6 +328,15 @@ def get_genome_detail(
 def get_genome_backtest(
     run_id: str,
     genome_id: str,
+    window: Literal["training", "oos", "full"] = Query(
+        default="training",
+        description=(
+            "Which slice of the run's data window to backtest. "
+            "`training` = folds 0..K-2 concatenated (matches the GA's "
+            "fitness). `oos` = the held-out final fold (matches Gate B). "
+            "`full` = the entire effective data window."
+        ),
+    ),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(user_service.get_current_active_user),
 ) -> schemas.GenomeBacktestResult:
@@ -279,18 +346,25 @@ def get_genome_backtest(
     individual trades and per-bar signals are not stored. To match the
     "drill into a trial" experience users have for optimisation jobs, we
     re-execute the backtest on demand from the genome's DSL spec + the
-    run's data window. Result is deterministic (same DSL + same candles =
-    same trades), so re-running is safe and idempotent.
+    requested slice of the run's data window. Result is deterministic
+    (same DSL + same candles = same trades), so re-running is safe and
+    idempotent.
+
+    The `window` query param picks the slice — see the schema docstring
+    for the three options. Defaults to `training` so existing callers
+    (before this param existed) keep their current behaviour.
 
     Compute cost: ~1s on 120K candles. The page is interactive — re-run
     on every navigation — so no caching needed yet. If this becomes a hot
     path, persist results to a `genome_backtest_cache` table keyed by
-    (genome_id, data_window_hash).
+    (genome_id, window, data_window_hash).
     """
     # Lazy imports — the backtest engine pulls in pandas + numpy which we
     # don't want at router-import time.
     from agentfx.api.workers.evolution_runner import _clamp_window_to_data
-    from agentfx.core.validation import make_walk_forward_folds, training_window
+    from agentfx.core.validation import (
+        make_walk_forward_folds,
+    )
     from agentfx.services.backtest import run_backtest_from_db
 
     run = evolution_service.get_run(db, run_id)
@@ -307,12 +381,31 @@ def get_genome_backtest(
 
     # Reconstruct the same training window the orchestrator used so the
     # backtest's metrics line up with the displayed `fitness` value.
+    #
+    # Prefer the *effective* window the worker pinned at run-start (set
+    # on every run that completed snapshotting — v0.3.0+). Fall back to
+    # the user-supplied window dates, then to a rolling `data_years`
+    # window for ancient runs that pre-date the dates-first form. Using
+    # the effective dates means the re-run matches the GA's training
+    # window exactly even months later, instead of drifting with `now()`.
     config_dict = run.config_json or {}
-    data_years = int(config_dict.get("data_years", 5))
-    requested_window = (
-        datetime.now(tz=run.created_at.tzinfo) - timedelta(days=data_years * 365),
-        datetime.now(tz=run.created_at.tzinfo),
+    eff_start_raw = config_dict.get("effective_data_window_start") or config_dict.get(
+        "data_window_start"
     )
+    eff_end_raw = config_dict.get("effective_data_window_end") or config_dict.get(
+        "data_window_end"
+    )
+    if eff_start_raw and eff_end_raw:
+        requested_window = (
+            datetime.fromisoformat(eff_start_raw),
+            datetime.fromisoformat(eff_end_raw),
+        )
+    else:
+        data_years = int(config_dict.get("data_years", 5))
+        requested_window = (
+            datetime.now(tz=run.created_at.tzinfo) - timedelta(days=data_years * 365),
+            datetime.now(tz=run.created_at.tzinfo),
+        )
     clamped = _clamp_window_to_data(
         db,
         instrument=run.instrument,
@@ -328,25 +421,34 @@ def get_genome_backtest(
             ),
         )
 
-    # Slice to the training window (folds 0..k-2) so the re-run matches
-    # what the GA evaluated. OOS metrics live in `validation_folds`.
+    # Pick the slice the caller asked for. Folds are computed exactly the
+    # same way the orchestrator + validator computed them at run time, so
+    # the returned trades + metrics line up bar-for-bar with what the GA
+    # saw (training) or what Gate B was judged on (oos).
     n_folds = int(config_dict.get("n_validation_folds", 4))
     folds = make_walk_forward_folds(start=clamped[0], end=clamped[1], k=n_folds)
-    train_start, train_end = training_window(folds)
+    slice_start, slice_end = _resolve_backtest_slice(
+        folds=folds, full_window=clamped, window=window
+    )
 
     backtest_kwargs: dict = {
         "account_balance": float(config_dict.get("account_balance", 10000.0)),
         "position_size": int(config_dict.get("position_size", 10000)),
         "leverage": int(config_dict.get("leverage", 30)),
     }
-    if config_dict.get("spread_pips") is not None:
-        backtest_kwargs["spread_pips"] = float(config_dict["spread_pips"])
+    # Use the spread the worker pinned at run-start so the endpoint's
+    # replay matches the persisted walk-forward fold metrics. Live-spread
+    # drift between run completion and re-execution previously produced
+    # mismatching Sharpe/CAGR/MDD on the genome backtest page.
+    pinned_spread = _resolve_pinned_spread_pips(config_dict, run.instrument)
+    if pinned_spread is not None:
+        backtest_kwargs["spread_pips"] = pinned_spread
 
     result = run_backtest_from_db(
         instrument=run.instrument,
         granularity=run.granularity,
-        start=train_start,
-        end=train_end,
+        start=slice_start,
+        end=slice_end,
         strategy_name="dsl",
         strategy_params={"spec": genome_detail["dsl_json"]},
         capture_signals=True,
@@ -358,8 +460,9 @@ def get_genome_backtest(
         genome_id=genome_id,
         instrument=run.instrument,
         granularity=run.granularity,
-        data_range_start=train_start,
-        data_range_end=train_end,
+        window=window,
+        data_range_start=slice_start,
+        data_range_end=slice_end,
         metrics=result.get("metrics", {}),
         trades=result.get("trades", []),
         signals=result.get("signals", []),

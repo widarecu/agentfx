@@ -89,6 +89,10 @@ export function summarizeDsl(spec: DslSpec | null | undefined): string {
   if (typeof exit.stop_pips === 'number') exitParts.push(`${exit.stop_pips}-pip stop`);
   if (typeof exit.target_pips === 'number')
     exitParts.push(`${exit.target_pips}-pip target`);
+  // min_hold_bars only worth mentioning when non-zero — zero is the
+  // legacy default ("any exit can fire on the next bar"), no signal.
+  if (typeof exit.min_hold_bars === 'number' && exit.min_hold_bars > 0)
+    exitParts.push(`min ${exit.min_hold_bars}-bar hold`);
   if (typeof exit.max_hold_bars === 'number')
     exitParts.push(`max ${exit.max_hold_bars}-bar hold`);
   if (exit.opposite_signal) exitParts.push('exits on opposite signal');

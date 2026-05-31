@@ -162,15 +162,44 @@ export default function GenomeDetail() {
 
   // Build the "evaluated on …" line from the run config. The fitness on
   // this page is computed against this exact instrument+granularity+window.
-  const dataYears =
-    typeof run?.config_json?.data_years === 'number'
-      ? (run.config_json.data_years as number)
-      : null;
-  const evaluatedOnLine = run
-    ? `${run.instrument} ${run.granularity}${
-        dataYears ? ` · ${dataYears}y window` : ''
-      }`
-    : null;
+  // Prefer the effective window dates (set by the worker at run-start);
+  // fall back to the user-pinned window dates; fall back to legacy
+  // `data_years` only for ancient runs.
+  const evaluatedOnLine = (() => {
+    if (!run) return null;
+    const cfg = (run.config_json ?? {}) as Record<string, unknown>;
+    const startStr =
+      (typeof cfg.effective_data_window_start === 'string'
+        ? (cfg.effective_data_window_start as string)
+        : null) ??
+      (typeof cfg.data_window_start === 'string'
+        ? (cfg.data_window_start as string)
+        : null);
+    const endStr =
+      (typeof cfg.effective_data_window_end === 'string'
+        ? (cfg.effective_data_window_end as string)
+        : null) ??
+      (typeof cfg.data_window_end === 'string'
+        ? (cfg.data_window_end as string)
+        : null);
+    let windowPart = '';
+    if (startStr && endStr) {
+      const days = Math.max(
+        1,
+        Math.round(
+          (new Date(endStr).getTime() - new Date(startStr).getTime()) /
+            (24 * 3600 * 1000),
+        ),
+      );
+      windowPart =
+        days >= 365
+          ? ` · ${(days / 365).toFixed(1).replace(/\.0$/, '')}y window`
+          : ` · ${days}d window`;
+    } else if (typeof cfg.data_years === 'number') {
+      windowPart = ` · ${cfg.data_years as number}y window`;
+    }
+    return `${run.instrument} ${run.granularity}${windowPart}`;
+  })();
 
   return (
     <div className="container mx-auto px-4 py-8 space-y-6">
@@ -315,7 +344,7 @@ export default function GenomeDetail() {
       {/* ── 4. Walk-forward validation ──────────────────────────── */}
       <Section
         title="Walk-Forward Validation"
-        subtitle="Per-fold metrics. Cells are colored by whether each metric passes its Gate B threshold independently. Hover any cell for the delta vs threshold."
+        subtitle="Each fold is backtested independently from $10,000 starting balance — values won't sum or average to the Backtest page's tile metrics (which run one continuous backtest with the balance compounding across folds). Cells are colored by whether each metric passes its Gate B threshold independently. Hover any cell for the delta vs threshold."
       >
         <WalkForwardFoldTable folds={genome.validation_folds} />
       </Section>

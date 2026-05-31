@@ -167,6 +167,14 @@ class ValidatorAgent(BaseAgent):
 
         folds = make_walk_forward_folds(start=start, end=end, k=self.k)
         spec_params = {"spec": spec.model_dump(mode="json")}
+        # Force the trade-ledger metric path. Without this, the validator's
+        # per-fold Gate B verdicts would be evaluated on bar-level
+        # unit-position metrics that don't reflect the risk-sized,
+        # compounded behaviour the strategy actually exhibits. The portal
+        # walk-forward fold table reads these persisted values directly,
+        # so the ledger pipeline is what makes the WF table align with
+        # the backtest hero and tiles on the genome page.
+        backtest_kwargs.setdefault("capture_signals", True)
 
         fold_evaluations: list[FoldEvaluation] = []
         for fold in folds:

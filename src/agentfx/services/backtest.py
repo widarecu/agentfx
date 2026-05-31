@@ -372,39 +372,59 @@ def _lookup_financing_rates(instrument: str) -> tuple[float | None, float | None
             pass
 
 
-def _lookup_typical_spread(instrument: str) -> float | None:
-    """Read the per-pair typical spread (pips) cached on the instruments row.
+def _lookup_typical_spreads(instruments: list[str]) -> dict[str, float]:
+    """Read the per-pair typical spread (pips) for many instruments in
+    one query. Returns ``{symbol: spread_pips}`` for every instrument
+    whose row has a populated ``typical_spread_pips``. Missing rows /
+    null spreads are simply absent from the returned dict — the caller
+    decides how to handle them (default value, warning, raise).
 
-    Returns the spread in pips, or None if the row is missing, the seed
-    has not run yet, or the database is unreachable. A None result lets
-    the caller fall back to a global default with a warning.
+    This is the v0.4.0 entry point for the per-pair cost model. Today
+    the orchestrator calls it with a single-element list (one pair per
+    run); v0.5.0+ multi-symbol runs will pass the full instrument set
+    so each pair gets its own pinned spread. The function shape is the
+    upgrade — no migration needed when more pairs start coming in.
     """
+    if not instruments:
+        return {}
     try:
         from agentfx.api.core.database import SessionLocal
         from agentfx.api.models.instrument import Instrument
     except Exception as e:  # pragma: no cover - import guard
         logger.debug("Cannot import DB layer for spread lookup: %s", e)
-        return None
+        return {}
 
     try:
         db = SessionLocal()
     except Exception as e:
         logger.debug("Could not open DB session for spread lookup: %s", e)
-        return None
+        return {}
 
     try:
-        row = db.query(Instrument).filter(Instrument.symbol == instrument).first()
-        if row is None or row.typical_spread_pips is None:
-            return None
-        return float(row.typical_spread_pips)
+        rows = (
+            db.query(Instrument.symbol, Instrument.typical_spread_pips)
+            .filter(Instrument.symbol.in_(instruments))
+            .all()
+        )
+        return {symbol: float(spread) for symbol, spread in rows if spread is not None}
     except Exception as e:
-        logger.debug("Spread lookup failed for %s: %s", instrument, e)
-        return None
+        logger.debug("Per-pair spread lookup failed for %s: %s", instruments, e)
+        return {}
     finally:
         try:
             db.close()
         except Exception:  # pragma: no cover - defensive
             pass
+
+
+def _lookup_typical_spread(instrument: str) -> float | None:
+    """Single-pair wrapper around :func:`_lookup_typical_spreads` kept
+    for back-compat with the v0.3.0 call sites in this module. New
+    callers (and v0.4.0+ orchestrator code) should prefer the bulk
+    helper so multi-pair upgrades stay zero-touch.
+    """
+    found = _lookup_typical_spreads([instrument])
+    return found.get(instrument)
 
 
 def run_backtest_from_db(
@@ -764,6 +784,38 @@ def run_backtest_from_db(
             "is_dsl_risk_sized": is_dsl,
         }
 
+        # ── Trade-ledger metrics (canonical) ──
+        # Overwrite Sharpe / MaxDD / CAGR / HitRate / n_trades / total_return
+        # with values derived from the *risk-sized, compounded* dollar
+        # ledger. The previous bar-level computation assumed a fictional
+        # always-100%-invested unit-position strategy and routinely
+        # disagreed with the hero's realised account change. Trade-ledger
+        # is the version every other surface in the platform (hero chip,
+        # ending_balance, peak_balance, cost breakdown) is consistent
+        # with — picking it as canonical means the hero, the tiles, and
+        # the WF table (on new runs) all tell the same story.
+        from agentfx.core.metrics import summarize_from_trade_ledger
+
+        ledger = summarize_from_trade_ledger(
+            trade_list,
+            starting_balance=float(account_balance),
+            window_start=df.index[0].to_pydatetime() if len(df) else start,
+            window_end=df.index[-1].to_pydatetime() if len(df) else end,
+        )
+        # Drop balance fields out of the metrics dict — those already live
+        # under result["sizing"] for the UI hero. Keeping them only on the
+        # canonical surface avoids two competing copies that can drift.
+        for k in (
+            "sharpe",
+            "mdd",
+            "max_drawdown",
+            "hit_rate",
+            "cagr",
+            "n_trades",
+            "total_return",
+        ):
+            metrics[k] = ledger[k]
+
         # Compute additional metrics from closed trades
         if trade_list:
             pips_list = [t["pips"] for t in trade_list]
@@ -776,9 +828,6 @@ def run_backtest_from_db(
                 (sum(losses) / len(losses)) * pip_size if losses else 0.0
             )
             metrics["profit_factor"] = sum(wins) / abs(sum(losses)) if losses else 0.0
-            # n_trades and hit_rate are already produced by summarize() via the
-            # shared extract_closed_trades walker, so we do NOT overwrite them
-            # here — the two paths would otherwise compete on the same field.
 
             # Max consecutive losses
             max_consec = 0
@@ -796,10 +845,6 @@ def run_backtest_from_db(
             metrics["avg_trade_duration"] = (
                 sum(durations) / len(durations) / 60.0
             )  # in hours
-
-            # Total return from equity curve
-            eq = (1.0 + rets).cumprod()
-            metrics["total_return"] = float(eq.iloc[-1] - 1.0) if len(eq) > 0 else 0.0
 
             # Pips-based extended metrics
             total_pips_val = sum(t["pips"] for t in trade_list)

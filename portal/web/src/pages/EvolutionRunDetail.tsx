@@ -367,7 +367,6 @@ function RunHero({
 }) {
   const cfg = (run.config_json ?? {}) as Record<string, unknown>;
   const popSize = typeof cfg.population_size === 'number' ? cfg.population_size : null;
-  const dataYears = typeof cfg.data_years === 'number' ? cfg.data_years : null;
   const llmBudget = typeof cfg.llm_budget_usd === 'number' ? cfg.llm_budget_usd : null;
   const stopConds = (run.stop_conditions_json ?? {}) as Record<string, unknown>;
   const maxGens =
@@ -378,6 +377,13 @@ function RunHero({
   // run-start, live spread lookup, clamp to available data).
   const effSpread =
     typeof cfg.effective_spread_pips === 'number' ? cfg.effective_spread_pips : null;
+  // v0.4.0+ per-pair dict. Prefer this when present; fall back to
+  // legacy scalar `effective_spread_pips` for older runs.
+  const effSpreadPerPair: Record<string, number> | null =
+    cfg.effective_spread_pips_per_pair &&
+    typeof cfg.effective_spread_pips_per_pair === 'object'
+      ? (cfg.effective_spread_pips_per_pair as Record<string, number>)
+      : null;
   const effWindowStart =
     typeof cfg.effective_data_window_start === 'string'
       ? cfg.effective_data_window_start
@@ -399,10 +405,46 @@ function RunHero({
     return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
   }, [run.started_at, run.completed_at]);
 
+  // Prefer the *effective* window pinned by the worker at run-start
+  // (always set on v0.3.0+ runs that completed snapshotting). Fall back
+  // to the user-requested explicit dates, then to the legacy
+  // `data_years` field for ancient runs that pre-date the dates-first
+  // form.
+  const historySpan = useMemo(() => {
+    const startStr =
+      effWindowStart ??
+      (typeof cfg.data_window_start === 'string'
+        ? (cfg.data_window_start as string)
+        : null);
+    const endStr =
+      effWindowEnd ??
+      (typeof cfg.data_window_end === 'string'
+        ? (cfg.data_window_end as string)
+        : null);
+    if (startStr && endStr) {
+      const start = new Date(startStr);
+      const end = new Date(endStr);
+      const days = Math.max(
+        1,
+        Math.round((end.getTime() - start.getTime()) / (24 * 3600 * 1000)),
+      );
+      if (days >= 365) {
+        const years = days / 365;
+        return `${years.toFixed(1).replace(/\.0$/, '')}y of history`;
+      }
+      return `${days}d of history`;
+    }
+    // Ancient-run fallback (no window dates in config_json at all).
+    if (typeof cfg.data_years === 'number') {
+      return `${cfg.data_years}y of history`;
+    }
+    return null;
+  }, [cfg, effWindowStart, effWindowEnd]);
+
   const summarySentence = useMemo(() => {
     const parts: string[] = [];
     parts.push(`${run.instrument} ${run.granularity}`);
-    if (dataYears) parts.push(`${dataYears}y of history`);
+    if (historySpan) parts.push(historySpan);
     const popPart = popSize ? `${popSize}-genome population` : null;
     const genPart = maxGens ? `${maxGens} generation budget` : null;
     if (popPart && genPart) parts.push(`${popPart} × ${genPart}`);
@@ -410,7 +452,7 @@ function RunHero({
     else if (genPart) parts.push(genPart);
     if (llmBudget != null) parts.push(`$${llmBudget.toFixed(2)} LLM budget`);
     return parts.join(' · ');
-  }, [run, dataYears, popSize, maxGens, llmBudget]);
+  }, [run, historySpan, popSize, maxGens, llmBudget]);
 
   return (
     <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-5">
@@ -457,7 +499,10 @@ function RunHero({
         spec produced different fitness (spread drift, window shift,
         threshold change). Hidden when the row was created before the
         worker started snapshotting these. */}
-      {(effWindowStart || effSpread != null || minCagrPct != null) && (
+      {(effWindowStart ||
+        effSpread != null ||
+        (effSpreadPerPair != null && Object.keys(effSpreadPerPair).length > 0) ||
+        minCagrPct != null) && (
         <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-700 flex flex-wrap items-center gap-2 text-xs">
           <span className="text-slate-500 dark:text-slate-400 font-semibold uppercase tracking-wide">
             Effective inputs:
@@ -470,14 +515,29 @@ function RunHero({
               data: {effWindowStart.slice(0, 10)} → {effWindowEnd.slice(0, 10)}
             </span>
           )}
-          {effSpread != null && (
+          {effSpreadPerPair != null && Object.keys(effSpreadPerPair).length > 0 ? (
+            // v0.4.0+ per-pair shape. Render one chip per pair so a
+            // reader can see (and audit) exactly what cost model each
+            // backtest paid. Today this is one chip; v0.5.0+ multi-pair
+            // runs will line up several side by side.
+            Object.entries(effSpreadPerPair).map(([pair, spread]) => (
+              <span
+                key={pair}
+                className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-violet-50 dark:bg-violet-900/30 text-violet-800 dark:text-violet-300 font-mono"
+                title={`Spread (in pips) every backtest on ${pair} in this run paid. Pinned at run-start from either the user-provided value or the live instruments snapshot. Does not drift mid-run.`}
+              >
+                {pair} spread: {spread.toFixed(2)} pips
+              </span>
+            ))
+          ) : effSpread != null ? (
+            // Legacy v0.3.0 row without per-pair dict.
             <span
               className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-violet-50 dark:bg-violet-900/30 text-violet-800 dark:text-violet-300 font-mono"
               title="Spread (in pips) every backtest in this run paid. Pinned at run-start from either the user-provided value or the live instruments snapshot. Does not drift mid-run."
             >
               spread: {effSpread.toFixed(2)} pips
             </span>
-          )}
+          ) : null}
           {minCagrPct != null && (
             <span
               className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-900/30 text-emerald-800 dark:text-emerald-300 font-mono"
