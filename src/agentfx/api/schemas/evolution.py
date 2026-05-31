@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -268,10 +268,15 @@ class GenomeBacktestResult(BaseModel):
     """Full backtest output for a single genome.
 
     Computed on-demand by re-running `services.backtest.run_backtest_from_db`
-    with the genome's DSL spec over the run's training window. Used by the
-    portal's `GenomeBacktest` page to show metrics + trades + per-bar
-    signals at the same level of detail an optimization trial offers, with
-    no per-genome persistence overhead.
+    with the genome's DSL spec over a specific slice of the run's data
+    window — chosen by the `window` query param (``training`` | ``oos`` |
+    ``full``). Used by the portal's `GenomeBacktest` page to show metrics
+    + trades + per-bar signals at the same level of detail an
+    optimization trial offers, with no per-genome persistence overhead.
+
+    The `window` field on the response echoes the requested slice back so
+    the client can tell which view it's rendering (e.g. tab label and
+    "evaluated on …" hero line).
 
     Field shapes for `trades` and `signals` match the existing
     optimization-trial `OptimizationTrade` / `TradeSignal` response shapes
@@ -285,6 +290,12 @@ class GenomeBacktestResult(BaseModel):
     genome_id: str
     instrument: str
     granularity: str
+    # Which slice of the run's data window this result covers. ``training``
+    # = folds 0..K-2 concatenated (matches what the GA's fitness saw).
+    # ``oos`` = the held-out final fold (matches what Gate B was judged on).
+    # ``full`` = the entire effective window, for users who want a single
+    # equity curve across train + OOS — useful for spotting regime shifts.
+    window: Literal["training", "oos", "full"]
     data_range_start: datetime
     data_range_end: datetime
     metrics: dict[str, Any]
