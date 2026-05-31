@@ -3,6 +3,8 @@
 Tests the metrics calculation functions used in backtesting and optimization.
 """
 
+from datetime import datetime, timedelta
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -15,6 +17,7 @@ from src.agentfx.core.metrics import (
     per_trade_returns,
     sharpe,
     summarize,
+    summarize_from_trade_ledger,
     turnover,
 )
 
@@ -415,3 +418,127 @@ class TestExtractClosedTrades:
         assert r_legacy["n_trades"] >= 1
         assert 0.0 <= r_with_close["hit_rate"] <= 1.0
         assert 0.0 <= r_legacy["hit_rate"] <= 1.0
+
+
+@pytest.mark.unit
+class TestSummarizeFromTradeLedger:
+    """Canonical platform metrics: derived from the risk-sized, compounded
+    dollar ledger rather than bar-level unit-position returns. These are
+    the values surfaced on the genome backtest hero, the metric tiles,
+    and the walk-forward fold table — they all share this definition so
+    the page can never tell three contradictory stories about the same
+    fold (the bug that prompted this helper)."""
+
+    def _trade(self, day: int, pnl: float) -> dict:
+        """Minimal trade dict — only `exit_timestamp` and
+        `net_pnl_dollars` are read by the ledger summariser."""
+        ts = datetime(2024, 1, 1) + timedelta(days=day)
+        return {
+            "exit_timestamp": ts.isoformat(),
+            "net_pnl_dollars": pnl,
+        }
+
+    def test_no_trades_returns_flat_balance(self):
+        out = summarize_from_trade_ledger(
+            [],
+            starting_balance=10_000.0,
+            window_start=datetime(2024, 1, 1),
+            window_end=datetime(2024, 4, 1),
+        )
+        assert out["n_trades"] == 0
+        assert out["total_return"] == 0.0
+        assert out["cagr"] == 0.0
+        assert out["sharpe"] == 0.0
+        assert out["max_drawdown"] == 0.0
+        assert out["hit_rate"] == 0.0
+        assert out["ending_balance"] == 10_000.0
+        assert out["peak_balance"] == 10_000.0
+
+    def test_single_winning_trade_total_return_matches_ledger(self):
+        out = summarize_from_trade_ledger(
+            [self._trade(day=10, pnl=200.0)],
+            starting_balance=10_000.0,
+            window_start=datetime(2024, 1, 1),
+            window_end=datetime(2024, 2, 1),
+        )
+        # Ledger grew by $200 → +2% total return on $10k base.
+        assert out["ending_balance"] == pytest.approx(10_200.0)
+        assert out["total_return"] == pytest.approx(0.02)
+        assert out["n_trades"] == 1
+        assert out["hit_rate"] == 1.0  # the sole trade was a win
+        assert out["peak_balance"] == pytest.approx(10_200.0)
+
+    def test_loss_followed_by_recovery_max_drawdown_is_trough_to_peak(self):
+        # Lose $500, then gain $300 → ending -$200, peak briefly was $10k,
+        # trough was $9,500. MaxDD measured against running peak.
+        out = summarize_from_trade_ledger(
+            [
+                self._trade(day=10, pnl=-500.0),
+                self._trade(day=20, pnl=300.0),
+            ],
+            starting_balance=10_000.0,
+            window_start=datetime(2024, 1, 1),
+            window_end=datetime(2024, 2, 1),
+        )
+        assert out["ending_balance"] == pytest.approx(9_800.0)
+        assert out["total_return"] == pytest.approx(-0.02)
+        # Initial peak of $10k → trough $9.5k = -5% drawdown
+        assert out["max_drawdown"] == pytest.approx(-0.05, abs=1e-6)
+        assert out["peak_balance"] == pytest.approx(10_000.0)
+
+    def test_hit_rate_counts_net_dollar_wins_not_gross_pip_wins(self):
+        """A trade with negative net P&L is NOT a win, even if its gross
+        pips were positive. The ledger uses post-cost economics throughout."""
+        trades = [
+            self._trade(day=1, pnl=100.0),
+            self._trade(day=2, pnl=-50.0),
+            self._trade(day=3, pnl=0.0),  # break-even isn't a win
+        ]
+        out = summarize_from_trade_ledger(
+            trades,
+            starting_balance=10_000.0,
+            window_start=datetime(2024, 1, 1),
+            window_end=datetime(2024, 2, 1),
+        )
+        assert out["hit_rate"] == pytest.approx(1.0 / 3.0)
+
+    def test_cagr_annualises_over_calendar_time_not_bar_count(self):
+        """1% return over 90 days should annualise to roughly +4%, not
+        +1% (which would happen if we used the simple total return)."""
+        out = summarize_from_trade_ledger(
+            [self._trade(day=85, pnl=100.0)],
+            starting_balance=10_000.0,
+            window_start=datetime(2024, 1, 1),
+            window_end=datetime(2024, 1, 1) + timedelta(days=90),
+        )
+        assert out["total_return"] == pytest.approx(0.01)
+        # (1.01)^(365.25/90) - 1 ≈ 0.0413
+        assert out["cagr"] == pytest.approx(0.0413, abs=5e-4)
+
+    def test_sharpe_zero_when_returns_have_no_variance(self):
+        """All-flat days produce undefined Sharpe — handled as 0."""
+        out = summarize_from_trade_ledger(
+            [],
+            starting_balance=10_000.0,
+            window_start=datetime(2024, 1, 1),
+            window_end=datetime(2024, 2, 1),
+        )
+        assert out["sharpe"] == 0.0
+
+    def test_multiple_trades_on_same_day_aggregate_into_one_balance_step(self):
+        """Sharpe annualises off daily returns, so two trades on the same
+        day must bucket into one daily P&L row (not two), otherwise the
+        daily-return series gets a spurious extra step."""
+        same_day = [
+            self._trade(day=5, pnl=200.0),
+            self._trade(day=5, pnl=-50.0),
+        ]
+        out = summarize_from_trade_ledger(
+            same_day,
+            starting_balance=10_000.0,
+            window_start=datetime(2024, 1, 1),
+            window_end=datetime(2024, 2, 1),
+        )
+        # Net: +150 → ending 10,150, total_return = 1.5%, 2 trades.
+        assert out["ending_balance"] == pytest.approx(10_150.0)
+        assert out["n_trades"] == 2

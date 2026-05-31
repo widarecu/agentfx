@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from datetime import datetime
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -212,6 +213,145 @@ def _cagr(eq: pd.Series) -> float:
     if years <= 0:
         return 0.0
     return float(eq.iloc[-1] ** (1.0 / years) - 1.0)
+
+
+def summarize_from_trade_ledger(
+    trades: list[dict[str, Any]],
+    *,
+    starting_balance: float,
+    window_start: datetime,
+    window_end: datetime,
+) -> dict[str, float]:
+    """Trade-ledger metrics: how the configured strategy actually moved
+    the account.
+
+    Replaces the older bar-level Sharpe/MaxDD/CAGR/HitRate definitions
+    that computed against a fictional unit-position return series. Those
+    were useful for direction-only signal evaluation but disagreed
+    wildly with what a real account would have done — the hero balance
+    chip and the headline tiles were derived from different concepts of
+    "performance" and routinely told contradictory stories.
+
+    Inputs are the per-trade dicts that ``run_backtest_from_db``
+    produces inside its ``capture_signals`` block (each carrying
+    ``exit_timestamp``, ``net_pnl_dollars``, and the
+    ``current_balance``-aware sizing applied at trade time). The
+    function builds a daily equity series from realised net P&L, then
+    derives Sharpe/MDD/CAGR/HitRate the way a brokerage statement
+    would.
+
+    Args:
+        trades: List of trade dicts. Required keys: ``exit_timestamp``
+            (ISO string or ``datetime``) and ``net_pnl_dollars`` (float).
+        starting_balance: Account balance at the start of the window
+            (before any trade).
+        window_start: Start of the data window (used for CAGR
+            annualisation — uses elapsed calendar time, not bar count).
+        window_end: End of the data window.
+    """
+    if not trades:
+        return {
+            "sharpe": 0.0,
+            "mdd": 0.0,
+            "max_drawdown": 0.0,
+            "hit_rate": 0.0,
+            "cagr": 0.0,
+            "n_trades": 0,
+            "total_return": 0.0,
+            "starting_balance": float(starting_balance),
+            "ending_balance": float(starting_balance),
+            "peak_balance": float(starting_balance),
+        }
+
+    def _parse_ts(v: Any) -> pd.Timestamp:
+        if isinstance(v, pd.Timestamp):
+            return v
+        if isinstance(v, datetime):
+            return pd.Timestamp(v)
+        return pd.Timestamp(v)
+
+    # Aggregate realised P&L by calendar day. Daily granularity matches
+    # standard Sharpe-annualisation convention (sqrt(252)) and is the
+    # right resolution for FX strategies that close many trades per day.
+    daily_pnl: dict[pd.Timestamp, float] = {}
+    for t in trades:
+        ts = _parse_ts(t["exit_timestamp"]).normalize()
+        daily_pnl[ts] = daily_pnl.get(ts, 0.0) + float(t["net_pnl_dollars"])
+
+    start_ts = pd.Timestamp(window_start).normalize()
+    end_ts = pd.Timestamp(window_end).normalize()
+    # Strip tz so the index is comparable to the keys (which we already
+    # normalised). Trade timestamps are UTC in production; for tests
+    # with naive timestamps this is a no-op.
+    if start_ts.tzinfo is not None:
+        start_ts = start_ts.tz_convert("UTC").tz_localize(None)
+    if end_ts.tzinfo is not None:
+        end_ts = end_ts.tz_convert("UTC").tz_localize(None)
+    daily_pnl = {
+        (k.tz_convert("UTC").tz_localize(None) if k.tzinfo is not None else k): v
+        for k, v in daily_pnl.items()
+    }
+    all_days = pd.date_range(start_ts, end_ts, freq="D")
+    balance = float(starting_balance)
+    equity_vals: list[float] = []
+    for d in all_days:
+        balance += daily_pnl.get(d, 0.0)
+        equity_vals.append(balance)
+    if not equity_vals:
+        equity_vals = [float(starting_balance)]
+        all_days = pd.DatetimeIndex([start_ts])
+    eq = pd.Series(equity_vals, index=all_days, dtype=float)
+
+    # Sharpe from daily equity returns, annualised √252.
+    daily_returns = eq.pct_change().dropna()
+    sharpe_val = 0.0
+    if not daily_returns.empty:
+        sigma = float(daily_returns.std(ddof=0))
+        if sigma > 0:
+            mu = float(daily_returns.mean())
+            sharpe_val = (mu * 252.0) / (sigma * np.sqrt(252.0))
+
+    # MaxDD as a negative fraction of peak equity, same convention the
+    # existing `max_drawdown()` returns.
+    peak = eq.cummax()
+    # Guard against divide-by-zero if equity ever hits 0 (catastrophic
+    # blowup — peak is still positive at that point so safe).
+    dd_series = (eq - peak) / peak
+    max_dd = float(dd_series.min())
+
+    ending = float(eq.iloc[-1])
+    peak_balance = float(peak.iloc[-1])
+    total_return = (ending - starting_balance) / starting_balance
+
+    # CAGR: annualise the total realised return over elapsed calendar
+    # time. Clamp years to >= 1 day to avoid blowing up on very short
+    # windows (a 1-trade single-day fold becomes a huge CAGR otherwise).
+    elapsed_days = (window_end - window_start).total_seconds() / 86400.0
+    years = max(elapsed_days / 365.25, 1.0 / 365.25)
+    cagr_val = 0.0
+    if ending > 0:
+        cagr_val = (ending / float(starting_balance)) ** (1.0 / years) - 1.0
+    else:
+        cagr_val = -1.0  # account was wiped out
+
+    # Hit rate: trades that paid AFTER costs (net), not gross. A +2 pip
+    # gross trade that paid 1.5 pip in spread is NOT a winning trade in
+    # the trader's mental model.
+    n_wins = sum(1 for t in trades if float(t.get("net_pnl_dollars", 0.0)) > 0)
+    hit = n_wins / len(trades)
+
+    return {
+        "sharpe": float(sharpe_val),
+        "mdd": max_dd,
+        "max_drawdown": max_dd,
+        "hit_rate": float(hit),
+        "cagr": float(cagr_val),
+        "n_trades": len(trades),
+        "total_return": float(total_return),
+        "starting_balance": float(starting_balance),
+        "ending_balance": ending,
+        "peak_balance": peak_balance,
+    }
 
 
 def summarize(

@@ -784,6 +784,38 @@ def run_backtest_from_db(
             "is_dsl_risk_sized": is_dsl,
         }
 
+        # ── Trade-ledger metrics (canonical) ──
+        # Overwrite Sharpe / MaxDD / CAGR / HitRate / n_trades / total_return
+        # with values derived from the *risk-sized, compounded* dollar
+        # ledger. The previous bar-level computation assumed a fictional
+        # always-100%-invested unit-position strategy and routinely
+        # disagreed with the hero's realised account change. Trade-ledger
+        # is the version every other surface in the platform (hero chip,
+        # ending_balance, peak_balance, cost breakdown) is consistent
+        # with — picking it as canonical means the hero, the tiles, and
+        # the WF table (on new runs) all tell the same story.
+        from agentfx.core.metrics import summarize_from_trade_ledger
+
+        ledger = summarize_from_trade_ledger(
+            trade_list,
+            starting_balance=float(account_balance),
+            window_start=df.index[0].to_pydatetime() if len(df) else start,
+            window_end=df.index[-1].to_pydatetime() if len(df) else end,
+        )
+        # Drop balance fields out of the metrics dict — those already live
+        # under result["sizing"] for the UI hero. Keeping them only on the
+        # canonical surface avoids two competing copies that can drift.
+        for k in (
+            "sharpe",
+            "mdd",
+            "max_drawdown",
+            "hit_rate",
+            "cagr",
+            "n_trades",
+            "total_return",
+        ):
+            metrics[k] = ledger[k]
+
         # Compute additional metrics from closed trades
         if trade_list:
             pips_list = [t["pips"] for t in trade_list]
@@ -796,9 +828,6 @@ def run_backtest_from_db(
                 (sum(losses) / len(losses)) * pip_size if losses else 0.0
             )
             metrics["profit_factor"] = sum(wins) / abs(sum(losses)) if losses else 0.0
-            # n_trades and hit_rate are already produced by summarize() via the
-            # shared extract_closed_trades walker, so we do NOT overwrite them
-            # here — the two paths would otherwise compete on the same field.
 
             # Max consecutive losses
             max_consec = 0
@@ -816,10 +845,6 @@ def run_backtest_from_db(
             metrics["avg_trade_duration"] = (
                 sum(durations) / len(durations) / 60.0
             )  # in hours
-
-            # Total return from equity curve
-            eq = (1.0 + rets).cumprod()
-            metrics["total_return"] = float(eq.iloc[-1] - 1.0) if len(eq) > 0 else 0.0
 
             # Pips-based extended metrics
             total_pips_val = sum(t["pips"] for t in trade_list)

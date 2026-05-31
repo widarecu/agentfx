@@ -252,6 +252,17 @@ def compute_fitness(
 
         backtest_fn = run_backtest_from_db
 
+    # capture_signals=True triggers the trade-ledger walk inside
+    # run_backtest_from_db, which overwrites the bar-level Sharpe/MaxDD/
+    # CAGR/HitRate with trade-ledger (risk-sized, compounded) values.
+    # This is the canonical metric definition the platform uses end-to-end
+    # — without it, GA fitness would optimise against a fictional always-
+    # 100%-invested unit-position pipeline that disagrees with what the
+    # account actually does. The trades[] / signals[] in the response are
+    # ignored here (fitness only needs `metrics`), but the trade walk
+    # itself is what makes the metrics ledger-based.
+    backtest_kwargs.setdefault("capture_signals", True)
+
     result = backtest_fn(
         instrument=instrument,
         granularity=granularity,
