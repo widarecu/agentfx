@@ -344,7 +344,7 @@ export default function GenomeDetail() {
       {/* ── 4. Walk-forward validation ──────────────────────────── */}
       <Section
         title="Walk-Forward Validation"
-        subtitle="Per-fold metrics. Cells are colored by whether each metric passes its Gate B threshold independently. Hover any cell for the delta vs threshold."
+        subtitle="Each fold is backtested independently from $10,000 starting balance — values won't sum or average to the Backtest page's tile metrics (which run one continuous backtest with the balance compounding across folds). Cells are colored by whether each metric passes its Gate B threshold independently. Hover any cell for the delta vs threshold."
       >
         <WalkForwardFoldTable folds={genome.validation_folds} />
       </Section>

@@ -274,11 +274,20 @@ export interface GenomeBacktestSizing {
   compounded?: boolean;
 }
 
+/** Which slice the backtest endpoint covered. `training` matches what
+ * the GA's fitness saw (folds 0..K-2). `oos` matches Gate B's held-out
+ * final fold. `full` is the entire effective data window. */
+export type GenomeBacktestWindow = 'training' | 'oos' | 'full';
+
 export interface GenomeBacktestResult {
   run_id: string;
   genome_id: string;
   instrument: string;
   granularity: string;
+  /** Echo of the requested `?window=…` query param. Required so the
+   * portal can label the view, tint the chart, and avoid mixing
+   * training and OOS data in the same components by mistake. */
+  window: GenomeBacktestWindow;
   data_range_start: string;
   data_range_end: string;
   metrics: Record<string, number>;
