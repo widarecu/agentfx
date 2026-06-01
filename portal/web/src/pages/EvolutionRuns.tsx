@@ -15,13 +15,11 @@ import {
   formatLlmCost,
   listEvolutionRuns,
 } from '../services/evolutionApi';
+import { marketDataService } from '../services/marketData';
 import type {
   EvolutionRun,
   EvolutionRunStatus,
 } from '../types/evolution';
-
-const PAIRS = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'AUD_USD', 'USD_CHF', 'USD_CAD'];
-const GRANULARITIES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4'];
 
 export default function EvolutionRuns() {
   const [runs, setRuns] = useState<EvolutionRun[]>([]);
@@ -297,8 +295,79 @@ function CreateRunModal({
   submitting: boolean;
   error: string | null;
 }) {
-  const [instrument, setInstrument] = useState(PAIRS[0]);
-  const [granularity, setGranularity] = useState('M1');
+  // Instrument + granularity options are pulled from the API so the form
+  // reflects what's actually been ingested on this environment. The
+  // granularities list is re-fetched whenever the user picks a different
+  // instrument so it never shows a timeframe that has no data for the
+  // selected pair — what used to be hardcoded
+  // `['M1','M5','M15','M30','H1','H4']` silently hid M10 on environments
+  // (like staging/UAT) where M10 had been backfilled but the constant
+  // didn't list it.
+  const [instrumentList, setInstrumentList] = useState<string[] | null>(null);
+  const [granularityList, setGranularityList] = useState<string[] | null>(null);
+  const [instrument, setInstrument] = useState<string>('');
+  const [granularity, setGranularity] = useState<string>('');
+
+  // Initial load: get instruments. Default to first available so the form
+  // is usable on first open without an extra click.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const items = await marketDataService.getInstruments();
+        if (cancelled) return;
+        const symbols = items.map((i) => i.symbol);
+        setInstrumentList(symbols);
+        if (symbols.length > 0 && !instrument) {
+          setInstrument(symbols[0]);
+        }
+      } catch {
+        if (cancelled) return;
+        // Fail-safe: surface an empty list, the user will see no options
+        // and can refresh. We deliberately don't fall back to a hardcoded
+        // list because that's the bug we're fixing.
+        setInstrumentList([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // intentionally empty deps — fetch once on mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Whenever instrument changes, re-fetch the timeframes that have
+  // candles for THAT instrument. Pick a sensible default (M1 if present,
+  // else the shortest-tag candidate the API returns).
+  useEffect(() => {
+    if (!instrument) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const tfs = await marketDataService.getTimeframes(instrument);
+        if (cancelled) return;
+        const codes = tfs.map((t) => t.code);
+        setGranularityList(codes);
+        if (codes.length === 0) {
+          setGranularity('');
+        } else if (codes.includes('M1')) {
+          setGranularity('M1');
+        } else if (!codes.includes(granularity)) {
+          setGranularity(codes[0]);
+        }
+      } catch {
+        if (cancelled) return;
+        setGranularityList([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // granularity is intentionally NOT in the deps — we only want to
+    // re-derive when the instrument changes, not when the user picks a
+    // granularity from the current list.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [instrument]);
   // Numeric inputs are stored as strings so editing behaves naturally
   // (clear → type, no leading-zero stickiness, no jump-back-to-min). They
   // are parsed and validated at submit time. Defaults match the
@@ -391,24 +460,44 @@ function CreateRunModal({
           className="px-5 py-4 space-y-4 text-sm"
         >
           <div className="grid grid-cols-2 gap-4">
-            <Field label="Instrument">
+            <Field
+              label="Instrument"
+              hint={
+                instrumentList === null
+                  ? 'loading…'
+                  : instrumentList.length === 0
+                    ? 'no instruments configured — seed_instruments.py needs to run'
+                    : undefined
+              }
+            >
               <select
                 value={instrument}
                 onChange={(e) => setInstrument(e.target.value)}
-                className="form-select w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
+                disabled={instrumentList === null || instrumentList.length === 0}
+                className="form-select w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 disabled:opacity-50"
               >
-                {PAIRS.map((p) => (
+                {(instrumentList ?? []).map((p) => (
                   <option key={p}>{p}</option>
                 ))}
               </select>
             </Field>
-            <Field label="Granularity">
+            <Field
+              label="Granularity"
+              hint={
+                granularityList === null
+                  ? 'loading…'
+                  : granularityList.length === 0
+                    ? `no candles ingested for ${instrument} yet`
+                    : 'only timeframes with backfilled candles are listed'
+              }
+            >
               <select
                 value={granularity}
                 onChange={(e) => setGranularity(e.target.value)}
-                className="form-select w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
+                disabled={granularityList === null || granularityList.length === 0}
+                className="form-select w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 disabled:opacity-50"
               >
-                {GRANULARITIES.map((g) => (
+                {(granularityList ?? []).map((g) => (
                   <option key={g}>{g}</option>
                 ))}
               </select>
@@ -587,8 +676,13 @@ function CreateRunModal({
             </button>
             <button
               type="submit"
-              disabled={submitting}
-              className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-md text-sm font-medium"
+              disabled={submitting || !instrument || !granularity}
+              title={
+                !instrument || !granularity
+                  ? 'Pick an instrument + granularity that have candles ingested.'
+                  : undefined
+              }
+              className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-md text-sm font-medium"
             >
               {submitting && <Loader2 className="w-4 h-4 animate-spin" />}
               Start Run
