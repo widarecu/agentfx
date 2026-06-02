@@ -384,6 +384,12 @@ function RunHero({
     typeof cfg.effective_spread_pips_per_pair === 'object'
       ? (cfg.effective_spread_pips_per_pair as Record<string, number>)
       : null;
+  // The seed the worker actually used to drive the GA. For runs that
+  // pin a seed via the form, this equals the user's input. For runs
+  // that left it blank, this is a fresh 32-bit value the worker
+  // generated at run-start and persisted onto config_json — copy it
+  // forward to a new run to reproduce the same lineage exactly.
+  const effRngSeed = typeof cfg.rng_seed === 'number' ? cfg.rng_seed : null;
   const effWindowStart =
     typeof cfg.effective_data_window_start === 'string'
       ? cfg.effective_data_window_start
@@ -502,7 +508,8 @@ function RunHero({
       {(effWindowStart ||
         effSpread != null ||
         (effSpreadPerPair != null && Object.keys(effSpreadPerPair).length > 0) ||
-        minCagrPct != null) && (
+        minCagrPct != null ||
+        effRngSeed != null) && (
         <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-700 flex flex-wrap items-center gap-2 text-xs">
           <span className="text-slate-500 dark:text-slate-400 font-semibold uppercase tracking-wide">
             Effective inputs:
@@ -544,6 +551,14 @@ function RunHero({
               title="Gate B CAGR floor applied to OOS validation in this run."
             >
               min CAGR: {(minCagrPct * 100).toFixed(0)}%/yr
+            </span>
+          )}
+          {effRngSeed != null && (
+            <span
+              className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-700/60 text-slate-700 dark:text-slate-300 font-mono"
+              title="The 32-bit RNG seed the GA actually used to drive mutation/crossover/tournament selection. Pin this on a new run's seed field to reproduce the same lineage."
+            >
+              rng_seed: {effRngSeed.toLocaleString()}
             </span>
           )}
         </div>

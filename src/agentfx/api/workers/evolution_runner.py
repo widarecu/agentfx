@@ -563,6 +563,23 @@ def _subprocess_entry(run_id: str) -> None:
         config_dict = run.config_json or {}
         stop_dict = run.stop_conditions_json or {}
 
+        # Resolve a fresh random seed when the user didn't pin one. The
+        # previous default-42 made independent runs deterministically
+        # converge on the same winning DSL — turning the GA into a
+        # confirmation loop instead of a search. Writing the resolved
+        # value back into `config_dict` lets the snapshot block below
+        # persist it on the row, so a past run remains reproducible by
+        # pinning the same value on a new run.
+        if config_dict.get("rng_seed") is None:
+            import secrets
+
+            config_dict["rng_seed"] = secrets.randbits(32)
+            logger.info(
+                "resolved fresh rng_seed=%s for run %s (no seed pinned by caller)",
+                config_dict["rng_seed"],
+                run_id,
+            )
+
         config = _build_orchestrator_config(
             config_dict,
             instrument=run.instrument,

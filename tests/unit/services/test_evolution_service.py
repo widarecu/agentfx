@@ -115,6 +115,31 @@ class TestCreateRun:
         assert run.config_json["population_size"] == 50
         assert run.config_json["rng_seed"] == 999
 
+    def test_rng_seed_defaults_to_none_when_caller_omits(self, db: Session) -> None:
+        """The schema default was changed from 42 → None so the worker
+        can pick a fresh random seed per run. If this regresses to 42
+        (or any other fixed value), independent runs deterministically
+        converge on the same winner — the GA stops searching and starts
+        confirming. See evorun_20260528_2f23b758 et al. for the four
+        identical-DSL runs that triggered this change."""
+        body = schemas.EvolutionRunCreate(instrument="EUR_USD")
+        assert body.config is None  # nothing supplied by the caller
+
+        # When no config block is passed at all, the create_run service
+        # picks up the OrchestratorConfigSchema defaults — including the
+        # new None default for rng_seed.
+        run = evolution_service.create_run(db, body)
+        # The resolution happens in the worker, NOT the service layer.
+        # The service must NOT silently substitute 42 here — that would
+        # bypass the worker's random-seed-per-run logic.
+        assert run.config_json.get("rng_seed") is None, (
+            "Service-layer create_run must persist rng_seed=None for the "
+            "worker to resolve. Got "
+            f"{run.config_json.get('rng_seed')!r}. If this is 42 or any "
+            "other fixed value, the GA's deterministic-convergence bug "
+            "has regressed."
+        )
+
     def test_create_records_creator(self, db: Session) -> None:
         # FK to users.id — create the user first so SQLite's enforced
         # foreign-key constraint is satisfied.

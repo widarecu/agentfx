@@ -271,7 +271,10 @@ interface CreateRunBody {
   data_window_end: string;
   config?: {
     population_size: number;
-    rng_seed: number;
+    /** Optional: pin a seed for reproducibility. When omitted, the worker
+     * generates a fresh 32-bit random seed at run-start and persists it
+     * onto config_json so the run can be reproduced later. */
+    rng_seed?: number;
     leverage?: number;
     min_cagr_pct?: number;
     spread_pips?: number | null;
@@ -384,6 +387,12 @@ function CreateRunModal({
   // results reproducible across container rebuilds (which re-fetch the
   // live spread and would otherwise silently shift the cost model).
   const [spreadPipsStr, setSpreadPipsStr] = useState('');
+  // Optional RNG seed for the GA. Blank = "let the worker pick a fresh
+  // random seed and persist it on the row" (the recommended default —
+  // hardcoded seeds were causing independent runs to deterministically
+  // converge on the same winner). Pin a numeric value to reproduce a
+  // specific past run.
+  const [rngSeedStr, setRngSeedStr] = useState('');
   // Data window is always explicit start + end (UTC midnight). Removed
   // the legacy "Data years" rolling-window mode in favour of a single,
   // unambiguous control: by always pinning the window the run is
@@ -438,7 +447,12 @@ function CreateRunModal({
               data_window_end: `${dataEndStr}T00:00:00Z`,
               config: {
                 population_size: populationSize,
-                rng_seed: 42,
+                // Only forward when user pinned an explicit seed; blank
+                // = let the worker pick a fresh random seed.
+                ...(rngSeedStr.trim() !== '' &&
+                Number.isFinite(Number(rngSeedStr))
+                  ? { rng_seed: Number(rngSeedStr) }
+                  : {}),
                 leverage,
                 min_cagr_pct: minCagrPct / 100,
                 // Only forward when the user explicitly pinned a value;
@@ -657,7 +671,21 @@ function CreateRunModal({
                 className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
               />
             </Field>
-            <div /> {/* spacer to keep grid alignment on the final row */}
+            <Field
+              label="RNG seed (optional)"
+              hint="Blank = fresh random seed every run (recommended). Pin a value to reproduce a specific past run — the seed actually used is persisted on the run row."
+            >
+              <input
+                type="number"
+                inputMode="numeric"
+                min={0}
+                max={4294967295}
+                placeholder="(random)"
+                value={rngSeedStr}
+                onChange={(e) => setRngSeedStr(e.target.value)}
+                className="form-input w-full px-3 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
+              />
+            </Field>
           </div>
 
           {error && (
