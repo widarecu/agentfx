@@ -234,6 +234,15 @@ class StrategyGenomePublic(BaseSchema):
     parent_ids: list[str]
     origin: str  # GenomeOrigin value
     fitness: float | None = None
+    # Per-fold training metrics + penalty breakdown. Populated by the
+    # orchestrator's fitness evaluation pipeline for every genome that
+    # was scored (carried-over elites and pre-v0.5.0 rows may have None).
+    # Contains keys: sharpe / max_drawdown / hit_rate / n_trades / cagr
+    # (aggregated across training folds) plus per_fold_sharpe (list),
+    # fold_consistency_std, mean_fold_sharpe, fold_consistency_lambda,
+    # and `penalty_breakdown` (a dict with raw_fitness, each penalty's
+    # deduction, dilution factors, final_fitness).
+    metrics_json: dict[str, Any] | None = None
     validator_passed: bool | None = None
     validation_failures: list[str] = Field(default_factory=list)
     llm_reasoning: str | None = None

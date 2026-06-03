@@ -296,6 +296,57 @@ export interface GenomeBacktestResult {
   sizing?: GenomeBacktestSizing;
 }
 
+/** Per-fold training metrics + the penalty chain that turned raw
+ * fitness into final fitness. Populated for every genome the GA scored
+ * (carried-over elites and pre-v0.5.0 rows may be null). The portal
+ * renders this to answer "why did this genome get this fitness?"
+ * without log-diving. */
+export interface GenomeMetrics {
+  // Aggregated fields used by the penalty layer (see
+  // `_aggregate_fold_metrics` in fitness.py).
+  sharpe?: number;
+  max_drawdown?: number;
+  hit_rate?: number;
+  n_trades?: number;
+  cagr?: number;
+  total_return?: number;
+  starting_balance?: number;
+  ending_balance?: number;
+  peak_balance?: number;
+  // Inspection fields from fold-consistency mode.
+  per_fold_sharpe?: number[];
+  /** Lightweight per-training-fold summary for the portal's training-
+   * fold table. Mirrors the validator's ValidationFold shape but
+   * without `fold_index` / `is_oos` since the index is the array
+   * position and these are ALL training folds. */
+  per_fold_training_metrics?: Array<{
+    sharpe: number | null;
+    max_drawdown: number | null;
+    hit_rate: number | null;
+    n_trades: number;
+    cagr: number | null;
+    total_return: number | null;
+  }>;
+  fold_consistency_std?: number;
+  fold_consistency_lambda?: number;
+  mean_fold_sharpe?: number;
+  // The (raw → each penalty → final) breakdown captured by
+  // `_apply_penalties`.
+  penalty_breakdown?: {
+    raw_fitness: number;
+    zero_trade_penalty: number;
+    trade_shortfall_penalty: number;
+    drawdown_breach_penalty: number;
+    gate_b_dilution_factor: number;
+    diversity_penalty_factor: number;
+    final_fitness: number;
+  };
+  // Any other backend-computed fields ride here (avg_win, avg_loss,
+  // profit_factor, cost breakdown, etc.). Loosely typed so backend
+  // additions don't break the frontend.
+  [k: string]: unknown;
+}
+
 export interface StrategyGenome {
   id: string;
   generation_id: string;
@@ -304,6 +355,9 @@ export interface StrategyGenome {
   parent_ids: string[];
   origin: GenomeOrigin;
   fitness: number | null;
+  /** v0.5.0+ — per-fold metrics + penalty breakdown. Null for old rows
+   * and for elites that carried over without re-evaluation. */
+  metrics_json: GenomeMetrics | null;
   validator_passed: boolean | null;
   validation_failures: string[];
   llm_reasoning: string | null;

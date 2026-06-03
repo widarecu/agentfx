@@ -171,8 +171,15 @@ def _apply_penalties(
     elite_specs: list[StrategySpec] | None,
     diversity_threshold: int,
     gate_b_overrides: dict[str, float] | None = None,
-) -> float:
+) -> tuple[float, dict[str, Any]]:
     """Apply Gate B and diversity penalties to a raw fitness value.
+
+    Returns ``(final_fitness, breakdown)`` where ``breakdown`` is a dict
+    with the per-step deductions so the caller can show the user
+    exactly what got applied. The portal renders this as a chain:
+    raw → zero-trade → shortfall → drawdown → ×gate_b → ×diversity →
+    final. Zero-cost (the values are computed anyway) — we just stopped
+    throwing them away.
 
     Penalty order (additive, then multiplicative):
       1. Trade-count shortfall: additive penalty that scales 0 → -10 as
@@ -187,6 +194,14 @@ def _apply_penalties(
          elite, preventing premature convergence.
     """
     fitness = raw_fitness
+    breakdown: dict[str, Any] = {
+        "raw_fitness": float(raw_fitness),
+        "zero_trade_penalty": 0.0,
+        "trade_shortfall_penalty": 0.0,
+        "drawdown_breach_penalty": 0.0,
+        "gate_b_dilution_factor": 1.0,
+        "diversity_penalty_factor": 1.0,
+    }
 
     # 1a. Zero-trade hard penalty — for genuinely degenerate genomes that
     # never open a position. Without this hard floor, the proportional
@@ -194,24 +209,30 @@ def _apply_penalties(
     n_trades = metrics.get("n_trades", 0) or 0
     if n_trades == 0:
         fitness -= ZERO_TRADE_HARD_PENALTY
+        breakdown["zero_trade_penalty"] = -float(ZERO_TRADE_HARD_PENALTY)
     else:
         # 1b. Proportional shortfall — for strategies that DO trade but
         # come up short of Gate B's minimum.
         min_trades = GATE_B_THRESHOLDS["min_trades"]
         if n_trades < min_trades:
             shortfall_ratio = (min_trades - n_trades) / min_trades
-            fitness -= shortfall_ratio * TRADE_SHORTFALL_PENALTY_SCALE
+            deduction = shortfall_ratio * TRADE_SHORTFALL_PENALTY_SCALE
+            fitness -= deduction
+            breakdown["trade_shortfall_penalty"] = -float(deduction)
 
     # 2. Drawdown breach — additive, proportional to over-cap excess.
     max_dd = metrics.get("max_drawdown", 0) or 0
     if max_dd > GATE_B_THRESHOLDS["max_drawdown"]:
         breach = max_dd - GATE_B_THRESHOLDS["max_drawdown"]
-        fitness -= breach * DRAWDOWN_BREACH_PENALTY_SCALE
+        deduction = breach * DRAWDOWN_BREACH_PENALTY_SCALE
+        fitness -= deduction
+        breakdown["drawdown_breach_penalty"] = -float(deduction)
 
     # 3. Gate B dilution: halve positive fitness if any threshold breached.
     passes_gate_b, _ = evaluate_gate_b(metrics, overrides=gate_b_overrides)
     if not passes_gate_b and fitness > 0:
         fitness = fitness * GATE_B_FAILURE_DILUTION
+        breakdown["gate_b_dilution_factor"] = float(GATE_B_FAILURE_DILUTION)
 
     # 4. Diversity penalty: halve fitness if too close to an elite.
     if (
@@ -220,8 +241,10 @@ def _apply_penalties(
         and is_near_elite(candidate, elite_specs, threshold=diversity_threshold)
     ):
         fitness = fitness * DIVERSITY_PENALTY_FACTOR
+        breakdown["diversity_penalty_factor"] = float(DIVERSITY_PENALTY_FACTOR)
 
-    return fitness
+    breakdown["final_fitness"] = float(fitness)
+    return fitness, breakdown
 
 
 def _aggregate_fold_metrics(
@@ -290,6 +313,31 @@ def _aggregate_fold_metrics(
     cagrs = _f("cagr")
     trade_counts = [int(m.get("n_trades", 0) or 0) for m in per_fold_metrics]
 
+    # Full per-fold projection — kept lightweight (just the fields the
+    # portal's WF-style table renders). The full metrics dict per fold
+    # would balloon the row size; this is the audit trail the user needs.
+    per_fold_summary = [
+        {
+            "sharpe": (float(m.get("sharpe")) if m.get("sharpe") is not None else None),
+            "max_drawdown": (
+                float(m.get("max_drawdown"))
+                if m.get("max_drawdown") is not None
+                else None
+            ),
+            "hit_rate": (
+                float(m.get("hit_rate")) if m.get("hit_rate") is not None else None
+            ),
+            "n_trades": int(m.get("n_trades", 0) or 0),
+            "cagr": float(m.get("cagr")) if m.get("cagr") is not None else None,
+            "total_return": (
+                float(m.get("total_return"))
+                if m.get("total_return") is not None
+                else None
+            ),
+        }
+        for m in per_fold_metrics
+    ]
+
     aggregated = {
         "sharpe": raw_fitness,
         "max_drawdown": worst_dd,
@@ -297,10 +345,10 @@ def _aggregate_fold_metrics(
         "cagr": sum(cagrs) / len(cagrs) if cagrs else 0.0,
         "n_trades": sum(trade_counts),
         # Inspection fields — surfaced verbatim on the genome's metrics
-        # dict so the portal can show "Sharpe per training fold" alongside
-        # the aggregate. Not yet rendered, but persisted for the v0.5.0
-        # WF-table-aware UI work.
+        # dict so the portal can render "training fold by fold" the same
+        # way the validator's OOS WF table renders the final fold.
         "per_fold_sharpe": sharpes,
+        "per_fold_training_metrics": per_fold_summary,
         "fold_consistency_std": std_sharpe,
         "fold_consistency_lambda": fold_consistency_lambda,
         "mean_fold_sharpe": mean_sharpe,
@@ -429,7 +477,7 @@ def compute_fitness(
             raw_sharpe = float("-inf")
         raw_fitness = float(raw_sharpe)
 
-    fitness = _apply_penalties(
+    fitness, penalty_breakdown = _apply_penalties(
         raw_fitness=raw_fitness,
         metrics=metrics,
         candidate=spec,
@@ -437,6 +485,12 @@ def compute_fitness(
         diversity_threshold=diversity_threshold,
         gate_b_overrides=gate_b_overrides,
     )
+    # Surface the chain (raw → each penalty → final) on the metrics dict
+    # so the persister can save it and the portal can render it. Cost:
+    # ~80 bytes per genome added to the JSON column. Worth it — without
+    # this the user can't see why a 1.5 raw-Sharpe strategy got fitness
+    # 0.39 (variance penalty + Gate-B dilution + diversity).
+    metrics["penalty_breakdown"] = penalty_breakdown
 
     return fitness, metrics
 

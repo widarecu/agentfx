@@ -212,6 +212,14 @@ class StrategyGenome(Base):
     )
 
     fitness = Column(Float, nullable=True)
+    # Full metrics dict from the fitness evaluation: per-fold Sharpe /
+    # MaxDD / hit-rate / trades / CAGR for every training fold, plus
+    # the penalty breakdown (raw fitness, each penalty's contribution,
+    # final fitness). Populated by the orchestrator's
+    # _evaluate_population_fitness pipeline. Nullable for back-compat
+    # with rows written before v0.5.0 and for elites that carried over
+    # without re-evaluation.
+    metrics_json = Column(JSON, nullable=True)
     validator_passed = Column(Boolean, nullable=True)
     # Human-readable failure messages from evaluate_gate_b()
     validation_failures = Column(JSON, nullable=False, default=list)
