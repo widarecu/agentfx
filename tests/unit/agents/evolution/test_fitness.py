@@ -8,7 +8,9 @@ import pytest
 
 from agentfx.agents.evolution.fitness import (
     DIVERSITY_PENALTY_FACTOR,
+    FOLD_CONSISTENCY_LAMBDA_DEFAULT,
     GATE_B_FAILURE_DILUTION,
+    _aggregate_fold_metrics,
     compute_fitness,
     is_near_elite,
     spec_edit_distance,
@@ -280,3 +282,288 @@ class TestComputeFitness:
             backtest_fn=backtest,
         )
         assert metrics == rich_metrics
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Fold-consistency mode (v0.5.0)
+# ─────────────────────────────────────────────────────────────────────────
+# The GA's fitness was previously the Sharpe of ONE backtest over the
+# concatenated training window, which rewarded "found a regime and rode
+# it" strategies that look great on average but collapse OOS. The new
+# mode runs a backtest per training fold and aggregates per-fold Sharpe
+# via `mean − λ·std`, penalising variance. These tests lock the
+# aggregator math and the orchestrator-to-aggregator wiring.
+
+
+class TestAggregatorMath:
+    """Pure math on _aggregate_fold_metrics — no backtest, no DB."""
+
+    def test_consistent_folds_keep_full_mean(self):
+        """Three folds with the same Sharpe → std=0 → fitness = mean.
+        This is the "perfectly consistent" baseline; nothing should be
+        deducted because there's no inconsistency to penalise."""
+        per_fold = [
+            {
+                "sharpe": 1.2,
+                "max_drawdown": -0.05,
+                "hit_rate": 0.5,
+                "n_trades": 200,
+                "cagr": 0.10,
+            },
+            {
+                "sharpe": 1.2,
+                "max_drawdown": -0.05,
+                "hit_rate": 0.5,
+                "n_trades": 200,
+                "cagr": 0.10,
+            },
+            {
+                "sharpe": 1.2,
+                "max_drawdown": -0.05,
+                "hit_rate": 0.5,
+                "n_trades": 200,
+                "cagr": 0.10,
+            },
+        ]
+        raw, agg = _aggregate_fold_metrics(per_fold, fold_consistency_lambda=0.5)
+        assert raw == pytest.approx(1.2)
+        assert agg["sharpe"] == pytest.approx(1.2)
+        assert agg["fold_consistency_std"] == pytest.approx(0.0)
+        assert agg["mean_fold_sharpe"] == pytest.approx(1.2)
+
+    def test_one_great_fold_two_bad_folds_gets_penalised(self):
+        """The pathological case the v0.5.0 change is built to catch:
+        one fold has Sharpe 3.0, the other two have 0.1 each.
+        Mean = 1.07, but std is large → fitness < mean.
+        Compare against the OLD (mean-only) signal of 1.07."""
+        per_fold = [
+            {
+                "sharpe": 0.1,
+                "n_trades": 50,
+                "max_drawdown": -0.03,
+                "hit_rate": 0.4,
+                "cagr": 0.0,
+            },
+            {
+                "sharpe": 3.0,
+                "n_trades": 300,
+                "max_drawdown": -0.05,
+                "hit_rate": 0.55,
+                "cagr": 0.4,
+            },
+            {
+                "sharpe": 0.1,
+                "n_trades": 50,
+                "max_drawdown": -0.03,
+                "hit_rate": 0.4,
+                "cagr": 0.0,
+            },
+        ]
+        raw, agg = _aggregate_fold_metrics(per_fold, fold_consistency_lambda=0.5)
+        # Old behaviour: fitness ≈ mean = 1.07
+        # New: mean − 0.5·std ≈ 1.07 − 0.5·1.37 ≈ 0.39
+        # A genuinely consistent Sharpe-1.0 strategy would now beat this.
+        assert raw < agg["mean_fold_sharpe"], (
+            "Inconsistent strategy must get a fitness BELOW its average — "
+            "that's the whole point of fold-consistency penalty."
+        )
+        assert raw == pytest.approx(0.39, abs=0.05)
+        # Inspection fields surface through to the caller so the portal
+        # can show the per-fold spread if it wants.
+        assert agg["per_fold_sharpe"] == [0.1, 3.0, 0.1]
+        assert agg["fold_consistency_std"] > 1.0
+
+    def test_max_drawdown_aggregated_as_worst_fold(self):
+        """MaxDD must be the WORST per-fold value, not the mean. If one
+        fold drops 30% and the others are fine, the strategy is still
+        risky overall and the penalty function should see that."""
+        per_fold = [
+            {
+                "sharpe": 1.0,
+                "max_drawdown": -0.30,
+                "hit_rate": 0.5,
+                "n_trades": 100,
+                "cagr": 0.0,
+            },
+            {
+                "sharpe": 1.0,
+                "max_drawdown": -0.02,
+                "hit_rate": 0.5,
+                "n_trades": 100,
+                "cagr": 0.0,
+            },
+            {
+                "sharpe": 1.0,
+                "max_drawdown": -0.03,
+                "hit_rate": 0.5,
+                "n_trades": 100,
+                "cagr": 0.0,
+            },
+        ]
+        _, agg = _aggregate_fold_metrics(per_fold, fold_consistency_lambda=0.5)
+        assert agg["max_drawdown"] == pytest.approx(-0.30), (
+            "Worst-fold DD must propagate so the Gate-B drawdown penalty "
+            "still fires when ANY fold breaches the 10% cap."
+        )
+
+    def test_n_trades_aggregated_as_sum(self):
+        """Total trades = sum across folds. The Gate-B 300-trade-minimum
+        threshold operates on this total, the same way it would on a
+        concatenated training run."""
+        per_fold = [
+            {
+                "sharpe": 1.0,
+                "n_trades": 100,
+                "max_drawdown": 0,
+                "hit_rate": 0.5,
+                "cagr": 0,
+            },
+            {
+                "sharpe": 1.0,
+                "n_trades": 100,
+                "max_drawdown": 0,
+                "hit_rate": 0.5,
+                "cagr": 0,
+            },
+            {
+                "sharpe": 1.0,
+                "n_trades": 100,
+                "max_drawdown": 0,
+                "hit_rate": 0.5,
+                "cagr": 0,
+            },
+        ]
+        _, agg = _aggregate_fold_metrics(per_fold, fold_consistency_lambda=0.5)
+        assert agg["n_trades"] == 300
+
+    def test_empty_per_fold_returns_minus_infinity(self):
+        """No folds → no signal → -inf fitness so the GA discards it."""
+        raw, agg = _aggregate_fold_metrics([], fold_consistency_lambda=0.5)
+        assert raw == float("-inf")
+        assert agg == {}
+
+    def test_all_folds_have_minus_infinity_sharpe(self):
+        """All-degenerate (no trades on any fold) → -inf fitness."""
+        per_fold = [
+            {"sharpe": float("-inf"), "n_trades": 0},
+            {"sharpe": float("-inf"), "n_trades": 0},
+        ]
+        raw, agg = _aggregate_fold_metrics(per_fold, fold_consistency_lambda=0.5)
+        assert raw == float("-inf")
+
+    def test_lambda_zero_reverts_to_pure_mean(self):
+        """λ=0 disables the consistency penalty; result = mean(per-fold)."""
+        per_fold = [
+            {
+                "sharpe": 0.5,
+                "n_trades": 100,
+                "max_drawdown": 0,
+                "hit_rate": 0.5,
+                "cagr": 0,
+            },
+            {
+                "sharpe": 1.5,
+                "n_trades": 100,
+                "max_drawdown": 0,
+                "hit_rate": 0.5,
+                "cagr": 0,
+            },
+            {
+                "sharpe": 2.5,
+                "n_trades": 100,
+                "max_drawdown": 0,
+                "hit_rate": 0.5,
+                "cagr": 0,
+            },
+        ]
+        raw, _ = _aggregate_fold_metrics(per_fold, fold_consistency_lambda=0.0)
+        assert raw == pytest.approx(1.5)  # plain mean
+
+
+class TestComputeFitnessFoldMode:
+    """End-to-end via compute_fitness with the new ``training_folds`` arg."""
+
+    def test_fold_mode_runs_backtest_per_fold(self):
+        """Three folds → three backtest invocations, in order. Each call
+        receives the fold's (start, end) and the backtest's metrics flow
+        into the aggregator."""
+        from datetime import UTC, datetime, timedelta
+
+        d0 = datetime(2024, 1, 1, tzinfo=UTC)
+        folds = [
+            (d0, d0 + timedelta(days=90)),
+            (d0 + timedelta(days=90), d0 + timedelta(days=180)),
+            (d0 + timedelta(days=180), d0 + timedelta(days=270)),
+        ]
+        # Each fold gives the same metrics — pure consistency case.
+        per_fold_result = {
+            "metrics": {
+                "sharpe": 1.5,
+                "max_drawdown": -0.05,
+                "hit_rate": 0.5,
+                "n_trades": 200,
+                "cagr": 0.20,
+            }
+        }
+        backtest = MagicMock(return_value=per_fold_result)
+        fitness, metrics = compute_fitness(
+            MA_CROSSOVER_SEED,
+            instrument="EUR_USD",
+            training_folds=folds,
+            backtest_fn=backtest,
+        )
+
+        assert backtest.call_count == 3, (
+            "One backtest per training fold; if this is 1, the function "
+            "fell through to single-window mode silently."
+        )
+        # Per-fold start/end pairs were passed through verbatim
+        call_windows = [
+            (c.kwargs["start"], c.kwargs["end"]) for c in backtest.call_args_list
+        ]
+        assert call_windows == folds
+        # Aggregated metrics carry the consistency-inspection fields
+        assert metrics["mean_fold_sharpe"] == pytest.approx(1.5)
+        assert metrics["fold_consistency_std"] == pytest.approx(0.0)
+        assert metrics["fold_consistency_lambda"] == pytest.approx(
+            FOLD_CONSISTENCY_LAMBDA_DEFAULT
+        )
+
+    def test_fold_mode_overrides_start_end_window(self):
+        """When ``training_folds`` is given, the legacy ``start`` and
+        ``end`` args are ignored — no single-window backtest happens."""
+        from datetime import UTC, datetime, timedelta
+
+        d0 = datetime(2024, 1, 1, tzinfo=UTC)
+        folds = [(d0, d0 + timedelta(days=30))]
+        backtest = MagicMock(return_value={"metrics": {"sharpe": 1.0, "n_trades": 100}})
+        compute_fitness(
+            MA_CROSSOVER_SEED,
+            instrument="EUR_USD",
+            start=d0,  # different from the fold window
+            end=d0 + timedelta(days=999),
+            training_folds=folds,
+            backtest_fn=backtest,
+        )
+        # Exactly one call, with the fold's window — NOT the start/end.
+        assert backtest.call_count == 1
+        assert backtest.call_args.kwargs["start"] == folds[0][0]
+        assert backtest.call_args.kwargs["end"] == folds[0][1]
+
+    def test_empty_training_folds_falls_back_to_single_window(self):
+        """An empty list ≠ "no folds requested" — fall back to single
+        window mode so existing callers (and the orchestrator on a
+        misconfigured run) don't crash."""
+        from datetime import UTC, datetime
+
+        d0 = datetime(2024, 1, 1, tzinfo=UTC)
+        backtest = MagicMock(return_value={"metrics": {"sharpe": 1.0, "n_trades": 100}})
+        compute_fitness(
+            MA_CROSSOVER_SEED,
+            instrument="EUR_USD",
+            start=d0,
+            end=d0,
+            training_folds=[],
+            backtest_fn=backtest,
+        )
+        assert backtest.call_count == 1  # single-window path

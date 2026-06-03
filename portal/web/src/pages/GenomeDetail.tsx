@@ -341,7 +341,38 @@ export default function GenomeDetail() {
         </div>
       )}
 
-      {/* ── 4. Walk-forward validation ──────────────────────────── */}
+      {/* ── 4a. Training-fold metrics (every scored genome) ──────── */}
+      {genome.metrics_json?.per_fold_training_metrics &&
+        genome.metrics_json.per_fold_training_metrics.length > 0 && (
+          <Section
+            title="Training-fold metrics"
+            subtitle="Per-training-fold metrics the GA's fitness function actually scored against (v0.5.0+). One row per fold the GA ran a backtest on; the OOS fold is held out for the validator and appears in the Walk-Forward Validation section below (only for genomes that passed selection)."
+          >
+            <TrainingFoldTable
+              folds={genome.metrics_json.per_fold_training_metrics}
+            />
+          </Section>
+        )}
+
+      {/* ── 4b. Fitness breakdown (raw → penalties → final) ──────── */}
+      {genome.metrics_json?.penalty_breakdown && (
+        <Section
+          title="Fitness breakdown"
+          subtitle="The chain that turned the raw training-window signal into the final fitness the GA used for selection. Additive deductions are subtracted first; multiplicative dilution factors are applied after."
+        >
+          <FitnessBreakdown
+            breakdown={genome.metrics_json.penalty_breakdown}
+            consistency={{
+              meanFoldSharpe: genome.metrics_json.mean_fold_sharpe,
+              foldConsistencyStd: genome.metrics_json.fold_consistency_std,
+              foldConsistencyLambda:
+                genome.metrics_json.fold_consistency_lambda,
+            }}
+          />
+        </Section>
+      )}
+
+      {/* ── 5. Walk-forward validation (validator's OOS-fold table) ──── */}
       <Section
         title="Walk-Forward Validation"
         subtitle="Each fold is backtested independently from $10,000 starting balance — values won't sum or average to the Backtest page's tile metrics (which run one continuous backtest with the balance compounding across folds). Cells are colored by whether each metric passes its Gate B threshold independently. Hover any cell for the delta vs threshold."
@@ -396,5 +427,201 @@ function Section({
       {!subtitle && <div className="mb-3" />}
       {children}
     </section>
+  );
+}
+
+// ── Training-fold table ─────────────────────────────────────────────
+// Same look-and-feel as WalkForwardFoldTable but rendered from the
+// fitness-time per-fold projection (one row per training fold the GA
+// scored against). Lightweight inline rendering because we don't have
+// is_oos / passed_gate_b semantics here — these are all training folds.
+
+function TrainingFoldTable({
+  folds,
+}: {
+  folds: NonNullable<
+    NonNullable<StrategyGenome['metrics_json']>['per_fold_training_metrics']
+  >;
+}) {
+  const fmt = (v: number | null | undefined, digits = 2) =>
+    v == null || !Number.isFinite(v) ? '—' : v.toFixed(digits);
+  const pct = (v: number | null | undefined, digits = 1) =>
+    v == null || !Number.isFinite(v) ? '—' : `${(v * 100).toFixed(digits)}%`;
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="min-w-full text-xs">
+        <thead className="text-slate-500 dark:text-slate-400 uppercase tracking-wide">
+          <tr>
+            <th className="py-2 pr-4 text-left font-medium">Fold</th>
+            <th className="py-2 px-3 text-right font-medium">Sharpe</th>
+            <th className="py-2 px-3 text-right font-medium">Max DD</th>
+            <th className="py-2 px-3 text-right font-medium">Hit rate</th>
+            <th className="py-2 px-3 text-right font-medium">Trades</th>
+            <th className="py-2 px-3 text-right font-medium">CAGR</th>
+            <th className="py-2 pl-3 text-right font-medium">Total return</th>
+          </tr>
+        </thead>
+        <tbody className="font-mono text-slate-800 dark:text-slate-200">
+          {folds.map((f, i) => (
+            <tr
+              key={i}
+              className="border-t border-slate-200 dark:border-slate-700"
+            >
+              <td className="py-2 pr-4">#{i}</td>
+              <td className="py-2 px-3 text-right">{fmt(f.sharpe)}</td>
+              <td className="py-2 px-3 text-right">{pct(f.max_drawdown)}</td>
+              <td className="py-2 px-3 text-right">{pct(f.hit_rate)}</td>
+              <td className="py-2 px-3 text-right">{f.n_trades}</td>
+              <td className="py-2 px-3 text-right">{pct(f.cagr)}</td>
+              <td className="py-2 pl-3 text-right">{pct(f.total_return)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── Fitness breakdown panel ─────────────────────────────────────────
+// Visualises the chain: raw fitness → each additive penalty →
+// multiplicative dilution → final. Lets the user see at a glance
+// whether the GA's signal was killed by a Gate-B miss, a drawdown
+// breach, the diversity penalty, or the v0.5.0 fold-consistency
+// variance penalty.
+
+function FitnessBreakdown({
+  breakdown,
+  consistency,
+}: {
+  breakdown: NonNullable<
+    NonNullable<StrategyGenome['metrics_json']>['penalty_breakdown']
+  >;
+  consistency: {
+    meanFoldSharpe?: number;
+    foldConsistencyStd?: number;
+    foldConsistencyLambda?: number;
+  };
+}) {
+  const fmt = (v: number, digits = 3) =>
+    Number.isFinite(v) ? (v >= 0 ? '+' : '') + v.toFixed(digits) : '—';
+  const dim = 'text-slate-500 dark:text-slate-400';
+
+  // Build the explanation rows. Penalties with 0 deduction still render
+  // so the user can see what *would* have been applied — fades them out
+  // so it's clear nothing actually happened there.
+  const rows: Array<{
+    label: string;
+    detail: string;
+    value: number;
+    op: '+' | '×' | '=';
+    active: boolean;
+  }> = [
+    {
+      label: 'Raw fitness',
+      detail:
+        consistency.foldConsistencyStd != null &&
+        consistency.foldConsistencyLambda != null &&
+        consistency.meanFoldSharpe != null
+          ? `mean(per-fold Sharpe) − ${consistency.foldConsistencyLambda} × std(per-fold Sharpe) = ${consistency.meanFoldSharpe.toFixed(3)} − ${(consistency.foldConsistencyLambda * consistency.foldConsistencyStd).toFixed(3)}`
+          : 'training-window Sharpe (single-window mode)',
+      value: breakdown.raw_fitness,
+      op: '=',
+      active: true,
+    },
+    {
+      label: 'Zero-trade hard floor',
+      detail: 'flat −100 if the genome opened 0 trades on any fold',
+      value: breakdown.zero_trade_penalty,
+      op: '+',
+      active: breakdown.zero_trade_penalty !== 0,
+    },
+    {
+      label: 'Trade-shortfall penalty',
+      detail:
+        'scales 0 → −10 as trade count drops from the Gate-B minimum to 0',
+      value: breakdown.trade_shortfall_penalty,
+      op: '+',
+      active: breakdown.trade_shortfall_penalty !== 0,
+    },
+    {
+      label: 'Drawdown breach penalty',
+      detail: '(max_drawdown − 10% cap) × 50 — only when MaxDD breaches Gate B',
+      value: breakdown.drawdown_breach_penalty,
+      op: '+',
+      active: breakdown.drawdown_breach_penalty !== 0,
+    },
+    {
+      label: 'Gate-B dilution',
+      detail:
+        'halves positive fitness when ANY Gate-B threshold fails (Sharpe / Hit / Trades / CAGR)',
+      value: breakdown.gate_b_dilution_factor,
+      op: '×',
+      active: breakdown.gate_b_dilution_factor !== 1.0,
+    },
+    {
+      label: 'Diversity penalty',
+      detail:
+        'halves fitness when the genome is within edit-distance 2 of an elite from this generation',
+      value: breakdown.diversity_penalty_factor,
+      op: '×',
+      active: breakdown.diversity_penalty_factor !== 1.0,
+    },
+  ];
+
+  return (
+    <div className="space-y-2 text-sm">
+      {rows.map((r, i) => (
+        <div
+          key={i}
+          className={`flex items-start justify-between gap-3 py-1.5 ${
+            r.active ? '' : 'opacity-50'
+          }`}
+        >
+          <div className="min-w-0 flex-1">
+            <div className="font-medium text-slate-800 dark:text-slate-200">
+              {r.op === '+' && r.active ? '➖ ' : ''}
+              {r.op === '×' && r.active ? '✖ ' : ''}
+              {r.label}
+              {!r.active && (
+                <span className={`ml-2 text-xs font-normal ${dim}`}>
+                  (not applied)
+                </span>
+              )}
+            </div>
+            <div className={`text-xs ${dim} mt-0.5`}>{r.detail}</div>
+          </div>
+          <div className="font-mono text-right shrink-0 w-28">
+            <span
+              className={
+                r.op === '×'
+                  ? 'text-slate-700 dark:text-slate-300'
+                  : r.value < 0
+                    ? 'text-rose-700 dark:text-rose-400'
+                    : r.value > 0
+                      ? 'text-emerald-700 dark:text-emerald-400'
+                      : 'text-slate-700 dark:text-slate-300'
+              }
+            >
+              {r.op === '×' ? `× ${r.value.toFixed(2)}` : fmt(r.value)}
+            </span>
+          </div>
+        </div>
+      ))}
+      <div className="border-t border-slate-200 dark:border-slate-700 pt-3 mt-3 flex items-center justify-between font-mono text-sm">
+        <span className="text-slate-700 dark:text-slate-200 font-semibold">
+          Final fitness
+        </span>
+        <span
+          className={
+            breakdown.final_fitness > 0
+              ? 'text-emerald-700 dark:text-emerald-400 font-semibold'
+              : 'text-rose-700 dark:text-rose-400 font-semibold'
+          }
+        >
+          {breakdown.final_fitness.toFixed(3)}
+        </span>
+      </div>
+    </div>
   );
 }

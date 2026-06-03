@@ -410,6 +410,7 @@ def get_genome_with_lineage(
             genome.origin.value if hasattr(genome.origin, "value") else genome.origin
         ),
         "fitness": genome.fitness,
+        "metrics_json": genome.metrics_json,
         "validator_passed": genome.validator_passed,
         "validation_failures": list(genome.validation_failures or []),
         "llm_reasoning": genome.llm_reasoning,
@@ -623,6 +624,11 @@ class SqlAlchemyPersister:
                 parent_ids=list(genome.parent_ids),
                 origin=models.GenomeOrigin(origin_value),
                 fitness=(genome.fitness_value if genome.has_fitness() else None),
+                # Per-fold training metrics + penalty breakdown. May be
+                # None for elites that carried over without re-evaluation
+                # or for genomes whose backtest failed before metrics
+                # could be collected.
+                metrics_json=(genome.metrics if genome.metrics else None),
                 validator_passed=None,
                 validation_failures=[],
                 llm_reasoning=genome.llm_reasoning,

@@ -76,7 +76,15 @@ class OrchestratorConfigSchema(BaseModel):
     mutation_prob: float = Field(default=0.3, ge=0.0, le=1.0)
     elite_fraction: float = Field(default=0.10, ge=0.0, le=0.5)
     tournament_size: int = Field(default=3, ge=2)
-    rng_seed: int = Field(default=42)
+    # When None (default), the worker picks a fresh seed via
+    # `secrets.randbits(32)` at run-start and writes it back to
+    # `config_json.rng_seed` so the run is reproducible by pinning
+    # that value on a later run. Hardcoded seeds (the previous
+    # `default=42`) made multiple independent runs deterministically
+    # converge on the same winner — turning the GA from a search into
+    # a confirmation. Pin a value here only to reproduce a specific
+    # past run; for new exploration leave it null.
+    rng_seed: int | None = Field(default=None, ge=0, le=4_294_967_295)
     account_balance: float = Field(default=10000.0, gt=0)
     position_size: int = Field(default=10000, gt=0)
     spread_pips: float | None = None
@@ -226,6 +234,15 @@ class StrategyGenomePublic(BaseSchema):
     parent_ids: list[str]
     origin: str  # GenomeOrigin value
     fitness: float | None = None
+    # Per-fold training metrics + penalty breakdown. Populated by the
+    # orchestrator's fitness evaluation pipeline for every genome that
+    # was scored (carried-over elites and pre-v0.5.0 rows may have None).
+    # Contains keys: sharpe / max_drawdown / hit_rate / n_trades / cagr
+    # (aggregated across training folds) plus per_fold_sharpe (list),
+    # fold_consistency_std, mean_fold_sharpe, fold_consistency_lambda,
+    # and `penalty_breakdown` (a dict with raw_fitness, each penalty's
+    # deduction, dilution factors, final_fitness).
+    metrics_json: dict[str, Any] | None = None
     validator_passed: bool | None = None
     validation_failures: list[str] = Field(default_factory=list)
     llm_reasoning: str | None = None
