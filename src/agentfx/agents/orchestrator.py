@@ -508,6 +508,13 @@ class OrchestratorAgent(BaseAgent):
         # the OOS fold (last fold of the same window) is held out for the
         # validator. See `core/validation.make_walk_forward_folds`.
         train_start, train_end = self._training_range()
+        # v0.5.0: GA fitness now runs ONE backtest per training fold and
+        # aggregates per-fold Sharpes via mean − λ·std, instead of one
+        # concatenated-training backtest. Rewards consistency across
+        # folds (= more likely to generalise) rather than "high average
+        # driven by one big fold". The fitness function falls back to
+        # single-window mode if this list is empty (tests).
+        training_fold_ranges = self._training_fold_ranges()
 
         # Track best fitness and plateau detection
         best_fitness_history: list[float] = []
@@ -522,7 +529,9 @@ class OrchestratorAgent(BaseAgent):
         pending_llm_call_id: str | None = None
 
         while True:
-            self._evaluate_population_fitness(population, train_start, train_end)
+            self._evaluate_population_fitness(
+                population, train_start, train_end, training_fold_ranges
+            )
 
             # Persist generation + genomes (assigns IDs)
             best_in_gen = population.best()
@@ -688,6 +697,23 @@ class OrchestratorAgent(BaseAgent):
         )
         return training_window(folds)
 
+    def _training_fold_ranges(self) -> list[tuple[datetime, datetime]]:
+        """The list of (start, end) tuples covering each *training* fold.
+
+        Drives the v0.5.0 fold-consistent fitness function: instead of
+        running one backtest over the concatenated training window, the
+        GA runs one backtest per fold and rewards strategies whose
+        Sharpe is *consistent* across folds (not just high on average).
+        Excludes the OOS fold — that one is the validator's, not the
+        GA's.
+        """
+        folds = make_walk_forward_folds(
+            start=self.data_window[0],
+            end=self.data_window[1],
+            k=self.config.n_validation_folds,
+        )
+        return [(f.start, f.end) for f in folds if not f.is_oos]
+
     def _record_evaluated(self, population: Population) -> None:
         """Stash this generation's genomes in the hall-of-fame, keyed by
         canonical spec JSON so elite carry-overs aren't duplicated.
@@ -719,8 +745,16 @@ class OrchestratorAgent(BaseAgent):
         population: Population,
         train_start: datetime,
         train_end: datetime,
+        training_fold_ranges: list[tuple[datetime, datetime]] | None = None,
     ) -> None:
         """Evaluate every genome's fitness on the training window.
+
+        When ``training_fold_ranges`` is supplied (v0.5.0+ default), the
+        fitness function runs one backtest per fold and aggregates them
+        via ``mean − λ·std`` of per-fold Sharpe. When omitted (older
+        callers / tests), it falls back to a single backtest over
+        ``[train_start, train_end]``. The concatenated-window args are
+        still computed for back-compat callers and ignored in fold mode.
 
         Only genomes that haven't been evaluated yet are run — elites
         carried over from the previous generation already have their
@@ -753,6 +787,7 @@ class OrchestratorAgent(BaseAgent):
                 granularity=self.config.granularity,
                 start=train_start,
                 end=train_end,
+                training_folds=training_fold_ranges,
                 elite_specs=elite_specs,
                 gate_b_overrides={"min_cagr": self.config.min_cagr_pct},
                 **backtest_kwargs,

@@ -49,11 +49,24 @@ database. Production code passes the real `run_backtest_from_db`.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Any, Protocol
 
 from agentfx.core.dsl import StrategySpec
 from agentfx.core.gates import GATE_B_THRESHOLDS, evaluate_gate_b
+
+# Penalty weight applied to the std-dev of per-fold Sharpe when the GA
+# evaluates a genome on multiple training folds. With λ=0.5 a strategy
+# whose Sharpes spread by σ=1.0 across folds loses 0.5 of its mean
+# Sharpe as fitness — heavy enough to push the GA away from one-fold-
+# wonder strategies (which look great on average but collapse OOS),
+# moderate enough that genuinely-good-but-imperfect strategies still
+# rank ahead of consistently-mediocre ones. Tunable: λ=0 reverts to
+# pure-mean (no consistency bonus), λ=1.0 is much stricter (closer to
+# min-of-folds behaviour). 0.5 is the starting heuristic; revisit
+# after seeing a few real runs.
+FOLD_CONSISTENCY_LAMBDA_DEFAULT = 0.5
 
 
 class BacktestFn(Protocol):
@@ -211,6 +224,90 @@ def _apply_penalties(
     return fitness
 
 
+def _aggregate_fold_metrics(
+    per_fold_metrics: list[dict[str, Any]],
+    *,
+    fold_consistency_lambda: float,
+) -> tuple[float, dict[str, Any]]:
+    """Combine per-fold backtest metrics into one (raw_sharpe, aggregated_metrics)
+    pair that the existing penalty stack can score.
+
+    The raw Sharpe used for fitness is **`mean(fold_sharpes) − λ × std(fold_sharpes)`**.
+    Per-fold Sharpe variance is a direct proxy for "regime-fragile"
+    strategies — the ones that look fine on training average but
+    collapse OOS because their wins came from one good fold. The
+    variance penalty pushes the GA away from those without taking the
+    extreme step of `min(folds)` (which can be so strict that nothing
+    ever clears).
+
+    Other Gate-B-relevant fields are aggregated for the penalty
+    function as follows:
+      - ``max_drawdown``: **worst** (largest-magnitude) per-fold value —
+        if any fold has a 30% DD, the strategy is risky overall, regardless
+        of the other folds.
+      - ``hit_rate``: **mean** across folds.
+      - ``n_trades``: **sum** across folds (total training trades).
+      - ``cagr``: **mean** across folds.
+
+    The returned `aggregated_metrics["per_fold_sharpe"]` and
+    `["fold_consistency_std"]` are passed through for visibility in the
+    portal (no schema change yet — they ride on the existing metrics
+    dict).
+    """
+    if not per_fold_metrics:
+        return float("-inf"), {}
+
+    def _f(field: str, default: float = 0.0) -> list[float]:
+        return [
+            float(m.get(field, default)) if m.get(field) is not None else default
+            for m in per_fold_metrics
+        ]
+
+    sharpes = _f("sharpe", default=float("-inf"))
+    # If ANY fold completely failed to produce metrics (e.g. -inf
+    # Sharpe), keep that signal in — the variance term will blow up the
+    # fitness, which is the correct outcome.
+    finite_sharpes = [s for s in sharpes if math.isfinite(s)]
+    if not finite_sharpes:
+        return float("-inf"), {"sharpe": float("-inf"), "n_trades": 0}
+
+    n = len(finite_sharpes)
+    mean_sharpe = sum(finite_sharpes) / n
+    if n >= 2:
+        var = sum((s - mean_sharpe) ** 2 for s in finite_sharpes) / n
+        std_sharpe = math.sqrt(var)
+    else:
+        std_sharpe = 0.0
+
+    raw_fitness = mean_sharpe - fold_consistency_lambda * std_sharpe
+
+    # Worst-case max_drawdown (max magnitude, i.e. most negative since
+    # MDD is negative-or-zero by convention from `summarize_from_trade_ledger`).
+    dds = _f("max_drawdown")
+    worst_dd = min(dds) if dds else 0.0  # most negative
+
+    hit_rates = _f("hit_rate")
+    cagrs = _f("cagr")
+    trade_counts = [int(m.get("n_trades", 0) or 0) for m in per_fold_metrics]
+
+    aggregated = {
+        "sharpe": raw_fitness,
+        "max_drawdown": worst_dd,
+        "hit_rate": sum(hit_rates) / len(hit_rates) if hit_rates else 0.0,
+        "cagr": sum(cagrs) / len(cagrs) if cagrs else 0.0,
+        "n_trades": sum(trade_counts),
+        # Inspection fields — surfaced verbatim on the genome's metrics
+        # dict so the portal can show "Sharpe per training fold" alongside
+        # the aggregate. Not yet rendered, but persisted for the v0.5.0
+        # WF-table-aware UI work.
+        "per_fold_sharpe": sharpes,
+        "fold_consistency_std": std_sharpe,
+        "fold_consistency_lambda": fold_consistency_lambda,
+        "mean_fold_sharpe": mean_sharpe,
+    }
+    return raw_fitness, aggregated
+
+
 def compute_fitness(
     spec: StrategySpec,
     *,
@@ -218,21 +315,49 @@ def compute_fitness(
     granularity: str = "M1",
     start: datetime | None = None,
     end: datetime | None = None,
+    training_folds: list[tuple[datetime, datetime]] | None = None,
+    fold_consistency_lambda: float = FOLD_CONSISTENCY_LAMBDA_DEFAULT,
     backtest_fn: BacktestFn | None = None,
     elite_specs: list[StrategySpec] | None = None,
     diversity_threshold: int = 2,
     gate_b_overrides: dict[str, float] | None = None,
     **backtest_kwargs: Any,
 ) -> tuple[float, dict[str, Any]]:
-    """Run the backtest for a genome and compute its fitness.
+    """Run the backtest(s) for a genome and compute its fitness.
+
+    Two modes:
+
+      - **Single-window** (legacy, used by tests): pass ``start`` + ``end``,
+        leave ``training_folds`` as None. One backtest is run over that
+        window and its Sharpe becomes raw fitness.
+
+      - **Fold-consistent** (production, v0.5.0+): pass ``training_folds`` =
+        list of ``(start, end)`` tuples for each training fold. One
+        backtest is run per fold, then per-fold Sharpes are aggregated
+        via ``mean − λ × std``. This rewards strategies that work
+        *consistently* across all training folds, not just on average
+        — which is the GA-search signal that maps to "will generalise
+        on OOS".
+
+    The same penalty stack applies in both modes (zero-trade, trade-
+    shortfall, drawdown breach, Gate-B dilution, diversity). In fold-
+    consistent mode, the penalties operate on per-fold-aggregated
+    metrics (sum of trades, worst DD, mean hit rate, etc.).
 
     Args:
         spec: The strategy genome to evaluate.
         instrument: Currency pair (e.g. "EUR_USD").
         granularity: Candle timeframe (default "M1").
-        start, end: Backtest window (None means "all available data").
+        start, end: Single-window mode bounds. Ignored when
+            ``training_folds`` is provided.
+        training_folds: Fold-consistent mode. List of ``(start, end)``
+            datetime tuples — one per *training* fold (the validator's
+            OOS fold MUST NOT appear here). When set, one backtest is
+            run per entry and metrics are aggregated.
+        fold_consistency_lambda: Penalty weight on std-of-Sharpe across
+            folds. See ``FOLD_CONSISTENCY_LAMBDA_DEFAULT`` for rationale.
         backtest_fn: Override the default backtest call (injection point
-            for unit tests). Defaults to `run_backtest_from_db`.
+            for unit tests). Defaults to ``run_backtest_from_db``.
         elite_specs: Current elite genomes' specs. Used for diversity
             penalty. Pass an empty list or None to skip the penalty.
         diversity_threshold: Edit-distance below which a candidate is
@@ -241,9 +366,10 @@ def compute_fitness(
             account_balance, position_size, spread_pips).
 
     Returns:
-        (fitness_value, metrics_dict). The metrics dict is the raw output
-        from the backtest function — preserved verbatim so the caller can
-        record it on the genome row for the portal.
+        (fitness_value, metrics_dict). In fold-consistent mode,
+        metrics_dict includes ``per_fold_sharpe``,
+        ``fold_consistency_std``, ``fold_consistency_lambda``, and
+        ``mean_fold_sharpe`` for inspection.
     """
     if backtest_fn is None:
         # Lazy import to avoid pulling DB layer at module import time —
@@ -262,24 +388,49 @@ def compute_fitness(
     # ignored here (fitness only needs `metrics`), but the trade walk
     # itself is what makes the metrics ledger-based.
     backtest_kwargs.setdefault("capture_signals", True)
+    strategy_params = {"spec": spec.model_dump(mode="json")}
 
-    result = backtest_fn(
-        instrument=instrument,
-        granularity=granularity,
-        start=start,
-        end=end,
-        strategy_name="dsl",
-        strategy_params={"spec": spec.model_dump(mode="json")},
-        **backtest_kwargs,
-    )
+    if training_folds is not None and len(training_folds) > 0:
+        # Fold-consistent mode: one backtest per fold, then aggregate.
+        per_fold_metrics: list[dict[str, Any]] = []
+        for fold_start, fold_end in training_folds:
+            result = backtest_fn(
+                instrument=instrument,
+                granularity=granularity,
+                start=fold_start,
+                end=fold_end,
+                strategy_name="dsl",
+                strategy_params=strategy_params,
+                **backtest_kwargs,
+            )
+            per_fold_metrics.append(
+                result.get("metrics", {}) if isinstance(result, dict) else {}
+            )
 
-    metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
-    raw_sharpe = metrics.get("sharpe")
-    if raw_sharpe is None:
-        raw_sharpe = float("-inf")
+        raw_fitness, metrics = _aggregate_fold_metrics(
+            per_fold_metrics,
+            fold_consistency_lambda=fold_consistency_lambda,
+        )
+    else:
+        # Single-window mode (legacy, used by tests).
+        result = backtest_fn(
+            instrument=instrument,
+            granularity=granularity,
+            start=start,
+            end=end,
+            strategy_name="dsl",
+            strategy_params=strategy_params,
+            **backtest_kwargs,
+        )
+
+        metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
+        raw_sharpe = metrics.get("sharpe")
+        if raw_sharpe is None:
+            raw_sharpe = float("-inf")
+        raw_fitness = float(raw_sharpe)
 
     fitness = _apply_penalties(
-        raw_fitness=float(raw_sharpe),
+        raw_fitness=raw_fitness,
         metrics=metrics,
         candidate=spec,
         elite_specs=elite_specs,
