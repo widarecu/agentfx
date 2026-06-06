@@ -5,7 +5,6 @@ import logging
 import os
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -21,11 +20,19 @@ from agentfx.core.strategy import (
 
 logger = logging.getLogger(__name__)
 
-# OANDA charges financing at 17:00 New York time. On Wednesdays the charge
-# is tripled to cover the upcoming weekend (when interest still accrues but
-# FX markets are closed).
-_ET_ZONE = ZoneInfo("America/New_York")
-_ROLLOVER_HOUR = 17  # 17:00 ET
+# OANDA AU (the broker we trade through) charges financing at 07:00 AEST,
+# which is 21:00 UTC. The schedule is one charge per weekday-UTC; the
+# 21:00 UTC marks that fall on Saturday or Sunday (= Sun/Mon morning AEST)
+# are skipped. There is NO 3× Wednesday multiplier — verified against the
+# user's OANDA platform transaction screenshots over a ~2 week open trade
+# where no triple charge was ever observed.
+#
+# Weekly schedule (5 charges per 7 calendar days):
+#     Mon UTC : 1×   Thu UTC : 1×
+#     Tue UTC : 1×   Fri UTC : 1×
+#     Wed UTC : 1×   Sat UTC : 0× (skipped — Sun morning AEST)
+#                    Sun UTC : 0× (skipped — Mon morning AEST)
+_ROLLOVER_HOUR_UTC = 21  # 21:00 UTC = 07:00 AEST (next day)
 
 
 def _data_dir(root: str, pair: str, granularity: str = "M1") -> str:
@@ -143,36 +150,31 @@ def load_price_df_from_db(
 
 
 def _count_rollovers(prev_ts: pd.Timestamp, ts: pd.Timestamp) -> int:
-    """Sum the financing-charge multiplier for rollovers in (prev_ts, ts].
+    """Count the OANDA AU financing rollovers in (prev_ts, ts].
 
-    OANDA charges interest each weekday at 17:00 ET, with Wednesday counting
-    triple to cover Saturday and Sunday when FX is closed but interest still
-    accrues. The weekly schedule is therefore:
+    A rollover fires at 21:00 UTC (= 07:00 AEST) every day EXCEPT when
+    21:00 UTC falls on Saturday or Sunday — those marks correspond to
+    Sun/Mon morning AEST, which OANDA AU does not charge (the broker
+    closes financing on the weekend and does not back-charge Monday).
 
-        Mon : 1×   Thu : 1×
-        Tue : 1×   Fri : 1×
-        Wed : 3×   Sat : 0× (market closed)
-                   Sun : 0× (market closed)
-
-    which sums to 7 charges per 7 calendar days.
+    There is NO 3× Wednesday multiplier — every charge is 1×. This
+    departs from older NY-based OANDA documentation; the user verified
+    the AU schedule against actual transaction history on a multi-day
+    open trade.
 
     Both timestamps must be tz-aware (UTC).
     """
-    prev_et = prev_ts.tz_convert(_ET_ZONE)
-    ts_et = ts.tz_convert(_ET_ZONE)
+    prev_utc = prev_ts.tz_convert("UTC") if prev_ts.tzinfo else prev_ts
+    ts_utc = ts.tz_convert("UTC") if ts.tzinfo else ts
 
-    candidate = prev_et.normalize() + pd.Timedelta(hours=_ROLLOVER_HOUR)
-    if candidate <= prev_et:
+    candidate = prev_utc.normalize() + pd.Timedelta(hours=_ROLLOVER_HOUR_UTC)
+    if candidate <= prev_utc:
         candidate = candidate + pd.Timedelta(days=1)
 
     total = 0
-    while candidate <= ts_et:
+    while candidate <= ts_utc:
         wd = candidate.weekday()  # Mon=0..Sun=6
-        if wd == 2:  # Wednesday
-            total += 3
-        elif wd in (5, 6):  # Sat, Sun — market closed
-            pass
-        else:  # Mon, Tue, Thu, Fri
+        if wd not in (5, 6):  # skip Sat & Sun in UTC
             total += 1
         candidate = candidate + pd.Timedelta(days=1)
     return total
@@ -187,9 +189,10 @@ def compute_swap_returns(
     """Per-bar overnight financing return aligned to df.index.
 
     For each bar whose interval (prev_close, this_close] crosses one or more
-    OANDA rollovers (17:00 ET) and where a position is held during the bar,
-    return ``rate / 365 * multiplier`` where rate is ``long_rate`` for longs
-    and ``short_rate`` for shorts.
+    OANDA AU rollovers (21:00 UTC = 07:00 AEST, skipping Sat/Sun UTC) and
+    where a position is held during the bar, return
+    ``rate / 365 * multiplier`` where rate is ``long_rate`` for longs and
+    ``short_rate`` for shorts.
 
     Sign convention matches OANDA's ``/v3/instruments`` payload: positive
     rate = position receives credit, negative rate = position pays. The
@@ -435,7 +438,7 @@ def run_backtest_from_db(
     strategy_name: str = "ma",
     strategy_params: dict | None = None,
     spread_pips: float | None = None,
-    slippage_pips_per_side: float = 0.1,
+    slippage_pips_per_side: float = 0.0,
     max_abs_position: int = 1,
     max_trades_per_hour: int = 60,
     daily_loss_threshold: float = 0.02,
@@ -988,7 +991,7 @@ def run_backtest(
     strategy_name: str = "ma",
     strategy_params: dict | None = None,
     spread_pips: float | None = None,
-    slippage_pips_per_side: float = 0.1,
+    slippage_pips_per_side: float = 0.0,
     max_abs_position: int = 1,
     max_trades_per_hour: int = 60,
     daily_loss_threshold: float = 0.02,
@@ -1092,7 +1095,7 @@ def backtest_pairs(
     strategy_name: str = "ma",
     strategy_params: dict | None = None,
     spread_pips: float | None = None,
-    slippage_pips_per_side: float = 0.1,
+    slippage_pips_per_side: float = 0.0,
     max_abs_position: int = 1,
     max_trades_per_hour: int = 60,
     daily_loss_threshold: float = 0.02,

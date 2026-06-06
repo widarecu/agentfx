@@ -4,7 +4,7 @@ Endpoints:
 - POST   /api/v1/evolution-runs                          (TRADER+, 202)
 - GET    /api/v1/evolution-runs                          (paginated)
 - GET    /api/v1/evolution-runs/{run_id}                 (detail)
-- DELETE /api/v1/evolution-runs/{run_id}                 (ADMIN)
+- DELETE /api/v1/evolution-runs/{run_id}                 (TRADER+, terminal-state only)
 - POST   /api/v1/evolution-runs/{run_id}/stop            (TRADER+, manual halt)
 - GET    /api/v1/evolution-runs/{run_id}/generations     (lineage)
 - GET    /api/v1/evolution-runs/{run_id}/genomes/{id}    (genome detail)
@@ -199,12 +199,25 @@ def delete_evolution_run(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(user_service.get_current_active_user),
 ) -> dict[str, bool | str]:
-    """ADMIN only — deletes a run and all its lineage (cascades)."""
-    _ensure_admin(current_user)
+    """Delete a run and all its lineage (generations, genomes, validation
+    folds, decisions cascade via FK ON DELETE CASCADE).
+
+    TRADER+ — same auth as create/stop. Refuses with 409 if the run is
+    still queued or running; stop it first via POST .../stop.
+    """
+    _ensure_trader(current_user)
     run = evolution_service.get_run(db, run_id)
     if run is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Evolution run not found"
+        )
+    if run.status in (
+        models.EvolutionRunStatus.QUEUED,
+        models.EvolutionRunStatus.RUNNING,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(f"Run is {run.status.value}; stop it first before deleting."),
         )
     db.delete(run)
     db.commit()

@@ -24,6 +24,7 @@ import {
   ChevronLeft,
   Loader2,
   Square,
+  Trash2,
   CheckCircle2,
   XCircle,
   AlertTriangle,
@@ -37,6 +38,7 @@ import RunNarrative from '../components/RunNarrative';
 import LlmInjectionCard from '../components/LlmInjectionCard';
 import {
   formatLlmCost,
+  deleteEvolutionRun,
   getEvolutionRun,
   getGenome,
   listDecisions,
@@ -211,6 +213,22 @@ export default function EvolutionRunDetail() {
             alert(err instanceof Error ? err.message : 'Failed to stop run');
           }
         }}
+        onDelete={async () => {
+          if (
+            !confirm(
+              `Delete run ${run.id}?\n\nThis permanently removes all generations, ` +
+                `genomes, validation folds, and decision-log entries for this run. ` +
+                `The cascade cannot be undone.`,
+            )
+          )
+            return;
+          try {
+            await deleteEvolutionRun(run.id);
+            navigate('/evolution');
+          } catch (err) {
+            alert(err instanceof Error ? err.message : 'Failed to delete run');
+          }
+        }}
       />
 
       {/* ── 2. Outcome banner ──────────────────────────────────────── */}
@@ -360,10 +378,12 @@ function RunHero({
   run,
   sortedGens,
   onStop,
+  onDelete,
 }: {
   run: EvolutionRun;
   sortedGens: Generation[];
   onStop: () => void | Promise<void>;
+  onDelete: () => void | Promise<void>;
 }) {
   const cfg = (run.config_json ?? {}) as Record<string, unknown>;
   const popSize = typeof cfg.population_size === 'number' ? cfg.population_size : null;
@@ -474,15 +494,27 @@ function RunHero({
             {summarySentence}
           </p>
         </div>
-        {(run.status === 'running' || run.status === 'queued') && (
-          <button
-            onClick={onStop}
-            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md bg-amber-100 hover:bg-amber-200 dark:bg-amber-900/40 dark:hover:bg-amber-900/60 text-amber-800 dark:text-amber-300 text-sm shrink-0"
-          >
-            <Square className="w-4 h-4" />
-            Stop
-          </button>
-        )}
+        <div className="flex items-center gap-2 shrink-0">
+          {(run.status === 'running' || run.status === 'queued') && (
+            <button
+              onClick={onStop}
+              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md bg-amber-100 hover:bg-amber-200 dark:bg-amber-900/40 dark:hover:bg-amber-900/60 text-amber-800 dark:text-amber-300 text-sm"
+            >
+              <Square className="w-4 h-4" />
+              Stop
+            </button>
+          )}
+          {run.status !== 'running' && run.status !== 'queued' && (
+            <button
+              onClick={onDelete}
+              title="Delete this run and all its lineage (cannot be undone)"
+              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md bg-red-100 hover:bg-red-200 dark:bg-red-900/40 dark:hover:bg-red-900/60 text-red-700 dark:text-red-300 text-sm"
+            >
+              <Trash2 className="w-4 h-4" />
+              Delete
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">

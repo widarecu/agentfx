@@ -26,7 +26,7 @@ interface TradesTableProps {
   pair: string;
 }
 
-type SortField = 'entryTimestamp' | 'direction' | 'pips' | 'netPips' | 'durationMinutes' | 'spreadCostPips' | 'swapCostPips' | 'positionSize';
+type SortField = 'entryTimestamp' | 'direction' | 'pips' | 'netPips' | 'durationMinutes' | 'spreadCostPips' | 'slippageCostPips' | 'swapCostPips' | 'positionSize';
 type SortDirection = 'asc' | 'desc';
 
 const PAGE_SIZE = 50;
@@ -94,12 +94,28 @@ export default function TradesTable({ trades, viewMode, pair }: TradesTableProps
   const losingTrades = trades.filter(t => t.pips < 0).length;
   const totalPips = trades.reduce((sum, t) => sum + t.pips, 0);
   const totalNetPips = trades.reduce((sum, t) => sum + t.netPips, 0);
-  const totalNetDollars = trades.reduce((sum, t) => sum + t.netPnlDollars, 0);
+  const totalGrossDollars = trades.reduce((sum, t) => sum + (t.grossPnlDollars ?? 0), 0);
+  const totalNetDollars = trades.reduce((sum, t) => sum + (t.netPnlDollars ?? 0), 0);
+  const totalSpreadPips = trades.reduce((s, t) => s + (t.spreadCostPips ?? 0), 0);
+  const totalSpreadDollars = trades.reduce((s, t) => s + (t.spreadCostDollars ?? 0), 0);
+  const totalSlippagePips = trades.reduce((s, t) => s + (t.slippageCostPips ?? 0), 0);
+  const totalSlippageDollars = trades.reduce((s, t) => s + (t.slippageCostDollars ?? 0), 0);
+  const totalSwapPips = trades.reduce((s, t) => s + (t.swapCostPips ?? 0), 0);
+  const totalSwapDollars = trades.reduce((s, t) => s + (t.swapCostDollars ?? 0), 0);
+
+  const fmtCost = (pips: number, dollars: number): string =>
+    viewMode === 'pips'
+      ? `${pips.toFixed(1)}p`
+      : formatDollars(dollars);
+  const fmtPnl = (pips: number, dollars: number): string =>
+    viewMode === 'pips'
+      ? `${formatPips(pips)}p`
+      : formatDollars(dollars);
 
   return (
     <div className="space-y-4">
       {/* Summary Row */}
-      <div className="flex flex-wrap items-center gap-4 text-sm">
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm">
         <div className="flex items-center gap-2">
           <span className="text-slate-500 dark:text-slate-400">Total Trades:</span>
           <span className="font-semibold text-slate-900 dark:text-slate-100">{totalTrades}</span>
@@ -113,35 +129,72 @@ export default function TradesTable({ trades, viewMode, pair }: TradesTableProps
           <span className="font-semibold text-red-600 dark:text-red-400">{losingTrades}</span>
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-slate-500 dark:text-slate-400">
-            {viewMode === 'pips' ? 'Total P&L:' : 'Net P&L:'}
-          </span>
+          <span className="text-slate-500 dark:text-slate-400">Gross:</span>
           <span
             className={`font-semibold font-mono ${
-              (viewMode === 'pips' ? totalPips : totalNetDollars) >= 0
+              totalPips >= 0
                 ? 'text-green-600 dark:text-green-400'
                 : 'text-red-600 dark:text-red-400'
             }`}
           >
-            {viewMode === 'pips'
-              ? `${formatPips(totalPips)} pips`
-              : formatDollars(totalNetDollars)}
+            {fmtPnl(totalPips, totalGrossDollars)}
           </span>
         </div>
-        {viewMode === 'dollars' && (
-          <div className="flex items-center gap-2">
-            <span className="text-slate-500 dark:text-slate-400">Gross:</span>
-            <span
-              className={`font-semibold font-mono ${
-                totalPips >= 0
-                  ? 'text-green-600 dark:text-green-400'
-                  : 'text-red-600 dark:text-red-400'
-              }`}
-            >
-              {formatPips(totalPips)} pips
-            </span>
-          </div>
-        )}
+        <div className="flex items-center gap-2">
+          <span className="text-slate-500 dark:text-slate-400" title="Total OANDA spread paid across all trades">
+            Spread:
+          </span>
+          <span className="font-semibold font-mono text-amber-600 dark:text-amber-400">
+            -{fmtCost(totalSpreadPips, totalSpreadDollars)}
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-slate-500 dark:text-slate-400" title="Total slippage buffer applied (0 by default)">
+            Slippage:
+          </span>
+          <span
+            className={`font-semibold font-mono ${
+              totalSlippagePips > 0
+                ? 'text-amber-600 dark:text-amber-400'
+                : 'text-slate-400 dark:text-slate-500'
+            }`}
+          >
+            {totalSlippagePips > 0
+              ? `-${fmtCost(totalSlippagePips, totalSlippageDollars)}`
+              : '—'}
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-slate-500 dark:text-slate-400" title="Total overnight financing charged across all trades">
+            Swap:
+          </span>
+          <span
+            className={`font-semibold font-mono ${
+              totalSwapPips !== 0
+                ? 'text-amber-600 dark:text-amber-400'
+                : 'text-slate-400 dark:text-slate-500'
+            }`}
+          >
+            {totalSwapPips !== 0
+              ? `${totalSwapPips > 0 ? '-' : '+'}${fmtCost(
+                  Math.abs(totalSwapPips),
+                  Math.abs(totalSwapDollars)
+                )}`
+              : '—'}
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-slate-500 dark:text-slate-400">Net:</span>
+          <span
+            className={`font-semibold font-mono ${
+              (viewMode === 'pips' ? totalNetPips : totalNetDollars) >= 0
+                ? 'text-green-600 dark:text-green-400'
+                : 'text-red-600 dark:text-red-400'
+            }`}
+          >
+            {fmtPnl(totalNetPips, totalNetDollars)}
+          </span>
+        </div>
       </div>
 
       {/* Table */}
@@ -199,43 +252,53 @@ export default function TradesTable({ trades, viewMode, pair }: TradesTableProps
               <th
                 className="px-3 py-2 text-right font-medium text-slate-600 dark:text-slate-400 cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-700/50"
                 onClick={() => handleSort('pips')}
+                title="Raw price movement from entry to exit, before any costs"
               >
                 <div className="flex items-center justify-end gap-1">
-                  {viewMode === 'pips' ? 'P&L (pips)' : 'Gross'}
+                  Gross
                   <SortIcon field="pips" />
                 </div>
               </th>
-              {viewMode === 'dollars' && (
-                <>
-                  <th
-                    className="px-3 py-2 text-right font-medium text-slate-600 dark:text-slate-400 cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-700/50"
-                    onClick={() => handleSort('spreadCostPips')}
-                  >
-                    <div className="flex items-center justify-end gap-1">
-                      Spread
-                      <SortIcon field="spreadCostPips" />
-                    </div>
-                  </th>
-                  <th
-                    className="px-3 py-2 text-right font-medium text-slate-600 dark:text-slate-400 cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-700/50"
-                    onClick={() => handleSort('swapCostPips')}
-                  >
-                    <div className="flex items-center justify-end gap-1">
-                      Swap
-                      <SortIcon field="swapCostPips" />
-                    </div>
-                  </th>
-                  <th
-                    className="px-3 py-2 text-right font-medium text-slate-600 dark:text-slate-400 cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-700/50"
-                    onClick={() => handleSort('netPips')}
-                  >
-                    <div className="flex items-center justify-end gap-1">
-                      Net P&L
-                      <SortIcon field="netPips" />
-                    </div>
-                  </th>
-                </>
-              )}
+              <th
+                className="px-3 py-2 text-right font-medium text-slate-600 dark:text-slate-400 cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-700/50"
+                onClick={() => handleSort('spreadCostPips')}
+                title="OANDA spread charged on this round trip (half on open, half on close = advertised spread per execution)"
+              >
+                <div className="flex items-center justify-end gap-1">
+                  Spread
+                  <SortIcon field="spreadCostPips" />
+                </div>
+              </th>
+              <th
+                className="px-3 py-2 text-right font-medium text-slate-600 dark:text-slate-400 cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-700/50"
+                onClick={() => handleSort('slippageCostPips')}
+                title="Execution slippage buffer. OANDA does not bill slippage as a line item; default is 0 pips/side. Override via BACKTEST_SLIPPAGE_PIPS for stress tests."
+              >
+                <div className="flex items-center justify-end gap-1">
+                  Slippage
+                  <SortIcon field="slippageCostPips" />
+                </div>
+              </th>
+              <th
+                className="px-3 py-2 text-right font-medium text-slate-600 dark:text-slate-400 cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-700/50"
+                onClick={() => handleSort('swapCostPips')}
+                title="OANDA overnight financing — one charge per 21:00 UTC mark crossed, Sat/Sun (UTC) skipped, no 3× Wednesday multiplier"
+              >
+                <div className="flex items-center justify-end gap-1">
+                  Swap
+                  <SortIcon field="swapCostPips" />
+                </div>
+              </th>
+              <th
+                className="px-3 py-2 text-right font-medium text-slate-600 dark:text-slate-400 cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-700/50"
+                onClick={() => handleSort('netPips')}
+                title="Gross − spread − slippage − swap. The number that actually hits the account."
+              >
+                <div className="flex items-center justify-end gap-1">
+                  Net
+                  <SortIcon field="netPips" />
+                </div>
+              </th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-200 dark:divide-slate-700">
@@ -292,32 +355,58 @@ export default function TradesTable({ trades, viewMode, pair }: TradesTableProps
                     }
                   >
                     {viewMode === 'pips'
-                      ? `${formatPips(trade.pips)} pips`
+                      ? `${formatPips(trade.pips)}p`
                       : formatDollars(trade.grossPnlDollars)}
                   </span>
                 </td>
-                {viewMode === 'dollars' && (
-                  <>
-                    <td className="px-3 py-2 text-right text-amber-600 dark:text-amber-400 font-mono text-xs">
-                      -{(trade.spreadCostPips ?? 0).toFixed(1)}p / {formatDollars(trade.spreadCostDollars, false)}
-                    </td>
-                    <td className="px-3 py-2 text-right text-amber-600 dark:text-amber-400 font-mono text-xs">
-                      {(trade.swapCostPips ?? 0) > 0 ? `-${(trade.swapCostPips ?? 0).toFixed(1)}p` : '0'}
-                      {(trade.swapCostDollars ?? 0) > 0 ? ` / ${formatDollars(trade.swapCostDollars, false)}` : ''}
-                    </td>
-                    <td className="px-3 py-2 text-right font-mono text-xs">
-                      <span
-                        className={
-                          trade.netPnlDollars >= 0
-                            ? 'text-green-600 dark:text-green-400'
-                            : 'text-red-600 dark:text-red-400'
-                        }
-                      >
-                        {formatDollars(trade.netPnlDollars)}
-                      </span>
-                    </td>
-                  </>
-                )}
+                <td className="px-3 py-2 text-right text-amber-600 dark:text-amber-400 font-mono text-xs">
+                  {viewMode === 'pips'
+                    ? `-${(trade.spreadCostPips ?? 0).toFixed(1)}p`
+                    : formatDollars(-(trade.spreadCostDollars ?? 0))}
+                </td>
+                <td
+                  className={`px-3 py-2 text-right font-mono text-xs ${
+                    (trade.slippageCostPips ?? 0) > 0
+                      ? 'text-amber-600 dark:text-amber-400'
+                      : 'text-slate-400 dark:text-slate-500'
+                  }`}
+                >
+                  {(trade.slippageCostPips ?? 0) > 0
+                    ? viewMode === 'pips'
+                      ? `-${(trade.slippageCostPips ?? 0).toFixed(1)}p`
+                      : formatDollars(-(trade.slippageCostDollars ?? 0))
+                    : '—'}
+                </td>
+                <td
+                  className={`px-3 py-2 text-right font-mono text-xs ${
+                    (trade.swapCostPips ?? 0) !== 0
+                      ? 'text-amber-600 dark:text-amber-400'
+                      : 'text-slate-400 dark:text-slate-500'
+                  }`}
+                >
+                  {(trade.swapCostPips ?? 0) !== 0
+                    ? viewMode === 'pips'
+                      ? `${(trade.swapCostPips ?? 0) > 0 ? '-' : '+'}${Math.abs(
+                          trade.swapCostPips ?? 0
+                        ).toFixed(2)}p`
+                      : formatDollars(-(trade.swapCostDollars ?? 0))
+                    : '—'}
+                </td>
+                <td className="px-3 py-2 text-right font-mono text-xs">
+                  <span
+                    className={
+                      (viewMode === 'pips'
+                        ? (trade.netPips ?? 0)
+                        : (trade.netPnlDollars ?? 0)) >= 0
+                        ? 'text-green-600 dark:text-green-400'
+                        : 'text-red-600 dark:text-red-400'
+                    }
+                  >
+                    {viewMode === 'pips'
+                      ? `${formatPips(trade.netPips ?? 0)}p`
+                      : formatDollars(trade.netPnlDollars)}
+                  </span>
+                </td>
               </tr>
             ))}
           </tbody>
@@ -363,19 +452,15 @@ export default function TradesTable({ trades, viewMode, pair }: TradesTableProps
           minSize === maxSize
             ? `${minSize.toLocaleString()} units`
             : `${minSize.toLocaleString()}–${maxSize.toLocaleString()} units (varies with entry close, sized to risk per trade)`;
+        const perTradeSpread =
+          totalTrades > 0 ? totalSpreadPips / totalTrades : 0;
         return (
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            {viewMode === 'pips' ? (
-              <>
-                Showing raw P&L in pips without transaction costs. Switch to
-                "Dollars" to see net results. Order size: {sizeLabel}.
-              </>
-            ) : (
-              <>
-                Net P&L includes spread ({trades[0]?.spreadCostPips || 0.8}{' '}
-                pips) and overnight swap costs. Order size: {sizeLabel}.
-              </>
-            )}
+            Costs per trade: spread ≈ {perTradeSpread.toFixed(2)} pips round-trip
+            (half on open + half on close, snapshotted at evolution-run start),
+            slippage {totalSlippagePips > 0 ? `≈ ${(totalSlippagePips / totalTrades).toFixed(2)} pips` : '0 (OANDA does not bill slippage)'},
+            swap fires once per 21:00 UTC mark crossed (Sat/Sun UTC skipped).
+            Order size: {sizeLabel}.
           </p>
         );
       })()}
