@@ -7,11 +7,12 @@
 
 import React, { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Loader2, Plus, X } from 'lucide-react';
+import { Loader2, Plus, Trash2, X } from 'lucide-react';
 
 import {
   STATUS_BADGE_CLASSES,
   createEvolutionRun,
+  deleteEvolutionRun,
   formatLlmCost,
   listEvolutionRuns,
 } from '../services/evolutionApi';
@@ -104,7 +105,26 @@ export default function EvolutionRuns() {
           <Loader2 className="w-8 h-8 text-blue-500 animate-spin" />
         </div>
       ) : (
-        <RunsTable runs={runs} onRowClick={(id) => navigate(`/evolution/${id}`)} />
+        <RunsTable
+          runs={runs}
+          onRowClick={(id) => navigate(`/evolution/${id}`)}
+          onDelete={async (id) => {
+            if (
+              !confirm(
+                `Delete run ${id}?\n\nThis permanently removes all generations, ` +
+                  `genomes, validation folds, and decision-log entries for this ` +
+                  `run. The cascade cannot be undone.`,
+              )
+            )
+              return;
+            try {
+              await deleteEvolutionRun(id);
+              await fetchRuns();
+            } catch (err) {
+              alert(err instanceof Error ? err.message : 'Failed to delete run');
+            }
+          }}
+        />
       )}
 
       {/* Pagination */}
@@ -187,9 +207,11 @@ export default function EvolutionRuns() {
 function RunsTable({
   runs,
   onRowClick,
+  onDelete,
 }: {
   runs: EvolutionRun[];
   onRowClick: (id: string) => void;
+  onDelete: (id: string) => void | Promise<void>;
 }) {
   if (runs.length === 0) {
     return (
@@ -211,6 +233,7 @@ function RunsTable({
             <th className="px-4 py-3 text-right font-medium">LLM cost</th>
             <th className="px-4 py-3 text-left font-medium">Stop reason</th>
             <th className="px-4 py-3 text-left font-medium">Created</th>
+            <th className="px-4 py-3 text-right font-medium w-12"></th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-200 dark:divide-slate-700">
@@ -242,6 +265,20 @@ function RunsTable({
               </td>
               <td className="px-4 py-3 text-xs text-slate-500 dark:text-slate-400">
                 {new Date(r.created_at).toLocaleString()}
+              </td>
+              <td className="px-4 py-3 text-right">
+                {r.status !== 'running' && r.status !== 'queued' && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void onDelete(r.id);
+                    }}
+                    title="Delete this run and all its lineage (cannot be undone)"
+                    className="inline-flex items-center justify-center p-1.5 rounded text-slate-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                )}
               </td>
             </tr>
           ))}
