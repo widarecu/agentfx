@@ -128,7 +128,8 @@ class OandaClient:
 
         Calls GET /v3/accounts/{accountID}/instruments?instruments={instrument}
         and returns the per-day financing rates that OANDA charges or credits
-        when a position is held past 17:00 ET.
+        when a position is held past the daily rollover (21:00 UTC for
+        OANDA AU accounts).
 
         Returns:
             dict with keys:
