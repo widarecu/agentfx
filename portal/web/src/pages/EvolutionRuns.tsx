@@ -450,7 +450,7 @@ function CreateRunModal({
       role="dialog"
       aria-modal="true"
     >
-      <div className="w-full max-w-lg bg-white dark:bg-slate-800 rounded-lg shadow-xl border border-slate-200 dark:border-slate-700">
+      <div className="w-full max-w-lg max-h-[calc(100vh-2rem)] overflow-y-auto bg-white dark:bg-slate-800 rounded-lg shadow-xl border border-slate-200 dark:border-slate-700">
         <div className="px-5 py-4 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
           <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
             Start New Evolution Run
