@@ -12,6 +12,8 @@
 
 import { expect, test } from '@playwright/test';
 
+import { startNewEvolutionRunWithDefaults } from './test-helpers';
+
 test('genome → view full backtest → metrics + trades render', async ({
   page,
 }) => {
@@ -37,11 +39,9 @@ test('genome → view full backtest → metrics + trades render', async ({
     .filter({ hasText: /^evorun_/ })
     .first();
   if ((await firstRunLink.count()) === 0) {
-    await page.getByRole('button', { name: /Start New Run/i }).click();
-    await page.getByRole('button', { name: /^Start Run$/i }).click();
-    // Modal closes, redirect to /evolution/<id>. Pop back to the list
-    // so the rest of the flow is symmetric.
-    await page.waitForURL(/\/evolution\/evorun_/, { timeout: 15_000 });
+    await startNewEvolutionRunWithDefaults(page);
+    // We're now on the detail page. Pop back to the list so the rest
+    // of the flow is symmetric.
     await page.goto('/evolution');
     await page.waitForLoadState('networkidle');
     firstRunLink = page
