@@ -12,6 +12,8 @@
 
 import { expect, test } from '@playwright/test';
 
+import { startNewEvolutionRunWithDefaults } from './test-helpers';
+
 test.describe('Evolution UX smoke', () => {
   test('runs list → detail → genome detail (real run)', async ({ page }) => {
     // Login as trader
@@ -33,11 +35,23 @@ test.describe('Evolution UX smoke', () => {
       fullPage: true,
     });
 
-    // Click the most recent completed run
-    const firstRunLink = page
+    // Click the most recent completed run. If the test DB is empty
+    // (clean CI run before any other spec has created one), bootstrap
+    // a run so the smoke flow is self-contained.
+    let firstRunLink = page
       .getByRole('link')
       .filter({ hasText: /evorun_/ })
       .first();
+    if ((await firstRunLink.count()) === 0) {
+      await startNewEvolutionRunWithDefaults(page);
+      await page.goto('/evolution');
+      await page.waitForLoadState('networkidle');
+      firstRunLink = page
+        .getByRole('link')
+        .filter({ hasText: /evorun_/ })
+        .first();
+      await expect(firstRunLink).toBeVisible({ timeout: 15_000 });
+    }
     await firstRunLink.click();
     await page.waitForLoadState('networkidle');
     await page.waitForTimeout(800); // Let the chart render

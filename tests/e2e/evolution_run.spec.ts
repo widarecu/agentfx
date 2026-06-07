@@ -1,6 +1,8 @@
 import { test, expect } from '@playwright/test';
 import type { Page } from '@playwright/test';
 
+import { startNewEvolutionRunWithDefaults } from './test-helpers';
+
 /**
  * Evolution E2E Tests (v0.3.0).
  *
@@ -85,15 +87,8 @@ test.describe('Evolution Runs Page', () => {
     await login(page, TRADER_EMAIL, TRADER_PASSWORD);
     await page.goto('/evolution');
 
-    // Open the modal
-    await page.getByRole('button', { name: /Start New Run/i }).click();
-    await expect(page.getByRole('dialog')).toBeVisible();
+    await startNewEvolutionRunWithDefaults(page);
 
-    // Submit the form (defaults are fine)
-    await page.getByRole('button', { name: /^Start Run$/i }).click();
-
-    // Should navigate to /evolution/<id>
-    await page.waitForURL(/\/evolution\/evorun_/, { timeout: 15000 });
     // Detail page header (run id is mono text inside an h1)
     await expect(page.locator('h1').first()).toContainText('evorun_');
   });
@@ -129,11 +124,9 @@ test.describe('Evolution Run Detail', () => {
   }) => {
     await login(page, TRADER_EMAIL, TRADER_PASSWORD);
 
-    // Create a fresh run via the API path (UI flow already covered above)
+    // Create a fresh run via the UI (modal → submit → detail page).
     await page.goto('/evolution');
-    await page.getByRole('button', { name: /Start New Run/i }).click();
-    await page.getByRole('button', { name: /^Start Run$/i }).click();
-    await page.waitForURL(/\/evolution\/evorun_/, { timeout: 15000 });
+    await startNewEvolutionRunWithDefaults(page);
 
     // Stop button should be visible (run is queued/running)
     await expect(page.getByRole('button', { name: /^Stop$/ })).toBeVisible({
@@ -154,9 +147,7 @@ test.describe('Evolution Run Detail', () => {
   test('back link returns to runs list', async ({ page }) => {
     await login(page, TRADER_EMAIL, TRADER_PASSWORD);
     await page.goto('/evolution');
-    await page.getByRole('button', { name: /Start New Run/i }).click();
-    await page.getByRole('button', { name: /^Start Run$/i }).click();
-    await page.waitForURL(/\/evolution\/evorun_/, { timeout: 15000 });
+    await startNewEvolutionRunWithDefaults(page);
 
     await page.getByRole('link', { name: /Back to runs/i }).click();
     await expect(page).toHaveURL('/evolution', { timeout: 5000 });
