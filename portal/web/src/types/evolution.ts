@@ -176,6 +176,9 @@ export interface ValidationFold {
   n_trades: number | null;
   cagr: number | null;
   passed_gate_b: boolean;
+  // v0.4.0 regime tags. Null for legacy K=4 rows.
+  regime_volatility: string | null;
+  regime_trend: string | null;
 }
 
 /**

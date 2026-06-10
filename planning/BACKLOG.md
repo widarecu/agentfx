@@ -109,7 +109,9 @@ This backlog is organized by version milestone. Each item links to executable us
 
 ---
 
-## v0.3.0 - Autonomous Strategy Loop
+## v0.3.0 - Autonomous Strategy Loop (FUNCTIONALLY COMPLETE)
+
+**Status:** 4 of 5 acceptance criteria met. The loop runs end-to-end nightly on Railway. **Acceptance #3 (a VALIDATED genome that differs structurally from the gen-0 seeds) has never fired** — root cause documented in `v0.4.0 - Capability Expansion` below (evidence: 8 of 9 recent M10 runs produced training Sharpe +1.6 to +3 but OOS Sharpe −0.4 to −1.8 on the same Apr-Jul 2024 OOS slice).
 
 **Theme:** First genuinely agentic increment — a scheduled closed loop that discovers, evolves, and validates trading strategies without human intervention. Discovery and Validation are absorbed into this milestone (no longer separate versions).
 
@@ -124,76 +126,44 @@ This backlog is organized by version milestone. Each item links to executable us
 
 ### P0 - Must Have
 
-- [ ] `TODO` Strategy DSL v1 + compiler + indicator catalog + gen-0 seeds
-  - Req: [US-006](requirements/US-006-strategy-dsl.md)
-  - Files: `src/agentfx/core/dsl/{grammar.py, compiler.py, indicators.py, seeds.py}`
-  - Acceptance: existing MA/RSI/Donchian re-expressed as DSL specs; compiled-DSL signals match classic-class signals on identical data (DSL-completeness gate)
+- [x] `DONE` Strategy DSL v1 + compiler + indicator catalog + gen-0 seeds
+  - 9 indicators shipped: `close, sma, ema, rsi, atr, bb_upper, bb_lower, donchian_high, donchian_low`. Existing MA/RSI/Donchian re-expressed as DSL seeds.
 
-- [ ] `TODO` Extract `evaluate_gate_b()` to `core/gates.py`
-  - Files: `src/agentfx/core/gates.py` (new); `src/agentfx/agents/optimizer.py` (import update)
+- [x] `DONE` Extract `evaluate_gate_b()` to `core/gates.py`
 
-- [ ] `TODO` Persistence: ORM models + Alembic migration
-  - Tables: `evolution_run`, `generation`, `strategy_genome`, `validation_fold`, `decision_log`
-  - Files: `src/agentfx/api/models/evolution.py`, `migrations/versions/<new>.py`
+- [x] `DONE` Persistence: ORM models + Alembic migration
+  - All five tables live in Postgres (`evolution_runs`, `generations`, `strategy_genomes`, `validation_folds`, `decision_logs`)
 
-- [ ] `TODO` GA core (DEAP + custom DSL operators)
-  - Req: [US-003](requirements/US-003-evolution-run-lifecycle.md)
-  - Files: `src/agentfx/agents/evolution/{ga.py, fitness.py, population.py}`
-  - Operators: tournament-3 selection, subtree crossover (p=0.6), 5 mutation types (p=0.3), 10% elitism, edit-distance ≤ 2 diversity penalty
-  - Population: 30/generation
+- [x] `DONE` GA core (tournament-3 + subtree crossover + 5 mutation types + 10% elitism + diversity penalty + 30-genome population)
 
-- [ ] `TODO` LLM hypothesis injector
-  - Req: [US-005](requirements/US-005-llm-hypothesis-injection.md)
-  - Files: `src/agentfx/agents/evolution/{llm_client.py, prompts.py}`
-  - Anthropic SDK with prompt caching, structured output via `propose_strategy` tool, exponential-backoff retries, hard per-run cost cap (`EVOLUTION_LLM_BUDGET_USD` default 5.00)
-  - Invoked every N=3 generations, replaces bottom-5 by fitness
+- [x] `DONE` LLM hypothesis injector — Anthropic SDK, prompt caching, structured output, per-run budget cap, every-N=3-generation injection
 
-- [ ] `TODO` Validator agent (replace stub)
-  - Req: [US-004](requirements/US-004-walk-forward-validation.md)
-  - Files: `src/agentfx/agents/validator.py`
-  - K=4 contiguous walk-forward folds; final fold withheld from GA entirely; Gate B applied on OOS
+- [x] `DONE` Validator agent — K=4 walk-forward, final fold withheld from GA, Gate B applied on OOS
 
-- [ ] `TODO` Orchestrator agent (replace stub) + subprocess runner
-  - Req: [US-003](requirements/US-003-evolution-run-lifecycle.md)
-  - Files: `src/agentfx/agents/orchestrator.py`, `src/agentfx/api/workers/evolution_runner.py`
-  - Drives the loop; forks `multiprocessing.Process` per run with `resource.setrlimit()` RAM (2 GiB) + CPU-time (6h) caps
-  - Stop conditions: `max_generations`, `max_wall_clock_seconds`, `target_oos_sharpe`, `no_improvement_generations`, `llm_budget_exhausted`
-  - Crash handling: parent detects child non-zero exit → marks run `FAILED` → continues serving
+- [x] `DONE` Orchestrator agent + subprocess runner with `resource.setrlimit()` RAM (6 GiB after PR-era raise) + CPU-time caps. All five stop conditions wired.
 
-- [ ] `TODO` Backtest dispatch on DSL specs
-  - Files: `src/agentfx/services/backtest.py:655-669` — extend `make_strategy()` to accept `{"type": "dsl", "spec": {...}}`
+- [x] `DONE` Backtest dispatch on DSL specs
 
-- [ ] `TODO` API surface: routers + schemas + service + lifespan recovery
-  - Req: [US-003](requirements/US-003-evolution-run-lifecycle.md), [US-016](requirements/US-016-evolution-observability.md)
-  - Files: `src/agentfx/api/routers/evolution.py`, `src/agentfx/api/schemas/evolution.py`, `src/agentfx/api/services/evolution.py`
-  - Endpoints: `POST /evolution-runs` (TRADER+, 202), `GET list`, `GET detail`, `GET /generations`, `GET /genomes/{id}`, `GET /decisions`, `POST /stop`
-  - `recover_queued_evolution_runs()` registered in `api/main.py` lifespan
+- [x] `DONE` API surface (`POST/GET/DELETE /evolution-runs`, `POST /stop`, sub-resources for generations / genomes / decisions; `recover_queued_evolution_runs()` in lifespan)
+  - DELETE landed in v0.4.0-era PR #6 — TRADER+, refuses with 409 when run is queued or running
 
-- [ ] `TODO` Portal: Evolution pages + DSL tree renderer
-  - Req: [US-016](requirements/US-016-evolution-observability.md)
-  - Files: `portal/web/src/pages/{EvolutionRuns.tsx, EvolutionRunDetail.tsx, GenomeDetail.tsx}`, `portal/web/src/router.tsx`
-  - GenomeDetail shows DSL spec as readable tree, walk-forward fold metrics, parent/child lineage, LLM reasoning text for `origin='llm'` genomes
-  - Reuses existing `StrategyChart.tsx` for candle + signal rendering
+- [x] `DONE` Portal: Evolution pages + DSL tree renderer + LineageExplainer + LlmInjectionCard + RunNarrative + FitnessCurveChart + WalkForwardFoldTable + per-fold metrics + fitness breakdown
 
-- [ ] `TODO` Decision log on every agent action (observability)
-  - Req: [US-016](requirements/US-016-evolution-observability.md)
-  - Append-only `decision_log` rows from every agent step; LLM cost + latency emitted as Prometheus metrics via `api/core/metrics.py`
+- [x] `DONE` Decision log on every agent action (observability) — UI surfaces it on the run-detail page
 
 ### P1 - Should Have
 
-- [ ] `TODO` Backtest perf benchmark + budget realism check
-  - Time a single backtest on 30d M1 data; if > 5s, reduce population/granularity for v0.3.0 or accelerate `run_backtest_from_db()`
-  - If consistently > 6h wall-clock per run, the **pre-committed `backtest-worker` split** fires (see plan)
+- [x] `DONE` Backtest perf is comfortable (runs complete in minutes, not hours). Formal `backtest-worker` split has not fired — wall-clock and queue depth stay far under the 6h / 200-job triggers documented in the plan.
 
-- [ ] `TODO` Add `anthropic>=0.40` and `deap>=1.4` to `requirements.in`; regenerate `requirements.txt`
+- [x] `DONE` `anthropic>=0.40` and `deap>=1.4` in requirements; production deploys use them
 
-- [ ] `TODO` Railway cron declaration in `railway.toml` for nightly evolution-run trigger
+- [x] `DONE` Railway nightly cron declared and firing — `scripts/trigger_nightly_evolution.py`
 
 ### P2 - Could Have
 
-- [ ] `TODO` Diversity-injection variant using `claude-haiku-4-5-20251001` for cheap high-frequency seeding
+- [ ] `TODO` Diversity-injection variant using `claude-haiku-4-5-20251001` for cheap high-frequency seeding (deferred — current Sonnet 4.6 cost is well inside the per-run budget)
 
-- [ ] `TODO` Evolution-run export (CSV/JSON of full lineage)
+- [ ] `TODO` Evolution-run export (CSV/JSON of full lineage) — deferred
 
 ### Out of Scope (deferred to v0.4.0+)
 
@@ -207,31 +177,80 @@ This backlog is organized by version milestone. Each item links to executable us
 
 ### Acceptance for "v0.3.0 done"
 
-1. A scheduled Railway cron triggers a fresh evolution run nightly.
-2. The run completes unattended, hits a stop condition, persists VALIDATED genomes for human review.
-3. At least one VALIDATED genome differs structurally from the gen-0 seeds (i.e. system actually discovered something).
-4. Decision log lets a reviewer reconstruct *why* each surviving genome was kept.
-5. LLM cost stays under the configured per-run budget across 5 consecutive nightly runs.
+1. [x] A scheduled Railway cron triggers a fresh evolution run nightly.
+2. [x] The run completes unattended, hits a stop condition, persists VALIDATED genomes for human review.
+3. [ ] **OPEN** — At least one VALIDATED genome differs structurally from the gen-0 seeds. *No genome has ever cleared Gate B.* Evidence (12 recent UAT runs analysed): training-fold Sharpes of +1.5 to +3 routinely become OOS Sharpes of −0.4 to −1.8. Three independent runs on the same Apr-Jul 2024 OOS slice all produced negative Sharpe with hit rates 0.35-0.41 — i.e. systematically inverse to training, which is a regime-shift signature, not random GA overfit. Mitigation moved into v0.4.0 (rolling walk-forward + regime tagging).
+4. [x] Decision log lets a reviewer reconstruct *why* each surviving genome was kept.
+5. [x] LLM cost stays under the configured per-run budget across 5 consecutive nightly runs.
 
 ---
 
-## v0.4.0 - Capability Expansion
+## v0.4.0 - Capability Expansion (IN PROGRESS)
 
-**Theme:** Grow the discovery surface area now that the loop works.
+**Theme:** Two things at once — close v0.3.0 acceptance #3 (regime-aware validation) AND grow the discovery surface (richer DSL).
 
-- [ ] `TODO` Expand DSL: more indicators (MACD, stochastic, ADX, OBV, ichimoku, …), time-of-day entry filters, multi-timeframe references
-- [ ] `TODO` Multi-symbol portfolios within one evolution run
-- [ ] `TODO` Per-pair configurable spread (carry-over from open memory item)
-- [ ] `TODO` Regime tags as prompt context (volatility quintile, trend strength)
+**Status:** Partially shipped (per-pair spread snapshot, `min_hold_bars` field, OOS-split tabs, trade-ledger metrics, cost-model rewrite to OANDA AU schedule, deletable runs). Indicators / TOD / multi-symbol / regime-aware validation still to come.
+
+### Recently shipped (May-June 2026)
+
+- [x] `DONE` Per-pair configurable spread snapshot at run-start
+- [x] `DONE` `min_hold_bars` DSL field — minimum bars between flips
+- [x] `DONE` OOS-split tabs on backtest page + per-trade cost columns
+- [x] `DONE` Trade-ledger metrics (compounded, risk-sized) alongside bar-level unit-position metrics
+- [x] `DONE` Cost-model rewrite — OANDA AU 21:00 UTC daily rollover, no Wed 3×, slippage default 0.0 (PR #6)
+- [x] `DONE` Delete invalid evolution runs from UI (PR #6)
+- [x] `DONE` Scrollable evolution form modal (PR #8) + EUR_USD form pin in CI (PR #7)
+- [x] `DONE` Read-only investigation script comparing current model against OANDA empirical fills (`scripts/investigate_cost_model_gap.py`)
+
+### P0 — Close the OOS gap (regime-aware validation)
+
+Surfaced by the 2026-06-07 fold analysis: the GA produces consistent training Sharpe but the *single* OOS fold systematically inverts when the most-recent 25% of the data is a different regime. Pure search-space expansion doesn't fix this — we need to change *how we validate*.
+
+- [ ] `TODO` Rolling walk-forward instead of fixed-25%-tail OOS
+  - Multiple overlapping OOS folds, e.g. 5 × {train 60% of window → validate next 10%, slide forward}
+  - Fitness = MEDIAN OOS Sharpe across folds, not mean training Sharpe
+  - **Direct fix for the "good train, bad OOS" pattern** — the average across overlapping OOS slices is less brittle than betting on one
+- [ ] `TODO` Regime tagging on training AND OOS folds
+  - Compute per-fold features at run-start: realised vol (quintile), trend strength (Hurst or ADX), session mix
+  - Reject runs early when train/OOS regime tags disagree past a threshold (saves 30 generations of wasted compute)
+- [ ] `TODO` Regime tags as LLM prompt context (was already on the backlog; promoted here)
+  - LLM sees "training period regime tag was X, OOS regime tag is Y, propose strategies whose edge survives both"
+
+### P0 — Expand DSL surface
+
+- [ ] `TODO` 5 more indicators: MACD, stochastic, ADX, OBV, ichimoku
+- [ ] `TODO` Time-of-day entry filter — restrict entry signals to chosen UTC hour ranges (London/NY session, news-blackout)
+- [ ] `TODO` Multi-timeframe references — allow a M5 strategy to reference an H1 indicator value (richer signal hierarchy)
+
+### P1 — Should Have
+
+- [ ] `TODO` Multi-symbol portfolios within one evolution run — design decision pending (portfolio-of-strategies vs. generalised strategy applied per pair)
 - [ ] `TODO` Optional Bayesian late-stage refiner — repurpose the existing `BayesianOptimizerAgent` to fine-tune numeric thresholds inside a winning genome shape after the GA selects it
 
+### Acceptance for "v0.4.0 done"
+
+1. At least one VALIDATED genome clears Gate B on a real nightly run (carries over v0.3.0 acceptance #3, finally closed).
+2. DSL grammar covers ≥ 12 indicators and time-of-day filters.
+3. Rolling walk-forward produces a stable median OOS Sharpe across at least 3 non-overlapping data slices.
+4. Per-pair spread accuracy verified against historical OANDA spread data on EUR_USD + GBP_USD + USD_JPY.
+
 ---
 
-## v0.5.0 - Self-Improvement
+## v0.5.0 - Self-Improvement (IN PROGRESS)
 
 **Theme:** The platform learns across runs, not just within runs.
 
-- [ ] `TODO` Evolution agent (real implementation, replacing the v0.3.0-era stub) — distils results across runs into prompt updates and learned DSL priors
+### Recently shipped (May-June 2026)
+
+- [x] `DONE` Randomised `rng_seed` per run (was hardcoded 42 — all runs were converging on bit-identical DSL)
+- [x] `DONE` Fold-consistency fitness: `mean(per_fold_sharpe) − 0.5·std(per_fold_sharpe)` instead of mean alone
+- [x] `DONE` Per-genome training-fold metrics + fitness-breakdown panel in `GenomeDetail`
+- [x] `DONE` LLM-injection cards on `EvolutionRunDetail` show per-proposal DSL + reasoning + Δ vs incumbent
+- [x] `DONE` Archetype badges on the genome hero (trend-following / mean-reverting / breakout / mixed / degenerate)
+
+### TODO
+
+- [ ] `TODO` Real Evolution agent — distils results across runs into prompt updates and learned DSL priors
 - [ ] `TODO` Drift detection on currently-running validated strategies — when behaviour drifts from validation distribution, re-trigger evolution
 - [ ] `TODO` Cross-run hypothesis lineage — LLM prompts include patterns observed across the last K runs, not just the current one
 - [ ] `TODO` LLM prompt A/B testing infrastructure to measure prompt-quality improvements quantitatively

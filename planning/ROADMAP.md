@@ -75,7 +75,7 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 
 ---
 
-## v0.3.0 - Autonomous Strategy Loop
+## v0.3.0 - Autonomous Strategy Loop (FUNCTIONALLY COMPLETE)
 
 **Theme:** First genuinely agentic increment.
 
@@ -83,8 +83,10 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 
 **Reference:** Full plan at `~/.claude/plans/i-think-we-need-functional-pony.md`.
 
-**Key Capabilities:**
-- Strategy DSL v1 (constrained JSON grammar over a 6-indicator catalogue) with a compiler that emits the existing `Strategy` interface
+**Status:** 4 of 5 exit criteria met. The loop runs end-to-end nightly on Railway. Acceptance #3 is **open** — no genome has cleared Gate B because of regime fragility in the validator (single-OOS-fold walk-forward systematically inverts when the OOS slice is a different regime to the training folds). Mitigation belongs in v0.4.0 (rolling walk-forward + regime tagging).
+
+**Key Capabilities (delivered):**
+- Strategy DSL v1 (constrained JSON grammar over a 9-indicator catalogue) with a compiler that emits the existing `Strategy` interface
 - Genetic algorithm core (`deap>=1.4` + custom Pydantic-aware mutation/crossover) — population of 30 genomes evolved with tournament-3 selection, 10% elitism, edit-distance diversity penalty
 - LLM-driven hypothesis injection every N=3 generations via the `anthropic>=0.40` SDK with mandatory prompt caching, structured output via tool-use, hard per-run cost cap
 - Walk-forward validator (K=4 folds, final fold withheld from GA) applying Gate B (Sharpe ≥ 1.0, MDD ≤ 10%, Hit Rate ≥ 48%, ≥ 300 trades) on held-out OOS
@@ -95,41 +97,54 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 **User Stories:** [US-003](requirements/US-003-evolution-run-lifecycle.md), [US-004](requirements/US-004-walk-forward-validation.md), [US-005](requirements/US-005-llm-hypothesis-injection.md), [US-006](requirements/US-006-strategy-dsl.md), [US-016](requirements/US-016-evolution-observability.md)
 
 **Exit Criteria:**
-- [ ] Scheduled Railway cron triggers a fresh evolution run nightly
-- [ ] Run completes unattended, hits a stop condition, persists VALIDATED genomes for human review
-- [ ] At least one VALIDATED genome differs structurally from the gen-0 seeds (system actually discovered something)
-- [ ] Decision log lets a reviewer reconstruct *why* each surviving genome was kept
-- [ ] LLM cost stays under per-run budget across 5 consecutive nightly runs
+- [x] Scheduled Railway cron triggers a fresh evolution run nightly
+- [x] Run completes unattended, hits a stop condition, persists VALIDATED genomes for human review
+- [ ] **OPEN** — At least one VALIDATED genome differs structurally from the gen-0 seeds (system actually discovered something). Carries into v0.4.0.
+- [x] Decision log lets a reviewer reconstruct *why* each surviving genome was kept
+- [x] LLM cost stays under per-run budget across 5 consecutive nightly runs
 
 ---
 
-## v0.4.0 - Capability Expansion
+## v0.4.0 - Capability Expansion + Regime-Aware Validation (IN PROGRESS)
 
-**Theme:** Grow the discovery surface area now that the loop works.
+**Theme:** Two goals at once — (a) close v0.3.0 acceptance #3 by fixing the validator's regime fragility; (b) grow the discovery surface so genomes have more to express.
 
-**Goal:** Make the autonomous loop find better strategies by enriching what it has to work with — more indicators, more contextual prompts, multi-asset reasoning.
+**Why both:** The 2026-06-07 analysis of 9 recent UAT M10 runs revealed that training-fold Sharpes of +1.5 to +3 routinely become OOS Sharpes of −0.4 to −1.8 on the same Apr-Jul 2024 OOS slice. Three independent runs with different RNG seeds all lost on the same OOS slice — a regime-shift signature, not random GA overfit. Expanding the DSL alone wouldn't close the gap; we need to change *how we validate* in parallel with *what we can express*.
 
-**Key Capabilities:**
-- Expanded DSL: MACD, stochastic, ADX, OBV, ichimoku, time-of-day filters, multi-timeframe references
-- Multi-symbol portfolios within a single evolution run
-- Per-pair configurable spread (carry-over from open memory item)
-- Regime tags as prompt context (volatility quintile, trend strength)
-- Optional Bayesian late-stage refiner — repurpose `BayesianOptimizerAgent` to fine-tune numeric thresholds inside winning genome shapes after GA selection
+**Already shipped (May-June 2026):**
+- Per-pair configurable spread snapshot at run-start; `min_hold_bars` DSL field
+- OOS-split tabs + per-trade cost columns + trade-ledger metrics
+- Cost-model rewrite to OANDA AU 21:00 UTC schedule + slippage default 0.0 (PR #6)
+- Delete invalid evolution runs from UI; scrollable form modal; CI E2E fixes (PRs #6/#7/#8)
+
+**Planned Capabilities:**
+- *Regime-aware validation* — rolling walk-forward instead of fixed-25%-tail OOS; per-fold regime tagging (vol quintile + trend strength); early-reject runs where train/OOS regimes disagree
+- *Expanded DSL* — 5 new indicators (MACD, stochastic, ADX, OBV, ichimoku); time-of-day entry filter; multi-timeframe references
+- *Multi-symbol portfolios* — within a single evolution run (design decision pending)
+- *Regime tags as LLM prompt context* — surfaces train/OOS regime asymmetry to the proposer
+- *Optional Bayesian late-stage refiner* — repurpose `BayesianOptimizerAgent` to fine-tune numeric thresholds inside winning genome shapes after GA selection
 
 **Exit Criteria:**
+- [ ] At least one VALIDATED genome clears Gate B on a real nightly run (closes v0.3.0 acceptance #3)
 - [ ] DSL grammar covers ≥ 12 indicators and time-of-day filters
+- [ ] Rolling walk-forward produces a stable median OOS Sharpe across ≥ 3 non-overlapping data slices
 - [ ] Evolution runs can target a portfolio of 3+ pairs simultaneously
-- [ ] Per-pair spread accuracy verified against historical OANDA spread data
+- [ ] Per-pair spread accuracy verified against historical OANDA spread data on EUR_USD + GBP_USD + USD_JPY
 
 ---
 
-## v0.5.0 - Self-Improvement
+## v0.5.0 - Self-Improvement (IN PROGRESS)
 
 **Theme:** The platform learns *across* runs, not just *within* runs.
 
 **Goal:** Evolution becomes meta — the system distils what worked into priors and prompts that condition future runs.
 
-**Key Capabilities:**
+**Already shipped (May-June 2026):**
+- Randomised `rng_seed` per run (was hardcoded 42 — all runs were converging on bit-identical DSL)
+- Fold-consistency fitness: `mean(per_fold_sharpe) − 0.5·std(per_fold_sharpe)` instead of mean alone
+- Per-genome training-fold metrics + fitness-breakdown panel; LLM-injection cards with per-proposal DSL + reasoning; archetype badges
+
+**Key Capabilities (planned):**
 - Real Evolution agent (replacing the v0.3.0-era stub) that distils cross-run patterns into prompt updates and learned DSL priors
 - Drift detection on live-running validated strategies; re-triggers evolution when behaviour drifts from validation distribution
 - LLM prompts include patterns observed across the last K runs, not just the current one

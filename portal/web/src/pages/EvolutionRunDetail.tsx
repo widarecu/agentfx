@@ -234,6 +234,9 @@ export default function EvolutionRunDetail() {
       {/* ── 2. Outcome banner ──────────────────────────────────────── */}
       <OutcomeBanner run={run} validateDecision={validateDecision} />
 
+      {/* ── 2b. Regime chip (v0.4.0) ─────────────────────────────────── */}
+      <RegimeChip decisions={allDecisions} />
+
       {/* ── 3. Narrative ───────────────────────────────────────────── */}
       <Section title="What happened in this run">
         <RunNarrative
@@ -923,6 +926,62 @@ function DecisionRow({ entry }: { entry: DecisionLogEntry }) {
       </span>
       <div className="text-slate-700 dark:text-slate-300 flex-1">
         {entry.reasoning_text ?? <em className="text-slate-400">(no reasoning)</em>}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Regime chip (v0.4.0) — surfaces train/OOS regime tags + agreement
+// ─────────────────────────────────────────────────────────────────────
+
+function RegimeChip({ decisions }: { decisions: DecisionLogEntry[] }) {
+  // The orchestrator logs a `regime_check` decision at run start with the
+  // train/OOS region tags + whether they match. The UI surfaces this as a
+  // single chip so reviewers can spot regime mismatches without drilling
+  // into the decision log.
+  const entry = decisions.find((d) => d.action === 'regime_check');
+  if (!entry) return null;
+  const inputs = (entry.inputs_json ?? {}) as {
+    train_region_regime?: string | null;
+    oos_region_regime?: string | null;
+    regimes_match?: boolean | null;
+    auto_stop_enabled?: boolean;
+  };
+  const train = inputs.train_region_regime;
+  const oos = inputs.oos_region_regime;
+  if (!train || !oos) return null;
+
+  const match = inputs.regimes_match === true;
+  const tone = match
+    ? 'bg-emerald-50 dark:bg-emerald-900/20 text-emerald-800 dark:text-emerald-200 border-emerald-200 dark:border-emerald-800'
+    : 'bg-amber-50 dark:bg-amber-900/20 text-amber-800 dark:text-amber-200 border-amber-200 dark:border-amber-800';
+  const icon = match ? '✓' : '⚠';
+
+  return (
+    <div
+      className={`rounded-lg border px-4 py-3 text-sm flex items-start gap-3 ${tone}`}
+    >
+      <span className="font-bold text-base leading-none mt-0.5">{icon}</span>
+      <div className="flex-1">
+        <div className="font-medium">
+          {match
+            ? 'Training and OOS regimes match'
+            : "Training and OOS regimes don't match"}
+        </div>
+        <div className="text-xs mt-0.5 opacity-80">
+          Training region:{' '}
+          <span className="font-mono">{train}</span>; OOS region:{' '}
+          <span className="font-mono">{oos}</span>.
+          {!match && (
+            <>
+              {' '}
+              {inputs.auto_stop_enabled
+                ? 'Auto-stop was enabled — the run aborted before generation 0.'
+                : 'Auto-stop was off — the run will complete but OOS results are likely brittle. Consider re-running with a data window where the regimes align, or enable auto-stop to skip doomed runs.'}
+            </>
+          )}
+        </div>
       </div>
     </div>
   );

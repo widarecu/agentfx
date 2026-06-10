@@ -672,6 +672,13 @@ class SqlAlchemyPersister:
                 n_trades=fe.metrics.get("n_trades"),
                 cagr=fe.metrics.get("cagr"),
                 passed_gate_b=fe.passed_gate_b,
+                # v0.4.0: per-fold regime label. None when the orchestrator
+                # couldn't compute it (e.g. candle load failed) — the UI
+                # renders "—" in that case.
+                regime_volatility=(
+                    fe.regime.volatility if fe.regime is not None else None
+                ),
+                regime_trend=(fe.regime.trend if fe.regime is not None else None),
             )
             self.db.add(row)
 

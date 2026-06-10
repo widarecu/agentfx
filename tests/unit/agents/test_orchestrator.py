@@ -406,12 +406,14 @@ class TestFitnessEvaluation:
         )
         orchestrator.run_loop()
 
-        # Training window is the canonical training_window() of the
-        # k-way split — last fold (OOS) is held back. The validator,
-        # not the GA, evaluates that fold.
+        # v0.4.0 rolling design: training region is the first 70% of the
+        # window. The validator runs over the remaining 30% (5 OOS folds).
+        # The GA never sees data from the OOS region.
+        from agentfx.core.validation import make_rolling_walk_forward_folds
+
         full_start = datetime(2024, 1, 1, tzinfo=UTC)
         full_end = datetime(2024, 5, 1, tzinfo=UTC)
-        folds = make_walk_forward_folds(full_start, full_end, k=4)
+        folds = make_rolling_walk_forward_folds(full_start, full_end)
         expected_train_start, expected_train_end = training_window(folds)
 
         first_call_kwargs = fitness_fn.call_args_list[0].kwargs

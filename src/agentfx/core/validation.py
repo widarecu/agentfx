@@ -105,22 +105,115 @@ def training_window(folds: list[WalkForwardFold]) -> tuple[datetime, datetime]:
 def oos_window(folds: list[WalkForwardFold]) -> tuple[datetime, datetime]:
     """The (start, end) the validator uses for OOS evaluation.
 
-    Always the final fold's range, but exposed as a helper for symmetry
-    with `training_window()` and to centralize the OOS-selection rule.
+    Returns the union of all OOS folds: `(first_oos.start, last_oos.end)`.
+    For the legacy K=4 design (one OOS fold), this is just that fold's
+    range. For the v0.4.0 rolling design (5 OOS folds in the last 30%),
+    this is the contiguous last-30% span — exactly what the on-demand
+    backtest endpoints expect to slice.
     """
     if not folds:
         raise ValueError("folds must be non-empty")
     oos_folds = [f for f in folds if f.is_oos]
-    if len(oos_folds) != 1:
+    if not oos_folds:
         raise ValueError(
-            f"expected exactly 1 OOS fold, got {len(oos_folds)} — "
-            "make_walk_forward_folds() should always produce 1"
+            "no OOS folds — make_walk_forward_folds() should produce at least 1"
         )
-    return oos_folds[0].start, oos_folds[0].end
+    return oos_folds[0].start, oos_folds[-1].end
+
+
+def make_rolling_walk_forward_folds(
+    start: datetime,
+    end: datetime,
+    *,
+    n_train_folds: int = 3,
+    n_oos_folds: int = 5,
+    train_frac: float = 0.7,
+) -> list[WalkForwardFold]:
+    """v0.4.0 rolling walk-forward — N training folds + M OOS folds.
+
+    Splits `[start, end)` into two regions:
+
+    - Training region — first `train_frac` of the window, divided into
+      `n_train_folds` contiguous non-overlapping training folds. The GA's
+      fitness function evaluates over these (one backtest per fold; the
+      fold-consistency penalty rewards strategies that perform similarly
+      across them).
+    - OOS region — the remaining `(1 - train_frac)`, divided into
+      `n_oos_folds` contiguous non-overlapping OOS folds. The validator
+      runs one backtest per OOS fold; the median Sharpe across them is the
+      promotion signal.
+
+    Why two regions and not full overlap: keeping the OOS region strictly
+    after the training region preserves the walk-forward integrity
+    guarantee — the GA never sees data from after the training region's
+    end. Within each region the folds are contiguous (no overlap, no gap).
+    Five OOS folds gives a meaningful median signal at modest extra cost
+    (~25% more backtest calls than the legacy K=4 design).
+
+    Returned folds are ordered by `index` from 0 (first training fold) to
+    `n_train_folds + n_oos_folds - 1` (last OOS fold). Training folds have
+    `is_oos=False`; OOS folds have `is_oos=True`.
+
+    Args:
+        start: Window start (inclusive). Tz-aware.
+        end: Window end (exclusive). Tz-aware and > start.
+        n_train_folds: Number of training folds. Default 3.
+        n_oos_folds: Number of OOS folds. Default 5.
+        train_frac: Fraction of the total window allocated to training.
+            Default 0.7 (70% train / 30% OOS).
+
+    Raises:
+        ValueError: on bad inputs (negative fold counts, train_frac
+            outside (0, 1), naive timestamps, or end <= start).
+    """
+    if n_train_folds < 1:
+        raise ValueError(f"n_train_folds must be >= 1 (got {n_train_folds})")
+    if n_oos_folds < 1:
+        raise ValueError(f"n_oos_folds must be >= 1 (got {n_oos_folds})")
+    if not (0.0 < train_frac < 1.0):
+        raise ValueError(f"train_frac must be in (0, 1) exclusive (got {train_frac})")
+    if start.tzinfo is None or end.tzinfo is None:
+        raise ValueError("start and end must be tz-aware datetimes")
+    if end <= start:
+        raise ValueError(f"end ({end}) must be > start ({start})")
+
+    duration = end - start
+    train_end = start + duration * train_frac
+    train_fold_duration = (train_end - start) / n_train_folds
+    oos_fold_duration = (end - train_end) / n_oos_folds
+
+    folds: list[WalkForwardFold] = []
+    for i in range(n_train_folds):
+        fold_start = start + train_fold_duration * i
+        fold_end = (
+            train_end
+            if i == n_train_folds - 1
+            else start + train_fold_duration * (i + 1)
+        )
+        folds.append(
+            WalkForwardFold(index=i, start=fold_start, end=fold_end, is_oos=False)
+        )
+
+    for j in range(n_oos_folds):
+        fold_start = train_end + oos_fold_duration * j
+        fold_end = (
+            end if j == n_oos_folds - 1 else train_end + oos_fold_duration * (j + 1)
+        )
+        folds.append(
+            WalkForwardFold(
+                index=n_train_folds + j,
+                start=fold_start,
+                end=fold_end,
+                is_oos=True,
+            )
+        )
+
+    return folds
 
 
 __all__ = [
     "WalkForwardFold",
+    "make_rolling_walk_forward_folds",
     "make_walk_forward_folds",
     "oos_window",
     "training_window",
