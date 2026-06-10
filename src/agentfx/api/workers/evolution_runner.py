@@ -786,7 +786,16 @@ def _subprocess_entry(run_id: str) -> None:
                 "ANTHROPIC_API_KEY not set; running without LLM hypothesis injection"
             )
 
-        validator = ValidatorAgent(k=config.n_validation_folds)
+        # v0.4.0 rolling validator — three contiguous training folds in the
+        # first ``train_frac`` of the window + ``n_oos_folds`` sliding OOS
+        # folds in the remaining region. Aggregates OOS metrics by median
+        # across the OOS folds. See `agents/validator.py` for why this
+        # replaces the legacy K-fold geometry.
+        validator = ValidatorAgent(
+            n_train_folds=config.n_train_folds,
+            n_oos_folds=config.n_oos_folds,
+            train_frac=config.train_frac,
+        )
         persister = SqlAlchemyPersister(db)
 
         orchestrator = OrchestratorAgent(
