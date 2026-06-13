@@ -273,10 +273,23 @@ The current evolve → evaluate → repeat loop is optimization without learning
 - [ ] `TODO` **Negative-progress detection** — if diagnostic-proposed changes consistently produce worse OOS results across N cycles, the diagnostic agent itself becomes the subject of review. Surfaces the agent's prompt / assumptions for human inspection. The platform must distrust its own feedback loop when evidence demands it.
 - [ ] `TODO` **Graduation logic** — a genome that clears Gate B AND has a stable regime-conditional activation policy moves out of the active evolution loop into the v0.6.0 portfolio queue. Further evolution effort shifts to filling regime coverage gaps (regimes the portfolio doesn't yet cover), not re-validating proven slots.
 
+**Specific failure modes the agent must learn to classify** (added 2026-06-13 from analysis of `evorun_20260613_ddf434f8` / `evorun_20260613_f753385e`):
+
+- [ ] `TODO` **`no_directional_thesis`** — the DSL has no signal that determines *which way* to trade, only filters (e.g. `atr(20) < atr(63)` is a vol filter, not a direction signal; firing it as a long trigger means "go long whenever vol is contracting" with no price-direction logic). The high training Sharpe is coincidence between the filter's firing pattern and the training-window drift; OOS reveals it as 50/50 noise. The diagnostic agent should detect this structurally — flag specs where the long or short side lacks any price-direction component — and reject the genome before it reaches the validator.
+- [ ] `TODO` **`small_sample_overconfidence`** — when per-fold OOS trade counts are small (e.g. 20–30), individual Sharpe estimates have wide confidence intervals (~±2 around the true value with 25 trades). Median across 5 noisy folds is still noisy. The agent should compute the *aggregated-OOS Sharpe* (one Sharpe on the concatenated OOS trade ledger, 100+ trades) alongside the per-fold median, and flag any genome where the per-fold median differs meaningfully from the aggregated Sharpe — that gap is the noise signature. Also surface this in the conditional-edge classifier: "5 folds tagged 'down' had Sharpe ranging −4.4 to +5.1, mostly sample noise" is a *different* finding from "5 folds tagged 'down' consistently positive."
+- [ ] `TODO` **`ga_selection_bias_on_noisy_signal`** — when training-fold Sharpe range is large (e.g. 2.0 spread across 3 training folds with ~100 trades each), the GA's selection across N candidates ≈ picking the top of a noisy distribution. Training fitness is then a biased upper estimate, not the true expected value. The agent should detect this by checking training-fold *variance* against expected noise variance for the trade count, and discount fitness when the variance is consistent with pure noise. Concretely: a genome with training Sharpes [+2.3, +3.5, +0.7] and ~100 trades/fold has Sharpe variance > what 100-trade samples of a true-Sharpe-2.0 process would produce, so the +2.0 mean is partly noise-selected.
+
+**Statistical-power improvements to the validator** (post-v0.4.0, pre- or part-of v0.5.0):
+
+- [ ] `TODO` **Aggregated-OOS Sharpe** — alongside median across per-fold Sharpes, compute one Sharpe on the concatenated OOS trade list. Statistically much more powerful (1 estimate on 100+ trades vs 5 estimates on 25 each). Show both in the UI. When the aggregated-OOS Sharpe is positive but the median is noisy, that's a stronger signal of real edge than the median alone. When they agree, confidence is highest.
+- [ ] `TODO` **Sample-size badge on per-fold metrics** — UI shows a small confidence-interval indicator (or grays out) per-fold Sharpe when trade count is below a threshold where the estimate is reliable. Stops reviewers from over-reading individual fold numbers.
+- [ ] `TODO` **Training-fold variance penalty** — extend the fold-consistency penalty (`mean − 0.5·std`) to factor in expected variance at the training sample size. A wide training-fold spread on small samples may be pure noise; a wide spread on large samples is real instability. Currently we treat both the same.
+
 **Acceptance for diagnostic agent v1:**
 1. Every failed/underperforming genome has a structured diagnosis with audit-trail reasoning in the portal.
 2. At least one end-to-end cycle exists where a diagnosis produced a concrete change that demonstrably improved the next cycle's OOS result (measurable feedback loop closure, not anecdotal).
 3. Plateau detection successfully halts a stuck configuration without manual intervention.
+4. The classifier handles the three specific failure modes documented above (`no_directional_thesis`, `small_sample_overconfidence`, `ga_selection_bias_on_noisy_signal`) — verified on at least one historical example of each.
 
 ---
 
