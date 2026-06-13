@@ -40,6 +40,27 @@ IndicatorName = Literal[
 ComparatorName = Literal[">", "<", ">=", "<=", "crosses_above", "crosses_below"]
 
 
+# Mechanical-event taxonomy for the same-event pathology check.
+# Indicators are grouped by the kind of market behaviour they react to.
+# Two crossover triggers whose indicators all fall in the same family
+# are mechanically equivalent (e.g. both listening for "fast MA crosses
+# above slow MA"). This is the pathology the 2026-06-10 diagnostic
+# surfaced: long and short triggers both fired on the same upward MA
+# crossover, encoding an accidental net-short bias rather than a real
+# bidirectional edge. See `_long_and_short_must_have_distinct_event`.
+_INDICATOR_FAMILY: dict[str, str] = {
+    "sma": "ma",
+    "ema": "ma",
+    "rsi": "oscillator",
+    "atr": "vol_scalar",
+    "bb_upper": "vol_band",
+    "bb_lower": "vol_band",
+    "donchian_high": "channel",
+    "donchian_low": "channel",
+    "close": "price",
+}
+
+
 class IndicatorCall(BaseModel):
     """Reference to a named indicator with its numeric arguments.
 
@@ -132,6 +153,87 @@ class EntryConditions(BaseModel):
             raise ValueError(
                 "long entry condition is identical to short — the resulting "
                 "position series is identically zero (no trades)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _long_and_short_must_have_distinct_event(self) -> EntryConditions:
+        """Reject genomes where long and short triggers fire on the same
+        mechanical event.
+
+        Specifically targets the pattern surfaced by the 2026-06-10
+        diagnostic on genome ``..._3bc80a6a_001_010``:
+
+            long:  ema(10)  crosses_above  sma(34)    -> MA crossover, UP
+            short: ema(8.6) crosses_above  ema(34)    -> MA crossover, UP
+
+        Both triggers fire on the same kind of event (upward MA
+        crossover) with no actual downward signal mechanism. The
+        strategy encodes whatever directional bias the training-fold
+        drift happened to give it; when OOS drift flips, it inverts.
+        The rolling-median validator from PR #9 surfaces the failure
+        AFTER the run; this constraint prevents the GA from spending
+        its budget on the pathology in the first place.
+
+        The constraint is deliberately narrow:
+
+        - Only fires when BOTH long and short are single Comparison
+          nodes (not AND/OR compounds). Compound conditions naturally
+          tend toward mechanical distinctness so the false-positive
+          rate is higher for them.
+        - Only fires when BOTH comparators are crossover comparators
+          AND in the same direction (both ``crosses_above`` or both
+          ``crosses_below``). Crossovers are the only place where
+          identical comparator + identical indicator family ALWAYS
+          means the same mechanical event.
+        - Only fires when ALL indicators appearing on either side of
+          both triggers belong to the same family (e.g. all MA-family
+          or all volatility-band-family). Different families mean
+          different mechanical signals even if the comparator agrees.
+
+        Asymmetric strategies remain legal under this rule:
+
+        - long: ``ema crosses_above sma`` + short: ``rsi > 80``
+          -> different families, allowed
+        - long: ``ema crosses_above sma`` + short: ``ema crosses_below sma``
+          -> opposite crossover directions, allowed
+        - long: ``sma > close`` + short: ``sma < close * 0.99``
+          -> not crossovers (the rule only constrains crossovers),
+          allowed even with asymmetric thresholds
+        """
+        if not isinstance(self.long, Comparison) or not isinstance(
+            self.short, Comparison
+        ):
+            return self
+        if self.long.cmp not in ("crosses_above", "crosses_below"):
+            return self
+        if self.long.cmp != self.short.cmp:
+            return self
+
+        def _indicator_families(cmp: Comparison) -> set[str]:
+            fams: set[str] = set()
+            for side in (cmp.lhs, cmp.rhs):
+                if isinstance(side, IndicatorCall):
+                    fam = _INDICATOR_FAMILY.get(side.ind)
+                    # "price" (raw close) is not a real indicator family
+                    # for this check — it's just a reference scaffolding
+                    # for moving averages and bands to compare against.
+                    if fam and fam != "price":
+                        fams.add(fam)
+            return fams
+
+        long_fams = _indicator_families(self.long)
+        short_fams = _indicator_families(self.short)
+        if not long_fams or not short_fams:
+            return self
+        if long_fams == short_fams:
+            raise ValueError(
+                "long and short triggers both fire on the same mechanical "
+                f"event ({self.long.cmp} on the {next(iter(long_fams))} "
+                "family) — strategy has no actual short-signal mechanism. "
+                "Use a different comparator direction (e.g. crosses_below "
+                "for one side), a different indicator family, or a "
+                "compound condition that introduces real asymmetry."
             )
         return self
 
