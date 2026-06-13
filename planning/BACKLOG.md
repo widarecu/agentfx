@@ -256,6 +256,28 @@ Surfaced by the 2026-06-07 fold analysis: the GA produces consistent training Sh
 - [ ] `TODO` LLM prompt A/B testing infrastructure to measure prompt-quality improvements quantitatively
 - [ ] `TODO` **Warm-start source diversification** — `find_prior_winners` currently picks top-K unique specs by fitness across the whole pool. A run that finds a strong elite produces many parametric variants (different float thresholds, slightly different indicator windows) that all dedup as distinct under byte-comparison but represent the same strategy family. Result: when one historical run is meaningfully stronger than the others, warm-start can fill all K slots with near-elite variants from that one run, missing the elites of other runs. Concrete fix: in `_add_until_full`, first pass takes at most 1 spec per `source_run_id`, then top up by fitness only if K isn't met. ~10 lines. **Why deferred:** the binding constraint right now is "no genome has cleared Gate B," not "we have too many winners to mix well." Once we have at least one Gate-B-passing strategy, the diversity-vs-depth trade-off in warm-start becomes the real concern. See the 2026-06-13 thread in conversation history for the full debate. (Surfaced by the user when reviewing the post-step-2 runs `evorun_20260613_8575da19` / `evorun_20260613_4e96b20a`.)
 
+### Diagnostic Evaluation Agent — the missing feedback layer (2026-06-13 vision)
+
+The current evolve → evaluate → repeat loop is optimization without learning. The missing piece is an agent that examines each underperforming or rejected genome and answers *why* it failed, then converts that diagnosis into a concrete next-iteration instruction. Below is the breakdown of what that agent needs to ship. See the ROADMAP.md "North Star" section + v0.5.0 description for the full framing.
+
+- [ ] `TODO` **LLM-driven failure classifier** — given a genome + its rolling-fold metrics + regime tags, output a structured diagnosis: `flawed_dsl` | `regime_mismatch` | `cost_dominated` | `risk_bottlenecked` | `unknown`. Reasoning text persisted to `decision_log` for audit. Uses Anthropic SDK with prompt caching (rolling state is the only varying input).
+- [ ] `TODO` **Action proposer** — each diagnosis maps to a concrete instruction for the next iteration:
+  - `regime_mismatch` → "promote to conditional-edge portfolio for regime X, exit active evolution loop"
+  - `cost_dominated` → "propose a coarser-timeframe variant of this DSL"
+  - `flawed_dsl` → "this spec violates principle P; the next LLM proposal must avoid pattern Q"
+  - `risk_bottlenecked` → "stop / target / size needs rebalance; suggest specific changes"
+  - `unknown` → flag for human review
+- [ ] `TODO` **Feedback ingestion into LLM injection** — the next-generation injection prompt sees recent diagnoses as context, not just recent top genomes. The model proposes strategies that explicitly address the diagnosed weaknesses.
+- [ ] `TODO` **Per-genome diagnosis surfaced in the portal** — next to the fitness breakdown and conditional-edge badge. A human can audit the agent's reasoning by clicking through.
+- [ ] `TODO` **Plateau detection** — N consecutive cycles with no improvement AND no diagnostic-driven search-space change triggers a "we've exhausted this configuration" signal. The orchestrator halts re-evolution and either asks the human or escalates to a higher-level pivot (different instrument / timeframe / DSL extension).
+- [ ] `TODO` **Negative-progress detection** — if diagnostic-proposed changes consistently produce worse OOS results across N cycles, the diagnostic agent itself becomes the subject of review. Surfaces the agent's prompt / assumptions for human inspection. The platform must distrust its own feedback loop when evidence demands it.
+- [ ] `TODO` **Graduation logic** — a genome that clears Gate B AND has a stable regime-conditional activation policy moves out of the active evolution loop into the v0.6.0 portfolio queue. Further evolution effort shifts to filling regime coverage gaps (regimes the portfolio doesn't yet cover), not re-validating proven slots.
+
+**Acceptance for diagnostic agent v1:**
+1. Every failed/underperforming genome has a structured diagnosis with audit-trail reasoning in the portal.
+2. At least one end-to-end cycle exists where a diagnosis produced a concrete change that demonstrably improved the next cycle's OOS result (measurable feedback loop closure, not anecdotal).
+3. Plateau detection successfully halts a stuck configuration without manual intervention.
+
 ---
 
 ## v0.6.0 - Paper Trading
