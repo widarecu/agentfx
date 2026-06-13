@@ -679,6 +679,9 @@ class SqlAlchemyPersister:
                     fe.regime.volatility if fe.regime is not None else None
                 ),
                 regime_trend=(fe.regime.trend if fe.regime is not None else None),
+                regime_direction=(
+                    fe.regime.direction if fe.regime is not None else None
+                ),
             )
             self.db.add(row)
 

@@ -84,10 +84,11 @@ class TestComputeRegime:
             compute_regime(df, granularity="M1")
 
     def test_label_is_dash_joined(self):
-        # Public format used in the UI badges — kebab-case parts
+        # Public format used in the UI badges — kebab-case parts.
+        # Direction is always present in the suffix.
         closes = [1.10 + 0.0001 * i for i in range(200)]
         tag = compute_regime(_df_from_closes(closes), granularity="M1")
-        assert tag.label == f"{tag.volatility}-vol-{tag.trend}"
+        assert tag.label == f"{tag.volatility}-vol-{tag.trend}-{tag.direction}"
 
     @pytest.mark.parametrize("granularity", ["M1", "M10", "H1", "H4", "D"])
     def test_works_across_granularities(self, granularity):
@@ -98,24 +99,69 @@ class TestComputeRegime:
         assert isinstance(tag, RegimeTag)
 
 
+class TestDirectionLabel:
+    def test_strong_uptrend_data_labels_direction_up(self):
+        # +200 bars × 1bps each = +2% net move. Above the 0.5% flat
+        # threshold and positive, so direction must be "up".
+        closes = [1.10 + 0.0001 * i for i in range(200)]
+        tag = compute_regime(_df_from_closes(closes), granularity="M1")
+        assert tag.direction == "up"
+
+    def test_strong_downtrend_data_labels_direction_down(self):
+        closes = [1.20 - 0.0001 * i for i in range(200)]
+        tag = compute_regime(_df_from_closes(closes), granularity="M1")
+        assert tag.direction == "down"
+
+    def test_pure_oscillation_labels_direction_flat(self):
+        # Sine wave around constant — net move ~ 0, well under the flat
+        # threshold even at the noisy ends of the series
+        closes = [1.10 + 0.001 * np.sin(i / 5.0) for i in range(200)]
+        tag = compute_regime(_df_from_closes(closes), granularity="M1")
+        assert tag.direction == "flat"
+
+    def test_tiny_drift_within_flat_band(self):
+        # ~0.2% net move (below the 0.5% flat threshold). Should NOT be
+        # labelled "up" — protects against false positives on barely-
+        # moving choppy markets that just happened to close slightly up.
+        closes = [1.10 + 0.00001 * i for i in range(200)]
+        tag = compute_regime(_df_from_closes(closes), granularity="M1")
+        assert tag.direction == "flat"
+
+
 class TestRegimesMatch:
     def test_identical_tags_match(self):
-        a = RegimeTag(volatility="med", trend="trending")
-        b = RegimeTag(volatility="med", trend="trending")
+        a = RegimeTag(volatility="med", trend="trending", direction="up")
+        b = RegimeTag(volatility="med", trend="trending", direction="up")
         assert regimes_match(a, b) is True
 
     def test_different_vol_does_not_match(self):
-        a = RegimeTag(volatility="low", trend="trending")
-        b = RegimeTag(volatility="high", trend="trending")
+        a = RegimeTag(volatility="low", trend="trending", direction="up")
+        b = RegimeTag(volatility="high", trend="trending", direction="up")
         assert regimes_match(a, b) is False
 
     def test_different_trend_does_not_match(self):
-        a = RegimeTag(volatility="med", trend="trending")
-        b = RegimeTag(volatility="med", trend="choppy")
+        a = RegimeTag(volatility="med", trend="trending", direction="up")
+        b = RegimeTag(volatility="med", trend="choppy", direction="up")
+        assert regimes_match(a, b) is False
+
+    def test_different_direction_does_not_match(self):
+        # The whole point of adding direction — same vol+trend but
+        # opposite drift should NOT count as the same regime. This is
+        # exactly the OOS-2 vs OOS-3 pattern from the 2026-06-10
+        # diagnostic that the prior tag missed.
+        a = RegimeTag(volatility="low", trend="choppy", direction="down")
+        b = RegimeTag(volatility="low", trend="choppy", direction="up")
         assert regimes_match(a, b) is False
 
     def test_mixed_trend_is_not_a_wildcard(self):
         # Conservative choice — see docstring on regimes_match
-        a = RegimeTag(volatility="med", trend="mixed")
-        b = RegimeTag(volatility="med", trend="trending")
+        a = RegimeTag(volatility="med", trend="mixed", direction="up")
+        b = RegimeTag(volatility="med", trend="trending", direction="up")
+        assert regimes_match(a, b) is False
+
+    def test_flat_direction_is_not_a_wildcard(self):
+        # "flat" must equal "flat" on both sides — it is not a
+        # compatible-with-anything bucket
+        a = RegimeTag(volatility="low", trend="choppy", direction="flat")
+        b = RegimeTag(volatility="low", trend="choppy", direction="up")
         assert regimes_match(a, b) is False

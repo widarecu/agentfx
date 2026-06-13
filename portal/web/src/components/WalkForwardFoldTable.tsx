@@ -161,9 +161,33 @@ export default function WalkForwardFoldTable({
                     {f.regime_volatility && f.regime_trend ? (
                       <span
                         className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200"
-                        title={`Volatility: ${f.regime_volatility}; Trend: ${f.regime_trend}`}
+                        title={
+                          `Volatility: ${f.regime_volatility}; ` +
+                          `Trend: ${f.regime_trend}` +
+                          (f.regime_direction
+                            ? `; Direction: ${f.regime_direction}`
+                            : '')
+                        }
                       >
                         {f.regime_volatility}-vol / {f.regime_trend}
+                        {f.regime_direction && (
+                          <span
+                            className={
+                              f.regime_direction === 'up'
+                                ? 'text-emerald-600 dark:text-emerald-400 font-medium'
+                                : f.regime_direction === 'down'
+                                  ? 'text-rose-600 dark:text-rose-400 font-medium'
+                                  : 'text-slate-500 dark:text-slate-400'
+                            }
+                          >
+                            {' / '}
+                            {f.regime_direction === 'up'
+                              ? '↑ up'
+                              : f.regime_direction === 'down'
+                                ? '↓ down'
+                                : '→ flat'}
+                          </span>
+                        )}
                       </span>
                     ) : (
                       <span className="text-slate-400 dark:text-slate-500">—</span>

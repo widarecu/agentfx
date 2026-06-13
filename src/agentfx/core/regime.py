@@ -13,8 +13,8 @@ during a time slice. The v0.4.0 validator uses these labels in two ways:
    aborts before generation 0 if train/OOS regimes disagree past a
    threshold, saving 30 generations of doomed compute.
 
-This module is statistics-only. No machine learning, no LLM. Two measurements
-combine into a label:
+This module is statistics-only. No machine learning, no LLM. Three
+measurements combine into a label:
 
 - **Volatility quintile**: standard deviation of bar-level returns, bucketed
   against absolute thresholds calibrated for FX majors. ``low`` (annualised
@@ -22,6 +22,13 @@ combine into a label:
 - **Trend strength**: ratio of net move to total path length. If the price
   ended far from where it started relative to its zigzag, that's trending;
   if it zigzagged a lot but ended near where it started, that's choppy.
+- **Direction**: sign of net move as a fraction of starting price. Adds
+  directional context to the trend coordinate — a "choppy" slice can still
+  drift up or down by 1-2% over a 22-day window, which is enough to flip
+  the verdict on a directionally-biased strategy. Added in the v0.4.0
+  diagnostic pass that traced a catastrophic OOS fold to a +146-pip
+  directional reversal between adjacent windows the prior tag couldn't
+  distinguish.
 
 The thresholds are hard-coded for EUR_USD-shaped pairs at minute-to-hour
 granularities. They are NOT empirically calibrated against years of OANDA
@@ -38,6 +45,7 @@ import pandas as pd
 
 VolatilityLabel = Literal["low", "med", "high"]
 TrendLabel = Literal["trending", "choppy", "mixed"]
+DirectionLabel = Literal["up", "down", "flat"]
 
 # Bars per trading day per granularity. Used to annualise the bar-level
 # standard deviation of returns into a comparable cross-timeframe number.
@@ -66,18 +74,31 @@ _VOL_HIGH = 0.15
 _TREND_STRONG = 0.30
 _TREND_WEAK = 0.15
 
+# Direction thresholds. ``(close[-1] - close[0]) / close[0]`` as a percent.
+# A 22-day EUR_USD window typically drifts 0.3-1.5% over its span; ``flat``
+# captures the range where directional bias isn't strong enough to label.
+# The diagnostic on 2026-06-10 showed that adjacent low-vol-choppy folds
+# can swing from -1.13% to +1.36% net move — a 2.5pp directional
+# reversal that the previous tagger collapsed into the same label.
+_DIRECTION_FLAT = 0.005  # |net move| < 0.5% → flat
+
 
 @dataclass(frozen=True)
 class RegimeTag:
-    """Two coordinate labels + a combined string suitable for badges."""
+    """Three coordinate labels + a combined string suitable for badges."""
 
     volatility: VolatilityLabel
     trend: TrendLabel
+    direction: DirectionLabel = "flat"
 
     @property
     def label(self) -> str:
-        """Combined ``vol-trend`` form, e.g. ``"med-vol-trending"``."""
-        return f"{self.volatility}-vol-{self.trend}"
+        """Combined ``vol-trend-direction`` form, e.g.
+        ``"med-vol-trending-up"``. The direction suffix is always
+        present so consumers (UI badges, log messages) can pattern-match
+        on a stable shape.
+        """
+        return f"{self.volatility}-vol-{self.trend}-{self.direction}"
 
 
 def _annualised_vol(returns: pd.Series, granularity: str) -> float:
@@ -129,6 +150,29 @@ def _trend_label(strength: float) -> TrendLabel:
     return "mixed"
 
 
+def _net_move_pct(closes: pd.Series) -> float:
+    """Signed net move as a fraction of the starting price.
+
+    Positive = price ended higher than it started; negative = ended lower.
+    Returns 0.0 if the series is empty or the starting price is zero
+    (defensive — shouldn't happen on real candle data).
+    """
+    if len(closes) < 2:
+        return 0.0
+    start = float(closes.iloc[0])
+    if start == 0.0:
+        return 0.0
+    return (float(closes.iloc[-1]) - start) / start
+
+
+def _direction_label(net_move_pct: float) -> DirectionLabel:
+    if net_move_pct > _DIRECTION_FLAT:
+        return "up"
+    if net_move_pct < -_DIRECTION_FLAT:
+        return "down"
+    return "flat"
+
+
 def compute_regime(
     df: pd.DataFrame,
     granularity: str = "M1",
@@ -152,35 +196,45 @@ def compute_regime(
     if "close" not in df.columns:
         raise KeyError("compute_regime requires a 'close' column on df")
     if len(df) < 2:
-        return RegimeTag(volatility="low", trend="choppy")
+        return RegimeTag(volatility="low", trend="choppy", direction="flat")
 
     closes = df["close"]
     returns = closes.pct_change().dropna()
 
     vol = _annualised_vol(returns, granularity)
     trend = _trend_strength(closes)
+    net_move = _net_move_pct(closes)
 
     return RegimeTag(
         volatility=_volatility_label(vol),
         trend=_trend_label(trend),
+        direction=_direction_label(net_move),
     )
 
 
 def regimes_match(a: RegimeTag, b: RegimeTag) -> bool:
-    """Two tags match iff both coordinates agree exactly.
+    """Two tags match iff all three coordinates agree exactly.
 
     Used by the orchestrator's early-stop check to decide whether a
     training fold's regime is "the same kind of market" as an OOS fold's.
-    "mixed" trend is NOT treated as a wildcard — it must equal "mixed" on
-    both sides. Strict equality is the conservative choice; we can relax
-    it (e.g. treat "med" vol on one side and "mixed" trend on the other
-    as a partial match) once we have observed how often this fires in
-    production.
+    Direction (added in v0.4.0 follow-up) is part of the match — a
+    low-vol-choppy-up fold is genuinely a different market than a
+    low-vol-choppy-down fold, even though the older two-coordinate tag
+    collapsed them. "mixed" trend is NOT treated as a wildcard — it must
+    equal "mixed" on both sides. "flat" direction likewise is its own
+    bucket, not a wildcard. Strict equality is the conservative choice;
+    we can relax it (e.g. treat "flat" as compatible with up OR down)
+    once production observations show how often it fires.
     """
-    return a.volatility == b.volatility and a.trend == b.trend
+    return (
+        a.volatility == b.volatility
+        and a.trend == b.trend
+        and a.direction == b.direction
+    )
 
 
 __all__ = [
+    "DirectionLabel",
     "RegimeTag",
     "TrendLabel",
     "VolatilityLabel",

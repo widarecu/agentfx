@@ -229,6 +229,7 @@ class ValidationFoldPublic(BaseSchema):
     # v0.4.0 regime labels. None for legacy K=4 rows.
     regime_volatility: str | None = None
     regime_trend: str | None = None
+    regime_direction: str | None = None
 
 
 class StrategyGenomePublic(BaseSchema):

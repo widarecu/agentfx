@@ -179,6 +179,7 @@ export interface ValidationFold {
   // v0.4.0 regime tags. Null for legacy K=4 rows.
   regime_volatility: string | null;
   regime_trend: string | null;
+  regime_direction: string | null;
 }
 
 /**
