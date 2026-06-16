@@ -255,7 +255,9 @@ class TestEvolutionPipeline:
         )
         orchestrator.run_loop()
 
-        # Validation produced 4 fold rows for the run-best genome
+        # Validation produced 8 fold rows for the run-best genome under the
+        # v0.4.0 rolling design (3 training folds in the first 70% + 5 OOS
+        # folds in the last 30% — see core/validation.make_rolling_walk_forward_folds).
         db_session.refresh(run)
         assert run.best_genome_id is not None
         folds = (
@@ -264,11 +266,12 @@ class TestEvolutionPipeline:
             .order_by(models.ValidationFold.fold_index)
             .all()
         )
-        assert len(folds) == 4
-        # Exactly one OOS fold
+        assert len(folds) == 8
+        # Five OOS folds at the end (indices 3..7) — the validator aggregates
+        # by median across them rather than gating on a single OOS fold.
         oos = [f for f in folds if f.is_oos]
-        assert len(oos) == 1
-        assert oos[0].fold_index == 3
+        assert len(oos) == 5
+        assert [f.fold_index for f in oos] == [3, 4, 5, 6, 7]
 
     def test_run_best_genome_is_recorded(self, db_session, seed_evolution_candles):
         run = _make_run(db_session)
