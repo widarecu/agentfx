@@ -103,6 +103,14 @@ class OrchestratorConfigSchema(BaseModel):
     # fold. Default 0.15 = 15% per year after spread + swap.
     min_cagr_pct: float = Field(default=0.15, ge=-1.0, le=10.0)
 
+    # v0.4.0: when True, the orchestrator aborts the run before generation
+    # 0 if the training and OOS regions have different regime tags
+    # (volatility quintile × trend strength). Saves 30 generations of
+    # compute on doomed runs at the cost of refusing to evolve through
+    # regime shifts. Default off — the run-detail UI surfaces the
+    # mismatch info either way; this just flips it from warning to gate.
+    auto_stop_on_regime_mismatch: bool = False
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Evolution run
@@ -218,6 +226,10 @@ class ValidationFoldPublic(BaseSchema):
     n_trades: int | None = None
     cagr: float | None = None
     passed_gate_b: bool
+    # v0.4.0 regime labels. None for legacy K=4 rows.
+    regime_volatility: str | None = None
+    regime_trend: str | None = None
+    regime_direction: str | None = None
 
 
 class StrategyGenomePublic(BaseSchema):

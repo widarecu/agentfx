@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agentfx.agents.evolution.fitness import (
+    COMPILER_ERROR_PENALTY,
     DIVERSITY_PENALTY_FACTOR,
     FOLD_CONSISTENCY_LAMBDA_DEFAULT,
     GATE_B_FAILURE_DILUTION,
@@ -15,6 +16,7 @@ from agentfx.agents.evolution.fitness import (
     is_near_elite,
     spec_edit_distance,
 )
+from agentfx.core.dsl.compiler import CompilerError
 from agentfx.core.dsl.seeds import (
     DONCHIAN_BREAKOUT_SEED,
     MA_CROSSOVER_SEED,
@@ -567,3 +569,77 @@ class TestComputeFitnessFoldMode:
             backtest_fn=backtest,
         )
         assert backtest.call_count == 1  # single-window path
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# CompilerError defense-in-depth (2026-06-16 staging crash)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestCompileErrorPenalty:
+    """Defense-in-depth: a genome whose DSL passes Pydantic grammar
+    validation but fails the compiler's semantic checks (e.g. arg arity
+    mismatch from a mutation that left donchian_high with 0 args) must
+    NOT crash the orchestrator subprocess. The fitness function catches
+    CompilerError and assigns the hard penalty; the GA continues with
+    the next genome.
+
+    Pre-fix bug: `evorun_20260615_f4fc6e63` on staging died with
+    `process_crashed` and stack ending in
+    `CompilerError: indicator 'donchian_high' takes 1 args, got 0`.
+    """
+
+    def test_compiler_error_returns_hard_penalty_in_single_window(self):
+        def raising_backtest(**kwargs):
+            raise CompilerError("indicator 'donchian_high' takes 1 args, got 0")
+
+        fitness, metrics = compute_fitness(
+            MA_CROSSOVER_SEED,
+            instrument="EUR_USD",
+            backtest_fn=raising_backtest,
+        )
+        assert fitness == COMPILER_ERROR_PENALTY
+        assert metrics["compiler_error"]  # truthy string set
+        assert metrics["n_trades"] == 0
+        assert metrics["penalty_breakdown"]["compiler_rejected"] is True
+
+    def test_compiler_error_returns_hard_penalty_in_fold_mode(self):
+        from datetime import UTC, datetime
+
+        call_count = [0]
+
+        def raising_on_first_fold(**kwargs):
+            call_count[0] += 1
+            raise CompilerError("indicator 'donchian_high' takes 1 args, got 0")
+
+        d0 = datetime(2024, 1, 1, tzinfo=UTC)
+        folds = [
+            (d0, datetime(2024, 4, 1, tzinfo=UTC)),
+            (datetime(2024, 4, 1, tzinfo=UTC), datetime(2024, 7, 1, tzinfo=UTC)),
+        ]
+        fitness, metrics = compute_fitness(
+            MA_CROSSOVER_SEED,
+            instrument="EUR_USD",
+            training_folds=folds,
+            backtest_fn=raising_on_first_fold,
+        )
+        # First call raised; subsequent folds skipped. Fitness pinned to
+        # the hard penalty floor.
+        assert fitness == COMPILER_ERROR_PENALTY
+        assert metrics["penalty_breakdown"]["compiler_rejected"] is True
+        assert call_count[0] == 1  # bailed after the first raising backtest
+
+    def test_non_compiler_value_errors_still_propagate(self):
+        """We want CompilerError caught, but other ValueErrors (real bugs
+        in the backtest pipeline) should still surface to the caller so
+        they don't get swallowed by the new defensive catch."""
+
+        def raising_other(**kwargs):
+            raise ValueError("genuinely broken — not a CompilerError")
+
+        with pytest.raises(ValueError, match="genuinely broken"):
+            compute_fitness(
+                MA_CROSSOVER_SEED,
+                instrument="EUR_USD",
+                backtest_fn=raising_other,
+            )

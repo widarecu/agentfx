@@ -56,7 +56,11 @@ from agentfx.agents.validator import FoldEvaluation, ValidatorAgent
 from agentfx.api.models import GenomeOrigin
 from agentfx.core.dsl import StrategySpec
 from agentfx.core.dsl.seeds import SEED_SPECS
-from agentfx.core.validation import training_window, make_walk_forward_folds
+from agentfx.core.regime import RegimeTag, compute_regime, regimes_match
+from agentfx.core.validation import (
+    make_rolling_walk_forward_folds,
+    training_window,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +136,23 @@ class OrchestratorConfig:
     # *positive* fitness for genomes that fail Gate B at this
     # threshold, biasing the GA toward profitable shapes.
     min_cagr_pct: float = 0.15  # 15% per year by default
+
+    # v0.4.0 rolling walk-forward parameters. Three training folds in the
+    # first `train_frac` of the window (the GA evaluates here); five OOS
+    # folds in the remaining region (the validator aggregates by median
+    # across these). See `core/validation.make_rolling_walk_forward_folds`
+    # and the 2026-06-07 analysis for why this beats fixed-25%-tail OOS.
+    n_train_folds: int = 3
+    n_oos_folds: int = 5
+    train_frac: float = 0.7
+
+    # When True, the orchestrator computes a regime tag for the training
+    # region and for the OOS region at run-start, and aborts the run with
+    # stop_reason='train_oos_regime_mismatch' if they disagree (saves the
+    # full 30 generations of doomed compute). Default off — surfaces the
+    # mismatch info in the UI but lets every run finish. Wire a checkbox
+    # on the Start New Run modal to flip this per-run.
+    auto_stop_on_regime_mismatch: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -283,7 +304,12 @@ class OrchestratorAgent(BaseAgent):
         self.persister = persister
 
         self.llm_injector = llm_injector  # may be None — runs without LLM injection
-        self.validator = validator or ValidatorAgent(k=config.n_validation_folds)
+        # v0.4.0 rolling validator — overridable via tests/injection.
+        self.validator = validator or ValidatorAgent(
+            n_train_folds=config.n_train_folds,
+            n_oos_folds=config.n_oos_folds,
+            train_frac=config.train_frac,
+        )
         self._compute_fitness_fn = compute_fitness_fn or compute_fitness
         self._seed_specs = seed_specs or SEED_SPECS
         self._rng = rng or Random(config.rng_seed)
@@ -369,6 +395,77 @@ class OrchestratorAgent(BaseAgent):
             },
             reasoning_text="Evolution run starting.",
         )
+
+        # ── Regime tagging + auto-stop pre-check ─────────────────────
+        # Compute per-fold regime tags and the train/OOS region-level
+        # tags. The per-fold tags get forwarded to the validator later
+        # for the audit trail; the region-level tags drive the optional
+        # auto-stop check.
+        self._fold_regimes, train_region_tag, oos_region_tag = (
+            self._compute_fold_regimes()
+        )
+        regime_decision_inputs = {
+            "train_region_regime": (
+                train_region_tag.label if train_region_tag else None
+            ),
+            "oos_region_regime": (oos_region_tag.label if oos_region_tag else None),
+            "regimes_match": (
+                regimes_match(train_region_tag, oos_region_tag)
+                if train_region_tag and oos_region_tag
+                else None
+            ),
+            "auto_stop_enabled": self.config.auto_stop_on_regime_mismatch,
+        }
+        self.persister.log_decision(
+            self.run_id,
+            agent_type="orchestrator",
+            action="regime_check",
+            inputs_json=regime_decision_inputs,
+            reasoning_text=(
+                f"Training regime: {regime_decision_inputs['train_region_regime']}; "
+                f"OOS regime: {regime_decision_inputs['oos_region_regime']}; "
+                f"match={regime_decision_inputs['regimes_match']}."
+            ),
+        )
+
+        if (
+            self.config.auto_stop_on_regime_mismatch
+            and train_region_tag is not None
+            and oos_region_tag is not None
+            and not regimes_match(train_region_tag, oos_region_tag)
+        ):
+            duration = self._clock() - loop_start
+            self.persister.update_run(
+                self.run_id,
+                status="failed",
+                completed_at=datetime.now(UTC),
+                stop_reason="train_oos_regime_mismatch",
+            )
+            self.persister.log_decision(
+                self.run_id,
+                agent_type="orchestrator",
+                action="run_stopped",
+                outputs_json={
+                    "stop_reason": "train_oos_regime_mismatch",
+                    "train_region_regime": train_region_tag.label,
+                    "oos_region_regime": oos_region_tag.label,
+                },
+                reasoning_text=(
+                    "Auto-stop: training and OOS regimes disagree "
+                    f"({train_region_tag.label} vs {oos_region_tag.label}). "
+                    "Set auto_stop_on_regime_mismatch=False to override."
+                ),
+            )
+            return LoopSummary(
+                run_id=self.run_id,
+                generations_completed=0,
+                stop_reason="train_oos_regime_mismatch",
+                best_genome_id=None,
+                best_fitness=None,
+                llm_cost_usd=0.0,
+                validated_count=0,
+                duration_seconds=duration,
+            )
 
         # ── Gen 0 ────────────────────────────────────────────────────
         # Composite seeding strategy:
@@ -686,16 +783,92 @@ class OrchestratorAgent(BaseAgent):
 
     # ── Internals ──────────────────────────────────────────────────────
 
-    def _training_range(self) -> tuple[datetime, datetime]:
-        """The GA evaluates fitness over training folds 0..k-2; the
-        validator's OOS fold (k-1) is withheld. Returns (start, end) of
-        the training span."""
-        folds = make_walk_forward_folds(
+    def _rolling_folds(self):
+        """Single source of truth for the rolling walk-forward geometry
+        used by both the GA's fitness evaluation (training folds) and the
+        validator (OOS folds). Aligning them through one helper guarantees
+        the GA never accidentally sees data from the validator's OOS
+        region.
+        """
+        return make_rolling_walk_forward_folds(
             start=self.data_window[0],
             end=self.data_window[1],
-            k=self.config.n_validation_folds,
+            n_train_folds=self.config.n_train_folds,
+            n_oos_folds=self.config.n_oos_folds,
+            train_frac=self.config.train_frac,
         )
-        return training_window(folds)
+
+    def _compute_fold_regimes(
+        self,
+    ) -> tuple[dict[int, RegimeTag], RegimeTag | None, RegimeTag | None]:
+        """Tag each fold with a regime label + return aggregate train/OOS tags.
+
+        Returns:
+            (per_fold, train_region, oos_region) where:
+              - ``per_fold`` is keyed by fold.index with the per-slice
+                RegimeTag the UI surfaces in the walk-forward fold table.
+              - ``train_region`` is the regime tag of the concatenated
+                training window (used by the auto-stop check).
+              - ``oos_region`` is the regime tag of the concatenated OOS
+                window (used by the auto-stop check).
+
+        Each is ``None`` if the underlying candle load fails — the
+        orchestrator treats a missing tag as "unknown" and skips the
+        auto-stop check rather than crashing the run.
+        """
+        from agentfx.services.backtest import load_price_df_from_db
+
+        folds = self._rolling_folds()
+        per_fold: dict[int, RegimeTag] = {}
+        train_tag: RegimeTag | None = None
+        oos_tag: RegimeTag | None = None
+
+        try:
+            df_full = load_price_df_from_db(
+                instrument=self.config.instrument,
+                granularity=self.config.granularity,
+                start=self.data_window[0],
+                end=self.data_window[1],
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "regime tagging skipped — could not load candles for %s %s: %s",
+                self.config.instrument,
+                self.config.granularity,
+                e,
+            )
+            return per_fold, None, None
+
+        for fold in folds:
+            slice_df = df_full[
+                (df_full.index >= fold.start) & (df_full.index < fold.end)
+            ]
+            per_fold[fold.index] = compute_regime(
+                slice_df, granularity=self.config.granularity
+            )
+
+        train_folds = [f for f in folds if not f.is_oos]
+        oos_folds = [f for f in folds if f.is_oos]
+        if train_folds:
+            train_start, train_end = train_folds[0].start, train_folds[-1].end
+            train_slice = df_full[
+                (df_full.index >= train_start) & (df_full.index < train_end)
+            ]
+            train_tag = compute_regime(train_slice, granularity=self.config.granularity)
+        if oos_folds:
+            oos_start, oos_end = oos_folds[0].start, oos_folds[-1].end
+            oos_slice = df_full[
+                (df_full.index >= oos_start) & (df_full.index < oos_end)
+            ]
+            oos_tag = compute_regime(oos_slice, granularity=self.config.granularity)
+
+        return per_fold, train_tag, oos_tag
+
+    def _training_range(self) -> tuple[datetime, datetime]:
+        """The GA evaluates fitness over the training region of the
+        rolling design. Returns (start, end) of the union of all training
+        folds."""
+        return training_window(self._rolling_folds())
 
     def _training_fold_ranges(self) -> list[tuple[datetime, datetime]]:
         """The list of (start, end) tuples covering each *training* fold.
@@ -704,15 +877,9 @@ class OrchestratorAgent(BaseAgent):
         running one backtest over the concatenated training window, the
         GA runs one backtest per fold and rewards strategies whose
         Sharpe is *consistent* across folds (not just high on average).
-        Excludes the OOS fold — that one is the validator's, not the
-        GA's.
+        Excludes the OOS folds — those are the validator's, not the GA's.
         """
-        folds = make_walk_forward_folds(
-            start=self.data_window[0],
-            end=self.data_window[1],
-            k=self.config.n_validation_folds,
-        )
-        return [(f.start, f.end) for f in folds if not f.is_oos]
+        return [(f.start, f.end) for f in self._rolling_folds() if not f.is_oos]
 
     def _record_evaluated(self, population: Population) -> None:
         """Stash this generation's genomes in the hall-of-fame, keyed by
@@ -1016,6 +1183,7 @@ class OrchestratorAgent(BaseAgent):
                     start=self.data_window[0],
                     end=self.data_window[1],
                     gate_b_overrides={"min_cagr": self.config.min_cagr_pct},
+                    fold_regimes=getattr(self, "_fold_regimes", None),
                     **validator_kwargs,
                 )
             except Exception:  # noqa: BLE001

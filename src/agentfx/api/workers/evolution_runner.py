@@ -341,6 +341,13 @@ def _build_orchestrator_config(
         llm_seed_gen0=bool(config_dict.get("llm_seed_gen0", True)),
         n_llm_gen0_proposals=int(config_dict.get("n_llm_gen0_proposals", 5)),
         min_cagr_pct=float(config_dict.get("min_cagr_pct", 0.15)),
+        # v0.4.0 rolling walk-forward + regime knobs
+        n_train_folds=int(config_dict.get("n_train_folds", 3)),
+        n_oos_folds=int(config_dict.get("n_oos_folds", 5)),
+        train_frac=float(config_dict.get("train_frac", 0.7)),
+        auto_stop_on_regime_mismatch=bool(
+            config_dict.get("auto_stop_on_regime_mismatch", False)
+        ),
     )
 
 
@@ -779,7 +786,16 @@ def _subprocess_entry(run_id: str) -> None:
                 "ANTHROPIC_API_KEY not set; running without LLM hypothesis injection"
             )
 
-        validator = ValidatorAgent(k=config.n_validation_folds)
+        # v0.4.0 rolling validator — three contiguous training folds in the
+        # first ``train_frac`` of the window + ``n_oos_folds`` sliding OOS
+        # folds in the remaining region. Aggregates OOS metrics by median
+        # across the OOS folds. See `agents/validator.py` for why this
+        # replaces the legacy K-fold geometry.
+        validator = ValidatorAgent(
+            n_train_folds=config.n_train_folds,
+            n_oos_folds=config.n_oos_folds,
+            train_frac=config.train_frac,
+        )
         persister = SqlAlchemyPersister(db)
 
         orchestrator = OrchestratorAgent(

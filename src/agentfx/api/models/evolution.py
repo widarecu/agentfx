@@ -284,6 +284,15 @@ class ValidationFold(Base):
     cagr = Column(Float, nullable=True)  # net annualised return
     passed_gate_b = Column(Boolean, nullable=False)
 
+    # v0.4.0 regime tags (vol-quintile × trend-strength × direction) — see
+    # core/regime.py. Nullable because legacy rows from v0.3.0 K=4 runs were
+    # written before the orchestrator tagged folds; the UI shows "—" in
+    # that case. `regime_direction` was added in the v0.4.0 follow-up
+    # diagnostic pass; older v0.4.0 rows have direction NULL too.
+    regime_volatility = Column(String(8), nullable=True)  # "low" | "med" | "high"
+    regime_trend = Column(String(12), nullable=True)  # "trending" | "choppy" | "mixed"
+    regime_direction = Column(String(8), nullable=True)  # "up" | "down" | "flat"
+
     created_at = Column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

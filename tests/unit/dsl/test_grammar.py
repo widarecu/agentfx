@@ -191,3 +191,156 @@ class TestSchemaExport:
         # Round-trip
         restored = StrategySpec.model_validate(payload)
         assert restored == spec
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Same-mechanical-event constraint (v0.4.0 follow-up)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _spec_with_entry(entry: dict) -> dict:
+    """Wrap an `entry` dict in the minimal scaffolding for a StrategySpec."""
+    return {
+        "version": 1,
+        "entry": entry,
+        "exit": {
+            "stop_pips": 20,
+            "target_pips": 60,
+            "max_hold_bars": 100,
+            "min_hold_bars": 5,
+            "opposite_signal": True,
+        },
+        "size": {"risk_pct": 0.003},
+    }
+
+
+def _cmp(
+    lhs_ind: str,
+    lhs_args: list[float],
+    cmp: str,
+    rhs_ind: str | None,
+    rhs_args: list[float] | None = None,
+    rhs_const: float | None = None,
+) -> dict:
+    """Shorthand to build a Comparison dict."""
+    rhs: dict | float
+    if rhs_const is not None:
+        rhs = rhs_const
+    else:
+        assert rhs_ind is not None
+        rhs = {"ind": rhs_ind, "args": rhs_args or []}
+    return {"lhs": {"ind": lhs_ind, "args": lhs_args}, "cmp": cmp, "rhs": rhs}
+
+
+class TestSameMechanicalEventConstraint:
+    """Targets the pathology surfaced by the 2026-06-10 diagnostic:
+
+    long:  ema(10)  crosses_above  sma(34)    -> MA crossover, UP
+    short: ema(8.6) crosses_above  ema(34)    -> MA crossover, UP
+
+    The constraint rejects specs where BOTH long and short triggers
+    are crossovers in the same direction, AND all the indicators on
+    both triggers belong to the same family. Asymmetric strategies
+    with genuinely different mechanical events stay valid.
+    """
+
+    def test_rejects_same_direction_same_family_crossovers(self) -> None:
+        """The actual pathology: both crosses_above on MA family."""
+        spec = _spec_with_entry(
+            {
+                "long": _cmp("ema", [10.0], "crosses_above", "sma", [34.0]),
+                "short": _cmp("ema", [8.6], "crosses_above", "ema", [34.0]),
+            }
+        )
+        with pytest.raises(ValidationError, match="same mechanical event"):
+            StrategySpec.model_validate(spec)
+
+    def test_rejects_same_direction_crosses_below_on_ma_family(self) -> None:
+        """Symmetric pathology in the down direction."""
+        spec = _spec_with_entry(
+            {
+                "long": _cmp("ema", [10.0], "crosses_below", "sma", [34.0]),
+                "short": _cmp("sma", [8.0], "crosses_below", "ema", [50.0]),
+            }
+        )
+        with pytest.raises(ValidationError, match="same mechanical event"):
+            StrategySpec.model_validate(spec)
+
+    def test_rejects_same_direction_crossovers_on_volatility_band_family(self) -> None:
+        """Same pathology in a non-MA family — both crosses_above on bb_upper / bb_lower."""
+        spec = _spec_with_entry(
+            {
+                "long": _cmp("bb_upper", [20.0, 2.0], "crosses_above", "close"),
+                "short": _cmp("bb_lower", [20.0, 2.0], "crosses_above", "close"),
+            }
+        )
+        with pytest.raises(ValidationError, match="same mechanical event"):
+            StrategySpec.model_validate(spec)
+
+    def test_accepts_mirror_crossover_directions(self) -> None:
+        """The canonical bidirectional pattern: long on upward cross, short on downward."""
+        spec = _spec_with_entry(
+            {
+                "long": _cmp("ema", [10.0], "crosses_above", "sma", [34.0]),
+                "short": _cmp("ema", [10.0], "crosses_below", "sma", [34.0]),
+            }
+        )
+        StrategySpec.model_validate(spec)  # Must not raise
+
+    def test_accepts_different_indicator_families(self) -> None:
+        """MA crossover paired with RSI extreme — different mechanisms, both upward direction."""
+        spec = _spec_with_entry(
+            {
+                "long": _cmp("ema", [10.0], "crosses_above", "sma", [34.0]),
+                "short": _cmp("rsi", [14.0], ">", rhs_ind=None, rhs_const=80.0),
+            }
+        )
+        StrategySpec.model_validate(spec)  # Must not raise
+
+    def test_accepts_same_family_when_one_side_is_not_crossover(self) -> None:
+        """Constraint only applies to crossover-vs-crossover pairs. Static
+        comparisons (>, <, >=, <=) on the same family are allowed even
+        when both share comparator family — thresholds can carry the
+        asymmetry."""
+        spec = _spec_with_entry(
+            {
+                "long": _cmp("ema", [10.0], "crosses_above", "sma", [34.0]),
+                "short": _cmp("sma", [20.0], ">", "close"),
+            }
+        )
+        StrategySpec.model_validate(spec)  # Must not raise
+
+    def test_accepts_compound_conditions(self) -> None:
+        """Constraint is deliberately narrow: it doesn't fire on AND/OR
+        compounds. Compound conditions naturally tend toward mechanical
+        distinctness; the false-positive risk is higher for them."""
+        spec = _spec_with_entry(
+            {
+                "long": {
+                    "op": "AND",
+                    "args": [
+                        _cmp("ema", [10.0], "crosses_above", "sma", [34.0]),
+                        _cmp("rsi", [14.0], ">", rhs_ind=None, rhs_const=50.0),
+                    ],
+                },
+                "short": {
+                    "op": "AND",
+                    "args": [
+                        _cmp("ema", [10.0], "crosses_above", "sma", [50.0]),
+                        _cmp("rsi", [14.0], ">", rhs_ind=None, rhs_const=70.0),
+                    ],
+                },
+            }
+        )
+        StrategySpec.model_validate(spec)  # Must not raise
+
+    def test_canonical_seeds_still_validate(self) -> None:
+        """Regression guard: the three canonical seeds must remain valid
+        under the new constraint. SMA-cross uses ``>`` and ``<`` (not
+        crossovers), RSI mean-reversion uses ``<`` and ``>``, Donchian
+        breakout uses ``>`` and ``<``. None hit the constraint."""
+        from agentfx.core.dsl.seeds import SEED_SPECS
+
+        for spec in SEED_SPECS:
+            # Round-trip through model_validate to exercise the validators
+            StrategySpec.model_validate(spec.model_dump(mode="json"))

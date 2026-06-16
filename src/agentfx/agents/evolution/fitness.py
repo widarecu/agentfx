@@ -49,12 +49,28 @@ database. Production code passes the real `run_backtest_from_db`.
 
 from __future__ import annotations
 
+import logging
 import math
 from datetime import datetime
 from typing import Any, Protocol
 
 from agentfx.core.dsl import StrategySpec
+from agentfx.core.dsl.compiler import CompilerError
 from agentfx.core.gates import GATE_B_THRESHOLDS, evaluate_gate_b
+
+logger = logging.getLogger(__name__)
+
+# Hard penalty for genomes whose DSL passes Pydantic grammar validation
+# but fails the compiler's per-indicator semantic checks (e.g. arg arity,
+# arg bounds, oscillator/price mixing). Without this catch, a single
+# malformed genome (typically from an LLM proposal or a mutation that
+# leaves an indicator with the wrong number of args) propagates a
+# CompilerError up through `compute_fitness` → `_evaluate_population_fitness`
+# → the orchestrator child process, killing the entire run with
+# `process_crashed`. The fix is defense-in-depth: skip the bad genome by
+# assigning it the same hard floor we use for zero-trade degenerates, log
+# the failure for debugging, and let the GA continue.
+COMPILER_ERROR_PENALTY = -100.0
 
 # Penalty weight applied to the std-dev of per-fold Sharpe when the GA
 # evaluates a genome on multiple training folds. With λ=0.5 a strategy
@@ -438,44 +454,68 @@ def compute_fitness(
     backtest_kwargs.setdefault("capture_signals", True)
     strategy_params = {"spec": spec.model_dump(mode="json")}
 
-    if training_folds is not None and len(training_folds) > 0:
-        # Fold-consistent mode: one backtest per fold, then aggregate.
-        per_fold_metrics: list[dict[str, Any]] = []
-        for fold_start, fold_end in training_folds:
+    try:
+        if training_folds is not None and len(training_folds) > 0:
+            # Fold-consistent mode: one backtest per fold, then aggregate.
+            per_fold_metrics: list[dict[str, Any]] = []
+            for fold_start, fold_end in training_folds:
+                result = backtest_fn(
+                    instrument=instrument,
+                    granularity=granularity,
+                    start=fold_start,
+                    end=fold_end,
+                    strategy_name="dsl",
+                    strategy_params=strategy_params,
+                    **backtest_kwargs,
+                )
+                per_fold_metrics.append(
+                    result.get("metrics", {}) if isinstance(result, dict) else {}
+                )
+
+            raw_fitness, metrics = _aggregate_fold_metrics(
+                per_fold_metrics,
+                fold_consistency_lambda=fold_consistency_lambda,
+            )
+        else:
+            # Single-window mode (legacy, used by tests).
             result = backtest_fn(
                 instrument=instrument,
                 granularity=granularity,
-                start=fold_start,
-                end=fold_end,
+                start=start,
+                end=end,
                 strategy_name="dsl",
                 strategy_params=strategy_params,
                 **backtest_kwargs,
             )
-            per_fold_metrics.append(
-                result.get("metrics", {}) if isinstance(result, dict) else {}
-            )
 
-        raw_fitness, metrics = _aggregate_fold_metrics(
-            per_fold_metrics,
-            fold_consistency_lambda=fold_consistency_lambda,
+            metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
+            raw_sharpe = metrics.get("sharpe")
+            if raw_sharpe is None:
+                raw_sharpe = float("-inf")
+            raw_fitness = float(raw_sharpe)
+    except CompilerError as e:
+        # Genome's DSL passed grammar validation but fails the compiler's
+        # semantic checks (typically arg-arity mismatch from a mutation or
+        # LLM proposal). Without this catch the exception kills the
+        # orchestrator subprocess and crashes the entire run with
+        # `process_crashed`. Caught here so the bad genome is just penalised
+        # and the GA continues with the next candidate.
+        logger.warning(
+            "compute_fitness: genome %s rejected by compiler (%s) — "
+            "assigning hard penalty %s and continuing",
+            spec.model_dump(mode="json"),
+            e,
+            COMPILER_ERROR_PENALTY,
         )
-    else:
-        # Single-window mode (legacy, used by tests).
-        result = backtest_fn(
-            instrument=instrument,
-            granularity=granularity,
-            start=start,
-            end=end,
-            strategy_name="dsl",
-            strategy_params=strategy_params,
-            **backtest_kwargs,
-        )
-
-        metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
-        raw_sharpe = metrics.get("sharpe")
-        if raw_sharpe is None:
-            raw_sharpe = float("-inf")
-        raw_fitness = float(raw_sharpe)
+        return COMPILER_ERROR_PENALTY, {
+            "compiler_error": str(e),
+            "n_trades": 0,
+            "penalty_breakdown": {
+                "raw_fitness": COMPILER_ERROR_PENALTY,
+                "final_fitness": COMPILER_ERROR_PENALTY,
+                "compiler_rejected": True,
+            },
+        }
 
     fitness, penalty_breakdown = _apply_penalties(
         raw_fitness=raw_fitness,

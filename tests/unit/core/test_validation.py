@@ -12,6 +12,7 @@ import pytest
 
 from agentfx.core.validation import (
     WalkForwardFold,
+    make_rolling_walk_forward_folds,
     make_walk_forward_folds,
     oos_window,
     training_window,
@@ -164,5 +165,163 @@ class TestOosWindow:
             WalkForwardFold(0, _utc(2024, 1, 1), _utc(2024, 2, 1), is_oos=False),
             WalkForwardFold(1, _utc(2024, 2, 1), _utc(2024, 3, 1), is_oos=False),
         ]
-        with pytest.raises(ValueError, match="exactly 1 OOS fold"):
+        with pytest.raises(ValueError, match="at least 1"):
             oos_window(bogus)
+
+    def test_returns_union_of_multiple_oos_folds(self) -> None:
+        # v0.4.0 rolling design: multiple contiguous OOS folds.
+        # oos_window now returns the union (first OOS start → last OOS end).
+        folds = make_rolling_walk_forward_folds(
+            start=_utc(2024, 1, 1),
+            end=_utc(2024, 12, 31),
+            n_train_folds=3,
+            n_oos_folds=5,
+        )
+        oos_folds = [f for f in folds if f.is_oos]
+        oos_start, oos_end = oos_window(folds)
+        assert oos_start == oos_folds[0].start
+        assert oos_end == oos_folds[-1].end
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Rolling walk-forward (v0.4.0)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestMakeRollingWalkForwardFolds:
+    def test_default_returns_three_train_plus_five_oos(self) -> None:
+        folds = make_rolling_walk_forward_folds(
+            start=_utc(2024, 1, 1), end=_utc(2024, 12, 31)
+        )
+        assert len(folds) == 8
+        train = [f for f in folds if not f.is_oos]
+        oos = [f for f in folds if f.is_oos]
+        assert len(train) == 3
+        assert len(oos) == 5
+
+    def test_indexes_are_zero_based_and_ordered(self) -> None:
+        folds = make_rolling_walk_forward_folds(
+            start=_utc(2024, 1, 1), end=_utc(2024, 12, 31)
+        )
+        assert [f.index for f in folds] == list(range(8))
+
+    def test_training_folds_come_before_oos_folds(self) -> None:
+        folds = make_rolling_walk_forward_folds(
+            start=_utc(2024, 1, 1), end=_utc(2024, 12, 31)
+        )
+        for i in range(3):
+            assert folds[i].is_oos is False
+        for i in range(3, 8):
+            assert folds[i].is_oos is True
+
+    def test_train_region_is_seventy_percent_by_default(self) -> None:
+        start = _utc(2024, 1, 1)
+        end = _utc(2024, 12, 31)
+        folds = make_rolling_walk_forward_folds(start=start, end=end)
+        train_end = folds[2].end
+        oos_start = folds[3].start
+        # Training region ends exactly where OOS starts — contiguous, no gap
+        assert train_end == oos_start
+        # Training span is ~70% of total (allow rounding for sub-second)
+        total = (end - start).total_seconds()
+        train_span = (train_end - start).total_seconds()
+        assert abs(train_span / total - 0.7) < 0.001
+
+    def test_first_train_fold_starts_at_window_start(self) -> None:
+        start = _utc(2024, 1, 1)
+        folds = make_rolling_walk_forward_folds(start=start, end=_utc(2024, 12, 31))
+        assert folds[0].start == start
+
+    def test_last_oos_fold_ends_exactly_at_window_end(self) -> None:
+        end = _utc(2024, 12, 31)
+        folds = make_rolling_walk_forward_folds(start=_utc(2024, 1, 1), end=end)
+        assert folds[-1].end == end
+
+    def test_all_folds_are_contiguous(self) -> None:
+        folds = make_rolling_walk_forward_folds(
+            start=_utc(2024, 1, 1), end=_utc(2024, 12, 31)
+        )
+        for prev, curr in zip(folds, folds[1:]):
+            assert prev.end == curr.start
+
+    def test_oos_folds_have_roughly_equal_duration(self) -> None:
+        folds = make_rolling_walk_forward_folds(
+            start=_utc(2024, 1, 1), end=_utc(2024, 12, 31)
+        )
+        oos = [f for f in folds if f.is_oos]
+        durations = [(f.end - f.start).total_seconds() for f in oos]
+        # All within 0.1% of each other
+        assert max(durations) - min(durations) < 0.001 * max(durations)
+
+    def test_custom_fold_counts(self) -> None:
+        folds = make_rolling_walk_forward_folds(
+            start=_utc(2024, 1, 1),
+            end=_utc(2024, 12, 31),
+            n_train_folds=4,
+            n_oos_folds=3,
+        )
+        train = [f for f in folds if not f.is_oos]
+        oos = [f for f in folds if f.is_oos]
+        assert len(train) == 4
+        assert len(oos) == 3
+
+    def test_custom_train_frac(self) -> None:
+        start = _utc(2024, 1, 1)
+        end = _utc(2024, 12, 31)
+        folds = make_rolling_walk_forward_folds(start=start, end=end, train_frac=0.5)
+        train_end = folds[2].end
+        total = (end - start).total_seconds()
+        train_span = (train_end - start).total_seconds()
+        assert abs(train_span / total - 0.5) < 0.001
+
+    def test_training_window_helper_works_with_rolling(self) -> None:
+        # training_window() should return the union of all train folds
+        folds = make_rolling_walk_forward_folds(
+            start=_utc(2024, 1, 1), end=_utc(2024, 12, 31)
+        )
+        train_start, train_end = training_window(folds)
+        assert train_start == folds[0].start
+        assert train_end == folds[2].end  # last train fold
+
+    def test_zero_train_folds_raises(self) -> None:
+        with pytest.raises(ValueError, match="n_train_folds"):
+            make_rolling_walk_forward_folds(
+                start=_utc(2024, 1, 1),
+                end=_utc(2024, 12, 31),
+                n_train_folds=0,
+            )
+
+    def test_zero_oos_folds_raises(self) -> None:
+        with pytest.raises(ValueError, match="n_oos_folds"):
+            make_rolling_walk_forward_folds(
+                start=_utc(2024, 1, 1),
+                end=_utc(2024, 12, 31),
+                n_oos_folds=0,
+            )
+
+    def test_train_frac_out_of_range_raises(self) -> None:
+        with pytest.raises(ValueError, match="train_frac"):
+            make_rolling_walk_forward_folds(
+                start=_utc(2024, 1, 1),
+                end=_utc(2024, 12, 31),
+                train_frac=1.0,
+            )
+        with pytest.raises(ValueError, match="train_frac"):
+            make_rolling_walk_forward_folds(
+                start=_utc(2024, 1, 1),
+                end=_utc(2024, 12, 31),
+                train_frac=0.0,
+            )
+
+    def test_naive_timestamps_raise(self) -> None:
+        with pytest.raises(ValueError, match="tz-aware"):
+            make_rolling_walk_forward_folds(
+                start=datetime(2024, 1, 1),
+                end=_utc(2024, 12, 31),
+            )
+
+    def test_end_before_start_raises(self) -> None:
+        with pytest.raises(ValueError, match="must be >"):
+            make_rolling_walk_forward_folds(
+                start=_utc(2024, 12, 31), end=_utc(2024, 1, 1)
+            )

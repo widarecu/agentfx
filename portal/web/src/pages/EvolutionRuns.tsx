@@ -315,6 +315,11 @@ interface CreateRunBody {
     leverage?: number;
     min_cagr_pct?: number;
     spread_pips?: number | null;
+    /** v0.4.0: when true, the orchestrator aborts the run before gen 0
+     * if the training and OOS regions have different regime tags
+     * (vol × trend). Default false — surfaces the mismatch in the UI
+     * either way but lets the run finish. */
+    auto_stop_on_regime_mismatch?: boolean;
   };
   stop_conditions?: {
     max_generations: number;
@@ -416,6 +421,10 @@ function CreateRunModal({
   const [maxGenerationsStr, setMaxGenerationsStr] = useState('30');
   const [targetFitnessStr, setTargetFitnessStr] = useState('1.5');
   const [enableTargetFitnessStop, setEnableTargetFitnessStop] = useState(false);
+  // v0.4.0 — auto-stop the run if the training and OOS regions are
+  // different regimes (vol × trend). Off by default; flipping it on
+  // saves 30 generations of compute on doomed runs.
+  const [autoStopOnRegimeMismatch, setAutoStopOnRegimeMismatch] = useState(false);
   const [llmBudgetUsdStr, setLlmBudgetUsdStr] = useState('5.0');
   const [leverage, setLeverage] = useState<30 | 50>(30);
   const [minCagrPctStr, setMinCagrPctStr] = useState('15'); // % per year — Gate B floor
@@ -499,6 +508,7 @@ function CreateRunModal({
                 Number.isFinite(Number(spreadPipsStr))
                   ? { spread_pips: Number(spreadPipsStr) }
                   : {}),
+                auto_stop_on_regime_mismatch: autoStopOnRegimeMismatch,
               },
               stop_conditions: {
                 max_generations: maxGenerations,
@@ -657,6 +667,29 @@ function CreateRunModal({
                 later-generation candidate that would have OOS-passed.
                 Leave unchecked to exhaust the generation budget and let
                 top-K validation pick the survivor.
+              </span>
+            </span>
+          </label>
+
+          <label className="flex items-start gap-2 text-xs cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={autoStopOnRegimeMismatch}
+              onChange={(e) => setAutoStopOnRegimeMismatch(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span className="text-slate-700 dark:text-slate-300">
+              <span className="font-semibold">
+                Stop if training and OOS regimes don't match
+              </span>
+              <span className="block text-slate-500 dark:text-slate-400 mt-0.5">
+                Off by default. When enabled, the orchestrator computes a
+                regime tag (volatility × trend strength) on the training
+                region and OOS region before generation 0. If they
+                disagree, the run aborts with{' '}
+                <code className="font-mono">train_oos_regime_mismatch</code>{' '}
+                — saving 30 generations on doomed runs. Leave unchecked to
+                see the regime info in the UI without auto-stopping.
               </span>
             </span>
           </label>
