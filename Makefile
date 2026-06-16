@@ -13,7 +13,7 @@ MAXABS?=1
 MAXRATE?=60
 LOSS?=0.02
 
-.PHONY: venv install dev lock update precommit test test-unit test-integration test-e2e lint typecheck format backtest backtest-full portal-mock portal-mock-test portal-web-e2e start-backend start-frontend start-all e2e docker-up docker-down docker-logs docker-backend-logs docker-restart docker-rebuild
+.PHONY: venv install dev lock update precommit test test-unit test-integration test-e2e dump-indicator-fixtures verify-fixtures lint typecheck format backtest backtest-full portal-mock portal-mock-test portal-web-e2e start-backend start-frontend start-all e2e docker-up docker-down docker-logs docker-backend-logs docker-restart docker-rebuild
 
 venv:
 	$(PY) -m venv $(VENV)
@@ -50,15 +50,46 @@ precommit:
 # The ENVIRONMENT variable tells config.py which .env.* file to load.
 # ============================================================================
 
-# Run all tests (unit + integration)
-# Note: For E2E tests, use 'make e2e' which handles server lifecycle
-test:
-	ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/pytest -q --ignore=tests/e2e
+# Run all tests (unit + integration). Unit = backend pytest + frontend
+# vitest (parity / classifier / oscillator routing). Integration = pytest
+# against Dockerised Postgres on 5433.
+# Note: For E2E tests, use 'make e2e' which handles server lifecycle.
+test: test-unit test-integration
 
-# Unit tests: Fast, isolated tests with mocked dependencies
-# These should not require a database connection
-test-unit:
-	ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/pytest -q -m unit
+# Unit tests: Fast, isolated tests with mocked dependencies.
+# Covers BOTH runtimes — there is no separate frontend stage:
+#   - backend pytest (-m unit) — no DB, no Docker, mocked.
+#   - frontend vitest — parity tests for the JS DSL indicator
+#     implementations against a Python-generated fixture, archetype
+#     classifier, oscillator routing. Runs in node, no DB, no browser.
+# verify-fixtures runs first so a stale parity fixture fails loudly
+# rather than letting the JS tests pass against outdated Python output.
+# Both runtimes always run regardless of the other's outcome so the
+# operator sees every failure in one pass (a backend coverage gripe
+# does not silently skip frontend tests, etc.).
+test-unit: verify-fixtures
+	@set +e; rc=0; \
+	  echo "--- backend pytest ---"; \
+	  ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/pytest -q -m unit || rc=$$?; \
+	  echo "--- frontend vitest ---"; \
+	  (cd portal/web && npm test --silent) || rc=$$?; \
+	  exit $$rc
+
+# Regenerate the JS↔Python indicator parity fixture from the Python
+# reference implementation. Re-run whenever
+# src/agentfx/core/dsl/indicators.py changes; the JSON is checked in so
+# the frontend test suite does not need Python at run time.
+dump-indicator-fixtures:
+	ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/python scripts/dump_indicator_fixtures.py
+
+# Guard against fixture staleness: regenerate the parity fixture and
+# fail if it changed. Catches "someone edited indicators.py without
+# re-running dump-indicator-fixtures", which would otherwise let the
+# frontend parity tests pass against an outdated Python reference.
+verify-fixtures: dump-indicator-fixtures
+	@git diff --exit-code -- portal/web/tests/fixtures/indicator-values.json \
+	  || (echo "ERROR: parity fixture is stale. Run 'make dump-indicator-fixtures' \
+and commit the regenerated portal/web/tests/fixtures/indicator-values.json." && exit 1)
 
 # Integration tests: Tests with real database (Dockerised PostgreSQL on port 5433)
 # Requires: docker-compose --profile test up first.

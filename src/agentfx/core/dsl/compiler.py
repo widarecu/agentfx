@@ -76,7 +76,12 @@ def _walk_condition(cond: Condition, visit) -> None:
         for sub in cond.args:
             _walk_condition(sub, visit)
     else:
-        raise CompilerError(f"unknown condition type: {type(cond).__name__}")
+        # Defensive — grammar only constructs Comparison / AndCondition /
+        # OrCondition. Marked unreachable for the same reason as line 150
+        # and lines 164-166 below.
+        raise CompilerError(
+            f"unknown condition type: {type(cond).__name__}"
+        )  # pragma: no cover
 
 
 def _validate_entry(entry: EntryConditions) -> None:

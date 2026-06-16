@@ -24,6 +24,14 @@ INDICATOR_NAMES = (
     "bb_lower",
     "donchian_high",
     "donchian_low",
+    # v0.4.0 expansion
+    "macd_line",
+    "macd_signal",
+    "stoch",
+    "adx",
+    "obv",
+    "ichimoku_tenkan",
+    "ichimoku_kijun",
 )
 IndicatorName = Literal[
     "close",
@@ -35,6 +43,14 @@ IndicatorName = Literal[
     "bb_lower",
     "donchian_high",
     "donchian_low",
+    # v0.4.0 expansion (2026-06-16)
+    "macd_line",
+    "macd_signal",
+    "stoch",
+    "adx",
+    "obv",
+    "ichimoku_tenkan",
+    "ichimoku_kijun",
 ]
 
 ComparatorName = Literal[">", "<", ">=", "<=", "crosses_above", "crosses_below"]
@@ -58,6 +74,22 @@ _INDICATOR_FAMILY: dict[str, str] = {
     "donchian_high": "channel",
     "donchian_low": "channel",
     "close": "price",
+    # v0.4.0 expansion. Group each new indicator into the closest of the
+    # existing families so the same-mechanical-event constraint
+    # naturally extends to them. MACD line + signal are MA-derived
+    # (EMA-of-close arithmetic) so they sit in "ma". Stochastic + ADX
+    # are bounded oscillators like RSI. Ichimoku tenkan/kijun are
+    # high-low channel midpoints — "channel" alongside Donchian. OBV
+    # is its own family ("volume") since it's the only volume-based
+    # indicator so far; no other "volume" entries means the same-
+    # mechanical-event check won't ever fire on it.
+    "macd_line": "ma",
+    "macd_signal": "ma",
+    "stoch": "oscillator",
+    "adx": "oscillator",
+    "obv": "volume",
+    "ichimoku_tenkan": "channel",
+    "ichimoku_kijun": "channel",
 }
 
 

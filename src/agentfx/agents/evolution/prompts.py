@@ -101,11 +101,13 @@ def to_full_spec(llm_spec: LLMStrategySpec) -> StrategySpec:
 def _format_indicator_catalog() -> str:
     """Render the indicator catalog as a human-readable bullet list for the
     system prompt. Uses INDICATOR_ARG_BOUNDS so this stays in sync with the
-    DSL automatically."""
+    DSL automatically. The purposes/descriptions live in
+    `_INDICATOR_PURPOSES`; this helper renders only signatures and bounds.
+    """
     lines = []
     for name, bounds in INDICATOR_ARG_BOUNDS.items():
         if not bounds:
-            lines.append(f"- `{name}()` — close-price series")
+            lines.append(f"- `{name}()` (no args)")
         else:
             arg_descs = []
             for i, (lo, hi) in enumerate(bounds):
@@ -115,15 +117,22 @@ def _format_indicator_catalog() -> str:
 
 
 _INDICATOR_PURPOSES = """\
-- `close()`           — current close price (no args)
-- `sma(n)`            — simple moving average over n bars
-- `ema(n)`            — exponential moving average, span n
-- `rsi(n)`            — relative strength index, period n; oscillator in [0, 100]
-- `atr(n)`            — average true range over n bars (price units)
-- `bb_upper(n, k)`    — Bollinger upper band: sma(n) + k·stdev(n)
-- `bb_lower(n, k)`    — Bollinger lower band: sma(n) − k·stdev(n)
-- `donchian_high(n)`  — running max of prior n highs (excludes current bar)
-- `donchian_low(n)`   — running min of prior n lows (excludes current bar)
+- `close()`              — current close price (no args)
+- `sma(n)`               — simple moving average over n bars
+- `ema(n)`               — exponential moving average, span n
+- `rsi(n)`               — relative strength index, period n; oscillator in [0, 100]
+- `atr(n)`               — average true range over n bars (price units)
+- `bb_upper(n, k)`       — Bollinger upper band: sma(n) + k·stdev(n)
+- `bb_lower(n, k)`       — Bollinger lower band: sma(n) − k·stdev(n)
+- `donchian_high(n)`     — running max of prior n highs (excludes current bar)
+- `donchian_low(n)`      — running min of prior n lows (excludes current bar)
+- `macd_line(nf, ns)`    — MACD line: ema(close, nf) − ema(close, ns); typical 12/26
+- `macd_signal(nf, ns, n_sig)` — EMA of macd_line with span n_sig (typical 9). Classic signal: `crosses_above` of macd_line vs macd_signal.
+- `stoch(n, k_smooth)`   — stochastic %K oscillator in [0, 100]; n=lookback, k_smooth=SMA smoothing
+- `adx(n)`               — Average Directional Index in [0, 100]; trend STRENGTH not direction. Above 25 = strong trend; below 20 = no trend. Used as a FILTER (combine with directional signal).
+- `obv()`                — On-Balance Volume (no args); cumulative tick-volume direction. Note: FX uses tick volume not true volume, so OBV is a momentum/activity proxy, not institutional flow.
+- `ichimoku_tenkan(n)`   — Ichimoku Conversion Line; midpoint of last n bars' high/low range (typical n=9)
+- `ichimoku_kijun(n)`    — Ichimoku Base Line; same formula, slower (typical n=26). Classic: `crosses_above` of tenkan vs kijun.
 """
 
 

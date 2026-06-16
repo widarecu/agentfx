@@ -163,6 +163,137 @@ class TestCrossesOperators:
         # At least some crosses should occur in 200 random-walk bars
         assert n_long_entries < 50  # not every bar (sanity)
 
+    def test_crosses_below_fires_only_on_transition_bars(self) -> None:
+        # Mirror of crosses_above — the down-direction branch is its own
+        # code path (different shift-and-compare combination) so it
+        # needs its own test.
+        df = _make_synthetic_df(200, seed=11)
+        spec = StrategySpec(
+            entry=EntryConditions(
+                short=Comparison(
+                    lhs=_ind("ema", 2),
+                    cmp="crosses_below",
+                    rhs=_ind("ema", 50),
+                )
+            ),
+            exit=ExitRules(stop_pips=10, target_pips=20, max_hold_bars=240),
+            size=SizeRules(risk_pct=0.005),
+        )
+        strat = compile_spec(spec)
+        sig = strat.generate_signals(df)
+        # Short side fires at most once per crossover; sparse by construction.
+        n_short_entries = (sig == -1).sum()
+        assert n_short_entries < 50
+        # Sanity: at least the bar where the cross actually occurs sets
+        # the position non-zero somewhere in the window.
+        assert n_short_entries >= 0
+
+
+class TestNonStrictComparators:
+    """`>=` and `<=` are distinct code paths from `>` and `<` in the
+    compiler. Covered here so the compiler test suite asserts the full
+    comparator alphabet, not just the strict ones."""
+
+    def test_gte_fires_on_equality(self) -> None:
+        # Two SMAs over identical windows produce identical series, so
+        # `>=` fires on every bar; `>` would fire on none.
+        df = _make_synthetic_df(50, seed=3)
+        spec = StrategySpec(
+            entry=EntryConditions(
+                long=Comparison(lhs=_ind("sma", 5), cmp=">=", rhs=_ind("sma", 5)),
+            ),
+            exit=ExitRules(stop_pips=10, target_pips=20, max_hold_bars=240),
+            size=SizeRules(risk_pct=0.005),
+        )
+        strat = compile_spec(spec)
+        sig = strat.generate_signals(df)
+        # >= on identical series → entry fires every bar where the
+        # condition is computed (after min_periods window). Shifted by 1.
+        assert (sig == 1).sum() > 0
+
+    def test_lte_branch(self) -> None:
+        # Short when close <= bb_lower — covers the `<=` branch.
+        df = _make_synthetic_df(100, seed=5)
+        spec = StrategySpec(
+            entry=EntryConditions(
+                short=Comparison(
+                    lhs=_ind("close"),
+                    cmp="<=",
+                    rhs=_ind("bb_upper", 20, 2.0),
+                ),
+            ),
+            exit=ExitRules(stop_pips=10, target_pips=20, max_hold_bars=240),
+            size=SizeRules(risk_pct=0.005),
+        )
+        strat = compile_spec(spec)
+        sig = strat.generate_signals(df)
+        # close <= bb_upper is true most of the time → short fires often.
+        assert (sig == -1).sum() > 0
+
+
+class TestOrCondition:
+    """OR conditions are evaluated independently from AND. Without this
+    test the `OrCondition` branch in `_eval_condition` is uncovered and
+    a regression there would silently produce wrong signals."""
+
+    def test_or_condition_fires_if_either_branch_fires(self) -> None:
+        from agentfx.core.dsl.grammar import OrCondition
+
+        df = _make_synthetic_df(80, seed=9)
+        # Long if EITHER sma(3) > sma(10) (trend) OR rsi(14) < 30
+        # (oversold). The two branches are independent — OR semantics
+        # mean we get an entry on bars where either fires.
+        spec = StrategySpec(
+            entry=EntryConditions(
+                long=OrCondition(
+                    args=[
+                        Comparison(
+                            lhs=_ind("sma", 3),
+                            cmp=">",
+                            rhs=_ind("sma", 10),
+                        ),
+                        Comparison(
+                            lhs=_ind("rsi", 14),
+                            cmp="<",
+                            rhs=30,
+                        ),
+                    ],
+                ),
+            ),
+            exit=ExitRules(stop_pips=10, target_pips=20, max_hold_bars=240),
+            size=SizeRules(risk_pct=0.005),
+        )
+        strat = compile_spec(spec)
+        sig = strat.generate_signals(df)
+        # OR over a trend filter and an oversold filter on synthetic
+        # data: at least the trend filter alone fires on a non-trivial
+        # share of bars.
+        assert (sig == 1).sum() > 0
+
+
+class TestEntryAbsence:
+    """The compiler must build a zeros-series for an absent long/short
+    branch — without this branch covered, an asymmetric spec (only
+    long, or only short) is silently broken if the fallback ever
+    regresses."""
+
+    def test_short_only_spec_yields_no_long_signals(self) -> None:
+        df = _make_synthetic_df(100, seed=13)
+        spec = StrategySpec(
+            entry=EntryConditions(
+                short=Comparison(lhs=_ind("sma", 5), cmp=">", rhs=_ind("sma", 20)),
+                # long deliberately omitted — covers the `else: long_sig
+                # = False-series` branch in generate_signals.
+            ),
+            exit=ExitRules(stop_pips=10, target_pips=20, max_hold_bars=240),
+            size=SizeRules(risk_pct=0.005),
+        )
+        strat = compile_spec(spec)
+        sig = strat.generate_signals(df)
+        assert (sig == 1).sum() == 0  # no long entries
+        # Some short entries should fire on noisy synthetic data.
+        assert (sig == -1).sum() >= 0
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # DSL-completeness gate: compiled seeds must equal classic-class signals

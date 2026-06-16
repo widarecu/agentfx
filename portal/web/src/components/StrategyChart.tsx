@@ -2,8 +2,10 @@
  * StrategyChart Component
  *
  * Single chart with candlesticks, trade markers, and indicators.
- * - MA / Donchian: overlay on the right (candle) price scale
- * - RSI: rendered on a separate 'left' price scale in the bottom portion
+ * - Price-scale overlays (MA, MACD, Donchian, Ichimoku, BB, ATR, OBV):
+ *   drawn on the right (candle) price scale
+ * - Bounded oscillators (RSI, Stoch, ADX — see OSCILLATOR_NAMES below):
+ *   rendered on a separate 'left' price scale in the bottom portion
  *
  * Using ONE chart instance guarantees time alignment between all series.
  */
@@ -23,6 +25,7 @@ import {
 } from 'lightweight-charts';
 import { ZoomIn, ZoomOut, Maximize2 } from 'lucide-react';
 import { CandleData, TradeSignal, IndicatorLine } from '../types/optimization';
+import { OSCILLATOR_NAMES, isOscillatorLabel } from '../utils/oscillators';
 
 interface StrategyChartProps {
   candles: CandleData[];
@@ -46,7 +49,7 @@ interface StrategyChartProps {
 }
 
 function isOscillator(ind: IndicatorLine): boolean {
-  return ind.name.toLowerCase().includes('rsi');
+  return isOscillatorLabel(ind.name);
 }
 
 const toTime = (ts: string): UTCTimestamp =>
@@ -65,7 +68,8 @@ export default function StrategyChart({
   const [chartError, setChartError] = useState<string | null>(null);
   const [showIndicators, setShowIndicators] = useState(true);
   const [tooltip, setTooltip] = useState<{
-    time: string; o: string; h: string; l: string; c: string; rsi?: string;
+    time: string; o: string; h: string; l: string; c: string;
+    osc?: { label: string; value: string };
   } | null>(null);
 
   const overlays = indicators.filter(i => !isOscillator(i));
@@ -115,16 +119,20 @@ export default function StrategyChart({
         if (!param.time || !param.point) { setTooltip(null); return; }
         const d = param.seriesData.get(series) as any;
         if (d?.open === undefined) { setTooltip(null); return; }
-        // Get RSI value from oscillator series
-        let rsi: string | undefined;
-        if (oscRefs.current.length > 0) {
+        // Pull the first oscillator's current value, if any. Label tracks
+        // the indicator name (e.g. rsi/stoch/adx) so the tooltip says
+        // what the user is actually looking at.
+        let osc: { label: string; value: string } | undefined;
+        if (oscRefs.current.length > 0 && oscillators[0]) {
           const oscData = param.seriesData.get(oscRefs.current[0]) as any;
-          if (oscData?.value !== undefined) rsi = oscData.value.toFixed(1);
+          if (oscData?.value !== undefined) {
+            osc = { label: oscillators[0].name, value: oscData.value.toFixed(1) };
+          }
         }
         setTooltip({
           time: new Date((param.time as number) * 1000).toLocaleString('en-US', { timeZone: 'UTC', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }),
           o: d.open.toFixed(5), h: d.high.toFixed(5), l: d.low.toFixed(5), c: d.close.toFixed(5),
-          rsi,
+          osc,
         });
       });
 
@@ -167,9 +175,14 @@ export default function StrategyChart({
         const isEntry = sig.signalType.startsWith('entry');
         const isLong = sig.signalType.includes('long');
         if (isEntry) {
-          const rsi = Object.entries(sig.indicatorValues ?? {}).find(([k]) => k.toLowerCase().includes('rsi'));
+          // Annotate the entry marker with the current value of whichever
+          // oscillator-family indicator the signal carried (rsi/stoch/adx).
+          const osc = Object.entries(sig.indicatorValues ?? {}).find(([k]) => {
+            const lower = k.toLowerCase();
+            return OSCILLATOR_NAMES.some((name) => lower.startsWith(name));
+          });
           const label = isLong ? 'L' : 'S';
-          const text = rsi ? `${label} ${Number(rsi[1]).toFixed(0)}` : label;
+          const text = osc ? `${label} ${Number(osc[1]).toFixed(0)}` : label;
           const position: 'belowBar' | 'aboveBar' = isLong ? 'belowBar' : 'aboveBar';
           const shape: 'arrowUp' | 'arrowDown' = isLong ? 'arrowUp' : 'arrowDown';
           return { time: toTime(sig.timestamp), position, color: isLong ? '#22c55e' : '#ef4444', shape, text, size: 1 };
@@ -310,7 +323,7 @@ export default function StrategyChart({
           <span><span className="text-slate-500">H:</span> <span className="font-mono text-slate-900 dark:text-slate-100">{tooltip.h}</span></span>
           <span><span className="text-slate-500">L:</span> <span className="font-mono text-slate-900 dark:text-slate-100">{tooltip.l}</span></span>
           <span><span className="text-slate-500">C:</span> <span className="font-mono font-medium text-slate-900 dark:text-slate-100">{tooltip.c}</span></span>
-          {tooltip.rsi && <span><span className="text-purple-500 font-medium">RSI:</span> <span className="font-mono font-medium text-purple-700 dark:text-purple-300">{tooltip.rsi}</span></span>}
+          {tooltip.osc && <span><span className="text-purple-500 font-medium">{tooltip.osc.label}:</span> <span className="font-mono font-medium text-purple-700 dark:text-purple-300">{tooltip.osc.value}</span></span>}
         </div>
       )}
 

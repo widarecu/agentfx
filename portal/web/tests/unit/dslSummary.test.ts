@@ -1,0 +1,189 @@
+/**
+ * Archetype classifier + plain-English summary behaviour, focusing on
+ * the v0.4.0 indicator expansion (MACD, stochastic, ADX, OBV, Ichimoku).
+ *
+ * The classifier is the heuristic that picks the badge shown on the
+ * GenomeDetail hero. Before v0.4.0 it only knew about RSI / SMA / EMA /
+ * Bollinger / Donchian; this suite asserts the new indicators are routed
+ * to the correct archetype family and that the human-readable "why this
+ * was tagged" reason picks them up.
+ */
+
+import { describe, expect, it } from 'vitest';
+
+import {
+  inferArchetype,
+  summarizeDsl,
+  archetypeReason,
+} from '../../src/utils/dslSummary';
+import type { DslSpec } from '../../src/types/evolution';
+
+function buildSpec(
+  long: unknown | null,
+  short: unknown | null,
+): DslSpec {
+  return {
+    version: 1,
+    entry: { long, short },
+    exit: {
+      stop_pips: 10,
+      target_pips: 20,
+      max_hold_bars: 50,
+      min_hold_bars: 0,
+      opposite_signal: true,
+    },
+    size: { risk_pct: 0.001 },
+  } as DslSpec;
+}
+
+function ind(name: string, args: number[] = []) {
+  return { ind: name, args };
+}
+
+describe('inferArchetype — v0.4.0 indicator expansion', () => {
+  it('classifies stoch oversold/overbought as mean-reversion', () => {
+    const spec = buildSpec(
+      { lhs: ind('stoch', [14, 3]), cmp: '<', rhs: 20 },
+      { lhs: ind('stoch', [14, 3]), cmp: '>', rhs: 80 },
+    );
+    expect(inferArchetype(spec)).toBe('mean-reversion');
+    expect(archetypeReason(spec, 'mean-reversion')).toMatch(/stoch/);
+  });
+
+  it('classifies adx threshold strategies as mean-reversion (bounded oscillator)', () => {
+    // ADX is an oscillator family member even though it's typically used
+    // as a trend filter — the heuristic groups by scale (bounded) rather
+    // than by user intent. This is the correct fallthrough today;
+    // re-evaluate when a dedicated "filter" archetype is added.
+    const spec = buildSpec(
+      { lhs: ind('adx', [14]), cmp: '>', rhs: 25 },
+      { lhs: ind('adx', [14]), cmp: '<', rhs: 20 },
+    );
+    expect(inferArchetype(spec)).toBe('mean-reversion');
+    expect(archetypeReason(spec, 'mean-reversion')).toMatch(/adx/);
+  });
+
+  it('classifies MACD line crossing signal as trend-following', () => {
+    const spec = buildSpec(
+      {
+        lhs: ind('macd_line', [12, 26]),
+        cmp: 'crosses_above',
+        rhs: ind('macd_signal', [12, 26, 9]),
+      },
+      {
+        lhs: ind('macd_line', [12, 26]),
+        cmp: 'crosses_below',
+        rhs: ind('macd_signal', [12, 26, 9]),
+      },
+    );
+    expect(inferArchetype(spec)).toBe('trend');
+    expect(archetypeReason(spec, 'trend')).toMatch(/macd_line/);
+  });
+
+  it('classifies Ichimoku tenkan/kijun crossover as breakout (channel family)', () => {
+    const spec = buildSpec(
+      {
+        lhs: ind('ichimoku_tenkan', [9]),
+        cmp: 'crosses_above',
+        rhs: ind('ichimoku_kijun', [26]),
+      },
+      {
+        lhs: ind('ichimoku_tenkan', [9]),
+        cmp: 'crosses_below',
+        rhs: ind('ichimoku_kijun', [26]),
+      },
+    );
+    expect(inferArchetype(spec)).toBe('breakout');
+    const reason = archetypeReason(spec, 'breakout');
+    expect(reason).toMatch(/ichimoku/);
+  });
+
+  it('classifies OBV-only specs as mixed (no archetype counterpart yet)', () => {
+    const spec = buildSpec(
+      { lhs: ind('obv'), cmp: '>', rhs: 0 },
+      { lhs: ind('obv'), cmp: '<', rhs: 0 },
+    );
+    // OBV doesn't fit any current archetype — confirm it doesn't get
+    // mis-classified into one of the existing buckets.
+    expect(inferArchetype(spec)).toBe('mixed');
+  });
+
+  it('regression: existing RSI mean-reversion still classifies as mean-reversion', () => {
+    const spec = buildSpec(
+      { lhs: ind('rsi', [14]), cmp: '<', rhs: 30 },
+      { lhs: ind('rsi', [14]), cmp: '>', rhs: 70 },
+    );
+    expect(inferArchetype(spec)).toBe('mean-reversion');
+    expect(archetypeReason(spec, 'mean-reversion')).toMatch(/rsi/);
+  });
+
+  it('regression: existing SMA crossover still classifies as trend', () => {
+    const spec = buildSpec(
+      { lhs: ind('sma', [10]), cmp: 'crosses_above', rhs: ind('sma', [50]) },
+      { lhs: ind('sma', [10]), cmp: 'crosses_below', rhs: ind('sma', [50]) },
+    );
+    expect(inferArchetype(spec)).toBe('trend');
+  });
+
+  it('regression: existing Donchian breakout still classifies as breakout', () => {
+    const spec = buildSpec(
+      { lhs: ind('donchian_high', [20]), cmp: '>', rhs: ind('donchian_low', [20]) },
+      null,
+    );
+    expect(inferArchetype(spec)).toBe('breakout');
+  });
+
+  it('degenerate detection still fires for identical long/short conditions', () => {
+    const cond = { lhs: ind('macd_line', [12, 26]), cmp: '>', rhs: 0 };
+    const spec = buildSpec(cond, cond);
+    expect(inferArchetype(spec)).toBe('degenerate');
+  });
+});
+
+describe('summarizeDsl — v0.4.0 indicators render in plain English', () => {
+  it('renders MACD line/signal crossover', () => {
+    const spec = buildSpec(
+      {
+        lhs: ind('macd_line', [12, 26]),
+        cmp: 'crosses_above',
+        rhs: ind('macd_signal', [12, 26, 9]),
+      },
+      null,
+    );
+    const summary = summarizeDsl(spec);
+    expect(summary).toMatch(/macd_line\(12, 26\)/);
+    expect(summary).toMatch(/crosses above/);
+    expect(summary).toMatch(/macd_signal\(12, 26, 9\)/);
+  });
+
+  it('renders OBV with no args (zero-arg form)', () => {
+    const spec = buildSpec({ lhs: ind('obv'), cmp: '>', rhs: 0 }, null);
+    const summary = summarizeDsl(spec);
+    // Zero-arg indicators render without an empty `()` per summarizeExpr's
+    // contract — confirm we don't get "obv()" hanging in the sentence.
+    expect(summary).toMatch(/\bobv\b/);
+    expect(summary).not.toMatch(/obv\(\s*\)/);
+  });
+
+  it('renders stoch with two args', () => {
+    const spec = buildSpec(
+      { lhs: ind('stoch', [14, 3]), cmp: '<', rhs: 20 },
+      null,
+    );
+    expect(summarizeDsl(spec)).toMatch(/stoch\(14, 3\) falls below 20/);
+  });
+
+  it('renders ichimoku tenkan/kijun cross with explicit windows', () => {
+    const spec = buildSpec(
+      {
+        lhs: ind('ichimoku_tenkan', [9]),
+        cmp: 'crosses_above',
+        rhs: ind('ichimoku_kijun', [26]),
+      },
+      null,
+    );
+    const summary = summarizeDsl(spec);
+    expect(summary).toMatch(/ichimoku_tenkan\(9\)/);
+    expect(summary).toMatch(/ichimoku_kijun\(26\)/);
+  });
+});
