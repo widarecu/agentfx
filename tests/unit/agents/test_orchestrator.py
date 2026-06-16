@@ -39,6 +39,7 @@ from agentfx.core.dsl.seeds import (
     DONCHIAN_BREAKOUT_SEED,
     MA_CROSSOVER_SEED,
     RSI_MEAN_REVERSION_SEED,
+    SEED_SPECS,
 )
 
 
@@ -344,9 +345,11 @@ class TestGenZero:
 
         gen0 = persister.generations[0]
         assert gen0.index == 0
-        # Seeds (3) should be present verbatim
+        # Every canonical seed must appear verbatim in gen 0; count drives
+        # off SEED_SPECS so adding/removing a seed family doesn't require
+        # touching this assertion.
         seed_origins = [g.origin for g in gen0.genomes if g.origin == GenomeOrigin.SEED]
-        assert len(seed_origins) == 3
+        assert len(seed_origins) == len(SEED_SPECS)
 
     def test_initial_population_size_matches_config(self) -> None:
         orchestrator, persister = _build_orchestrator()
@@ -664,6 +667,13 @@ class TestLLMInjection:
             config=OrchestratorConfig(
                 instrument="EUR_USD",
                 population_size=10,
+                # LLM gen-0 seeding is disabled here so the gen-0 size
+                # stays at len(SEED_SPECS) (= 9) instead of growing to
+                # 9 + 5 = 14, which would exceed population_size=10
+                # and trip InvalidPopulationSizeError. This test is
+                # about the recurring gen-3 injection behaviour, not
+                # the gen-0 seeding path.
+                llm_seed_gen0=False,
                 llm_injection_every_n=3,
                 n_llm_proposals=5,
                 n_validation_folds=4,

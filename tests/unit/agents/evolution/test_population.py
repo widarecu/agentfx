@@ -48,7 +48,7 @@ class TestPopulation:
     def test_len_and_iter(self) -> None:
         genomes = [Genome(spec=s, origin=GenomeOrigin.SEED) for s in SEED_SPECS]
         pop = Population(generation_index=0, genomes=genomes)
-        assert len(pop) == 3
+        assert len(pop) == len(SEED_SPECS)
         assert list(pop) == genomes
 
     def test_best_returns_none_when_no_fitness_set(self) -> None:
@@ -73,20 +73,26 @@ class TestPopulation:
 class TestInitializePopulation:
     def test_includes_every_seed_verbatim(self) -> None:
         rng = Random(0)
-        pop = initialize_population(SEED_SPECS, size=10, rng=rng, mutate_fn=mutate_spec)
+        size = len(SEED_SPECS) + 3
+        pop = initialize_population(
+            SEED_SPECS, size=size, rng=rng, mutate_fn=mutate_spec
+        )
         seed_genomes = [g for g in pop if g.origin == GenomeOrigin.SEED]
-        assert len(seed_genomes) == 3
+        assert len(seed_genomes) == len(SEED_SPECS)
         seed_specs_in_pop = {id(g.spec) for g in seed_genomes}
-        assert len(seed_specs_in_pop) == 3
+        assert len(seed_specs_in_pop) == len(SEED_SPECS)
         # Each original seed must appear exactly once
         for seed in SEED_SPECS:
             assert seed in [g.spec for g in seed_genomes]
 
     def test_remaining_slots_are_mutated_seeds(self) -> None:
         rng = Random(1)
-        pop = initialize_population(SEED_SPECS, size=10, rng=rng, mutate_fn=mutate_spec)
+        size = len(SEED_SPECS) + 3
+        pop = initialize_population(
+            SEED_SPECS, size=size, rng=rng, mutate_fn=mutate_spec
+        )
         mutated = [g for g in pop if g.origin == GenomeOrigin.MUTATION]
-        assert len(mutated) == 7  # 10 total - 3 seeds
+        assert len(mutated) == size - len(SEED_SPECS)
 
     def test_size_matches_request(self) -> None:
         rng = Random(2)
@@ -109,23 +115,26 @@ class TestInitializePopulation:
         mutated copy carries the seed's ID as its parent. This is what
         makes the gen-0 lineage visible in the portal."""
         rng = Random(7)
+        size = len(SEED_SPECS) + 3
         pop = initialize_population(
             SEED_SPECS,
-            size=10,
+            size=size,
             rng=rng,
             mutate_fn=mutate_spec,
             run_id="evorun_test_abc",
         )
         seeds = [g for g in pop if g.origin == GenomeOrigin.SEED]
-        # Seeds get pre-assigned IDs matching the persister's format
-        assert seeds[0].id == "genome_gen_evorun_test_abc_000_000"
-        assert seeds[1].id == "genome_gen_evorun_test_abc_000_001"
-        assert seeds[2].id == "genome_gen_evorun_test_abc_000_002"
+        # Seeds get pre-assigned IDs matching the persister's format —
+        # genome_gen_<run_id>_000_<index>, where <index> is zero-padded
+        # to 3 digits and runs 000..N-1 for the N seeds.
+        for i, g in enumerate(seeds):
+            expected = f"genome_gen_evorun_test_abc_000_{i:03d}"
+            assert g.id == expected, f"seed {i}: got {g.id!r}, want {expected!r}"
         seed_id_set = {g.id for g in seeds}
 
         # Every mutation references one of the seed IDs as its parent
         mutations = [g for g in pop if g.origin == GenomeOrigin.MUTATION]
-        assert len(mutations) == 7
+        assert len(mutations) == size - len(SEED_SPECS)
         for m in mutations:
             assert len(m.parent_ids) == 1
             assert m.parent_ids[0] in seed_id_set

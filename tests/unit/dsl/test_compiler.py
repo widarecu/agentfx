@@ -385,6 +385,227 @@ class TestDSLCompletenessGate:
         )
 
 
+class TestV040ExpansionSeeds:
+    """v0.4.0 expansion seeds — MACD, Stochastic, BB, Ichimoku, ADX, OBV.
+
+    These don't have classic-Python counterparts so the test surface is
+    different from the completeness gate: each seed must compile (passing
+    grammar + arg-bounds validation), reference the indicator(s) it
+    advertises, and produce a non-empty signal series on synthetic data.
+    """
+
+    def _indicator_names_used(self, spec: StrategySpec) -> set[str]:
+        from agentfx.core.dsl.grammar import (
+            AndCondition,
+            OrCondition,
+            IndicatorCall,
+        )
+
+        names: set[str] = set()
+
+        def collect(node: object) -> None:
+            if isinstance(node, IndicatorCall):
+                names.add(node.ind)
+            elif isinstance(node, Comparison):
+                collect(node.lhs)
+                collect(node.rhs)
+            elif isinstance(node, (AndCondition, OrCondition)):
+                for sub in node.args:
+                    collect(sub)
+
+        if spec.entry.long is not None:
+            collect(spec.entry.long)
+        if spec.entry.short is not None:
+            collect(spec.entry.short)
+        return names
+
+    def test_macd_crossover_seed_uses_both_macd_lines(self) -> None:
+        from agentfx.core.dsl.seeds import macd_crossover_seed
+
+        spec = macd_crossover_seed()
+        assert self._indicator_names_used(spec) == {"macd_line", "macd_signal"}
+        compiled = compile_spec(spec)
+        sig = compiled.generate_signals(_make_synthetic_df(500, seed=41))
+        # Crossovers fire infrequently — assert at least one fires so the
+        # seed produces a tradeable signal at all, not just a zero series.
+        assert (sig != 0).sum() > 0
+
+    def test_macd_crossover_rejects_fast_geq_slow(self) -> None:
+        from agentfx.core.dsl.seeds import macd_crossover_seed
+
+        with pytest.raises(ValueError, match="must be < n_slow"):
+            macd_crossover_seed(n_fast=26, n_slow=12)
+
+    def test_stoch_mean_reversion_seed_uses_stoch(self) -> None:
+        from agentfx.core.dsl.seeds import stoch_mean_reversion_seed
+
+        spec = stoch_mean_reversion_seed()
+        assert self._indicator_names_used(spec) == {"stoch"}
+        compiled = compile_spec(spec)
+        sig = compiled.generate_signals(_make_synthetic_df(500, seed=43))
+        assert (sig != 0).sum() > 0
+
+    def test_bb_mean_reversion_seed_uses_both_bands_and_close(self) -> None:
+        from agentfx.core.dsl.seeds import bb_mean_reversion_seed
+
+        spec = bb_mean_reversion_seed()
+        assert self._indicator_names_used(spec) == {"close", "bb_lower", "bb_upper"}
+        compiled = compile_spec(spec)
+        sig = compiled.generate_signals(_make_synthetic_df(500, seed=47))
+        assert (sig != 0).sum() > 0
+
+    def test_ichimoku_cross_seed_uses_both_lines(self) -> None:
+        from agentfx.core.dsl.seeds import ichimoku_cross_seed
+
+        spec = ichimoku_cross_seed()
+        assert self._indicator_names_used(spec) == {
+            "ichimoku_tenkan",
+            "ichimoku_kijun",
+        }
+        compiled = compile_spec(spec)
+        sig = compiled.generate_signals(_make_synthetic_df(500, seed=53))
+        # Slow channel midpoints cross less often; assert at least one
+        # fires to confirm the seed is tradeable.
+        assert (sig != 0).sum() > 0
+
+    def test_ichimoku_cross_rejects_tenkan_geq_kijun(self) -> None:
+        from agentfx.core.dsl.seeds import ichimoku_cross_seed
+
+        with pytest.raises(ValueError, match="must be < n_kijun"):
+            ichimoku_cross_seed(n_tenkan=26, n_kijun=9)
+
+    def test_adx_threshold_seed_uses_adx(self) -> None:
+        from agentfx.core.dsl.seeds import adx_threshold_seed
+
+        spec = adx_threshold_seed()
+        assert self._indicator_names_used(spec) == {"adx"}
+        # ADX is a strength indicator — the seed exists primarily for
+        # mutation lineage, not for backtest performance. We only assert
+        # that it compiles cleanly; signal density isn't a useful
+        # assertion because ADX > 25 vs < 20 can produce a sparse or
+        # dense series depending on the data's trendiness.
+        compile_spec(spec)
+
+    def test_adx_threshold_rejects_overlapping_thresholds(self) -> None:
+        from agentfx.core.dsl.seeds import adx_threshold_seed
+
+        with pytest.raises(ValueError, match="must be <"):
+            adx_threshold_seed(trend_threshold=20.0, no_trend_threshold=25.0)
+
+    def test_obv_directional_seed_uses_obv(self) -> None:
+        from agentfx.core.dsl.seeds import obv_directional_seed
+
+        spec = obv_directional_seed()
+        assert self._indicator_names_used(spec) == {"obv"}
+        # Same as ADX: lineage seed, not a strong strategy. Compile-only.
+        compile_spec(spec)
+
+
+class TestSeedSpecsRegistry:
+    """SEED_SPECS is the registry the orchestrator consumes for gen-0.
+    Asserts the registry's shape matches expectations so a reordering or
+    accidental drop doesn't silently change run behaviour.
+    """
+
+    def test_seed_count(self) -> None:
+        # 3 classic parity seeds + 6 v0.4.0 expansion seeds.
+        from agentfx.core.dsl.seeds import SEED_SPECS
+
+        assert len(SEED_SPECS) == 9
+
+    def test_each_seed_compiles(self) -> None:
+        # Catches grammar drift: if the grammar adds a new validator that
+        # one of the canonical seeds happens to violate, this fails fast.
+        from agentfx.core.dsl.seeds import SEED_SPECS
+
+        for i, spec in enumerate(SEED_SPECS):
+            try:
+                compile_spec(spec)
+            except Exception as exc:
+                raise AssertionError(f"SEED_SPECS[{i}] failed to compile: {exc}")
+
+    def test_seeds_cover_every_arity_bucket(self) -> None:
+        """The GA's `_mut_swap_indicator` is arity-constrained: it can
+        only swap between indicators with the same arg-count. If the
+        seed registry doesn't include a parent in every arity bucket,
+        some indicator families become unreachable via mutation.
+        """
+        from agentfx.core.dsl.grammar import AndCondition, IndicatorCall, OrCondition
+        from agentfx.core.dsl.indicators import INDICATOR_ARG_BOUNDS
+        from agentfx.core.dsl.seeds import SEED_SPECS
+
+        seeded_arities: set[int] = set()
+
+        def collect(node: object) -> None:
+            if isinstance(node, IndicatorCall):
+                seeded_arities.add(len(INDICATOR_ARG_BOUNDS.get(node.ind, [])))
+            elif isinstance(node, Comparison):
+                collect(node.lhs)
+                collect(node.rhs)
+            elif isinstance(node, (AndCondition, OrCondition)):
+                for sub in node.args:
+                    collect(sub)
+
+        for spec in SEED_SPECS:
+            if spec.entry.long is not None:
+                collect(spec.entry.long)
+            if spec.entry.short is not None:
+                collect(spec.entry.short)
+
+        # Every arity present in the grammar's catalog must have at
+        # least one seed indicator using it — so the GA can mutate
+        # within the bucket from gen 1 onward.
+        catalog_arities = {len(b) for b in INDICATOR_ARG_BOUNDS.values()}
+        missing = catalog_arities - seeded_arities
+        assert not missing, (
+            f"SEED_SPECS missing parents in arity buckets {missing}; "
+            "indicators in those buckets cannot emerge via the GA's "
+            "arity-constrained _mut_swap_indicator without an LLM "
+            "injection."
+        )
+
+    def test_seeds_collectively_reference_every_v040_indicator(self) -> None:
+        """Each v0.4.0 indicator family must appear in at least one
+        seed — otherwise an LLM-injection-disabled run would never see
+        the family in any genome.
+        """
+        from agentfx.core.dsl.grammar import AndCondition, IndicatorCall, OrCondition
+        from agentfx.core.dsl.seeds import SEED_SPECS
+
+        seeded_indicators: set[str] = set()
+
+        def collect(node: object) -> None:
+            if isinstance(node, IndicatorCall):
+                seeded_indicators.add(node.ind)
+            elif isinstance(node, Comparison):
+                collect(node.lhs)
+                collect(node.rhs)
+            elif isinstance(node, (AndCondition, OrCondition)):
+                for sub in node.args:
+                    collect(sub)
+
+        for spec in SEED_SPECS:
+            if spec.entry.long is not None:
+                collect(spec.entry.long)
+            if spec.entry.short is not None:
+                collect(spec.entry.short)
+
+        v040_indicators = {
+            "macd_line",
+            "macd_signal",
+            "stoch",
+            "adx",
+            "obv",
+            "ichimoku_tenkan",
+            "ichimoku_kijun",
+            # Pre-existing in grammar but previously unseeded:
+            "bb_upper",
+            "bb_lower",
+        }
+        missing = v040_indicators - seeded_indicators
+        assert not missing, f"SEED_SPECS does not reference: {missing}"
+
+
 class TestExitEnforcement:
     """The compiler now enforces the exit block. Each test wires a
     controlled entry condition that fires once, then drives close-price
