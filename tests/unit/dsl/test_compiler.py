@@ -606,6 +606,138 @@ class TestSeedSpecsRegistry:
         assert not missing, f"SEED_SPECS does not reference: {missing}"
 
 
+class TestExitReasonCapture:
+    """The compiled strategy exposes `exit_reasons_by_ts` so the
+    backtest engine can annotate each closed trade / exit signal with
+    the structural reason ('stop' / 'target' / 'max_hold' /
+    'opposite_flip'). Without this, the chart marker on UAT could not
+    tell a user "max_hold expired, re-entered" from "stop hit,
+    re-entered" — 2026-06-17 OBV-seed confusion came from this gap.
+    """
+
+    def _drive(
+        self,
+        spec: StrategySpec,
+        close: list[float],
+        long_when_true: list[bool] | None = None,
+    ) -> tuple[pd.Series, dict]:
+        """Build a controlled DataFrame, compile and run the spec,
+        return (signals, reasons_by_ts)."""
+        n = len(close)
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        df = pd.DataFrame(
+            {
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": [1000.0] * n,
+            },
+            index=idx,
+        )
+        compiled = compile_spec(spec)
+        sig = compiled.generate_signals(df)
+        return sig, compiled.exit_reasons_by_ts
+
+    def test_max_hold_emits_max_hold_reason(self) -> None:
+        # OBV-style "stays-while" spec — long whenever close > 1.0. With
+        # closes pinned at 1.5 the price never moves, so stop/target
+        # (max permitted 400/800 pips) cannot fire and max_hold=3 is
+        # the only exit path. This is the same code path that fired
+        # against the user's OBV trade on UAT 2026-06-17.
+        spec = StrategySpec(
+            entry=EntryConditions(
+                long=Comparison(lhs=_ind("close"), cmp=">", rhs=1.0),
+            ),
+            exit=ExitRules(
+                stop_pips=400,
+                target_pips=800,
+                max_hold_bars=3,
+                opposite_signal=True,
+            ),
+            size=SizeRules(risk_pct=0.005),
+        )
+        sig, reasons = self._drive(spec, close=[1.5] * 10)
+        # Every emitted exit (signal goes from non-zero to 0) should
+        # be a max_hold trigger here.
+        exit_timestamps = [
+            sig.index[i]
+            for i in range(1, len(sig))
+            if sig.iloc[i] == 0 and sig.iloc[i - 1] != 0
+        ]
+        assert exit_timestamps, "test setup wrong — no exits fired"
+        for ts in exit_timestamps:
+            assert reasons.get(ts) == "max_hold", (
+                f"expected max_hold at {ts}, got {reasons.get(ts)!r}"
+            )
+
+    def test_stop_emits_stop_reason(self) -> None:
+        # Long entry around 1.5; drop close by 0.005 (50 pips at
+        # 0.0001/pip) to trip the 10-pip stop.
+        spec = StrategySpec(
+            entry=EntryConditions(
+                long=Comparison(lhs=_ind("close"), cmp=">", rhs=1.0),
+            ),
+            exit=ExitRules(
+                stop_pips=10,
+                target_pips=800,
+                max_hold_bars=2880,
+                opposite_signal=False,
+            ),
+            size=SizeRules(risk_pct=0.005),
+        )
+        sig, reasons = self._drive(
+            spec, close=[1.5, 1.5, 1.5, 1.5, 1.495, 1.495, 1.495]
+        )
+        stop_ts = next((ts for ts in reasons if reasons[ts] == "stop"), None)
+        assert stop_ts is not None, f"no stop fired: {reasons}"
+
+    def test_target_emits_target_reason(self) -> None:
+        # Inverse of the stop test: a +12-pip move trips the 10-pip
+        # target (stop=5 doesn't fire on upward moves for a long).
+        spec = StrategySpec(
+            entry=EntryConditions(
+                long=Comparison(lhs=_ind("close"), cmp=">", rhs=1.0),
+            ),
+            exit=ExitRules(
+                stop_pips=5,
+                target_pips=10,
+                max_hold_bars=2880,
+                opposite_signal=False,
+            ),
+            size=SizeRules(risk_pct=0.005),
+        )
+        sig, reasons = self._drive(spec, close=[1.5, 1.5, 1.5, 1.5012, 1.5012, 1.5012])
+        target_ts = next((ts for ts in reasons if reasons[ts] == "target"), None)
+        assert target_ts is not None, f"no target fired: {reasons}"
+
+    def test_opposite_flip_emits_opposite_flip_reason(self) -> None:
+        # Long-then-short setup. opposite_signal=True flips at first
+        # bar where raw_pos = -1. Prices kept within ±400 pips of entry
+        # so the stop (max permitted = 400) can't pre-empt the flip.
+        spec = StrategySpec(
+            entry=EntryConditions(
+                long=Comparison(lhs=_ind("close"), cmp=">", rhs=1.5),
+                short=Comparison(lhs=_ind("close"), cmp="<", rhs=1.5),
+            ),
+            exit=ExitRules(
+                stop_pips=400,
+                target_pips=800,
+                max_hold_bars=2880,
+                opposite_signal=True,
+            ),
+            size=SizeRules(risk_pct=0.005),
+        )
+        # Move only 20 pips across the 1.5 threshold — well inside
+        # stop_pips=400, so opposite_flip is the only path that can
+        # close the long.
+        sig, reasons = self._drive(
+            spec, close=[1.501, 1.501, 1.501, 1.499, 1.499, 1.499]
+        )
+        flip_ts = next((ts for ts in reasons if reasons[ts] == "opposite_flip"), None)
+        assert flip_ts is not None, f"no opposite_flip captured: {reasons}"
+
+
 class TestExitEnforcement:
     """The compiler now enforces the exit block. Each test wires a
     controlled entry condition that fires once, then drives close-price

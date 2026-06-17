@@ -202,6 +202,17 @@ class TradeSignalPublic(BaseSchema):
     price: float
     pnl: float | None = None
     indicator_values: dict[str, float] | None = None
+    exit_reason: str | None = Field(
+        default=None,
+        description=(
+            "For exit signals only — which structural rule fired: "
+            "'stop' (stop_pips hit), 'target' (target_pips hit), "
+            "'max_hold' (held >= max_hold_bars), 'opposite_flip' "
+            "(opposite_signal=True and raw_pos flipped). None on entry "
+            "signals and on classic non-DSL strategies (which don't go "
+            "through the DSL exit walker)."
+        ),
+    )
 
 
 class TradeSignalList(BaseSchema):
@@ -242,6 +253,14 @@ class OptimizationTradePublic(BaseSchema):
     # Metadata
     duration_minutes: int
     position_size: int
+    exit_reason: str | None = Field(
+        default=None,
+        description=(
+            "Structural rule that closed the trade: 'stop' / 'target' "
+            "/ 'max_hold' / 'opposite_flip'. None on classic non-DSL "
+            "strategies. See TradeSignalPublic.exit_reason for details."
+        ),
+    )
 
 
 class OptimizationTradeList(BaseSchema):

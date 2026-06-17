@@ -140,6 +140,47 @@ describe('inferArchetype — v0.4.0 indicator expansion', () => {
   });
 });
 
+describe('summarizeDsl — "stays while" vs "goes when"', () => {
+  // State comparators (>, <, >=, <=) hold across many bars — the strategy
+  // STAYS in position while the condition is true. Crossover comparators
+  // are one-shot events — the strategy GOES into position when they fire.
+  // The verb in the rendered summary should reflect which one applies so
+  // the user reads "stays long while OBV > 0" (correct: continuous state)
+  // rather than "goes long when OBV > 0" (misleading: sounds eventful).
+  it('renders state-comparator long as "Stays long while ..."', () => {
+    const spec = buildSpec(
+      { lhs: { ind: 'obv', args: [] }, cmp: '>', rhs: 0 },
+      null,
+    );
+    expect(summarizeDsl(spec)).toMatch(/Stays long while obv is above 0/);
+    expect(summarizeDsl(spec)).not.toMatch(/Goes long when/);
+  });
+
+  it('renders state-comparator short as "Stays short while ..."', () => {
+    const spec = buildSpec(
+      null,
+      { lhs: { ind: 'rsi', args: [14] }, cmp: '>', rhs: 70 },
+    );
+    expect(summarizeDsl(spec)).toMatch(/Stays short while rsi\(14\) is above 70/);
+  });
+
+  it('renders crossover-comparator long as "Goes long when ..."', () => {
+    // crosses_above IS a one-shot event so "goes long when" is correct
+    // — no regression to "stays long while" for crossovers.
+    const spec = buildSpec(
+      {
+        lhs: { ind: 'macd_line', args: [12, 26] },
+        cmp: 'crosses_above',
+        rhs: { ind: 'macd_signal', args: [12, 26, 9] },
+      },
+      null,
+    );
+    const summary = summarizeDsl(spec);
+    expect(summary).toMatch(/Goes long when macd_line\(12, 26\) crosses above/);
+    expect(summary).not.toMatch(/Stays long while/);
+  });
+});
+
 describe('summarizeDsl — state vs event semantics', () => {
   // Before 2026-06-17 '>' / '<' rendered as "rises above" / "falls
   // below" which both imply transitions (one bar where the inequality

@@ -333,7 +333,31 @@ export default function StrategyChart({
         }
         const pips = sig.pnl != null ? sig.pnl * 10000 : exitPnl.get(sig.timestamp) ?? 0;
         const win = pips > 0;
-        return { time: toTime(sig.timestamp), position: 'aboveBar' as const, color: win ? '#22c55e' : '#ef4444', shape: 'circle' as const, text: pips !== 0 ? (win ? `+${pips.toFixed(0)}` : pips.toFixed(0)) : 'X', size: 1 };
+        // Annotate exit markers with the structural reason the
+        // compiler emitted (stop / target / max_hold / opposite_flip)
+        // — without this, an OBV-seed-style strategy looks like it
+        // fires "spurious" entries shortly after each exit because
+        // the user can't see WHY the position closed. Short labels
+        // (stp/tgt/mh/flip) so the marker text stays scannable.
+        const reasonAbbrev: Record<string, string> = {
+          stop: 'stp',
+          target: 'tgt',
+          max_hold: 'mh',
+          opposite_flip: 'flip',
+        };
+        const pnlText =
+          pips !== 0 ? (win ? `+${pips.toFixed(0)}` : pips.toFixed(0)) : 'X';
+        const exitText = sig.exitReason
+          ? `${pnlText} ${reasonAbbrev[sig.exitReason] ?? sig.exitReason}`
+          : pnlText;
+        return {
+          time: toTime(sig.timestamp),
+          position: 'aboveBar' as const,
+          color: win ? '#22c55e' : '#ef4444',
+          shape: 'circle' as const,
+          text: exitText,
+          size: 1,
+        };
       });
       markers.sort((a, b) => (a.time as number) - (b.time as number));
       candleRef.current.setMarkers(markers);

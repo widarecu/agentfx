@@ -516,6 +516,14 @@ def run_backtest_from_db(
     # for the stop/target/max_hold exit walker; classic ones ignore it.
     strat = make_strategy(strategy_name, pip_size=pip_size, **strategy_params)
     raw_signals = strat.generate_signals(df)
+    # DSL strategies expose `exit_reasons_by_ts` populated during
+    # generate_signals — bar timestamp → 'stop'/'target'/'max_hold'/
+    # 'opposite_flip'. Classic (MA/RSI/Donchian) strategies don't have
+    # exit walkers and produce no reasons. The chart marker UI shows
+    # the reason on each exit so users can tell "max_hold expired,
+    # re-entered" from "stop hit, re-entered" without re-deriving from
+    # prices (UAT 2026-06-17 OBV-seed confusion).
+    exit_reasons_by_ts: dict = getattr(strat, "exit_reasons_by_ts", {}) or {}
 
     # Apply policies
     pconf = PolicyConfig(
@@ -621,6 +629,9 @@ def run_backtest_from_db(
                                 indicator_values[col] = float(val)
 
                 # Determine signal type
+                exit_reason = (
+                    None  # Reset per iteration; only meaningful on exit signals
+                )
                 if prev_signal == 0 and signal_val != 0:
                     # Entry
                     signal_type = "entry_long" if signal_val > 0 else "entry_short"
@@ -633,6 +644,12 @@ def run_backtest_from_db(
                     # Exit (or flip — close current position first)
                     signal_type = "exit_long" if prev_signal > 0 else "exit_short"
                     exit_price = float(df.loc[timestamp, "close"])
+                    # Look up the structural reason the compiler emitted
+                    # for this exit so we can annotate both the signal
+                    # and trade rows. Missing key (e.g. policy-driven
+                    # exit emitted post-compiler by apply_policies) just
+                    # leaves it absent.
+                    exit_reason = exit_reasons_by_ts.get(timestamp)
 
                     # Calculate trade P&L
                     if entry_time is not None and entry_price is not None:
@@ -732,6 +749,7 @@ def run_backtest_from_db(
                                 / 60,
                                 "position_size": trade_units,
                                 "balance_after": current_balance + net_pnl_dollars,
+                                "exit_reason": exit_reason,
                             }
                         )
                         current_balance += net_pnl_dollars
@@ -748,6 +766,7 @@ def run_backtest_from_db(
                                 "signal_type": signal_type,
                                 "price": float(df.loc[timestamp, "close"]),
                                 "indicator_values": indicator_values,
+                                "exit_reason": exit_reason,
                             }
                         )
                         # Set up entry signal for the new position
@@ -766,6 +785,13 @@ def run_backtest_from_db(
                         "signal_type": signal_type,
                         "price": float(df.loc[timestamp, "close"]),
                         "indicator_values": indicator_values,
+                        # Only set on exit-shaped signals; entries leave
+                        # it as None (the field is always present in the
+                        # JSON so the frontend doesn't have to guard
+                        # `?? null` everywhere).
+                        "exit_reason": (
+                            exit_reason if signal_type.startswith("exit_") else None
+                        ),
                     }
                 )
 

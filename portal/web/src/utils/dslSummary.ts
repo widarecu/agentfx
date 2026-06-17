@@ -51,6 +51,18 @@ function isComparison(cond: DslCondition): cond is DslComparison {
   return cond != null && typeof cond === 'object' && 'cmp' in cond;
 }
 
+/**
+ * True if the top-level condition is a state comparator (>, <, >=, <=)
+ * — meaning the condition is "true on every bar where the inequality
+ * holds" rather than "true on the bar where it first holds". Drives
+ * verb choice ("stays while" vs "goes when") in summarizeDsl so users
+ * don't mistake a holding condition for a one-shot crossover trigger.
+ */
+function isStateComparator(cond: DslCondition | null | undefined): boolean {
+  if (!cond || !isComparison(cond)) return false;
+  return cond.cmp === '>' || cond.cmp === '<' || cond.cmp === '>=' || cond.cmp === '<=';
+}
+
 function summarizeCondition(cond: DslCondition | null | undefined): string | null {
   if (!cond) return null;
   if (isComparison(cond)) {
@@ -95,8 +107,24 @@ export function summarizeDsl(spec: DslSpec | null | undefined): string {
       `Degenerate: long and short conditions are identical (${longText ?? '—'}), so no trades fire.`,
     );
   } else {
-    if (longText) entryParts.push(`Goes long when ${longText}.`);
-    if (shortText) entryParts.push(`Goes short when ${shortText}.`);
+    // Verb choice reflects state vs event semantics. Top-level conditions
+    // that hinge on a state comparator (>, <, >=, <=) hold across many
+    // consecutive bars — "stays/holds long while X" is more accurate than
+    // "goes long when X" (which sounds like a one-shot event). Top-level
+    // conditions with `crosses_above` / `crosses_below` ARE one-shot
+    // events, so they keep the "goes long when" framing. The OBV-seed
+    // UAT confusion on 2026-06-17 came from "goes long when obv > 0"
+    // reading like a transition rather than a continuous state.
+    if (longText) {
+      const verb = isStateComparator(longCond) ? 'Stays long while' : 'Goes long when';
+      entryParts.push(`${verb} ${longText}.`);
+    }
+    if (shortText) {
+      const verb = isStateComparator(shortCond)
+        ? 'Stays short while'
+        : 'Goes short when';
+      entryParts.push(`${verb} ${shortText}.`);
+    }
   }
 
   const exit = spec.exit ?? {};

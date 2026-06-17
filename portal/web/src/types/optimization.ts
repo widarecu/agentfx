@@ -86,6 +86,13 @@ export interface TradeSignal {
   price: number;
   pnl?: number; // P&L for exit signals
   indicatorValues: Record<string, number>; // { fast_ma: 1.1220, slow_ma: 1.1200 }
+  // Structural exit reason for exit-shaped signals only. One of
+  // 'stop' / 'target' / 'max_hold' / 'opposite_flip'. Null on entry
+  // signals and on classic (non-DSL) strategies whose exits aren't
+  // tagged by the compiler. Surfaced on the chart marker so a user
+  // can distinguish "max_hold expired, re-entered" from "stop hit,
+  // re-entered" at a glance.
+  exitReason?: 'stop' | 'target' | 'max_hold' | 'opposite_flip' | null;
 }
 
 // Individual completed trade record
