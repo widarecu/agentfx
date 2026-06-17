@@ -11,6 +11,7 @@ import EvolutionRuns from './pages/EvolutionRuns'
 import EvolutionRunDetail from './pages/EvolutionRunDetail'
 import GenomeDetail from './pages/GenomeDetail'
 import GenomeBacktest from './pages/GenomeBacktest'
+import ChartGallery from './pages/ChartGallery'
 import { ProtectedRoute } from './components/ProtectedRoute'
 
 export const router = createBrowserRouter([
@@ -40,6 +41,11 @@ export const router = createBrowserRouter([
       { path: 'evolution/:runId', element: <EvolutionRunDetail /> },
       { path: 'evolution/:runId/genomes/:genomeId', element: <GenomeDetail /> },
       { path: 'evolution/:runId/genomes/:genomeId/backtest', element: <GenomeBacktest /> },
+      // Dev-only verification gallery — renders every canonical seed
+      // strategy on the same candle window so every indicator's chart
+      // routing / tooltip / archetype can be visually swept at once.
+      // Not linked from the nav; reach via /dev/chart-gallery.
+      { path: 'dev/chart-gallery', element: <ChartGallery /> },
     ],
   },
 ], {
