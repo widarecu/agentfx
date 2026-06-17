@@ -289,14 +289,44 @@ export default function StrategyChart({
         const isEntry = sig.signalType.startsWith('entry');
         const isLong = sig.signalType.includes('long');
         if (isEntry) {
-          // Annotate the entry marker with the current value of whichever
-          // oscillator-family indicator the signal carried (rsi/stoch/adx).
-          const osc = Object.entries(sig.indicatorValues ?? {}).find(([k]) => {
-            const lower = k.toLowerCase();
-            return OSCILLATOR_NAMES.some((name) => lower.startsWith(name));
-          });
+          // Annotate the entry marker with whichever indicator carried
+          // the trigger value the backend recorded against this signal.
+          // `indicatorValues` is captured at the SIGNAL bar (one bar
+          // before the entry bar — the no-lookahead shift in
+          // src/agentfx/core/dsl/compiler.py:317), so what shows here
+          // is exactly the value the spec evaluated to fire the trade.
+          //
+          // Skip `close` because it's just price (already on the chart
+          // axis) and prefer non-price-scale indicators that the user
+          // actually needs the value of to verify the trigger
+          // (oscillators, MACD, OBV). Falls back to whatever first
+          // entry exists.
+          const allValues = Object.entries(sig.indicatorValues ?? {});
+          const nonClose = allValues.filter(([k]) => k.toLowerCase() !== 'close');
+          // Prefer the most-diagnostic indicator family in order:
+          // oscillator → off-scale → first-available. For an OBV
+          // genome this picks OBV; for RSI it picks RSI; for an MA
+          // crossover it picks whichever MA was captured first.
+          const pick =
+            nonClose.find(([k]) => classifyIndicator(k) === 'oscillator') ??
+            nonClose.find(([k]) => classifyIndicator(k) === 'off_scale') ??
+            nonClose[0];
           const label = isLong ? 'L' : 'S';
-          const text = osc ? `${label} ${Number(osc[1]).toFixed(0)}` : label;
+          // Magnitude-aware formatting: OBV is thousands → integer
+          // with thousands-separator; MACD is ±0.001 → 4dp; everything
+          // else → 1dp (RSI 67.4, SMA 1.0850).
+          let text = label;
+          if (pick) {
+            const v = Number(pick[1]);
+            const abs = Math.abs(v);
+            const formatted =
+              abs >= 1000
+                ? Math.round(v).toLocaleString()
+                : abs < 0.01
+                  ? v.toFixed(4)
+                  : v.toFixed(1);
+            text = `${label} ${formatted}`;
+          }
           const position: 'belowBar' | 'aboveBar' = isLong ? 'belowBar' : 'aboveBar';
           const shape: 'arrowUp' | 'arrowDown' = isLong ? 'arrowUp' : 'arrowDown';
           return { time: toTime(sig.timestamp), position, color: isLong ? '#22c55e' : '#ef4444', shape, text, size: 1 };

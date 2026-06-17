@@ -13,9 +13,18 @@
 
 import type { DslSpec, DslCondition, DslComparison, DslExpr } from '../types/evolution';
 
+// State vs. event semantics matters here: '>' and '<' are *state*
+// comparisons (true on every bar where the inequality holds), not
+// transition events (only true on the bar where they first become so).
+// Earlier wording rendered '>' as "rises above" / '<' as "falls below"
+// which both imply transitions — that misled the UAT 2026-06-17 read
+// of the OBV seed ("Goes short when obv falls below 0") into expecting
+// short trades on every zero-crossing when actually the strategy stays
+// short for every bar where obv < 0. Use "is above" / "is below" to
+// match the actual semantics.
 const COMPARATOR_PHRASES: Record<DslComparison['cmp'], string> = {
-  '>': 'rises above',
-  '<': 'falls below',
+  '>': 'is above',
+  '<': 'is below',
   '>=': 'is at or above',
   '<=': 'is at or below',
   crosses_above: 'crosses above',

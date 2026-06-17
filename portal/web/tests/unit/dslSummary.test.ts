@@ -140,6 +140,46 @@ describe('inferArchetype — v0.4.0 indicator expansion', () => {
   });
 });
 
+describe('summarizeDsl — state vs event semantics', () => {
+  // Before 2026-06-17 '>' / '<' rendered as "rises above" / "falls
+  // below" which both imply transitions (one bar where the inequality
+  // first becomes true). The actual operator is a STATE check (every
+  // bar where the inequality holds). The misleading wording made the
+  // user read the OBV seed's summary as "shorts on every zero-cross"
+  // when actually it's "long while OBV > 0, short while OBV < 0".
+  it('renders > as a state ("is above"), not a transition', () => {
+    const spec = buildSpec(
+      { lhs: { ind: 'obv', args: [] }, cmp: '>', rhs: 0 },
+      null,
+    );
+    expect(summarizeDsl(spec)).toMatch(/obv is above 0/);
+    expect(summarizeDsl(spec)).not.toMatch(/rises above/);
+  });
+
+  it('renders < as a state ("is below"), not a transition', () => {
+    const spec = buildSpec(
+      null,
+      { lhs: { ind: 'obv', args: [] }, cmp: '<', rhs: 0 },
+    );
+    expect(summarizeDsl(spec)).toMatch(/obv is below 0/);
+    expect(summarizeDsl(spec)).not.toMatch(/falls below/);
+  });
+
+  it('keeps crosses_above as a transition phrase', () => {
+    // crosses_above IS a transition event (lhs[t-1] <= rhs[t-1] and
+    // lhs[t] > rhs[t]) — the wording correctly reflects that.
+    const spec = buildSpec(
+      {
+        lhs: { ind: 'macd_line', args: [12, 26] },
+        cmp: 'crosses_above',
+        rhs: { ind: 'macd_signal', args: [12, 26, 9] },
+      },
+      null,
+    );
+    expect(summarizeDsl(spec)).toMatch(/crosses above/);
+  });
+});
+
 describe('summarizeDsl — defensive against missing args', () => {
   // The Pydantic backend always serialises zero-arg indicators with
   // `args: []`, but hand-authored JSON literals (in the chart gallery
@@ -199,7 +239,7 @@ describe('summarizeDsl — v0.4.0 indicators render in plain English', () => {
       { lhs: ind('stoch', [14, 3]), cmp: '<', rhs: 20 },
       null,
     );
-    expect(summarizeDsl(spec)).toMatch(/stoch\(14, 3\) falls below 20/);
+    expect(summarizeDsl(spec)).toMatch(/stoch\(14, 3\) is below 20/);
   });
 
   it('renders ichimoku tenkan/kijun cross with explicit windows', () => {

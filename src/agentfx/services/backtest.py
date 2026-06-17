@@ -900,6 +900,90 @@ def _get_indicator_values(
     """
     strategy_name = strategy_name.lower()
 
+    if strategy_name == "dsl":
+        # Walk the spec's entry conditions, collect every unique
+        # IndicatorCall, and evaluate each into its own column. This is
+        # what lets the trade-marker UI show the value that actually
+        # triggered the trade (`indicator_values` dict on each signal
+        # row, captured at the signal bar one step before the trade
+        # bar — see the `signal_bar_idx = ts_idx - 1` walk above).
+        #
+        # Without this branch, every DSL-strategy trade signal carries
+        # an empty indicator_values dict, so the chart marker has
+        # nothing to display — users cannot read off what RSI/OBV/MACD
+        # was when the trade fired, and can't easily verify alignment
+        # between trade markers and the indicator line. UAT 2026-06-17.
+        try:
+            from agentfx.core.dsl import StrategySpec
+            from agentfx.core.dsl.grammar import (
+                AndCondition,
+                Comparison,
+                IndicatorCall,
+                OrCondition,
+            )
+            from agentfx.core.dsl.indicators import evaluate_indicator
+        except ImportError:
+            return None
+
+        spec_data = strategy_params.get("spec")
+        if spec_data is None:
+            return None
+        try:
+            spec = (
+                spec_data
+                if isinstance(spec_data, StrategySpec)
+                else StrategySpec.model_validate(spec_data)
+            )
+        except Exception:
+            return None
+
+        # Deduplicate by (ind name, args tuple) so e.g. an spec that
+        # uses sma(20) on both long and short branches yields one
+        # `sma(20)` column instead of two.
+        seen: dict[tuple[str, tuple[float, ...]], IndicatorCall] = {}
+
+        def visit(node: object) -> None:
+            if isinstance(node, IndicatorCall):
+                key = (node.ind, tuple(node.args))
+                seen.setdefault(key, node)
+            elif isinstance(node, Comparison):
+                visit(node.lhs)
+                visit(node.rhs)
+            elif isinstance(node, (AndCondition, OrCondition)):
+                for sub in node.args:
+                    visit(sub)
+
+        if spec.entry.long is not None:
+            visit(spec.entry.long)
+        if spec.entry.short is not None:
+            visit(spec.entry.short)
+        if not seen:
+            return None
+
+        columns: dict[str, pd.Series] = {}
+        for call in seen.values():
+            # Column label mirrors the JS labelFor() in
+            # portal/web/src/utils/dslIndicators.ts so the chart's
+            # marker-text lookup (which match by indicator-name prefix)
+            # finds these keys. Format float args as ints when whole-
+            # numbered to match the JS Number.toString() behaviour.
+            if not call.args:
+                label = call.ind
+            else:
+                args_str = ", ".join(
+                    str(int(a)) if a == int(a) else str(a) for a in call.args
+                )
+                label = f"{call.ind}({args_str})"
+            try:
+                columns[label] = evaluate_indicator(df, call.ind, list(call.args))
+            except Exception:
+                # Visualisation is best-effort — one bad indicator
+                # column shouldn't drop the whole capture.
+                continue
+        if not columns:
+            return None
+        return pd.DataFrame(columns, index=df.index)
+
     if strategy_name in ("ma", "mac", "ma_crossover", "macrossover"):
         fast = int(strategy_params.get("fast", 20))
         slow = int(strategy_params.get("slow", 50))
