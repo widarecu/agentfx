@@ -415,8 +415,22 @@ function CreateRunModal({
   }, [instrument]);
   // Numeric inputs are stored as strings so editing behaves naturally
   // (clear → type, no leading-zero stickiness, no jump-back-to-min). They
-  // are parsed and validated at submit time. Defaults match the
-  // OrchestratorConfigSchema defaults.
+  // are parsed and validated at submit time.
+  //
+  // Defaults are pinned to staging's "canonical config" — 2-year EUR_USD
+  // window with 15% CAGR floor, leverage 50, spread 0.8. This is the
+  // rubric every recent run has used; defaulting the form to it means
+  // the new run's evaluation rubric matches prior runs' rubrics, so
+  // `find_prior_winners` (config-match filter) actually finds warm-start
+  // candidates instead of falling back to canonical seeds because no
+  // prior run had a matching `effective_data_window_*` + `min_cagr_pct`.
+  //
+  // Background: 2026-06-17 the picker was fixed to filter prior winners
+  // by matching evaluation rubric (cross-config fitness comparison was
+  // invalid). The filter only helps if the user doesn't fiddle with the
+  // form's window/CAGR/leverage/spread fields per run; these defaults
+  // codify that — pick "Start new run" with no changes and you're
+  // guaranteed to inherit prior winners. Override to explore variants.
   const [populationSizeStr, setPopulationSizeStr] = useState('30');
   const [maxGenerationsStr, setMaxGenerationsStr] = useState('30');
   const [targetFitnessStr, setTargetFitnessStr] = useState('1.5');
@@ -426,32 +440,37 @@ function CreateRunModal({
   // saves 30 generations of compute on doomed runs.
   const [autoStopOnRegimeMismatch, setAutoStopOnRegimeMismatch] = useState(false);
   const [llmBudgetUsdStr, setLlmBudgetUsdStr] = useState('5.0');
-  const [leverage, setLeverage] = useState<30 | 50>(30);
+  // Default 50 (form-only override of the schema's 30) to match the
+  // canonical config. OANDA retail allows 30:1 majors / 50:1 some
+  // jurisdictions; 50 is what the staging exploration runs use.
+  const [leverage, setLeverage] = useState<30 | 50>(50);
   const [minCagrPctStr, setMinCagrPctStr] = useState('15'); // % per year — Gate B floor
-  // Empty string = "use live OANDA snapshot from instruments table"; a
-  // number = pin that exact spread for the whole run. Pinning makes
-  // results reproducible across container rebuilds (which re-fetch the
-  // live spread and would otherwise silently shift the cost model).
-  const [spreadPipsStr, setSpreadPipsStr] = useState('');
+  // Pin to 0.8 pips (the OANDA EUR_USD typical-spread baseline) so
+  // every run's cost model is identical and reproducible across
+  // container rebuilds. Empty string would mean "use live snapshot",
+  // which drifts as the snapshot refreshes; for canonical-config
+  // consistency we pin.
+  const [spreadPipsStr, setSpreadPipsStr] = useState('0.8');
   // Optional RNG seed for the GA. Blank = "let the worker pick a fresh
   // random seed and persist it on the row" (the recommended default —
   // hardcoded seeds were causing independent runs to deterministically
   // converge on the same winner). Pin a numeric value to reproduce a
   // specific past run.
   const [rngSeedStr, setRngSeedStr] = useState('');
-  // Data window is always explicit start + end (UTC midnight). Removed
-  // the legacy "Data years" rolling-window mode in favour of a single,
-  // unambiguous control: by always pinning the window the run is
-  // reproducible weeks later (no `now()` reference in the math) and the
-  // form has one less moving part.
-  const isoToday = new Date().toISOString().slice(0, 10);
-  const isoFiveYearsAgo = new Date(
-    Date.now() - 5 * 365 * 24 * 3600 * 1000,
-  )
-    .toISOString()
-    .slice(0, 10);
-  const [dataStartStr, setDataStartStr] = useState(isoFiveYearsAgo);
-  const [dataEndStr, setDataEndStr] = useState(isoToday);
+  // Data window pinned to the canonical 2-year staging window
+  // 2023-07-01 → 2025-07-01. Hardcoded dates rather than a rolling
+  // "last N years" calculation — rolling drifts daily, which would
+  // fragment the warm-start candidate pool: each new run would only
+  // match prior runs started on the exact same calendar day. Pinned
+  // dates mean every run within this config block has the same
+  // `effective_data_window_*` and therefore inherits prior winners.
+  //
+  // When this window ages (data starts to feel stale, OANDA backfill
+  // extends), bump both dates here AND accept that the picker will
+  // transitionally find no matching prior runs until you complete a
+  // new run on the bumped window. Document the bump in the commit.
+  const [dataStartStr, setDataStartStr] = useState('2023-07-01');
+  const [dataEndStr, setDataEndStr] = useState('2025-07-01');
 
   return (
     <div
@@ -728,7 +747,7 @@ function CreateRunModal({
           <div className="grid grid-cols-2 gap-4">
             <Field
               label="Spread (pips)"
-              hint="Blank = live OANDA snapshot. Pin a number to make this run reproducible across rebuilds."
+              hint="Defaults to 0.8 (canonical EUR_USD spread, keeps cost model identical across runs so warm-start can compare fitness). Blank = live OANDA snapshot."
             >
               <input
                 type="number"
