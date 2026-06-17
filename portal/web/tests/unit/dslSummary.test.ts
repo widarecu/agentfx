@@ -140,6 +140,35 @@ describe('inferArchetype — v0.4.0 indicator expansion', () => {
   });
 });
 
+describe('summarizeDsl — defensive against missing args', () => {
+  // The Pydantic backend always serialises zero-arg indicators with
+  // `args: []`, but hand-authored JSON literals (in the chart gallery
+  // page, in tests, in docs) sometimes omit the field. The summariser
+  // must not crash on that shape — the gallery did, with
+  // `Cannot read properties of undefined (reading 'length')`, on
+  // 2026-06-17 when viewing the BB/Donchian/OBV seed sections.
+  it('does not crash when an indicator omits the args field', () => {
+    const spec = buildSpec(
+      { lhs: { ind: 'obv' } as unknown as ReturnType<typeof ind>, cmp: '>', rhs: 0 },
+      null,
+    );
+    // Should render "obv" (the zero-arg case), not throw.
+    expect(summarizeDsl(spec)).toMatch(/\bobv\b/);
+  });
+
+  it('does not crash when close is referenced without an args field', () => {
+    const spec = buildSpec(
+      {
+        lhs: { ind: 'close' } as unknown as ReturnType<typeof ind>,
+        cmp: '>',
+        rhs: { ind: 'donchian_high', args: [20] },
+      },
+      null,
+    );
+    expect(summarizeDsl(spec)).toMatch(/close.*donchian_high\(20\)/);
+  });
+});
+
 describe('summarizeDsl — v0.4.0 indicators render in plain English', () => {
   it('renders MACD line/signal crossover', () => {
     const spec = buildSpec(

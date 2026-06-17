@@ -25,9 +25,15 @@ const COMPARATOR_PHRASES: Record<DslComparison['cmp'], string> = {
 function summarizeExpr(expr: DslExpr): string {
   if (typeof expr === 'number') return expr.toString();
   if (typeof expr === 'object' && expr !== null && 'ind' in expr) {
-    const ind = expr as { ind: string; args: number[] };
-    if (ind.ind === 'close' || ind.args.length === 0) return ind.ind;
-    return `${ind.ind}(${ind.args.join(', ')})`;
+    const ind = expr as { ind: string; args?: number[] };
+    // `args` is optional in the JSON shape — backend Pydantic produces
+    // `args: []` for zero-arg indicators (close, obv) but hand-authored
+    // JSON sometimes omits the field. Defaulting to [] keeps both paths
+    // working and avoids the .length-on-undefined crash that took down
+    // the chart gallery on 2026-06-17.
+    const args = ind.args ?? [];
+    if (ind.ind === 'close' || args.length === 0) return ind.ind;
+    return `${ind.ind}(${args.join(', ')})`;
   }
   return JSON.stringify(expr);
 }

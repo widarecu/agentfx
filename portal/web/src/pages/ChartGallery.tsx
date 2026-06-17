@@ -121,12 +121,12 @@ const SEED_GALLERY: SeedEntry[] = [
       version: 1,
       entry: {
         long: {
-          lhs: { ind: 'close' },
+          lhs: { ind: 'close', args: [] },
           cmp: '<',
           rhs: { ind: 'bb_lower', args: [20, 2.0] },
         },
         short: {
-          lhs: { ind: 'close' },
+          lhs: { ind: 'close', args: [] },
           cmp: '>',
           rhs: { ind: 'bb_upper', args: [20, 2.0] },
         },
@@ -142,12 +142,12 @@ const SEED_GALLERY: SeedEntry[] = [
       version: 1,
       entry: {
         long: {
-          lhs: { ind: 'close' },
+          lhs: { ind: 'close', args: [] },
           cmp: '>',
           rhs: { ind: 'donchian_high', args: [20] },
         },
         short: {
-          lhs: { ind: 'close' },
+          lhs: { ind: 'close', args: [] },
           cmp: '<',
           rhs: { ind: 'donchian_low', args: [20] },
         },
@@ -196,8 +196,8 @@ const SEED_GALLERY: SeedEntry[] = [
     spec: {
       version: 1,
       entry: {
-        long: { lhs: { ind: 'obv' }, cmp: '>', rhs: 0 },
-        short: { lhs: { ind: 'obv' }, cmp: '<', rhs: 0 },
+        long: { lhs: { ind: 'obv', args: [] }, cmp: '>', rhs: 0 },
+        short: { lhs: { ind: 'obv', args: [] }, cmp: '<', rhs: 0 },
       },
       exit: PERMISSIVE_EXIT,
       size: DEFAULT_SIZE,
