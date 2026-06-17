@@ -833,3 +833,175 @@ class TestFindPriorWinners:
         # Only one unique spec → exactly one row → highest fitness wins
         assert len(rows) == 1
         assert rows[0]["fitness"] == pytest.approx(-0.5)
+
+
+class TestFindPriorWinnersConfigMatch:
+    """Cross-config fitness comparison guard — staging 2026-06-17.
+
+    A run that scored fitness under one evaluation rubric (e.g. 1 year
+    of data, min_cagr_pct=0.10) is not directly comparable to a run
+    under a different rubric (2 years, min_cagr_pct=0.15). Without
+    filtering by config, the picker chases ghosts: every new run keeps
+    warm-starting from the loosest prior run's "winners" even when
+    they re-evaluate to deeply negative fitness on the new run's harder
+    rubric. The filter ensures only runs scored under the SAME rubric
+    contribute warm-start candidates.
+    """
+
+    def _run_with_config(
+        self,
+        db: Session,
+        *,
+        data_window_start: str,
+        data_window_end: str,
+        min_cagr_pct: float,
+        instrument: str = "EUR_USD",
+        granularity: str = "M1",
+    ) -> models.EvolutionRun:
+        """Create a completed run whose config_json carries the given
+        eval-rubric fields. Uses raw model construction since
+        create_run's schema layer doesn't expose effective_* fields
+        (those are populated by the worker at run-start)."""
+        run = evolution_service.create_run(
+            db,
+            schemas.EvolutionRunCreate(instrument=instrument, granularity=granularity),
+        )
+        run.status = models.EvolutionRunStatus.COMPLETED
+        # Match the field names the picker queries via
+        # config_json["..."].astext — these mirror what
+        # evolution_runner.py writes at run-start.
+        cfg = dict(run.config_json or {})
+        cfg["effective_data_window_start"] = data_window_start
+        cfg["effective_data_window_end"] = data_window_end
+        cfg["min_cagr_pct"] = min_cagr_pct
+        run.config_json = cfg
+        # SQLAlchemy doesn't track in-place mutations of JSON columns —
+        # mark dirty so the change persists.
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(run, "config_json")
+        db.commit()
+        return run
+
+    def _seed_unique_genome(
+        self,
+        db: Session,
+        *,
+        run: models.EvolutionRun,
+        fitness: float,
+        idx: int,
+    ) -> None:
+        gen_id = f"{run.id}_gen_000"
+        existing = db.get(models.Generation, gen_id)
+        if existing is None:
+            db.add(models.Generation(id=gen_id, run_id=run.id, index=0))
+            db.commit()
+        spec = MA_CROSSOVER_SEED.model_dump(mode="json")
+        # Make each idx structurally unique so dedup doesn't collapse
+        # them — picker would otherwise see only one row.
+        spec["entry"]["long"]["lhs"]["args"] = [10.0 + idx]
+        spec["entry"]["short"]["lhs"]["args"] = [10.0 + idx]
+        from agentfx.api.models import GenomeOrigin
+
+        db.add(
+            models.StrategyGenome(
+                id=f"genome_{run.id}_000_{idx:03d}",
+                generation_id=gen_id,
+                dsl_json=spec,
+                origin=GenomeOrigin.SEED,
+                fitness=fitness,
+            )
+        )
+        db.commit()
+
+    def test_filter_excludes_runs_with_different_data_window(self, db: Session) -> None:
+        # Run A scored against a 1-year window. Run B against 2 years.
+        # When asking for prior winners under the 2-year rubric, only
+        # Run B's genomes should qualify even though Run A has higher
+        # raw fitness (which it would, since smaller windows yield
+        # easier-to-fit Sharpe numbers).
+        run_a = self._run_with_config(
+            db,
+            data_window_start="2023-07-01T00:00:00+00:00",
+            data_window_end="2024-07-01T00:00:00+00:00",
+            min_cagr_pct=0.15,
+        )
+        run_b = self._run_with_config(
+            db,
+            data_window_start="2023-07-01T00:00:00+00:00",
+            data_window_end="2025-07-01T00:00:00+00:00",
+            min_cagr_pct=0.15,
+        )
+        self._seed_unique_genome(db, run=run_a, fitness=1.5, idx=0)  # higher
+        self._seed_unique_genome(db, run=run_b, fitness=0.4, idx=1)  # lower
+
+        rows = evolution_service.find_prior_winners(
+            db,
+            instrument="EUR_USD",
+            granularity="M1",
+            limit=3,
+            data_window_start=datetime.fromisoformat("2023-07-01T00:00:00+00:00"),
+            data_window_end=datetime.fromisoformat("2025-07-01T00:00:00+00:00"),
+            min_cagr_pct=0.15,
+        )
+        assert len(rows) == 1
+        assert rows[0]["source_run_id"] == run_b.id
+        assert rows[0]["fitness"] == pytest.approx(0.4)
+
+    def test_filter_excludes_runs_with_different_min_cagr(self, db: Session) -> None:
+        # Same data window, different min_cagr_pct. Run with looser
+        # 0.10 threshold can produce a higher fitness for a genome
+        # that wouldn't clear 0.15 — it must be excluded.
+        run_loose = self._run_with_config(
+            db,
+            data_window_start="2023-07-01T00:00:00+00:00",
+            data_window_end="2025-07-01T00:00:00+00:00",
+            min_cagr_pct=0.10,
+        )
+        run_strict = self._run_with_config(
+            db,
+            data_window_start="2023-07-01T00:00:00+00:00",
+            data_window_end="2025-07-01T00:00:00+00:00",
+            min_cagr_pct=0.15,
+        )
+        self._seed_unique_genome(db, run=run_loose, fitness=1.5, idx=0)
+        self._seed_unique_genome(db, run=run_strict, fitness=0.4, idx=1)
+
+        rows = evolution_service.find_prior_winners(
+            db,
+            instrument="EUR_USD",
+            granularity="M1",
+            limit=3,
+            data_window_start=datetime.fromisoformat("2023-07-01T00:00:00+00:00"),
+            data_window_end=datetime.fromisoformat("2025-07-01T00:00:00+00:00"),
+            min_cagr_pct=0.15,
+        )
+        assert len(rows) == 1
+        assert rows[0]["source_run_id"] == run_strict.id
+
+    def test_no_config_args_preserves_legacy_behaviour(self, db: Session) -> None:
+        # Without config args, the picker behaves as before: all
+        # completed runs match. Required for legacy callers and tests
+        # that don't care about config-match.
+        run_a = self._run_with_config(
+            db,
+            data_window_start="2023-07-01T00:00:00+00:00",
+            data_window_end="2024-07-01T00:00:00+00:00",
+            min_cagr_pct=0.10,
+        )
+        run_b = self._run_with_config(
+            db,
+            data_window_start="2023-07-01T00:00:00+00:00",
+            data_window_end="2025-07-01T00:00:00+00:00",
+            min_cagr_pct=0.15,
+        )
+        self._seed_unique_genome(db, run=run_a, fitness=1.5, idx=0)
+        self._seed_unique_genome(db, run=run_b, fitness=0.4, idx=1)
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        # Both runs included; highest fitness wins ordering
+        assert len(rows) == 2
+        assert rows[0]["fitness"] == pytest.approx(1.5)
+        assert rows[1]["fitness"] == pytest.approx(0.4)

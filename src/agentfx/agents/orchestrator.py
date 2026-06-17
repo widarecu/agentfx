@@ -228,8 +228,16 @@ class EvolutionStatePersister(Protocol):
         granularity: str,
         limit: int,
         exclude_run_id: str | None = None,
+        data_window_start: datetime | None = None,
+        data_window_end: datetime | None = None,
+        min_cagr_pct: float | None = None,
     ) -> list[dict]:
         """Return top-K genomes from completed runs matching the pair/timeframe.
+
+        The `data_window_*` and `min_cagr_pct` args narrow the candidate
+        pool to runs that scored fitness under the SAME evaluation
+        rubric — without them, cross-config fitness numbers are not
+        comparable and the picker chases ghosts (staging 2026-06-17).
 
         Each dict has keys: `id`, `dsl_json`, `fitness`,
         `source_run_id`. Returns an empty list if no prior winners
@@ -492,11 +500,23 @@ class OrchestratorAgent(BaseAgent):
 
         if self.config.use_prior_winners and self.config.n_prior_winners > 0:
             try:
+                # Pass the current run's evaluation rubric so the picker
+                # only considers runs scored under the SAME rules.
+                # Without this, a run with a looser config (e.g. shorter
+                # data window or lower min_cagr_pct) can produce a high
+                # fitness number that the picker keeps re-selecting even
+                # though that genome scores deeply negative under the
+                # current run's harder rules — staging 2026-06-17 found
+                # every new run starting from a Run-1 elite that
+                # re-evaluated to fitness ≈ −1.4.
                 prior = self.persister.find_prior_winners(
                     instrument=self.config.instrument,
                     granularity=self.config.granularity,
                     limit=self.config.n_prior_winners,
                     exclude_run_id=self.run_id,
+                    data_window_start=self.data_window[0],
+                    data_window_end=self.data_window[1],
+                    min_cagr_pct=self.config.min_cagr_pct,
                 )
             except Exception as e:
                 logger.warning(
