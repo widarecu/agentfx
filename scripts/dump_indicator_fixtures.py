@@ -61,7 +61,7 @@ def synthesize_candles(n_bars: int = 240) -> pd.DataFrame:
     # ISO-8601 minute-resolution timestamps — what the chart consumes.
     timestamps = pd.date_range("2026-01-01T00:00:00Z", periods=n_bars, freq="1min")
 
-    return pd.DataFrame(
+    df = pd.DataFrame(
         {
             "timestamp": [t.isoformat().replace("+00:00", "Z") for t in timestamps],
             "open": open_,
@@ -71,6 +71,17 @@ def synthesize_candles(n_bars: int = 240) -> pd.DataFrame:
             "volume": volume.astype(float),
         }
     )
+    # Quantize every OHLCV column to absorb last-bit ULP drift across
+    # platforms (macOS Accelerate vs Linux OpenBLAS — observed ~1e-13
+    # diffs from np.sin and rng.normal on different blas builds).
+    # Rounding HERE (in the synthesizer) rather than at serialize time
+    # means both the Python indicator computation and the JS indicator
+    # computation operate on identical rounded inputs — implementation
+    # drift between them is then the only source of disagreement, and
+    # that's bounded well under the parity test's tolerance.
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].round(_FIXTURE_DECIMAL_PRECISION)
+    return df
 
 
 # Each tuple: (indicator name, positional args, label used in the JS test)
@@ -104,6 +115,29 @@ INDICATOR_CASES: list[tuple[str, list[float], str]] = [
 ]
 
 
+# Round serialised values to this many decimal digits before writing the
+# fixture JSON. Reason: the staleness guard in CI (`make verify-fixtures`
+# = re-dump + `git diff --exit-code`) treats the JSON file as exact, but
+# the underlying numpy/pandas float math has last-bit ULP differences
+# across platforms (e.g. macOS Accelerate vs Linux OpenBLAS, or numpy
+# 1.26 vs 1.27). Without rounding, a fixture generated on macOS and
+# committed produces 17th-decimal-place diffs when regenerated on the
+# Ubuntu CI runner — see PR #10 first CI failure. Rounding to 10 decimals
+# (1e-10) is one order of magnitude tighter than the JS parity test's
+# default 1e-9 tolerance, and the candle synthesizer applies the same
+# rounding to the OHLCV columns BEFORE indicator computation so Python
+# and JS both work on identical rounded inputs. Implementation drift
+# between Python and JS indicator code is then the only source of
+# disagreement, and that's bounded well under 1e-9 for every indicator
+# we ship today.
+_FIXTURE_DECIMAL_PRECISION = 10
+
+
+def _quantize(v: float) -> float:
+    """Strip platform-level ULP drift from a serialised float."""
+    return round(float(v), _FIXTURE_DECIMAL_PRECISION)
+
+
 def serialize_series(timestamps: list[str], series: pd.Series) -> list[dict]:
     """Convert (ts, series) pairs into [{ts, value}] dropping NaN.
 
@@ -118,7 +152,7 @@ def serialize_series(timestamps: list[str], series: pd.Series) -> list[dict]:
             continue
         if isinstance(v, float) and math.isnan(v):
             continue
-        out.append({"ts": ts, "value": float(v)})
+        out.append({"ts": ts, "value": _quantize(v)})
     return out
 
 
@@ -129,11 +163,11 @@ def main() -> None:
     candles = [
         {
             "timestamp": row.timestamp,
-            "open": float(row.open),
-            "high": float(row.high),
-            "low": float(row.low),
-            "close": float(row.close),
-            "volume": float(row.volume),
+            "open": _quantize(row.open),
+            "high": _quantize(row.high),
+            "low": _quantize(row.low),
+            "close": _quantize(row.close),
+            "volume": _quantize(row.volume),
         }
         for row in df.itertuples(index=False)
     ]
