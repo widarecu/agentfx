@@ -76,7 +76,12 @@ def _walk_condition(cond: Condition, visit) -> None:
         for sub in cond.args:
             _walk_condition(sub, visit)
     else:
-        raise CompilerError(f"unknown condition type: {type(cond).__name__}")
+        # Defensive — grammar only constructs Comparison / AndCondition /
+        # OrCondition. Marked unreachable for the same reason as line 150
+        # and lines 164-166 below.
+        raise CompilerError(
+            f"unknown condition type: {type(cond).__name__}"
+        )  # pragma: no cover
 
 
 def _validate_entry(entry: EntryConditions) -> None:
@@ -176,7 +181,7 @@ def _apply_exits(
     close: np.ndarray,
     exit_rules: ExitRules,
     pip_size: float,
-) -> np.ndarray:
+) -> tuple[np.ndarray, dict[int, str]]:
     """Walk bars with state and apply DSL exit rules to a raw position
     series.
 
@@ -202,9 +207,18 @@ def _apply_exits(
     opposite. Same-bar exit + re-entry in the *same* direction is
     blocked (the `continue` skips the entry block on the exit bar) —
     same-bar opposite flip is allowed when `opposite_signal=True`.
+
+    Returns (signals, exit_reasons) where exit_reasons maps the bar
+    index at which an exit fired to one of the four reason codes:
+    'stop' / 'target' / 'max_hold' / 'opposite_flip'. The reason
+    map is what the trade-marker UI displays alongside each exit so
+    the user can tell "max_hold expired, re-entered" from "stop hit,
+    re-entered" without re-deriving from prices — UAT 2026-06-17
+    OBV-seed confusion stemmed from the absence of this signal.
     """
     n = len(raw_pos)
     final = np.zeros(n, dtype=np.int8)
+    exit_reasons: dict[int, str] = {}
     in_position = 0
     entry_close = 0.0
     entry_bar = -1
@@ -239,14 +253,17 @@ def _apply_exits(
                 # so extract_closed_trades records exit_price = close[t].
                 final[t] = 0
                 in_position = 0
+                exit_reasons[t] = "stop"
                 continue
             if move_pips >= target_pips:
                 final[t] = 0
                 in_position = 0
+                exit_reasons[t] = "target"
                 continue
             if bars_held >= max_hold:
                 final[t] = 0
                 in_position = 0
+                exit_reasons[t] = "max_hold"
                 continue
             if flip_on_opposite and raw_pos[t] == -in_position:
                 # Close current, open new in same bar — same as the
@@ -256,6 +273,7 @@ def _apply_exits(
                 in_position = int(raw_pos[t])
                 entry_close = float(close[t])
                 entry_bar = t
+                exit_reasons[t] = "opposite_flip"
                 continue
 
             # No exit triggered — hold.
@@ -270,7 +288,7 @@ def _apply_exits(
             final[t] = in_position
         # else: stay flat, final[t] is already 0.
 
-    return final
+    return final, exit_reasons
 
 
 class CompiledDSLStrategy(Strategy):
@@ -292,6 +310,11 @@ class CompiledDSLStrategy(Strategy):
     def __init__(self, spec: StrategySpec, pip_size: float) -> None:
         self.spec = spec
         self.pip_size = float(pip_size)
+        # Populated by generate_signals; maps timestamp → exit reason
+        # for callers (the backtest engine) that need it to annotate
+        # each closed trade / exit signal. Per-instance state because
+        # we call generate_signals once per backtest invocation.
+        self.exit_reasons_by_ts: dict[pd.Timestamp, str] = {}
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         cache: dict[tuple, pd.Series] = {}
@@ -315,7 +338,15 @@ class CompiledDSLStrategy(Strategy):
             .to_numpy()
         )
         close = df["close"].to_numpy()
-        final = _apply_exits(raw_pos, close, self.spec.exit, self.pip_size)
+        final, exit_reasons_by_idx = _apply_exits(
+            raw_pos, close, self.spec.exit, self.pip_size
+        )
+        # Translate bar-index → timestamp so the backtest engine can
+        # look up the reason by signal timestamp without re-deriving
+        # the bar offset.
+        self.exit_reasons_by_ts = {
+            df.index[i]: reason for i, reason in exit_reasons_by_idx.items()
+        }
         return pd.Series(final, index=df.index, dtype=int)
 
 

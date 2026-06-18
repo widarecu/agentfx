@@ -76,8 +76,12 @@ def find_prior_winners(
     granularity: str,
     limit: int = 3,
     exclude_run_id: str | None = None,
+    data_window_start: datetime | None = None,
+    data_window_end: datetime | None = None,
+    min_cagr_pct: float | None = None,
 ) -> list[dict]:
-    """Top-K genomes (by fitness) from completed runs on the same pair/timeframe.
+    """Top-K genomes (by fitness) from completed runs evaluated under the
+    SAME criteria as the new run.
 
     Used by the orchestrator's gen-0 seeding to warm-start a new run
     with the best surviving strategies from prior runs against the
@@ -85,6 +89,19 @@ def find_prior_winners(
     pulling genomes from runs that crashed mid-evaluation. The
     exclude_run_id parameter prevents a re-started run from importing
     its own genomes.
+
+    **Config-match guard (staging 2026-06-17):** a genome's `fitness`
+    column is only comparable across runs that used the same
+    evaluation rubric — same data window, same min_cagr_pct. A run
+    scored on 1 year of data with min_cagr_pct=0.10 can produce a
+    fitness of 1.5 that a 2-year / min_cagr_pct=0.15 run wouldn't
+    reach with the same spec. Without matching config, the picker
+    consistently chose the "loosest" prior run's elites, which then
+    re-evaluated to deeply negative fitness on the new run's harder
+    rules — every subsequent run started from genuinely bad seeds.
+    When the matching config args are passed, the picker filters to
+    only those runs. When omitted (legacy callers / tests), all
+    completed runs match (preserves prior behaviour).
 
     Filter strategy (most-to-least preferred), top up across tiers
     until we have `limit` candidates:
@@ -117,6 +134,56 @@ def find_prior_winners(
     ]
     if exclude_run_id is not None:
         base_filters.append(models.Generation.run_id != exclude_run_id)
+
+    # Cross-config fitness comparison is invalid — the fitness column
+    # is only meaningful within a single (data window, min_cagr_pct)
+    # rubric. When the caller passes any config arg, pre-resolve which
+    # run IDs match in Python (database-portable: the JSON column is
+    # generic JSON not JSONB, so `.astext` and JSONB operators aren't
+    # available cross-engine). Run counts are O(10s) — Python filtering
+    # is fine; the heavy query is then constrained to the matching
+    # subset.
+    has_config_filter = (
+        data_window_start is not None
+        or data_window_end is not None
+        or min_cagr_pct is not None
+    )
+    if has_config_filter:
+        candidate_runs = (
+            db.query(models.EvolutionRun.id, models.EvolutionRun.config_json)
+            .filter(
+                models.EvolutionRun.instrument == instrument,
+                models.EvolutionRun.granularity == granularity,
+                models.EvolutionRun.status == "completed",
+            )
+            .all()
+        )
+
+        def _matches(cfg: dict) -> bool:
+            if cfg is None:
+                return False
+            if data_window_start is not None:
+                v = cfg.get("effective_data_window_start") or cfg.get(
+                    "data_window_start"
+                )
+                if v != data_window_start.isoformat():
+                    return False
+            if data_window_end is not None:
+                v = cfg.get("effective_data_window_end") or cfg.get("data_window_end")
+                if v != data_window_end.isoformat():
+                    return False
+            if min_cagr_pct is not None:
+                v = cfg.get("min_cagr_pct")
+                # Tolerate int vs float JSON serialisation (0.15 vs
+                # "0.15" vs 0.15000000001) via a small epsilon.
+                if v is None or abs(float(v) - float(min_cagr_pct)) > 1e-9:
+                    return False
+            return True
+
+        matching_ids = [r.id for r in candidate_runs if _matches(r.config_json)]
+        if not matching_ids:
+            return []  # no run matches the rubric; no warm-start
+        base_filters.append(models.EvolutionRun.id.in_(matching_ids))
 
     def _query(extra_filters: list):
         # Pull a wider pool than `limit` so the Python-side dedupe below
@@ -752,6 +819,9 @@ class SqlAlchemyPersister:
         granularity: str,
         limit: int,
         exclude_run_id: str | None = None,
+        data_window_start: datetime | None = None,
+        data_window_end: datetime | None = None,
+        min_cagr_pct: float | None = None,
     ) -> list[dict]:
         """Thin wrapper around the module-level helper so the
         orchestrator can warm-start via its Persister Protocol."""
@@ -761,6 +831,9 @@ class SqlAlchemyPersister:
             granularity=granularity,
             limit=limit,
             exclude_run_id=exclude_run_id,
+            data_window_start=data_window_start,
+            data_window_end=data_window_end,
+            min_cagr_pct=min_cagr_pct,
         )
 
 

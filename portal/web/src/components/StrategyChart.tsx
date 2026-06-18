@@ -2,8 +2,10 @@
  * StrategyChart Component
  *
  * Single chart with candlesticks, trade markers, and indicators.
- * - MA / Donchian: overlay on the right (candle) price scale
- * - RSI: rendered on a separate 'left' price scale in the bottom portion
+ * - Price-scale overlays (MA, MACD, Donchian, Ichimoku, BB, ATR, OBV):
+ *   drawn on the right (candle) price scale
+ * - Bounded oscillators (RSI, Stoch, ADX — see OSCILLATOR_NAMES below):
+ *   rendered on a separate 'left' price scale in the bottom portion
  *
  * Using ONE chart instance guarantees time alignment between all series.
  */
@@ -23,6 +25,11 @@ import {
 } from 'lightweight-charts';
 import { ZoomIn, ZoomOut, Maximize2 } from 'lucide-react';
 import { CandleData, TradeSignal, IndicatorLine } from '../types/optimization';
+import {
+  OSCILLATOR_NAMES,
+  classifyIndicator,
+  offScaleId,
+} from '../utils/indicatorScales';
 
 interface StrategyChartProps {
   candles: CandleData[];
@@ -45,12 +52,65 @@ interface StrategyChartProps {
   defaultVisibleBars?: number;
 }
 
-function isOscillator(ind: IndicatorLine): boolean {
-  return ind.name.toLowerCase().includes('rsi');
-}
-
 const toTime = (ts: string): UTCTimestamp =>
   (new Date(ts).getTime() / 1000) as UTCTimestamp;
+
+interface ScaleMargins {
+  top: number;
+  bottom: number;
+}
+
+/**
+ * Compute per-scale vertical layout based on which indicator groups
+ * the spec actually uses. Returns the candle scale's bottom margin
+ * (how much vertical space is reserved for sub-panels), the
+ * oscillator scale's margins, and a map of off-scale group → margins.
+ *
+ * Reasoning: the chart has ONE shared time axis but multiple value
+ * scales. Without dedicated margins, an OBV series on the candle
+ * scale auto-fits the price axis to span [0, ~100000] and the
+ * candles collapse to a flat strip — the UAT bug reported
+ * 2026-06-17.
+ */
+function computeLayout(
+  hasOsc: boolean,
+  offScaleGroups: string[],
+): {
+  candleMargins: ScaleMargins;
+  oscMargins: ScaleMargins | null;
+  offScaleMargins: Map<string, ScaleMargins>;
+} {
+  const nBottom = (hasOsc ? 1 : 0) + offScaleGroups.length;
+  if (nBottom === 0) {
+    return {
+      candleMargins: { top: 0.02, bottom: 0.02 },
+      oscMargins: null,
+      offScaleMargins: new Map(),
+    };
+  }
+  // Reserve 30% of the chart for a single sub-panel, 50% if more than one.
+  const bottomReserved = nBottom === 1 ? 0.3 : 0.5;
+  const sectionHeight = (bottomReserved - 0.05) / nBottom; // 5% inter-section gap
+  const candleMargins: ScaleMargins = {
+    top: 0.02,
+    bottom: bottomReserved,
+  };
+  let cursor = 1 - bottomReserved + 0.03;
+  let oscMargins: ScaleMargins | null = null;
+  const offScaleMargins = new Map<string, ScaleMargins>();
+  if (hasOsc) {
+    oscMargins = { top: cursor, bottom: 1 - (cursor + sectionHeight) };
+    cursor += sectionHeight + 0.02;
+  }
+  for (const id of offScaleGroups) {
+    offScaleMargins.set(id, {
+      top: cursor,
+      bottom: Math.max(0.02, 1 - (cursor + sectionHeight)),
+    });
+    cursor += sectionHeight + 0.02;
+  }
+  return { candleMargins, oscMargins, offScaleMargins };
+}
 
 export default function StrategyChart({
   candles, signals, indicators, instrument, strategy, params,
@@ -61,16 +121,43 @@ export default function StrategyChart({
   const candleRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const overlayRefs = useRef<ISeriesApi<'Line'>[]>([]);
   const oscRefs = useRef<ISeriesApi<'Line'>[]>([]);
+  // Each entry is { scaleId, series } — kept alongside the scale ID so
+  // we can address each off-scale series for tooltip lookups by group.
+  const offScaleRefs = useRef<
+    Array<{ scaleId: string; label: string; series: ISeriesApi<'Line'> }>
+  >([]);
 
   const [chartError, setChartError] = useState<string | null>(null);
   const [showIndicators, setShowIndicators] = useState(true);
   const [tooltip, setTooltip] = useState<{
-    time: string; o: string; h: string; l: string; c: string; rsi?: string;
+    time: string; o: string; h: string; l: string; c: string;
+    osc?: { label: string; value: string };
+    offScales?: Array<{ label: string; value: string }>;
   } | null>(null);
 
-  const overlays = indicators.filter(i => !isOscillator(i));
-  const oscillators = indicators.filter(i => isOscillator(i));
+  // Three render-scale buckets — see utils/indicatorScales.ts.
+  // Off-scale indicators (obv, macd_line/signal) must NOT share the
+  // candle scale; each off-scale group gets its own overlay scale at
+  // the bottom of the chart so its auto-fit can't squash the candles.
+  const overlays = indicators.filter((i) => classifyIndicator(i.name) === 'price');
+  const oscillators = indicators.filter(
+    (i) => classifyIndicator(i.name) === 'oscillator',
+  );
+  const offScales = indicators.filter(
+    (i) => classifyIndicator(i.name) === 'off_scale',
+  );
   const hasOsc = oscillators.length > 0;
+  // De-duplicated list of off-scale group IDs (e.g. 'macd' is shared
+  // by macd_line and macd_signal so they auto-fit together).
+  const offScaleGroups = Array.from(
+    new Set(
+      offScales
+        .map((i) => offScaleId(i.name))
+        .filter((id): id is string => id !== null),
+    ),
+  );
+  const hasOff = offScaleGroups.length > 0;
+  const layout = computeLayout(hasOsc, offScaleGroups);
 
   // ── Chart init ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -84,16 +171,20 @@ export default function StrategyChart({
           horzLines: { color: dark ? '#1f2937' : '#e5e7eb' },
         },
         width: containerRef.current.clientWidth,
-        height: hasOsc ? 600 : 500,
+        // Bigger height when any sub-panel is present so the candles
+        // still have a usable vertical range. 700px when osc + off-scale
+        // are both stacked at the bottom; 600 when one is present; 500
+        // when none.
+        height: hasOsc && hasOff ? 700 : hasOsc || hasOff ? 600 : 500,
         timeScale: { timeVisible: true, secondsVisible: false, borderColor: dark ? '#374151' : '#d1d5db' },
         rightPriceScale: {
           borderColor: dark ? '#374151' : '#d1d5db',
-          scaleMargins: { top: 0.02, bottom: hasOsc ? 0.28 : 0.02 },
+          scaleMargins: layout.candleMargins,
         },
         leftPriceScale: {
           visible: hasOsc,
           borderColor: dark ? '#374151' : '#d1d5db',
-          scaleMargins: { top: 0.75, bottom: 0.02 },
+          scaleMargins: layout.oscMargins ?? { top: 0.75, bottom: 0.02 },
         },
         crosshair: {
           mode: CrosshairMode.Normal,
@@ -115,16 +206,35 @@ export default function StrategyChart({
         if (!param.time || !param.point) { setTooltip(null); return; }
         const d = param.seriesData.get(series) as any;
         if (d?.open === undefined) { setTooltip(null); return; }
-        // Get RSI value from oscillator series
-        let rsi: string | undefined;
-        if (oscRefs.current.length > 0) {
+        // Pull the first oscillator's current value, if any. Label tracks
+        // the indicator name (e.g. rsi/stoch/adx) so the tooltip says
+        // what the user is actually looking at.
+        let osc: { label: string; value: string } | undefined;
+        if (oscRefs.current.length > 0 && oscillators[0]) {
           const oscData = param.seriesData.get(oscRefs.current[0]) as any;
-          if (oscData?.value !== undefined) rsi = oscData.value.toFixed(1);
+          if (oscData?.value !== undefined) {
+            osc = { label: oscillators[0].name, value: oscData.value.toFixed(1) };
+          }
+        }
+        // Surface every off-scale indicator's current value with the
+        // same precision the value warrants — MACD is around ±0.001
+        // for FX so 6dp; OBV is in the tens of thousands so integer.
+        // Both render as a labelled chip in the tooltip strip.
+        const offScalesTooltip: Array<{ label: string; value: string }> = [];
+        for (const { label, scaleId, series: offSeries } of offScaleRefs.current) {
+          const d = param.seriesData.get(offSeries) as any;
+          if (d?.value === undefined) continue;
+          const formatted =
+            scaleId === 'obv'
+              ? Math.round(d.value).toLocaleString()
+              : d.value.toFixed(6);
+          offScalesTooltip.push({ label, value: formatted });
         }
         setTooltip({
           time: new Date((param.time as number) * 1000).toLocaleString('en-US', { timeZone: 'UTC', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }),
           o: d.open.toFixed(5), h: d.high.toFixed(5), l: d.low.toFixed(5), c: d.close.toFixed(5),
-          rsi,
+          osc,
+          offScales: offScalesTooltip.length > 0 ? offScalesTooltip : undefined,
         });
       });
 
@@ -133,11 +243,23 @@ export default function StrategyChart({
           chartRef.current.applyOptions({ width: containerRef.current.clientWidth });
       };
       window.addEventListener('resize', onResize);
-      return () => { window.removeEventListener('resize', onResize); chart.remove(); chartRef.current = null; candleRef.current = null; overlayRefs.current = []; oscRefs.current = []; };
+      return () => {
+        window.removeEventListener('resize', onResize);
+        chart.remove();
+        chartRef.current = null;
+        candleRef.current = null;
+        overlayRefs.current = [];
+        oscRefs.current = [];
+        offScaleRefs.current = [];
+      };
     } catch (err) {
       setChartError(err instanceof Error ? err.message : 'Failed to init chart');
     }
-  }, [hasOsc]);
+    // Recreate chart when the *shape* of the layout changes — i.e.
+    // gaining/losing an osc panel or gaining/losing a distinct
+    // off-scale group. We join offScaleGroups into a stable string so
+    // the effect re-fires for any add/remove/reorder.
+  }, [hasOsc, hasOff, offScaleGroups.join('|')]);
 
   // ── Candle data + markers ──────────────────────────────────────────
   useEffect(() => {
@@ -167,16 +289,75 @@ export default function StrategyChart({
         const isEntry = sig.signalType.startsWith('entry');
         const isLong = sig.signalType.includes('long');
         if (isEntry) {
-          const rsi = Object.entries(sig.indicatorValues ?? {}).find(([k]) => k.toLowerCase().includes('rsi'));
+          // Annotate the entry marker with whichever indicator carried
+          // the trigger value the backend recorded against this signal.
+          // `indicatorValues` is captured at the SIGNAL bar (one bar
+          // before the entry bar — the no-lookahead shift in
+          // src/agentfx/core/dsl/compiler.py:317), so what shows here
+          // is exactly the value the spec evaluated to fire the trade.
+          //
+          // Skip `close` because it's just price (already on the chart
+          // axis) and prefer non-price-scale indicators that the user
+          // actually needs the value of to verify the trigger
+          // (oscillators, MACD, OBV). Falls back to whatever first
+          // entry exists.
+          const allValues = Object.entries(sig.indicatorValues ?? {});
+          const nonClose = allValues.filter(([k]) => k.toLowerCase() !== 'close');
+          // Prefer the most-diagnostic indicator family in order:
+          // oscillator → off-scale → first-available. For an OBV
+          // genome this picks OBV; for RSI it picks RSI; for an MA
+          // crossover it picks whichever MA was captured first.
+          const pick =
+            nonClose.find(([k]) => classifyIndicator(k) === 'oscillator') ??
+            nonClose.find(([k]) => classifyIndicator(k) === 'off_scale') ??
+            nonClose[0];
           const label = isLong ? 'L' : 'S';
-          const text = rsi ? `${label} ${Number(rsi[1]).toFixed(0)}` : label;
+          // Magnitude-aware formatting: OBV is thousands → integer
+          // with thousands-separator; MACD is ±0.001 → 4dp; everything
+          // else → 1dp (RSI 67.4, SMA 1.0850).
+          let text = label;
+          if (pick) {
+            const v = Number(pick[1]);
+            const abs = Math.abs(v);
+            const formatted =
+              abs >= 1000
+                ? Math.round(v).toLocaleString()
+                : abs < 0.01
+                  ? v.toFixed(4)
+                  : v.toFixed(1);
+            text = `${label} ${formatted}`;
+          }
           const position: 'belowBar' | 'aboveBar' = isLong ? 'belowBar' : 'aboveBar';
           const shape: 'arrowUp' | 'arrowDown' = isLong ? 'arrowUp' : 'arrowDown';
           return { time: toTime(sig.timestamp), position, color: isLong ? '#22c55e' : '#ef4444', shape, text, size: 1 };
         }
         const pips = sig.pnl != null ? sig.pnl * 10000 : exitPnl.get(sig.timestamp) ?? 0;
         const win = pips > 0;
-        return { time: toTime(sig.timestamp), position: 'aboveBar' as const, color: win ? '#22c55e' : '#ef4444', shape: 'circle' as const, text: pips !== 0 ? (win ? `+${pips.toFixed(0)}` : pips.toFixed(0)) : 'X', size: 1 };
+        // Annotate exit markers with the structural reason the
+        // compiler emitted (stop / target / max_hold / opposite_flip)
+        // — without this, an OBV-seed-style strategy looks like it
+        // fires "spurious" entries shortly after each exit because
+        // the user can't see WHY the position closed. Short labels
+        // (stp/tgt/mh/flip) so the marker text stays scannable.
+        const reasonAbbrev: Record<string, string> = {
+          stop: 'stp',
+          target: 'tgt',
+          max_hold: 'mh',
+          opposite_flip: 'flip',
+        };
+        const pnlText =
+          pips !== 0 ? (win ? `+${pips.toFixed(0)}` : pips.toFixed(0)) : 'X';
+        const exitText = sig.exitReason
+          ? `${pnlText} ${reasonAbbrev[sig.exitReason] ?? sig.exitReason}`
+          : pnlText;
+        return {
+          time: toTime(sig.timestamp),
+          position: 'aboveBar' as const,
+          color: win ? '#22c55e' : '#ef4444',
+          shape: 'circle' as const,
+          text: exitText,
+          size: 1,
+        };
       });
       markers.sort((a, b) => (a.time as number) - (b.time as number));
       candleRef.current.setMarkers(markers);
@@ -266,6 +447,55 @@ export default function StrategyChart({
     }
   }, [indicators, showIndicators, candles, params]);
 
+  // ── Off-scale indicators (OBV, MACD) on dedicated overlay scales ────
+  // Each off-scale GROUP (macd line + signal share 'macd'; obv alone)
+  // gets its own priceScaleId so its auto-fit is isolated from both
+  // the candle scale (avoiding the OBV-squashes-candles bug) and from
+  // other off-scale groups (so OBV's tens-of-thousands magnitude can't
+  // squash MACD's ±0.001 range).
+  useEffect(() => {
+    if (!chartRef.current) return;
+    offScaleRefs.current.forEach((s) => {
+      try { chartRef.current?.removeSeries(s.series); } catch { /* */ }
+    });
+    offScaleRefs.current = [];
+    if (!showIndicators || offScales.length === 0) return;
+
+    for (const ind of offScales) {
+      const scaleId = offScaleId(ind.name);
+      if (!scaleId) continue;
+      const ls = chartRef.current!.addLineSeries({
+        color: ind.color,
+        lineWidth: 2,
+        title: ind.name,
+        priceScaleId: scaleId,
+        priceLineVisible: false,
+        lastValueVisible: false,
+      });
+      ls.setData(
+        ind.data
+          .map((p) => ({ time: toTime(p.timestamp), value: p.value } as LineData))
+          .sort((a, b) => (a.time as number) - (b.time as number)),
+      );
+      offScaleRefs.current.push({ scaleId, label: ind.name, series: ls });
+    }
+    // Apply scaleMargins per group so each occupies its own vertical
+    // strip. Lightweight-charts creates overlay scales on demand when
+    // a series references them, so it's safe to applyOptions here.
+    for (const scaleId of offScaleGroups) {
+      const margins = layout.offScaleMargins.get(scaleId);
+      if (!margins) continue;
+      chartRef.current!.priceScale(scaleId).applyOptions({
+        scaleMargins: margins,
+        // Keep the overlay scale visible so the user can read the
+        // magnitude — without this lightweight-charts hides overlay
+        // scales by default and the line is unlabelled.
+        visible: true,
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [indicators, showIndicators, candles]);
+
   // ── Zoom ───────────────────────────────────────────────────────────
   const zoom = (factor: number) => {
     const ts = chartRef.current?.timeScale();
@@ -310,7 +540,13 @@ export default function StrategyChart({
           <span><span className="text-slate-500">H:</span> <span className="font-mono text-slate-900 dark:text-slate-100">{tooltip.h}</span></span>
           <span><span className="text-slate-500">L:</span> <span className="font-mono text-slate-900 dark:text-slate-100">{tooltip.l}</span></span>
           <span><span className="text-slate-500">C:</span> <span className="font-mono font-medium text-slate-900 dark:text-slate-100">{tooltip.c}</span></span>
-          {tooltip.rsi && <span><span className="text-purple-500 font-medium">RSI:</span> <span className="font-mono font-medium text-purple-700 dark:text-purple-300">{tooltip.rsi}</span></span>}
+          {tooltip.osc && <span><span className="text-purple-500 font-medium">{tooltip.osc.label}:</span> <span className="font-mono font-medium text-purple-700 dark:text-purple-300">{tooltip.osc.value}</span></span>}
+          {tooltip.offScales?.map((o) => (
+            <span key={o.label}>
+              <span className="text-amber-500 font-medium">{o.label}:</span>{' '}
+              <span className="font-mono font-medium text-amber-700 dark:text-amber-300">{o.value}</span>
+            </span>
+          ))}
         </div>
       )}
 

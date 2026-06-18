@@ -72,6 +72,22 @@ jobs:
         run: ruff format --check src/
 
       # ------------------------------------------------------------------
+      # Parity-fixture staleness guard
+      # Regenerates portal/web/tests/fixtures/indicator-values.json from
+      # the Python reference implementation in
+      # src/agentfx/core/dsl/indicators.py and fails if it changed.
+      # Catches "someone edited indicators.py without re-running
+      # scripts/dump_indicator_fixtures.py" — without this, the
+      # frontend Vitest parity suite would pass against outdated
+      # Python output and the chart would silently drift from the
+      # backtest engine.
+      # ------------------------------------------------------------------
+      - name: Verify JS↔Python parity fixture is current
+        run: |
+          ENVIRONMENT=test PYTHONPATH=src python scripts/dump_indicator_fixtures.py
+          git diff --exit-code -- portal/web/tests/fixtures/indicator-values.json
+
+      # ------------------------------------------------------------------
       # Unit tests
       # No database required; fixtures mock all DB interactions.
       # ------------------------------------------------------------------
@@ -117,6 +133,19 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      # Frontend unit tests (Vitest). Currently covers:
+      #   - JS↔Python parity for every DSL indicator implementation
+      #     against the checked-in fixture (tests/fixtures/
+      #     indicator-values.json). A stale fixture is caught by the
+      #     verify-fixtures step in the backend job; this step asserts
+      #     the JS math matches the Python reference values.
+      #   - Archetype classifier coverage for v0.4.0 indicators.
+      #   - Oscillator-routing utility.
+      # Mirrors `make test-unit` (frontend leg) — kept as a separate
+      # step here so log output is grouped legibly per stage.
+      - name: Run frontend unit tests (Vitest)
+        run: npm test --silent
 
       # Build with the staging Vite mode, which is what deploy-frontend
       # uses. Building here verifies the production bundle compiles

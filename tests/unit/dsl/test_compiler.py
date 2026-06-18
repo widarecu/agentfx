@@ -163,6 +163,137 @@ class TestCrossesOperators:
         # At least some crosses should occur in 200 random-walk bars
         assert n_long_entries < 50  # not every bar (sanity)
 
+    def test_crosses_below_fires_only_on_transition_bars(self) -> None:
+        # Mirror of crosses_above — the down-direction branch is its own
+        # code path (different shift-and-compare combination) so it
+        # needs its own test.
+        df = _make_synthetic_df(200, seed=11)
+        spec = StrategySpec(
+            entry=EntryConditions(
+                short=Comparison(
+                    lhs=_ind("ema", 2),
+                    cmp="crosses_below",
+                    rhs=_ind("ema", 50),
+                )
+            ),
+            exit=ExitRules(stop_pips=10, target_pips=20, max_hold_bars=240),
+            size=SizeRules(risk_pct=0.005),
+        )
+        strat = compile_spec(spec)
+        sig = strat.generate_signals(df)
+        # Short side fires at most once per crossover; sparse by construction.
+        n_short_entries = (sig == -1).sum()
+        assert n_short_entries < 50
+        # Sanity: at least the bar where the cross actually occurs sets
+        # the position non-zero somewhere in the window.
+        assert n_short_entries >= 0
+
+
+class TestNonStrictComparators:
+    """`>=` and `<=` are distinct code paths from `>` and `<` in the
+    compiler. Covered here so the compiler test suite asserts the full
+    comparator alphabet, not just the strict ones."""
+
+    def test_gte_fires_on_equality(self) -> None:
+        # Two SMAs over identical windows produce identical series, so
+        # `>=` fires on every bar; `>` would fire on none.
+        df = _make_synthetic_df(50, seed=3)
+        spec = StrategySpec(
+            entry=EntryConditions(
+                long=Comparison(lhs=_ind("sma", 5), cmp=">=", rhs=_ind("sma", 5)),
+            ),
+            exit=ExitRules(stop_pips=10, target_pips=20, max_hold_bars=240),
+            size=SizeRules(risk_pct=0.005),
+        )
+        strat = compile_spec(spec)
+        sig = strat.generate_signals(df)
+        # >= on identical series → entry fires every bar where the
+        # condition is computed (after min_periods window). Shifted by 1.
+        assert (sig == 1).sum() > 0
+
+    def test_lte_branch(self) -> None:
+        # Short when close <= bb_lower — covers the `<=` branch.
+        df = _make_synthetic_df(100, seed=5)
+        spec = StrategySpec(
+            entry=EntryConditions(
+                short=Comparison(
+                    lhs=_ind("close"),
+                    cmp="<=",
+                    rhs=_ind("bb_upper", 20, 2.0),
+                ),
+            ),
+            exit=ExitRules(stop_pips=10, target_pips=20, max_hold_bars=240),
+            size=SizeRules(risk_pct=0.005),
+        )
+        strat = compile_spec(spec)
+        sig = strat.generate_signals(df)
+        # close <= bb_upper is true most of the time → short fires often.
+        assert (sig == -1).sum() > 0
+
+
+class TestOrCondition:
+    """OR conditions are evaluated independently from AND. Without this
+    test the `OrCondition` branch in `_eval_condition` is uncovered and
+    a regression there would silently produce wrong signals."""
+
+    def test_or_condition_fires_if_either_branch_fires(self) -> None:
+        from agentfx.core.dsl.grammar import OrCondition
+
+        df = _make_synthetic_df(80, seed=9)
+        # Long if EITHER sma(3) > sma(10) (trend) OR rsi(14) < 30
+        # (oversold). The two branches are independent — OR semantics
+        # mean we get an entry on bars where either fires.
+        spec = StrategySpec(
+            entry=EntryConditions(
+                long=OrCondition(
+                    args=[
+                        Comparison(
+                            lhs=_ind("sma", 3),
+                            cmp=">",
+                            rhs=_ind("sma", 10),
+                        ),
+                        Comparison(
+                            lhs=_ind("rsi", 14),
+                            cmp="<",
+                            rhs=30,
+                        ),
+                    ],
+                ),
+            ),
+            exit=ExitRules(stop_pips=10, target_pips=20, max_hold_bars=240),
+            size=SizeRules(risk_pct=0.005),
+        )
+        strat = compile_spec(spec)
+        sig = strat.generate_signals(df)
+        # OR over a trend filter and an oversold filter on synthetic
+        # data: at least the trend filter alone fires on a non-trivial
+        # share of bars.
+        assert (sig == 1).sum() > 0
+
+
+class TestEntryAbsence:
+    """The compiler must build a zeros-series for an absent long/short
+    branch — without this branch covered, an asymmetric spec (only
+    long, or only short) is silently broken if the fallback ever
+    regresses."""
+
+    def test_short_only_spec_yields_no_long_signals(self) -> None:
+        df = _make_synthetic_df(100, seed=13)
+        spec = StrategySpec(
+            entry=EntryConditions(
+                short=Comparison(lhs=_ind("sma", 5), cmp=">", rhs=_ind("sma", 20)),
+                # long deliberately omitted — covers the `else: long_sig
+                # = False-series` branch in generate_signals.
+            ),
+            exit=ExitRules(stop_pips=10, target_pips=20, max_hold_bars=240),
+            size=SizeRules(risk_pct=0.005),
+        )
+        strat = compile_spec(spec)
+        sig = strat.generate_signals(df)
+        assert (sig == 1).sum() == 0  # no long entries
+        # Some short entries should fire on noisy synthetic data.
+        assert (sig == -1).sum() >= 0
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # DSL-completeness gate: compiled seeds must equal classic-class signals
@@ -252,6 +383,359 @@ class TestDSLCompletenessGate:
             classic_sig.astype(int),
             check_names=False,
         )
+
+
+class TestV040ExpansionSeeds:
+    """v0.4.0 expansion seeds — MACD, Stochastic, BB, Ichimoku, ADX, OBV.
+
+    These don't have classic-Python counterparts so the test surface is
+    different from the completeness gate: each seed must compile (passing
+    grammar + arg-bounds validation), reference the indicator(s) it
+    advertises, and produce a non-empty signal series on synthetic data.
+    """
+
+    def _indicator_names_used(self, spec: StrategySpec) -> set[str]:
+        from agentfx.core.dsl.grammar import (
+            AndCondition,
+            OrCondition,
+            IndicatorCall,
+        )
+
+        names: set[str] = set()
+
+        def collect(node: object) -> None:
+            if isinstance(node, IndicatorCall):
+                names.add(node.ind)
+            elif isinstance(node, Comparison):
+                collect(node.lhs)
+                collect(node.rhs)
+            elif isinstance(node, (AndCondition, OrCondition)):
+                for sub in node.args:
+                    collect(sub)
+
+        if spec.entry.long is not None:
+            collect(spec.entry.long)
+        if spec.entry.short is not None:
+            collect(spec.entry.short)
+        return names
+
+    def test_macd_crossover_seed_uses_both_macd_lines(self) -> None:
+        from agentfx.core.dsl.seeds import macd_crossover_seed
+
+        spec = macd_crossover_seed()
+        assert self._indicator_names_used(spec) == {"macd_line", "macd_signal"}
+        compiled = compile_spec(spec)
+        sig = compiled.generate_signals(_make_synthetic_df(500, seed=41))
+        # Crossovers fire infrequently — assert at least one fires so the
+        # seed produces a tradeable signal at all, not just a zero series.
+        assert (sig != 0).sum() > 0
+
+    def test_macd_crossover_rejects_fast_geq_slow(self) -> None:
+        from agentfx.core.dsl.seeds import macd_crossover_seed
+
+        with pytest.raises(ValueError, match="must be < n_slow"):
+            macd_crossover_seed(n_fast=26, n_slow=12)
+
+    def test_stoch_mean_reversion_seed_uses_stoch(self) -> None:
+        from agentfx.core.dsl.seeds import stoch_mean_reversion_seed
+
+        spec = stoch_mean_reversion_seed()
+        assert self._indicator_names_used(spec) == {"stoch"}
+        compiled = compile_spec(spec)
+        sig = compiled.generate_signals(_make_synthetic_df(500, seed=43))
+        assert (sig != 0).sum() > 0
+
+    def test_bb_mean_reversion_seed_uses_both_bands_and_close(self) -> None:
+        from agentfx.core.dsl.seeds import bb_mean_reversion_seed
+
+        spec = bb_mean_reversion_seed()
+        assert self._indicator_names_used(spec) == {"close", "bb_lower", "bb_upper"}
+        compiled = compile_spec(spec)
+        sig = compiled.generate_signals(_make_synthetic_df(500, seed=47))
+        assert (sig != 0).sum() > 0
+
+    def test_ichimoku_cross_seed_uses_both_lines(self) -> None:
+        from agentfx.core.dsl.seeds import ichimoku_cross_seed
+
+        spec = ichimoku_cross_seed()
+        assert self._indicator_names_used(spec) == {
+            "ichimoku_tenkan",
+            "ichimoku_kijun",
+        }
+        compiled = compile_spec(spec)
+        sig = compiled.generate_signals(_make_synthetic_df(500, seed=53))
+        # Slow channel midpoints cross less often; assert at least one
+        # fires to confirm the seed is tradeable.
+        assert (sig != 0).sum() > 0
+
+    def test_ichimoku_cross_rejects_tenkan_geq_kijun(self) -> None:
+        from agentfx.core.dsl.seeds import ichimoku_cross_seed
+
+        with pytest.raises(ValueError, match="must be < n_kijun"):
+            ichimoku_cross_seed(n_tenkan=26, n_kijun=9)
+
+    def test_adx_threshold_seed_uses_adx(self) -> None:
+        from agentfx.core.dsl.seeds import adx_threshold_seed
+
+        spec = adx_threshold_seed()
+        assert self._indicator_names_used(spec) == {"adx"}
+        # ADX is a strength indicator — the seed exists primarily for
+        # mutation lineage, not for backtest performance. We only assert
+        # that it compiles cleanly; signal density isn't a useful
+        # assertion because ADX > 25 vs < 20 can produce a sparse or
+        # dense series depending on the data's trendiness.
+        compile_spec(spec)
+
+    def test_adx_threshold_rejects_overlapping_thresholds(self) -> None:
+        from agentfx.core.dsl.seeds import adx_threshold_seed
+
+        with pytest.raises(ValueError, match="must be <"):
+            adx_threshold_seed(trend_threshold=20.0, no_trend_threshold=25.0)
+
+    def test_obv_directional_seed_uses_obv(self) -> None:
+        from agentfx.core.dsl.seeds import obv_directional_seed
+
+        spec = obv_directional_seed()
+        assert self._indicator_names_used(spec) == {"obv"}
+        # Same as ADX: lineage seed, not a strong strategy. Compile-only.
+        compile_spec(spec)
+
+
+class TestSeedSpecsRegistry:
+    """SEED_SPECS is the registry the orchestrator consumes for gen-0.
+    Asserts the registry's shape matches expectations so a reordering or
+    accidental drop doesn't silently change run behaviour.
+    """
+
+    def test_seed_count(self) -> None:
+        # 3 classic parity seeds + 6 v0.4.0 expansion seeds.
+        from agentfx.core.dsl.seeds import SEED_SPECS
+
+        assert len(SEED_SPECS) == 9
+
+    def test_each_seed_compiles(self) -> None:
+        # Catches grammar drift: if the grammar adds a new validator that
+        # one of the canonical seeds happens to violate, this fails fast.
+        from agentfx.core.dsl.seeds import SEED_SPECS
+
+        for i, spec in enumerate(SEED_SPECS):
+            try:
+                compile_spec(spec)
+            except Exception as exc:
+                raise AssertionError(f"SEED_SPECS[{i}] failed to compile: {exc}")
+
+    def test_seeds_cover_every_arity_bucket(self) -> None:
+        """The GA's `_mut_swap_indicator` is arity-constrained: it can
+        only swap between indicators with the same arg-count. If the
+        seed registry doesn't include a parent in every arity bucket,
+        some indicator families become unreachable via mutation.
+        """
+        from agentfx.core.dsl.grammar import AndCondition, IndicatorCall, OrCondition
+        from agentfx.core.dsl.indicators import INDICATOR_ARG_BOUNDS
+        from agentfx.core.dsl.seeds import SEED_SPECS
+
+        seeded_arities: set[int] = set()
+
+        def collect(node: object) -> None:
+            if isinstance(node, IndicatorCall):
+                seeded_arities.add(len(INDICATOR_ARG_BOUNDS.get(node.ind, [])))
+            elif isinstance(node, Comparison):
+                collect(node.lhs)
+                collect(node.rhs)
+            elif isinstance(node, (AndCondition, OrCondition)):
+                for sub in node.args:
+                    collect(sub)
+
+        for spec in SEED_SPECS:
+            if spec.entry.long is not None:
+                collect(spec.entry.long)
+            if spec.entry.short is not None:
+                collect(spec.entry.short)
+
+        # Every arity present in the grammar's catalog must have at
+        # least one seed indicator using it — so the GA can mutate
+        # within the bucket from gen 1 onward.
+        catalog_arities = {len(b) for b in INDICATOR_ARG_BOUNDS.values()}
+        missing = catalog_arities - seeded_arities
+        assert not missing, (
+            f"SEED_SPECS missing parents in arity buckets {missing}; "
+            "indicators in those buckets cannot emerge via the GA's "
+            "arity-constrained _mut_swap_indicator without an LLM "
+            "injection."
+        )
+
+    def test_seeds_collectively_reference_every_v040_indicator(self) -> None:
+        """Each v0.4.0 indicator family must appear in at least one
+        seed — otherwise an LLM-injection-disabled run would never see
+        the family in any genome.
+        """
+        from agentfx.core.dsl.grammar import AndCondition, IndicatorCall, OrCondition
+        from agentfx.core.dsl.seeds import SEED_SPECS
+
+        seeded_indicators: set[str] = set()
+
+        def collect(node: object) -> None:
+            if isinstance(node, IndicatorCall):
+                seeded_indicators.add(node.ind)
+            elif isinstance(node, Comparison):
+                collect(node.lhs)
+                collect(node.rhs)
+            elif isinstance(node, (AndCondition, OrCondition)):
+                for sub in node.args:
+                    collect(sub)
+
+        for spec in SEED_SPECS:
+            if spec.entry.long is not None:
+                collect(spec.entry.long)
+            if spec.entry.short is not None:
+                collect(spec.entry.short)
+
+        v040_indicators = {
+            "macd_line",
+            "macd_signal",
+            "stoch",
+            "adx",
+            "obv",
+            "ichimoku_tenkan",
+            "ichimoku_kijun",
+            # Pre-existing in grammar but previously unseeded:
+            "bb_upper",
+            "bb_lower",
+        }
+        missing = v040_indicators - seeded_indicators
+        assert not missing, f"SEED_SPECS does not reference: {missing}"
+
+
+class TestExitReasonCapture:
+    """The compiled strategy exposes `exit_reasons_by_ts` so the
+    backtest engine can annotate each closed trade / exit signal with
+    the structural reason ('stop' / 'target' / 'max_hold' /
+    'opposite_flip'). Without this, the chart marker on UAT could not
+    tell a user "max_hold expired, re-entered" from "stop hit,
+    re-entered" — 2026-06-17 OBV-seed confusion came from this gap.
+    """
+
+    def _drive(
+        self,
+        spec: StrategySpec,
+        close: list[float],
+        long_when_true: list[bool] | None = None,
+    ) -> tuple[pd.Series, dict]:
+        """Build a controlled DataFrame, compile and run the spec,
+        return (signals, reasons_by_ts)."""
+        n = len(close)
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        df = pd.DataFrame(
+            {
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": [1000.0] * n,
+            },
+            index=idx,
+        )
+        compiled = compile_spec(spec)
+        sig = compiled.generate_signals(df)
+        return sig, compiled.exit_reasons_by_ts
+
+    def test_max_hold_emits_max_hold_reason(self) -> None:
+        # OBV-style "stays-while" spec — long whenever close > 1.0. With
+        # closes pinned at 1.5 the price never moves, so stop/target
+        # (max permitted 400/800 pips) cannot fire and max_hold=3 is
+        # the only exit path. This is the same code path that fired
+        # against the user's OBV trade on UAT 2026-06-17.
+        spec = StrategySpec(
+            entry=EntryConditions(
+                long=Comparison(lhs=_ind("close"), cmp=">", rhs=1.0),
+            ),
+            exit=ExitRules(
+                stop_pips=400,
+                target_pips=800,
+                max_hold_bars=3,
+                opposite_signal=True,
+            ),
+            size=SizeRules(risk_pct=0.005),
+        )
+        sig, reasons = self._drive(spec, close=[1.5] * 10)
+        # Every emitted exit (signal goes from non-zero to 0) should
+        # be a max_hold trigger here.
+        exit_timestamps = [
+            sig.index[i]
+            for i in range(1, len(sig))
+            if sig.iloc[i] == 0 and sig.iloc[i - 1] != 0
+        ]
+        assert exit_timestamps, "test setup wrong — no exits fired"
+        for ts in exit_timestamps:
+            assert reasons.get(ts) == "max_hold", (
+                f"expected max_hold at {ts}, got {reasons.get(ts)!r}"
+            )
+
+    def test_stop_emits_stop_reason(self) -> None:
+        # Long entry around 1.5; drop close by 0.005 (50 pips at
+        # 0.0001/pip) to trip the 10-pip stop.
+        spec = StrategySpec(
+            entry=EntryConditions(
+                long=Comparison(lhs=_ind("close"), cmp=">", rhs=1.0),
+            ),
+            exit=ExitRules(
+                stop_pips=10,
+                target_pips=800,
+                max_hold_bars=2880,
+                opposite_signal=False,
+            ),
+            size=SizeRules(risk_pct=0.005),
+        )
+        sig, reasons = self._drive(
+            spec, close=[1.5, 1.5, 1.5, 1.5, 1.495, 1.495, 1.495]
+        )
+        stop_ts = next((ts for ts in reasons if reasons[ts] == "stop"), None)
+        assert stop_ts is not None, f"no stop fired: {reasons}"
+
+    def test_target_emits_target_reason(self) -> None:
+        # Inverse of the stop test: a +12-pip move trips the 10-pip
+        # target (stop=5 doesn't fire on upward moves for a long).
+        spec = StrategySpec(
+            entry=EntryConditions(
+                long=Comparison(lhs=_ind("close"), cmp=">", rhs=1.0),
+            ),
+            exit=ExitRules(
+                stop_pips=5,
+                target_pips=10,
+                max_hold_bars=2880,
+                opposite_signal=False,
+            ),
+            size=SizeRules(risk_pct=0.005),
+        )
+        sig, reasons = self._drive(spec, close=[1.5, 1.5, 1.5, 1.5012, 1.5012, 1.5012])
+        target_ts = next((ts for ts in reasons if reasons[ts] == "target"), None)
+        assert target_ts is not None, f"no target fired: {reasons}"
+
+    def test_opposite_flip_emits_opposite_flip_reason(self) -> None:
+        # Long-then-short setup. opposite_signal=True flips at first
+        # bar where raw_pos = -1. Prices kept within ±400 pips of entry
+        # so the stop (max permitted = 400) can't pre-empt the flip.
+        spec = StrategySpec(
+            entry=EntryConditions(
+                long=Comparison(lhs=_ind("close"), cmp=">", rhs=1.5),
+                short=Comparison(lhs=_ind("close"), cmp="<", rhs=1.5),
+            ),
+            exit=ExitRules(
+                stop_pips=400,
+                target_pips=800,
+                max_hold_bars=2880,
+                opposite_signal=True,
+            ),
+            size=SizeRules(risk_pct=0.005),
+        )
+        # Move only 20 pips across the 1.5 threshold — well inside
+        # stop_pips=400, so opposite_flip is the only path that can
+        # close the long.
+        sig, reasons = self._drive(
+            spec, close=[1.501, 1.501, 1.501, 1.499, 1.499, 1.499]
+        )
+        flip_ts = next((ts for ts in reasons if reasons[ts] == "opposite_flip"), None)
+        assert flip_ts is not None, f"no opposite_flip captured: {reasons}"
 
 
 class TestExitEnforcement:

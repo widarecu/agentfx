@@ -7,15 +7,24 @@
  *
  * Deliberately simple: produces ~1 sentence, falls back to "unsupported
  * spec shape" if the input doesn't match the v1 grammar. The DSL is
- * small (6 indicators, 6 comparators) so a hand-rolled summariser is
- * the right size — no need for a general AST walker.
+ * still small (~15 indicators, 6 comparators) so a hand-rolled
+ * summariser is the right size — no need for a general AST walker.
  */
 
 import type { DslSpec, DslCondition, DslComparison, DslExpr } from '../types/evolution';
 
+// State vs. event semantics matters here: '>' and '<' are *state*
+// comparisons (true on every bar where the inequality holds), not
+// transition events (only true on the bar where they first become so).
+// Earlier wording rendered '>' as "rises above" / '<' as "falls below"
+// which both imply transitions — that misled the UAT 2026-06-17 read
+// of the OBV seed ("Goes short when obv falls below 0") into expecting
+// short trades on every zero-crossing when actually the strategy stays
+// short for every bar where obv < 0. Use "is above" / "is below" to
+// match the actual semantics.
 const COMPARATOR_PHRASES: Record<DslComparison['cmp'], string> = {
-  '>': 'rises above',
-  '<': 'falls below',
+  '>': 'is above',
+  '<': 'is below',
   '>=': 'is at or above',
   '<=': 'is at or below',
   crosses_above: 'crosses above',
@@ -25,15 +34,33 @@ const COMPARATOR_PHRASES: Record<DslComparison['cmp'], string> = {
 function summarizeExpr(expr: DslExpr): string {
   if (typeof expr === 'number') return expr.toString();
   if (typeof expr === 'object' && expr !== null && 'ind' in expr) {
-    const ind = expr as { ind: string; args: number[] };
-    if (ind.ind === 'close' || ind.args.length === 0) return ind.ind;
-    return `${ind.ind}(${ind.args.join(', ')})`;
+    const ind = expr as { ind: string; args?: number[] };
+    // `args` is optional in the JSON shape — backend Pydantic produces
+    // `args: []` for zero-arg indicators (close, obv) but hand-authored
+    // JSON sometimes omits the field. Defaulting to [] keeps both paths
+    // working and avoids the .length-on-undefined crash that took down
+    // the chart gallery on 2026-06-17.
+    const args = ind.args ?? [];
+    if (ind.ind === 'close' || args.length === 0) return ind.ind;
+    return `${ind.ind}(${args.join(', ')})`;
   }
   return JSON.stringify(expr);
 }
 
 function isComparison(cond: DslCondition): cond is DslComparison {
   return cond != null && typeof cond === 'object' && 'cmp' in cond;
+}
+
+/**
+ * True if the top-level condition is a state comparator (>, <, >=, <=)
+ * — meaning the condition is "true on every bar where the inequality
+ * holds" rather than "true on the bar where it first holds". Drives
+ * verb choice ("stays while" vs "goes when") in summarizeDsl so users
+ * don't mistake a holding condition for a one-shot crossover trigger.
+ */
+function isStateComparator(cond: DslCondition | null | undefined): boolean {
+  if (!cond || !isComparison(cond)) return false;
+  return cond.cmp === '>' || cond.cmp === '<' || cond.cmp === '>=' || cond.cmp === '<=';
 }
 
 function summarizeCondition(cond: DslCondition | null | undefined): string | null {
@@ -80,8 +107,24 @@ export function summarizeDsl(spec: DslSpec | null | undefined): string {
       `Degenerate: long and short conditions are identical (${longText ?? '—'}), so no trades fire.`,
     );
   } else {
-    if (longText) entryParts.push(`Goes long when ${longText}.`);
-    if (shortText) entryParts.push(`Goes short when ${shortText}.`);
+    // Verb choice reflects state vs event semantics. Top-level conditions
+    // that hinge on a state comparator (>, <, >=, <=) hold across many
+    // consecutive bars — "stays/holds long while X" is more accurate than
+    // "goes long when X" (which sounds like a one-shot event). Top-level
+    // conditions with `crosses_above` / `crosses_below` ARE one-shot
+    // events, so they keep the "goes long when" framing. The OBV-seed
+    // UAT confusion on 2026-06-17 came from "goes long when obv > 0"
+    // reading like a transition rather than a continuous state.
+    if (longText) {
+      const verb = isStateComparator(longCond) ? 'Stays long while' : 'Goes long when';
+      entryParts.push(`${verb} ${longText}.`);
+    }
+    if (shortText) {
+      const verb = isStateComparator(shortCond)
+        ? 'Stays short while'
+        : 'Goes short when';
+      entryParts.push(`${verb} ${shortText}.`);
+    }
   }
 
   const exit = spec.exit ?? {};
@@ -146,12 +189,24 @@ export function inferArchetype(
 
   const inds = Array.from(indicatorsUsed);
   if (inds.length === 0) return null;
-  const hasMomentum = inds.some((i) => i === 'rsi');
-  const hasMA = inds.some((i) => i === 'sma' || i === 'ema');
+  // Family checks must stay in sync with the Python catalog in
+  // src/agentfx/core/dsl/indicators.py:
+  //   - oscillator family → rsi/stoch/adx
+  //   - MA family (close-derived smooth lines) → sma/ema and MACD (which
+  //     is the difference of two EMAs and an EMA of that difference)
+  //   - vol-band family → bb_*
+  //   - channel family (high/low envelopes) → donchian_* and ichimoku_*
+  // OBV (volume) has no archetype counterpart yet — it falls through to
+  // 'mixed' on its own, which is the right tag until a volume archetype
+  // emerges.
+  const hasMomentum = inds.some((i) => i === 'rsi' || i === 'stoch' || i === 'adx');
+  const hasMA = inds.some((i) => i === 'sma' || i === 'ema' || i.startsWith('macd_'));
   const hasBands = inds.some((i) => i.startsWith('bb_'));
-  const hasDonchian = inds.some((i) => i.startsWith('donchian'));
+  const hasChannel = inds.some(
+    (i) => i.startsWith('donchian') || i.startsWith('ichimoku_'),
+  );
 
-  if (hasDonchian) return 'breakout';
+  if (hasChannel) return 'breakout';
   if (hasMA && long && short && isComparison(long) && isComparison(short)) {
     // MA-crossover heuristic: long uses '>' and short uses '<' (or vice versa) → trend
     const longCmp = (long as DslComparison).cmp;
@@ -226,14 +281,18 @@ export function archetypeReason(
   collect(short);
 
   if (archetype === 'breakout') {
-    const donchian = Array.from(inds).filter((i) => i.startsWith('donchian'));
-    return donchian.length > 0
-      ? `Uses Donchian channel indicator(s): ${donchian.join(', ')}.`
-      : 'Donchian-channel indicator detected.';
+    const channel = Array.from(inds).filter(
+      (i) => i.startsWith('donchian') || i.startsWith('ichimoku_'),
+    );
+    return channel.length > 0
+      ? `Uses high/low-channel indicator(s): ${channel.join(', ')}.`
+      : 'High/low-channel indicator detected.';
   }
 
   if (archetype === 'trend') {
-    const ma = Array.from(inds).filter((i) => i === 'sma' || i === 'ema');
+    const ma = Array.from(inds).filter(
+      (i) => i === 'sma' || i === 'ema' || i.startsWith('macd_'),
+    );
     const longCmp =
       long && isComparison(long) ? (long as DslComparison).cmp : '?';
     const shortCmp =
@@ -242,11 +301,17 @@ export function archetypeReason(
   }
 
   if (archetype === 'mean-reversion') {
-    if (inds.has('rsi')) return 'Uses RSI — a momentum oscillator typically traded mean-reversion-style.';
+    const osc = Array.from(inds).filter(
+      (i) => i === 'rsi' || i === 'stoch' || i === 'adx',
+    );
+    if (osc.length > 0)
+      return `Uses oscillator(s) ${osc.join('/')} — bounded momentum indicator typically traded mean-reversion-style.`;
     const bands = Array.from(inds).filter((i) => i.startsWith('bb_'));
     if (bands.length > 0)
       return `Uses Bollinger Bands (${bands.join(', ')}) — typically traded mean-reversion-style.`;
-    const ma = Array.from(inds).filter((i) => i === 'sma' || i === 'ema');
+    const ma = Array.from(inds).filter(
+      (i) => i === 'sma' || i === 'ema' || i.startsWith('macd_'),
+    );
     const longCmp =
       long && isComparison(long) ? (long as DslComparison).cmp : '?';
     const shortCmp =

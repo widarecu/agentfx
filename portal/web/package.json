@@ -10,7 +10,9 @@
     "build": "tsc -b && vite build --mode production",
     "build:staging": "tsc -b && vite build --mode staging",
     "build:test": "tsc -b && vite build --mode test",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@playwright/test": "^1.57.0",
@@ -33,6 +35,7 @@
     "postcss": "8.4.49",
     "tailwindcss": "3.4.14",
     "typescript": "5.6.3",
-    "vite": "5.4.10"
+    "vite": "5.4.10",
+    "vitest": "^2.1.9"
   }
 }

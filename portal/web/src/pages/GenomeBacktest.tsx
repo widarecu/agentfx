@@ -95,6 +95,7 @@ function mapSignal(s: Record<string, unknown>): TradeSignal {
     price: s.price as number,
     pnl: s.pnl as number | undefined,
     indicatorValues: (s.indicator_values as Record<string, number>) ?? {},
+    exitReason: (s.exit_reason as TradeSignal['exitReason']) ?? null,
   };
 }
 

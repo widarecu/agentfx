@@ -516,6 +516,14 @@ def run_backtest_from_db(
     # for the stop/target/max_hold exit walker; classic ones ignore it.
     strat = make_strategy(strategy_name, pip_size=pip_size, **strategy_params)
     raw_signals = strat.generate_signals(df)
+    # DSL strategies expose `exit_reasons_by_ts` populated during
+    # generate_signals — bar timestamp → 'stop'/'target'/'max_hold'/
+    # 'opposite_flip'. Classic (MA/RSI/Donchian) strategies don't have
+    # exit walkers and produce no reasons. The chart marker UI shows
+    # the reason on each exit so users can tell "max_hold expired,
+    # re-entered" from "stop hit, re-entered" without re-deriving from
+    # prices (UAT 2026-06-17 OBV-seed confusion).
+    exit_reasons_by_ts: dict = getattr(strat, "exit_reasons_by_ts", {}) or {}
 
     # Apply policies
     pconf = PolicyConfig(
@@ -621,6 +629,9 @@ def run_backtest_from_db(
                                 indicator_values[col] = float(val)
 
                 # Determine signal type
+                exit_reason = (
+                    None  # Reset per iteration; only meaningful on exit signals
+                )
                 if prev_signal == 0 and signal_val != 0:
                     # Entry
                     signal_type = "entry_long" if signal_val > 0 else "entry_short"
@@ -633,6 +644,12 @@ def run_backtest_from_db(
                     # Exit (or flip — close current position first)
                     signal_type = "exit_long" if prev_signal > 0 else "exit_short"
                     exit_price = float(df.loc[timestamp, "close"])
+                    # Look up the structural reason the compiler emitted
+                    # for this exit so we can annotate both the signal
+                    # and trade rows. Missing key (e.g. policy-driven
+                    # exit emitted post-compiler by apply_policies) just
+                    # leaves it absent.
+                    exit_reason = exit_reasons_by_ts.get(timestamp)
 
                     # Calculate trade P&L
                     if entry_time is not None and entry_price is not None:
@@ -732,6 +749,7 @@ def run_backtest_from_db(
                                 / 60,
                                 "position_size": trade_units,
                                 "balance_after": current_balance + net_pnl_dollars,
+                                "exit_reason": exit_reason,
                             }
                         )
                         current_balance += net_pnl_dollars
@@ -748,6 +766,7 @@ def run_backtest_from_db(
                                 "signal_type": signal_type,
                                 "price": float(df.loc[timestamp, "close"]),
                                 "indicator_values": indicator_values,
+                                "exit_reason": exit_reason,
                             }
                         )
                         # Set up entry signal for the new position
@@ -766,6 +785,13 @@ def run_backtest_from_db(
                         "signal_type": signal_type,
                         "price": float(df.loc[timestamp, "close"]),
                         "indicator_values": indicator_values,
+                        # Only set on exit-shaped signals; entries leave
+                        # it as None (the field is always present in the
+                        # JSON so the frontend doesn't have to guard
+                        # `?? null` everywhere).
+                        "exit_reason": (
+                            exit_reason if signal_type.startswith("exit_") else None
+                        ),
                     }
                 )
 
@@ -899,6 +925,90 @@ def _get_indicator_values(
         DataFrame with indicator columns, or None if not applicable
     """
     strategy_name = strategy_name.lower()
+
+    if strategy_name == "dsl":
+        # Walk the spec's entry conditions, collect every unique
+        # IndicatorCall, and evaluate each into its own column. This is
+        # what lets the trade-marker UI show the value that actually
+        # triggered the trade (`indicator_values` dict on each signal
+        # row, captured at the signal bar one step before the trade
+        # bar — see the `signal_bar_idx = ts_idx - 1` walk above).
+        #
+        # Without this branch, every DSL-strategy trade signal carries
+        # an empty indicator_values dict, so the chart marker has
+        # nothing to display — users cannot read off what RSI/OBV/MACD
+        # was when the trade fired, and can't easily verify alignment
+        # between trade markers and the indicator line. UAT 2026-06-17.
+        try:
+            from agentfx.core.dsl import StrategySpec
+            from agentfx.core.dsl.grammar import (
+                AndCondition,
+                Comparison,
+                IndicatorCall,
+                OrCondition,
+            )
+            from agentfx.core.dsl.indicators import evaluate_indicator
+        except ImportError:
+            return None
+
+        spec_data = strategy_params.get("spec")
+        if spec_data is None:
+            return None
+        try:
+            spec = (
+                spec_data
+                if isinstance(spec_data, StrategySpec)
+                else StrategySpec.model_validate(spec_data)
+            )
+        except Exception:
+            return None
+
+        # Deduplicate by (ind name, args tuple) so e.g. an spec that
+        # uses sma(20) on both long and short branches yields one
+        # `sma(20)` column instead of two.
+        seen: dict[tuple[str, tuple[float, ...]], IndicatorCall] = {}
+
+        def visit(node: object) -> None:
+            if isinstance(node, IndicatorCall):
+                key = (node.ind, tuple(node.args))
+                seen.setdefault(key, node)
+            elif isinstance(node, Comparison):
+                visit(node.lhs)
+                visit(node.rhs)
+            elif isinstance(node, (AndCondition, OrCondition)):
+                for sub in node.args:
+                    visit(sub)
+
+        if spec.entry.long is not None:
+            visit(spec.entry.long)
+        if spec.entry.short is not None:
+            visit(spec.entry.short)
+        if not seen:
+            return None
+
+        columns: dict[str, pd.Series] = {}
+        for call in seen.values():
+            # Column label mirrors the JS labelFor() in
+            # portal/web/src/utils/dslIndicators.ts so the chart's
+            # marker-text lookup (which match by indicator-name prefix)
+            # finds these keys. Format float args as ints when whole-
+            # numbered to match the JS Number.toString() behaviour.
+            if not call.args:
+                label = call.ind
+            else:
+                args_str = ", ".join(
+                    str(int(a)) if a == int(a) else str(a) for a in call.args
+                )
+                label = f"{call.ind}({args_str})"
+            try:
+                columns[label] = evaluate_indicator(df, call.ind, list(call.args))
+            except Exception:
+                # Visualisation is best-effort — one bad indicator
+                # column shouldn't drop the whole capture.
+                continue
+        if not columns:
+            return None
+        return pd.DataFrame(columns, index=df.index)
 
     if strategy_name in ("ma", "mac", "ma_crossover", "macrossover"):
         fast = int(strategy_params.get("fast", 20))

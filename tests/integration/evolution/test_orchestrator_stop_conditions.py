@@ -50,7 +50,10 @@ def _build_orchestrator(
     *,
     stop_conditions: StopConditions,
     fitness_value: float = 1.0,
-    population_size: int = 5,
+    # Population must be ≥ SEED_SPECS count, which grew from 3 → 9
+    # in v0.4.0 (MACD/Stoch/BB/Ichimoku/ADX/OBV seeds added). 15
+    # gives 9 seeds + 6 mutated copies.
+    population_size: int = 15,
     clock=None,
 ) -> OrchestratorAgent:
     return OrchestratorAgent(

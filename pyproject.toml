@@ -19,7 +19,29 @@ python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 
-# Coverage configuration
+# Coverage configuration.
+#
+# omit lists what `make test-unit` does NOT measure. The 80% fail_under
+# threshold (below) gates `make test-unit`, so anything in this list is
+# implicitly declared "not the unit-test stage's responsibility":
+#
+#   - tests / migrations / __pycache__: not source code.
+#   - tools/gen_wireframes.py: one-shot PIL tooling that generates
+#     planning artefacts — not library code, not run in production.
+#   - portal_mock/: dev-only mock portal backend used in local
+#     workflows. Behaviour is exercised manually; covering it under
+#     unit tests would be testing the harness, not the system.
+#   - services/cli.py: argparse shim that wraps backtest/ingest entry
+#     points. The wrapped functions are already covered by their own
+#     tests; the shim itself is integration-shaped (subprocess entry).
+#   - services/ingest.py: OANDA + DB I/O ingestion worker — its happy
+#     path is covered by `make test-integration` against the real
+#     OANDA API. Measuring it under unit coverage would falsely
+#     suggest it's untested when it isn't.
+#
+# Library code that affects production decisions (anything under core/,
+# everything in services/ besides cli/ingest, shared/config.py, agents/,
+# api/) is NOT omitted — those carry the 80% threshold.
 [tool.coverage.run]
 source = ["src"]
 omit = [
@@ -28,6 +50,10 @@ omit = [
     "*/conftest.py",
     "*/__pycache__/*",
     "*/migrations/*",
+    "*/tools/gen_wireframes.py",
+    "*/portal_mock/*",
+    "*/services/cli.py",
+    "*/services/ingest.py",
 ]
 
 [tool.coverage.report]
