@@ -49,7 +49,11 @@ def _build_orchestrator(
     instrument: str,
     granularity: str,
     data_window: tuple[datetime, datetime],
-    population_size: int = 5,
+    # Population must be ≥ SEED_SPECS count, which grew from 3 → 9
+    # when v0.4.0 added MACD/Stoch/BB/Ichimoku/ADX/OBV seeds. 15
+    # gives 9 seeds + 6 mutated copies — enough for the GA loop
+    # tests to exercise mutation/crossover paths.
+    population_size: int = 15,
     max_generations: int = 2,
     rng_seed: int = 7,
     target_fitness: float = 999.0,
@@ -105,7 +109,7 @@ class TestEvolutionPipeline:
                 seed_evolution_candles["start"],
                 seed_evolution_candles["end"],
             ),
-            population_size=5,
+            population_size=15,
             max_generations=2,
         )
         summary = orchestrator.run_loop()
@@ -136,7 +140,7 @@ class TestEvolutionPipeline:
                 seed_evolution_candles["start"],
                 seed_evolution_candles["end"],
             ),
-            population_size=5,
+            population_size=15,
             max_generations=2,
         )
         orchestrator.run_loop()
@@ -167,13 +171,15 @@ class TestEvolutionPipeline:
                 seed_evolution_candles["start"],
                 seed_evolution_candles["end"],
             ),
-            population_size=5,
+            population_size=15,
             max_generations=2,
         )
         orchestrator.run_loop()
 
-        # 5 genomes × 2 generations = 10 genome rows (some carryovers via
-        # elitism are persisted with new IDs in their own generation rows)
+        # population_size × max_generations genome rows (elitism
+        # carryovers get persisted with new IDs in their own generation
+        # rows, so the count is the simple product).
+        expected_genome_count = 15 * 2  # population_size × max_generations
         genome_count = (
             db_session.query(models.StrategyGenome)
             .join(
@@ -183,7 +189,7 @@ class TestEvolutionPipeline:
             .filter(models.Generation.run_id == run.id)
             .count()
         )
-        assert genome_count == 10
+        assert genome_count == expected_genome_count
 
         # Every genome has a non-null assigned ID matching the
         # `genome_{generation_id}_{idx}` convention
@@ -215,7 +221,7 @@ class TestEvolutionPipeline:
                 seed_evolution_candles["start"],
                 seed_evolution_candles["end"],
             ),
-            population_size=5,
+            population_size=15,
             max_generations=2,
         )
         orchestrator.run_loop()
@@ -250,7 +256,7 @@ class TestEvolutionPipeline:
                 seed_evolution_candles["start"],
                 seed_evolution_candles["end"],
             ),
-            population_size=5,
+            population_size=15,
             max_generations=2,
         )
         orchestrator.run_loop()
@@ -284,7 +290,7 @@ class TestEvolutionPipeline:
                 seed_evolution_candles["start"],
                 seed_evolution_candles["end"],
             ),
-            population_size=5,
+            population_size=15,
             max_generations=2,
         )
         orchestrator.run_loop()
