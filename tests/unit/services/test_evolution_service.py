@@ -653,17 +653,24 @@ class TestFindPriorWinners:
         gen_index: int = 0,
         idx: int = 0,
         dsl_json: dict | None = None,
+        origin: object | None = None,
     ) -> models.StrategyGenome:
         """Seed a genome. When `dsl_json` is None we generate a unique
         per-`idx` spec by perturbing MA_CROSSOVER_SEED's fast-window —
-        otherwise dedup collapses all per-idx rows into one slot."""
+        otherwise dedup collapses all per-idx rows into one slot.
+
+        `origin` defaults to GenomeOrigin.SEED for back-compat with
+        existing tests. Plateau-exclusion tests pass
+        GenomeOrigin.WARM_START to construct cascade-shaped scenarios.
+        """
+        from agentfx.api.models import GenomeOrigin
+
         gen_id = f"{run.id}_gen_{gen_index:03d}"
         existing = db.get(models.Generation, gen_id)
         if existing is None:
             db.add(models.Generation(id=gen_id, run_id=run.id, index=gen_index))
             db.commit()
         genome_id = f"genome_{run.id}_{gen_index:03d}_{idx:03d}"
-        from agentfx.api.models import GenomeOrigin
 
         if dsl_json is None:
             # Each idx gets a structurally-distinct DSL by varying the
@@ -679,7 +686,7 @@ class TestFindPriorWinners:
                 id=genome_id,
                 generation_id=gen_id,
                 dsl_json=dsl_json,
-                origin=GenomeOrigin.SEED,
+                origin=origin if origin is not None else GenomeOrigin.SEED,
                 fitness=fitness,
                 validator_passed=validator_passed,
             )
@@ -687,15 +694,34 @@ class TestFindPriorWinners:
         db.commit()
         return db.get(models.StrategyGenome, genome_id)
 
-    def test_tier3_carries_forward_when_all_runs_are_net_negative(
+    def _mark_run_terminated(
+        self,
+        db: Session,
+        *,
+        run: models.EvolutionRun,
+        stop_reason: str,
+        best_genome_id: str,
+    ) -> None:
+        """Attach a stop_reason + best_genome_id to a completed run, the
+        way the orchestrator does at end-of-loop. Plateau-exclusion
+        tests need this so the picker can see "this run's elite came
+        from warm-start AND the GA hit no_improvement"."""
+        run.stop_reason = stop_reason
+        run.best_genome_id = best_genome_id
+        db.commit()
+
+    def test_all_negative_run_returns_empty_after_tier3_removal(
         self, db: Session
     ) -> None:
-        """The regression the user hit: run completes with best fitness
-        −0.38 (no positives, no validation passes). Next run's warm-start
-        must still pick it up — otherwise GA progress is silently
-        discarded every run."""
+        """Tier 3 (`fitness > -50`) was REMOVED in the 2026-06-19
+        warm-start redesign. A run whose elites are all net-negative is
+        no longer surfaced for warm-start — the orchestrator falls
+        back to canonical seeds, which is strictly better than
+        seeding the next run with confirmed-losing strategies.
+        """
         run = self._make_completed_run(db)
-        # Three negative-but-non-degenerate genomes
+        # Three negative-but-non-degenerate genomes — pre-redesign these
+        # would have come back as tier-3 fallback.
         self._seed_genome(db, run=run, fitness=-0.38, idx=0)
         self._seed_genome(db, run=run, fitness=-0.51, idx=1)
         self._seed_genome(db, run=run, fitness=-2.10, idx=2)
@@ -703,31 +729,26 @@ class TestFindPriorWinners:
         rows = evolution_service.find_prior_winners(
             db, instrument="EUR_USD", granularity="M1", limit=3
         )
-        assert len(rows) == 3, (
-            "Tier 3 must carry forward net-negative genomes; got "
-            f"{len(rows)} candidates for a run with no positives and no "
-            f"validator passes."
-        )
-        # Top-by-fitness ordering preserved even in tier 3
-        assert rows[0]["fitness"] == pytest.approx(-0.38)
-        assert rows[1]["fitness"] == pytest.approx(-0.51)
-        assert rows[2]["fitness"] == pytest.approx(-2.10)
+        # Tier 1 (validator_passed) and tier 2 (fitness>0) are both empty;
+        # tier 3 is gone, so the result is empty.
+        assert rows == []
 
-    def test_tier3_excludes_degenerate_zero_trade_penalty(self, db: Session) -> None:
+    def test_degenerate_zero_trade_penalty_never_surfaces(self, db: Session) -> None:
         """Zero-trade genomes get fitness=−100 from the hard penalty.
-        These must NEVER warm-start a future run — they're degenerate by
-        construction (long == short condition, etc.)."""
+        These must NEVER warm-start a future run — they're degenerate
+        by construction (long == short condition, etc.). Under the
+        2026-06-19 redesign tier 2's `fitness > 0` filter handles this
+        naturally (no need for tier 3's explicit `>-50` floor)."""
         run = self._make_completed_run(db)
         self._seed_genome(db, run=run, fitness=-100.0, idx=0)  # zero-trade
         self._seed_genome(db, run=run, fitness=-95.5, idx=1)  # legacy float wobble
-        self._seed_genome(db, run=run, fitness=-49.9, idx=2)  # right at the edge
+        self._seed_genome(db, run=run, fitness=-49.9, idx=2)  # pre-redesign tier-3 edge
 
         rows = evolution_service.find_prior_winners(
             db, instrument="EUR_USD", granularity="M1", limit=3
         )
-        # Only the -49.9 genome qualifies; the others are below the -50 floor
-        assert len(rows) == 1
-        assert rows[0]["fitness"] == pytest.approx(-49.9)
+        # All three are below tier 2's `fitness > 0` cutoff → empty.
+        assert rows == []
 
     def test_tier_ordering_validator_passed_wins_over_higher_fitness(
         self, db: Session
@@ -745,6 +766,11 @@ class TestFindPriorWinners:
         assert rows[0]["fitness"] == pytest.approx(0.5)
 
     def test_tier2_used_when_no_validator_passes(self, db: Session) -> None:
+        """With tier 3 removed and source-run diversity enforced in
+        tier 2, a single run contributes at most ONE non-validator-
+        passed spec. The negative-fitness genome from the same run is
+        excluded both by the `fitness > 0` filter and (redundantly)
+        by source-run diversity."""
         run = self._make_completed_run(db)
         self._seed_genome(db, run=run, fitness=0.3, idx=0)
         self._seed_genome(db, run=run, fitness=-0.5, idx=1)
@@ -752,10 +778,9 @@ class TestFindPriorWinners:
         rows = evolution_service.find_prior_winners(
             db, instrument="EUR_USD", granularity="M1", limit=2
         )
-        # Tier 2 fills with the positive; tier 3 then tops up with the negative
-        assert len(rows) == 2
+        # Only the positive-fitness genome qualifies.
+        assert len(rows) == 1
         assert rows[0]["fitness"] == pytest.approx(0.3)
-        assert rows[1]["fitness"] == pytest.approx(-0.5)
 
     def test_excludes_running_or_failed_runs(self, db: Session) -> None:
         run = self._make_completed_run(db)
@@ -777,62 +802,350 @@ class TestFindPriorWinners:
     def test_dedupes_by_spec_content_so_one_elite_doesnt_fill_all_slots(
         self, db: Session
     ) -> None:
-        """The user's incident: a prior run's elite genome was carried
-        across generations 5, 6, 7. The warm-start query returned 3
-        rows with the SAME dsl_json, so all three warm-start slots in
-        the next run got identical specs — population collapsed to a
-        monoculture, crossover-of-clones produced clones, GA stuck."""
+        """The historical b60473a incident: a prior run's elite was
+        carried across 3 generations and the picker returned 3 rows
+        with the SAME dsl_json. Updated for the 2026-06-19 redesign:
+        the same source run also can't fill more than one slot for
+        non-validator-passed picks (source-run diversity), so even if
+        dedup didn't fire, the diversity rule alone would clamp the
+        count. Uses positive-fitness values so tier 2 surfaces them."""
         run = self._make_completed_run(db)
         # Same canonical spec replicated three times (simulating the
-        # elite carried across 3 generations of a prior run).
+        # elite carried across 3 generations of a prior run). Positive
+        # fitness so it lives in tier 2 post-redesign.
         for i in range(3):
-            self._seed_genome(db, run=run, fitness=-0.09, gen_index=i, idx=0)
-        # A second, structurally-different spec at lower fitness.
-        from agentfx.api.models import GenomeOrigin
-
-        gen_id = f"{run.id}_gen_other"
-        db.add(models.Generation(id=gen_id, run_id=run.id, index=10))
-        db.commit()
-        db.add(
-            models.StrategyGenome(
-                id="genome_diff_spec",
-                generation_id=gen_id,
-                # Different DSL → not deduped against the elite
-                dsl_json=RSI_MEAN_REVERSION_SEED.model_dump(mode="json"),
-                origin=GenomeOrigin.SEED,
-                fitness=-0.50,
-            )
-        )
-        db.commit()
-
+            self._seed_genome(db, run=run, fitness=0.5, gen_index=i, idx=0)
+        # Source-run diversity caps this run's contribution at 1 spec
+        # regardless of whether they're dedup'd or not.
         rows = evolution_service.find_prior_winners(
             db, instrument="EUR_USD", granularity="M1", limit=3
         )
-        assert len(rows) == 2, (
-            f"Expected 2 unique specs (one elite-cluster + one diff "
-            f"spec); got {len(rows)} which means dedup didn't fire."
-        )
-        # First slot = the higher-fitness elite (one copy, not three)
-        assert rows[0]["fitness"] == pytest.approx(-0.09)
-        # Second slot = the structurally-different lower-fitness spec
-        assert rows[1]["fitness"] == pytest.approx(-0.50)
+        assert len(rows) == 1
+        assert rows[0]["fitness"] == pytest.approx(0.5)
 
     def test_dedup_preserves_highest_fitness_representative(self, db: Session) -> None:
         """When the same spec appears multiple times at different
         fitnesses (e.g. elite scored under different generations'
         diversity penalties), dedup keeps the highest-fitness instance
-        as the representative."""
+        as the representative. Uses positive-fitness values so tier 2
+        surfaces them post-redesign."""
         run = self._make_completed_run(db)
-        self._seed_genome(db, run=run, fitness=-2.0, gen_index=0, idx=0)
-        self._seed_genome(db, run=run, fitness=-0.5, gen_index=1, idx=0)
-        self._seed_genome(db, run=run, fitness=-1.0, gen_index=2, idx=0)
+        self._seed_genome(db, run=run, fitness=0.2, gen_index=0, idx=0)
+        self._seed_genome(db, run=run, fitness=0.7, gen_index=1, idx=0)
+        self._seed_genome(db, run=run, fitness=0.4, gen_index=2, idx=0)
 
         rows = evolution_service.find_prior_winners(
             db, instrument="EUR_USD", granularity="M1", limit=3
         )
         # Only one unique spec → exactly one row → highest fitness wins
         assert len(rows) == 1
-        assert rows[0]["fitness"] == pytest.approx(-0.5)
+        assert rows[0]["fitness"] == pytest.approx(0.7)
+
+
+class TestFindPriorWinnersAntiCascade:
+    """The 2026-06-19 staging cascade: every new evolution was warm-
+    starting from the previous run's elite, that elite was inherited
+    from the run before, and so on. Each run hit `no_improvement` at
+    gen 5 because the GA couldn't beat its inherited starting point.
+    Two structural defences:
+      A. Plateau exclusion: skip runs whose best genome's origin is
+         warm_start AND stop_reason is no_improvement.
+      B. Source-run diversity: at most 1 spec per source run in
+         non-validator-passed tiers.
+    Validator_passed=True genomes ALWAYS bypass both defences — Gate B
+    clearance is real edge regardless of how the surrounding run ended.
+    """
+
+    # Reuse the helpers from TestFindPriorWinners by composition.
+    _helpers = TestFindPriorWinners()
+
+    def _make_run(self, db: Session, **kw):
+        return self._helpers._make_completed_run(db, **kw)
+
+    def _seed(self, db: Session, **kw):
+        return self._helpers._seed_genome(db, **kw)
+
+    def _terminate(self, db: Session, **kw):
+        return self._helpers._mark_run_terminated(db, **kw)
+
+    # ─────────────────────────────────────────────────────────────
+    # Plateau exclusion
+    # ─────────────────────────────────────────────────────────────
+
+    def test_cascade_run_excluded_warm_start_origin_plus_no_improvement(
+        self, db: Session
+    ) -> None:
+        """The literal cascade case: run's best genome was inherited as
+        a warm-start and the GA hit no_improvement. That elite is by
+        definition a local optimum the GA couldn't escape — passing it
+        forward re-creates the plateau in the next run.
+        """
+        from agentfx.api.models import GenomeOrigin
+
+        run = self._make_run(db)
+        # The elite was inherited via warm_start, and the run terminated
+        # at no_improvement → cascade shape.
+        elite = self._seed(
+            db,
+            run=run,
+            fitness=0.5,
+            idx=0,
+            origin=GenomeOrigin.WARM_START,
+        )
+        self._terminate(
+            db, run=run, stop_reason="no_improvement", best_genome_id=elite.id
+        )
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        assert rows == [], (
+            "Plateau filter must skip runs whose elite came from "
+            "warm_start AND that hit no_improvement — propagating that "
+            "elite is what caused the staging cascade."
+        )
+
+    def test_genuine_no_improvement_with_mutation_origin_still_surfaces(
+        self, db: Session
+    ) -> None:
+        """User-raised scenario: a run starts from canonical seeds at
+        fitness 0.3, the GA + LLM push to 1.2 across many generations,
+        then plateaus at gen 37 → no_improvement. The elite's origin
+        is `mutation` (or crossover / llm / seed) — genuine GA
+        discovery, NOT inherited from warm_start. This run's elite
+        IS worth preserving; the picker must include it.
+        """
+        from agentfx.api.models import GenomeOrigin
+
+        run = self._make_run(db)
+        elite = self._seed(
+            db,
+            run=run,
+            fitness=1.2,
+            idx=0,
+            origin=GenomeOrigin.MUTATION,
+        )
+        self._terminate(
+            db, run=run, stop_reason="no_improvement", best_genome_id=elite.id
+        )
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        assert len(rows) == 1
+        assert rows[0]["fitness"] == pytest.approx(1.2)
+
+    def test_no_improvement_with_crossover_origin_still_surfaces(
+        self, db: Session
+    ) -> None:
+        """Same as the mutation case — crossover origin is also genuine
+        GA work, not an inherited starting point."""
+        from agentfx.api.models import GenomeOrigin
+
+        run = self._make_run(db)
+        elite = self._seed(
+            db,
+            run=run,
+            fitness=0.8,
+            idx=0,
+            origin=GenomeOrigin.CROSSOVER,
+        )
+        self._terminate(
+            db, run=run, stop_reason="no_improvement", best_genome_id=elite.id
+        )
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        assert len(rows) == 1
+        assert rows[0]["fitness"] == pytest.approx(0.8)
+
+    def test_validator_passed_bypasses_plateau_exclusion(self, db: Session) -> None:
+        """Hypothetical: a run hits no_improvement, its elite is
+        warm_start origin (so it would normally be plateau-excluded),
+        BUT that elite also has validator_passed=True. Gate B
+        clearance is real OOS edge regardless of the surrounding
+        run's termination state — must always be picked.
+        """
+        from agentfx.api.models import GenomeOrigin
+
+        run = self._make_run(db)
+        elite = self._seed(
+            db,
+            run=run,
+            fitness=0.5,
+            validator_passed=True,
+            idx=0,
+            origin=GenomeOrigin.WARM_START,
+        )
+        self._terminate(
+            db, run=run, stop_reason="no_improvement", best_genome_id=elite.id
+        )
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        # validator_passed wins despite the plateau-exclusion criteria
+        assert len(rows) == 1
+        assert rows[0]["fitness"] == pytest.approx(0.5)
+
+    def test_other_stop_reasons_are_not_plateau_excluded(self, db: Session) -> None:
+        """`max_generations` or `target_fitness_reached` runs are NOT
+        plateau-excluded even when their elite came from warm_start —
+        the GA didn't formally give up trying. We're conservative: only
+        the explicit `no_improvement` signal triggers exclusion.
+        """
+        from agentfx.api.models import GenomeOrigin
+
+        run = self._make_run(db)
+        elite = self._seed(
+            db,
+            run=run,
+            fitness=0.6,
+            idx=0,
+            origin=GenomeOrigin.WARM_START,
+        )
+        self._terminate(
+            db, run=run, stop_reason="max_generations", best_genome_id=elite.id
+        )
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        assert len(rows) == 1
+        assert rows[0]["fitness"] == pytest.approx(0.6)
+
+    # ─────────────────────────────────────────────────────────────
+    # Source-run diversity
+    # ─────────────────────────────────────────────────────────────
+
+    def test_three_winners_from_one_run_capped_to_one_in_tier_2(
+        self, db: Session
+    ) -> None:
+        """Run A has 3 structurally-distinct positive-fitness genomes.
+        Source-run diversity caps its contribution to 1 in tier 2 —
+        forces gen-0 of the next run to draw from multiple historical
+        lineages.
+        """
+        run = self._make_run(db)
+        self._seed(db, run=run, fitness=1.5, idx=0)
+        self._seed(db, run=run, fitness=1.2, idx=1)
+        self._seed(db, run=run, fitness=0.8, idx=2)
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        # 3 distinct specs but all from one run → cap at 1
+        assert len(rows) == 1
+        assert rows[0]["fitness"] == pytest.approx(1.5)
+
+    def test_three_runs_each_with_winner_each_contribute_one(self, db: Session) -> None:
+        """3 prior runs each with a positive-fitness elite. Source-run
+        diversity allows 1 from each → fills the picker."""
+        run_a = self._make_run(db)
+        run_b = self._make_run(db)
+        run_c = self._make_run(db)
+        # Different fitness magnitudes — picker should pick top by
+        # fitness within the diversity constraint.
+        self._seed(db, run=run_a, fitness=1.0, idx=0)
+        self._seed(db, run=run_b, fitness=2.0, idx=1)
+        self._seed(db, run=run_c, fitness=1.5, idx=2)
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        assert len(rows) == 3
+        # Highest fitness first; one from each run
+        fitnesses = sorted([r["fitness"] for r in rows], reverse=True)
+        assert fitnesses == [pytest.approx(2.0), pytest.approx(1.5), pytest.approx(1.0)]
+        source_runs = {r["source_run_id"] for r in rows}
+        assert len(source_runs) == 3
+
+    def test_source_diversity_does_not_apply_to_validator_passed_picks(
+        self, db: Session
+    ) -> None:
+        """Multiple validator_passed genomes from the SAME run are all
+        real winners — Gate B clearance is per-genome, not per-run.
+        Source-run diversity must not strip these."""
+        run = self._make_run(db)
+        self._seed(db, run=run, fitness=0.5, validator_passed=True, idx=0)
+        self._seed(db, run=run, fitness=0.8, validator_passed=True, idx=1)
+        self._seed(db, run=run, fitness=1.0, validator_passed=True, idx=2)
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        # All 3 validator-passed picks survive; source diversity does
+        # NOT apply to tier 1.
+        assert len(rows) == 3
+
+    def test_validator_passed_then_tier2_uses_remaining_slots(
+        self, db: Session
+    ) -> None:
+        """Run A has 1 validator_passed (tier 1) + 2 distinct positive
+        non-validator (tier 2) genomes. Tier 1 takes its slot (no
+        diversity cap on tier 1). Tier 2 then enforces 1-per-source
+        and skips the other 2 from Run A since Run A is already
+        represented. The validator-passed slot doesn't count against
+        the diversity constraint for tier 2 — but the run IS already
+        in `seen_source_runs` once tier 1 picks one of its specs."""
+        run_a = self._make_run(db)
+        run_b = self._make_run(db)
+        # Run A: 1 validator-passed + 2 positive non-validator
+        self._seed(db, run=run_a, fitness=0.5, validator_passed=True, idx=0)
+        self._seed(db, run=run_a, fitness=1.5, idx=1)
+        self._seed(db, run=run_a, fitness=1.2, idx=2)
+        # Run B: 1 positive non-validator
+        self._seed(db, run=run_b, fitness=0.9, idx=3)
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        # Expected:
+        #   tier 1: Run A validator-passed (always included, fitness 0.5)
+        #   tier 2: Run B's 0.9 (Run A is already in seen_source_runs
+        #           from tier 1, so its non-validator-passed elites
+        #           are diversity-skipped).
+        assert len(rows) == 2
+        fitnesses = sorted(r["fitness"] for r in rows)
+        # validator-passed (0.5) + run B tier-2 pick (0.9)
+        assert fitnesses[0] == pytest.approx(0.5)
+        assert fitnesses[1] == pytest.approx(0.9)
+
+    # ─────────────────────────────────────────────────────────────
+    # Integration with config-match (already existing)
+    # ─────────────────────────────────────────────────────────────
+
+    def test_plateau_filter_runs_alongside_config_match(self, db: Session) -> None:
+        """The two filters compose cleanly: a run must match the
+        rubric AND not be plateau-cascaded to contribute."""
+        from agentfx.api.models import GenomeOrigin
+
+        # Run A: matching rubric, plateau-cascaded → excluded
+        run_a = self._make_run(db)
+        elite_a = self._seed(
+            db, run=run_a, fitness=1.5, idx=0, origin=GenomeOrigin.WARM_START
+        )
+        self._terminate(
+            db, run=run_a, stop_reason="no_improvement", best_genome_id=elite_a.id
+        )
+
+        # Run B: matching rubric, genuine progress → included
+        run_b = self._make_run(db)
+        elite_b = self._seed(
+            db, run=run_b, fitness=0.7, idx=1, origin=GenomeOrigin.MUTATION
+        )
+        self._terminate(
+            db, run=run_b, stop_reason="max_generations", best_genome_id=elite_b.id
+        )
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        # Only Run B survives; Run A is plateau-excluded.
+        assert len(rows) == 1
+        assert rows[0]["fitness"] == pytest.approx(0.7)
+        assert rows[0]["source_run_id"] == run_b.id
 
 
 class TestFindPriorWinnersConfigMatch:
