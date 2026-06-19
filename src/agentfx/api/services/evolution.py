@@ -81,7 +81,7 @@ def find_prior_winners(
     min_cagr_pct: float | None = None,
 ) -> list[dict]:
     """Top-K genomes (by fitness) from completed runs evaluated under the
-    SAME criteria as the new run.
+    SAME criteria as the new run, with anti-cascade safeguards.
 
     Used by the orchestrator's gen-0 seeding to warm-start a new run
     with the best surviving strategies from prior runs against the
@@ -103,24 +103,55 @@ def find_prior_winners(
     only those runs. When omitted (legacy callers / tests), all
     completed runs match (preserves prior behaviour).
 
-    Filter strategy (most-to-least preferred), top up across tiers
-    until we have `limit` candidates:
-      1. validator_passed = TRUE — genomes that cleared Gate B on OOS;
-         the gold standard for inheritance.
-      2. fitness > 0 — at least a positive Sharpe on training; not
-         brilliant but not garbage either.
-      3. fitness > -50 — non-degenerate. Carries over the best of a
-         run even when nothing crossed zero. Hard search spaces (M1
-         majors at realistic spreads) routinely produce runs whose
-         best is still net-negative for several iterations; without
-         this tier the next run starts from canonical seeds alone and
-         all the GA progress is thrown away. The −50 floor excludes
-         the zero-trade hard penalty (−100) and the per-trade
-         shortfall floor (~−10 to −20), so only "real losing" genomes
-         qualify — not degenerate ones.
+    **Anti-cascade safeguards (staging 2026-06-19).** The previous
+    "top-K by fitness within a tier" design had a fatal failure mode:
+    when prior runs converged on a local optimum, the picker passed
+    that optimum forward to the next run, the next run inherited it
+    via warm-start and couldn't beat it, and `no_improvement` fired
+    again — and so on across runs. Same symptom as the May-27
+    monoculture bug (`b60473a`) and the June-17 cross-config bug
+    (`16d086d`), different mechanism. Two structural changes:
 
-    If all three tiers are empty (e.g. fresh DB), return [] and the
-    orchestrator falls back to canonical seeds only.
+      A. PLATEAU EXCLUSION. Skip a run from the candidate pool when
+         `stop_reason == 'no_improvement'` AND that run's
+         `best_genome.origin == 'warm_start'`. Semantic: this run's
+         GA inherited a starting point and couldn't improve on it —
+         passing the same elite forward just re-creates the plateau.
+         Runs whose `best_genome.origin` is `mutation` / `crossover`
+         / `llm` / `seed` represent genuine GA discovery (even if
+         they later plateaued) — those still warm-start the next run.
+         Genomes with `validator_passed=True` ALWAYS bypass this
+         filter — Gate B clearance is real edge regardless of how
+         the surrounding run terminated.
+
+      B. SOURCE-RUN DIVERSITY. After the elite-spec dedupe (`b60473a`
+         part 2), enforce at most ONE spec per `source_run_id` in
+         the picked list for non-validator-passed tiers. Forces gen-0
+         to draw from multiple historical runs when possible, so a
+         single dominant lineage cannot fill all warm-start slots.
+         Validator-passed genomes bypass this rule — multiple Gate B
+         clearances from the same run are all real winners.
+
+    Filter strategy (most-to-least preferred), top up until we have
+    `limit` candidates:
+      1. validator_passed = TRUE — Gate B clearance; the gold standard
+         for inheritance. Bypasses anti-cascade safeguards (real
+         winners trump plateau/diversity heuristics).
+      2. fitness > 0 — at least a positive Sharpe on training; not
+         brilliant but not garbage either. Subject to plateau
+         exclusion + source-run diversity.
+
+    The previous tier 3 (`fitness > -50`, "carry-forward losing
+    strategies") was REMOVED. Combined with tier-2 + plateau filter +
+    source diversity, tier-3 was promoting confirmed-losing strategies
+    as starting points. When tiers 1 and 2 are empty, the right
+    answer is to fall back to canonical seeds and let the GA + LLM
+    explore fresh — not to seed with confirmed losers.
+
+    If all tiers come back empty (fresh DB, or every candidate run
+    was filtered by plateau/config), return [] and the orchestrator
+    falls back to canonical seeds. A WARNING-level log line records
+    the reason so the audit trail is preserved.
 
     Returns a list of {id, dsl_json, fitness, source_run_id} dicts —
     callers compile dsl_json via StrategySpec.model_validate for the
@@ -182,19 +213,84 @@ def find_prior_winners(
 
         matching_ids = [r.id for r in candidate_runs if _matches(r.config_json)]
         if not matching_ids:
+            logger.info(
+                "warm-start: no completed prior runs match the new run's "
+                "rubric (data_window=%s..%s, min_cagr_pct=%s) for %s %s — "
+                "falling back to canonical seeds",
+                data_window_start,
+                data_window_end,
+                min_cagr_pct,
+                instrument,
+                granularity,
+            )
             return []  # no run matches the rubric; no warm-start
         base_filters.append(models.EvolutionRun.id.in_(matching_ids))
 
-    def _query(extra_filters: list):
-        # Pull a wider pool than `limit` so the Python-side dedupe below
-        # has room to drop duplicates without exhausting candidates.
-        # Elite genomes carried across many generations of a prior run
-        # all share the same dsl_json — without this padding the top-K
-        # by fitness can be K copies of the same spec. 20× the limit is
-        # generous: real population sizes are ≤ 30, so even a fully-
-        # carryover-dominated prior run can't produce more than ~30
-        # duplicates per generation, and we usually want only 3–5.
-        return (
+    # Anti-cascade: identify runs whose elite was inherited via warm-start
+    # AND that hit `no_improvement`. Those runs' best genomes are by
+    # definition local optima the GA couldn't escape from — passing them
+    # forward re-creates the same plateau in the next run (staging
+    # 2026-06-19 cascade). Genomes with `validator_passed=True` bypass
+    # this filter, since Gate B clearance is real edge regardless of
+    # the surrounding run's termination state.
+    plateau_run_ids: set[str] = set()
+    candidate_runs_for_plateau = (
+        db.query(
+            models.EvolutionRun.id,
+            models.EvolutionRun.stop_reason,
+            models.EvolutionRun.best_genome_id,
+        )
+        .filter(
+            models.EvolutionRun.instrument == instrument,
+            models.EvolutionRun.granularity == granularity,
+            models.EvolutionRun.status == "completed",
+            models.EvolutionRun.stop_reason == "no_improvement",
+            models.EvolutionRun.best_genome_id.isnot(None),
+        )
+        .all()
+    )
+    if candidate_runs_for_plateau:
+        best_ids = [r.best_genome_id for r in candidate_runs_for_plateau]
+        warm_start_best = (
+            db.query(models.StrategyGenome.id)
+            .filter(
+                models.StrategyGenome.id.in_(best_ids),
+                models.StrategyGenome.origin == models.GenomeOrigin.WARM_START,
+            )
+            .all()
+        )
+        warm_start_best_ids = {row.id for row in warm_start_best}
+        plateau_run_ids = {
+            r.id
+            for r in candidate_runs_for_plateau
+            if r.best_genome_id in warm_start_best_ids
+        }
+        if plateau_run_ids:
+            logger.info(
+                "warm-start: plateau-excluding %d run(s) whose elite was "
+                "inherited via warm-start and the GA hit no_improvement "
+                "(cascade prevention): %s",
+                len(plateau_run_ids),
+                sorted(plateau_run_ids),
+            )
+
+    def _query(extra_filters: list, *, allow_plateau_runs: bool = False):
+        """Build the candidate query.
+
+        `allow_plateau_runs=True` is set ONLY for the validator-passed
+        tier — Gate B clearance is real edge regardless of how the
+        surrounding run terminated, so we must not let plateau
+        exclusion suppress it. Every other tier respects the plateau
+        filter.
+
+        Pulls a wider pool than `limit` so the Python-side dedupe +
+        source-run-diversity rules below have room to drop duplicates
+        without exhausting candidates. 20× the limit is generous: real
+        population sizes are ≤ 30, so even a fully-carryover-dominated
+        prior run can't produce more than ~30 duplicates per generation,
+        and we usually want only 3–5.
+        """
+        q = (
             db.query(
                 models.StrategyGenome.id,
                 models.StrategyGenome.dsl_json,
@@ -210,8 +306,11 @@ def find_prior_winners(
                 models.Generation.run_id == models.EvolutionRun.id,
             )
             .filter(*(base_filters + extra_filters))
-            .order_by(desc(models.StrategyGenome.fitness))
-            .limit(max(limit * 20, 100))
+        )
+        if not allow_plateau_runs and plateau_run_ids:
+            q = q.filter(models.Generation.run_id.notin_(plateau_run_ids))
+        return q.order_by(desc(models.StrategyGenome.fitness)).limit(
+            max(limit * 20, 100)
         )
 
     def _spec_key(dsl_json: Any) -> str:
@@ -232,42 +331,72 @@ def find_prior_winners(
 
     rows: list = []
     seen_specs: set[str] = set()  # canonical DSL keys we've already added
+    seen_source_runs: set[str] = set()  # source_run_ids we've already added
 
-    def _add_until_full(candidates) -> None:
+    def _add_until_full(candidates, *, enforce_source_diversity: bool) -> None:
         """Append `candidates` into `rows`, skipping any whose canonical
         spec we've already seen. Order is preserved (highest fitness
         first within the candidate list), so the strongest representative
-        of each unique spec wins its slot — and elite genomes carried
-        across many generations of a prior run only consume ONE slot,
-        not K."""
+        of each unique spec wins its slot.
+
+        When `enforce_source_diversity=True`, also skip any candidate
+        whose `source_run_id` we've already pulled from — forces the
+        picked list to draw from multiple historical runs so a single
+        dominant lineage cannot fill all the warm-start slots.
+        Validator-passed genomes call this with the rule OFF, since
+        multiple Gate B clearances from the same run are all real
+        winners worth preserving."""
         for r in candidates:
             if len(rows) >= limit:
                 return
             key = _spec_key(r.dsl_json)
             if key in seen_specs:
                 continue
+            if enforce_source_diversity and r.run_id in seen_source_runs:
+                continue
             seen_specs.add(key)
+            seen_source_runs.add(r.run_id)
             rows.append(r)
 
-    # Tier 1: genomes that passed validation (Gate B on OOS).
-    _add_until_full(_query([models.StrategyGenome.validator_passed.is_(True)]).all())
+    # Tier 1: genomes that passed validation (Gate B on OOS). The gold
+    # standard for inheritance — bypasses plateau exclusion AND
+    # source-run diversity (real winners trump heuristics).
+    _add_until_full(
+        _query(
+            [models.StrategyGenome.validator_passed.is_(True)],
+            allow_plateau_runs=True,
+        ).all(),
+        enforce_source_diversity=False,
+    )
 
     # Tier 2: genomes with positive training fitness (real Sharpe > 0,
     # not the zero-trade penalty floor of −100 nor the legacy
     # fitness=0.0 degenerate cases that re-compute as -100 today).
-    # Top up to `limit` if tier 1 didn't fill.
+    # Top up to `limit` if tier 1 didn't fill. Subject to plateau
+    # exclusion + source-run diversity.
     if len(rows) < limit:
-        _add_until_full(_query([models.StrategyGenome.fitness > 0]).all())
+        _add_until_full(
+            _query([models.StrategyGenome.fitness > 0]).all(),
+            enforce_source_diversity=True,
+        )
 
-    # Tier 3: best of the best, even if negative. Carries the GA's
-    # actual progress forward when a run completes without any
-    # positive-fitness genomes (the typical case on hard search
-    # spaces like M1 majors at realistic spreads). The −50 floor
-    # excludes degenerate genomes (zero-trade penalty −100) and the
-    # trade-shortfall floor (~−10 to −20), so we only keep "real
-    # losing" strategies, never broken ones.
+    # Audit log when the picker came up short — the orchestrator falls
+    # back to canonical seeds for the missing slots; recording why is
+    # what stops the next round of plateau debugging from being pure
+    # archaeology.
     if len(rows) < limit:
-        _add_until_full(_query([models.StrategyGenome.fitness > -50]).all())
+        logger.info(
+            "warm-start: returning %d of %d requested candidates for %s %s. "
+            "Tier 1 (validator_passed) and tier 2 (fitness>0) combined "
+            "produced %d unique specs after plateau exclusion + source-run "
+            "diversity — orchestrator will fill remaining slots from "
+            "canonical seeds.",
+            len(rows),
+            limit,
+            instrument,
+            granularity,
+            len(rows),
+        )
 
     return [
         {
