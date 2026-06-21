@@ -69,10 +69,18 @@ _VOL_LOW = 0.08
 _VOL_HIGH = 0.15
 
 # Trend-strength thresholds. The ratio is (|end - start|) / (sum of
-# absolute bar-to-bar moves). 0 = pure noise, 1 = monotone straight line.
-# Real FX clusters around 0.05-0.30; "trending" markets sit at the high end.
-_TREND_STRONG = 0.30
-_TREND_WEAK = 0.15
+# absolute bar-to-bar moves) computed on a DAILY-resampled close series
+# (see ``compute_regime``). Sub-daily granularities are dominated by
+# tick noise — on M1 EUR_USD a real +8% Q2 2025 rally produced a raw
+# trend ratio of 0.0075 (well below the 0.15 "choppy" threshold) because
+# 256k bars × ~0.5 pip tick noise swamps the 8% net move. Daily
+# resampling strips the noise; thresholds below are calibrated against
+# daily-scale ratios for FX majors, where:
+#   - genuine multi-week directional moves cluster at 0.20-0.30
+#   - sideways consolidation sits at 0.05-0.15
+#   - the 0.15-0.20 band is "mixed" (intermediate)
+_TREND_STRONG = 0.20
+_TREND_WEAK = 0.10
 
 # Direction thresholds. ``(close[-1] - close[0]) / close[0]`` as a percent.
 # A 22-day EUR_USD window typically drifts 0.3-1.5% over its span; ``flat``
@@ -113,6 +121,21 @@ def _annualised_vol(returns: pd.Series, granularity: str) -> float:
     bars_per_day = _BARS_PER_DAY.get(granularity.upper(), 1)
     bars_per_year = 252 * bars_per_day
     return float(returns.std() * (bars_per_year**0.5))
+
+
+def _daily_closes(closes: pd.Series) -> pd.Series:
+    """Resample a close series to daily (one bar per calendar day).
+
+    Returns the input unchanged if the index is not a DatetimeIndex —
+    keeps the unit-test path (synthetic data on RangeIndex) working,
+    where the original bar count is the meaningful scale.
+
+    Days with no observations are dropped so weekend gaps in FX data
+    don't create NaN bars that would inflate sum(|bar_to_bar|).
+    """
+    if not isinstance(closes.index, pd.DatetimeIndex):
+        return closes
+    return closes.resample("1D").last().dropna()
 
 
 def _trend_strength(closes: pd.Series) -> float:
@@ -202,7 +225,14 @@ def compute_regime(
     returns = closes.pct_change().dropna()
 
     vol = _annualised_vol(returns, granularity)
-    trend = _trend_strength(closes)
+    # Trend strength must be computed on a daily-resampled series. The raw
+    # ratio (|net_move| / sum(|bar_to_bar|)) is denominator-dominated by
+    # tick noise at sub-daily granularities and collapses to ~0 even when
+    # the price has moved a clear 5-10%. Resample once here so all
+    # downstream thresholds (_TREND_STRONG/_TREND_WEAK) are evaluated on
+    # the same scale regardless of input granularity.
+    trend_closes = _daily_closes(closes)
+    trend = _trend_strength(trend_closes) if len(trend_closes) >= 2 else 0.0
     net_move = _net_move_pct(closes)
 
     return RegimeTag(
