@@ -98,6 +98,55 @@ class TestComputeRegime:
         tag = compute_regime(_df_from_closes(closes), granularity=granularity)
         assert isinstance(tag, RegimeTag)
 
+    def test_m1_with_tick_noise_still_detects_real_trend(self):
+        # Regression test for the dead-trend-on-M1 bug found on
+        # 2026-06-21: the raw bar-to-bar trend_strength ratio on an M1
+        # series is dominated by tick-level noise across hundreds of
+        # thousands of bars, so a genuine +8% multi-month rally was
+        # being labelled "choppy". The fix resamples closes to daily
+        # before computing the ratio.
+        #
+        # Build a DatetimeIndex M1 series that drifts up ~3% over 30
+        # days while bouncing ±5 pips bar-to-bar (realistic M1 noise).
+        rng = np.random.default_rng(seed=7)
+        n_bars = 30 * 1440  # 30 days × 1440 M1 bars
+        idx = pd.date_range("2025-01-01", periods=n_bars, freq="1min")
+        drift = np.linspace(0, 0.03, n_bars)  # +3% net drift
+        noise = np.cumsum(rng.normal(0, 0.00005, n_bars))  # tick noise
+        closes = pd.Series(1.10 + drift + noise, index=idx)
+        df = pd.DataFrame({"close": closes})
+
+        tag = compute_regime(df, granularity="M1")
+        # Direction must reflect the +3% drift (well above 0.5% flat).
+        assert tag.direction == "up"
+        # Trend must NOT collapse to "choppy" — a clear directional
+        # move with realistic noise should land at "mixed" or
+        # "trending" once we resample away the tick floor.
+        assert tag.trend != "choppy", (
+            f"30-day +3% drift should not read as choppy; got {tag.trend}"
+        )
+
+    def test_m1_pure_noise_still_reads_choppy(self):
+        # Companion to the above: ensure the fix doesn't make
+        # everything trend. A genuine sideways M1 series (multiple
+        # oscillations around a constant, no net drift) must still be
+        # labelled "choppy" after the daily-resampling change.
+        # Built as a multi-cycle sine wave + small noise so daily
+        # resampling sees an oscillating series that returns to its
+        # starting price — the textbook "choppy" shape.
+        rng = np.random.default_rng(seed=11)
+        n_bars = 30 * 1440
+        idx = pd.date_range("2025-01-01", periods=n_bars, freq="1min")
+        # ~6 cycles over 30 days, amplitude ±0.5%, tiny tick noise on top.
+        t = np.arange(n_bars)
+        oscillation = 0.005 * np.sin(2 * np.pi * t / (5 * 1440))
+        noise = rng.normal(0, 0.00002, n_bars)
+        closes_arr = 1.10 + oscillation + noise
+        df = pd.DataFrame({"close": pd.Series(closes_arr, index=idx)})
+
+        tag = compute_regime(df, granularity="M1")
+        assert tag.trend == "choppy"
+
 
 class TestDirectionLabel:
     def test_strong_uptrend_data_labels_direction_up(self):
