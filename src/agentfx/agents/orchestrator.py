@@ -164,11 +164,13 @@ class OrchestratorConfig:
     # Background: Run 1's clean-slate trajectory (UAT 2026-06-25) shows
     # canonical seeds reaching fitness 0.25–0.50 by gen 5–8, at which point
     # a 0.55 warm-start pick is a competitor (1.1–1.8×), not a 5× inheritor
-    # that auto-dominates elitism. Injecting at gen 5+ gives canonical seeds
-    # the evolution time they need while still leveraging institutional memory.
+    # that auto-dominates elitism. Initial default was gen 5; empirical
+    # observation across UAT runs on 2026-06-26/27 showed that's still too
+    # early — canonical seeds need more like 8–12 gens to actually compete
+    # with a 0.55-fitness warm-start. Default raised to 10.
     warm_start_enabled: bool = True
     warm_start_first_injection_gen: int = (
-        5  # earliest gen at which warm-start CAN be injected
+        10  # earliest gen at which warm-start CAN be injected
     )
     warm_start_injection_interval: int = 3  # gens between subsequent injections
     warm_start_picks_per_injection: int = (
