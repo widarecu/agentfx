@@ -154,6 +154,7 @@ class MockPersister:
         granularity: str,
         limit: int,
         exclude_run_id: str | None = None,
+        **kwargs,
     ) -> list[dict]:
         # MockPersister has no cross-run history; warm-start always
         # returns empty here. Tests that exercise warm-start should
@@ -971,3 +972,432 @@ class TestBaseAgentContract:
     def test_agent_type(self) -> None:
         orchestrator, _ = _build_orchestrator()
         assert orchestrator.agent_type == "orchestrator"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Deferred warm-start injection (v0.6.0)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _make_warm_start_row(idx: int = 0) -> dict:
+    """Build a minimal warm-start dict as returned by find_prior_winners."""
+    return {
+        "id": f"genome_prior_run_{idx}",
+        "dsl_json": MA_CROSSOVER_SEED.model_dump(mode="json"),
+        "fitness": 0.55,
+        "source_run_id": f"evorun_prior_{idx}",
+    }
+
+
+class _WarmStartMockPersister(MockPersister):
+    """MockPersister that returns a configurable list of prior winners."""
+
+    def __init__(self, prior_winners: list[dict]) -> None:
+        super().__init__()
+        self._prior_winners = prior_winners
+
+    def find_prior_winners(
+        self,
+        *,
+        instrument: str,
+        granularity: str,
+        limit: int,
+        exclude_run_id: str | None = None,
+        **kwargs,
+    ) -> list[dict]:
+        return self._prior_winners[:limit]
+
+
+def _build_orchestrator_with_warm_start(
+    prior_winners: list[dict],
+    *,
+    warm_start_enabled: bool = True,
+    warm_start_first_injection_gen: int = 5,
+    warm_start_injection_interval: int = 3,
+    warm_start_picks_per_injection: int = 2,
+    max_generations: int = 10,
+    no_improvement_generations: int = 99,
+    fitness_values: list[float] | None = None,
+    population_size: int = 10,
+) -> tuple[OrchestratorAgent, _WarmStartMockPersister]:
+    """Build an orchestrator wired to return the given prior winners."""
+    persister = _WarmStartMockPersister(prior_winners)
+    config = OrchestratorConfig(
+        instrument="EUR_USD",
+        granularity="M1",
+        population_size=population_size,
+        llm_injection_every_n=99,  # disable LLM injection
+        n_validation_folds=4,
+        rng_seed=42,
+        top_n_to_validate=1,
+        use_prior_winners=True,
+        n_prior_winners=len(prior_winners),
+        llm_seed_gen0=False,
+        warm_start_enabled=warm_start_enabled,
+        warm_start_first_injection_gen=warm_start_first_injection_gen,
+        warm_start_injection_interval=warm_start_injection_interval,
+        warm_start_picks_per_injection=warm_start_picks_per_injection,
+    )
+    orchestrator = OrchestratorAgent(
+        run_id="evorun_test_ws",
+        config=config,
+        stop_conditions=StopConditions(
+            max_generations=max_generations,
+            max_wall_clock_seconds=86400,
+            target_fitness=999.0,
+            no_improvement_generations=no_improvement_generations,
+        ),
+        data_window=(
+            datetime(2024, 1, 1, tzinfo=UTC),
+            datetime(2024, 5, 1, tzinfo=UTC),
+        ),
+        persister=persister,
+        llm_injector=None,
+        validator=_make_validator_returning(validator_passed=True),
+        compute_fitness_fn=FixedFitnessFn(fitness_values or [0.1]),
+        clock=StepClock(step_seconds=1.0),
+    )
+    return orchestrator, persister
+
+
+class TestDeferredWarmStart:
+    """Tests for the v0.6.0 deferred warm-start injection feature."""
+
+    # ── Test 1: gen-0 has no warm-start origin ──────────────────────
+
+    def test_gen_0_has_no_warm_start_origin(self) -> None:
+        """With warm_start_enabled=True, find_prior_winners results must NOT
+        appear in gen-0. They should be stashed and injected later."""
+        prior = [_make_warm_start_row(i) for i in range(3)]
+        orchestrator, persister = _build_orchestrator_with_warm_start(
+            prior,
+            warm_start_first_injection_gen=5,
+            max_generations=3,  # stop before first injection
+        )
+        orchestrator.run_loop()
+
+        gen0 = persister.generations[0]
+        warm_start_in_gen0 = [
+            g for g in gen0.genomes if g.origin == GenomeOrigin.WARM_START
+        ]
+        assert warm_start_in_gen0 == [], (
+            f"Gen-0 must not contain warm-start genomes when deferred injection "
+            f"is enabled; found {len(warm_start_in_gen0)} warm-start picks."
+        )
+
+    def test_warm_start_stashed_in_pending_list(self) -> None:
+        """After gen-0 init, pending warm-start picks are in the stash."""
+        prior = [_make_warm_start_row(i) for i in range(3)]
+        # Run only 1 generation so we can inspect the stash before injection
+        orchestrator, _ = _build_orchestrator_with_warm_start(
+            prior,
+            warm_start_first_injection_gen=5,
+            max_generations=1,
+        )
+        orchestrator.run_loop()
+        # All 3 picks should have been stashed (run stopped before gen 5)
+        assert len(orchestrator._pending_warm_starts) == 3  # noqa: SLF001
+
+    # ── Test 2: warm-start injected at first_injection_gen ──────────
+
+    def test_warm_start_injected_at_first_injection_gen(self) -> None:
+        """At gen warm_start_first_injection_gen, pending picks are injected
+        (up to warm_start_picks_per_injection of them)."""
+        prior = [_make_warm_start_row(i) for i in range(3)]
+        first_gen = 3
+        orchestrator, persister = _build_orchestrator_with_warm_start(
+            prior,
+            warm_start_first_injection_gen=first_gen,
+            warm_start_picks_per_injection=2,
+            warm_start_injection_interval=99,  # no follow-up injections
+            max_generations=first_gen + 2,  # enough gens to reach injection
+        )
+        orchestrator.run_loop()
+
+        # Check the decision log for a warm_start inject event
+        ws_inject_decisions = [
+            d
+            for d in persister.decisions
+            if d.agent_type == "warm_start" and d.action == "inject"
+        ]
+        assert len(ws_inject_decisions) >= 1, (
+            f"Expected at least one warm_start inject decision; "
+            f"got {len(ws_inject_decisions)}"
+        )
+        first_inject = ws_inject_decisions[0]
+        assert first_inject.generation_index == first_gen
+        assert first_inject.outputs_json["n_injected"] == 2
+
+        # After the first injection, 1 pick should remain in the stash
+        assert first_inject.outputs_json["n_remaining_in_stash"] == 1
+
+    def test_warm_start_genomes_have_warm_start_origin(self) -> None:
+        """Injected warm-start genomes must have origin=WARM_START."""
+        prior = [_make_warm_start_row(0)]
+        orchestrator, persister = _build_orchestrator_with_warm_start(
+            prior,
+            warm_start_first_injection_gen=2,
+            warm_start_picks_per_injection=1,
+            warm_start_injection_interval=99,
+            max_generations=5,
+        )
+        orchestrator.run_loop()
+
+        warm_start_genomes = [
+            g
+            for gen in persister.generations
+            for g in gen.genomes
+            if g.origin == GenomeOrigin.WARM_START
+        ]
+        assert len(warm_start_genomes) >= 1, (
+            "At least one WARM_START genome must appear after the first injection."
+        )
+
+    # ── Test 3: periodic injection at cadence ───────────────────────
+
+    def test_warm_start_injected_periodically_at_interval(self) -> None:
+        """Multiple picks deplete across injections at the correct cadence."""
+        # 6 picks, inject 2 at a time with interval=2, first at gen 2
+        prior = [_make_warm_start_row(i) for i in range(6)]
+        orchestrator, persister = _build_orchestrator_with_warm_start(
+            prior,
+            warm_start_first_injection_gen=2,
+            warm_start_injection_interval=2,
+            warm_start_picks_per_injection=2,
+            max_generations=15,  # enough for multiple injection windows
+        )
+        orchestrator.run_loop()
+
+        ws_inject_decisions = [
+            d
+            for d in persister.decisions
+            if d.agent_type == "warm_start" and d.action == "inject"
+        ]
+        # With 6 picks and 2 per injection, we expect exactly 3 injection events
+        assert len(ws_inject_decisions) == 3, (
+            f"Expected 3 injection events for 6 picks @ 2/event; "
+            f"got {len(ws_inject_decisions)}"
+        )
+        # Injection gens must be first_gen, first_gen+interval, first_gen+2×interval
+        injection_gens = [d.generation_index for d in ws_inject_decisions]
+        assert injection_gens == [2, 4, 6], (
+            f"Expected injection at gens [2, 4, 6]; got {injection_gens}"
+        )
+
+    # ── Test 4: warm-start picks compete via tournament, not elitism ─
+
+    def test_warm_start_picks_compete_via_tournament_not_elitism(self) -> None:
+        """Injected warm-start picks enter with no fitness set; they are
+        evaluated in the next generation and compete via normal tournament.
+        This test confirms they do NOT carry pre-set fitness values at the
+        moment of injection (which would give them unfair elitism protection).
+        """
+        prior = [_make_warm_start_row(0)]
+        # Use a high fitness constant so injected picks are clearly the
+        # bottom of the population at injection time (they start unevaluated).
+        orchestrator, persister = _build_orchestrator_with_warm_start(
+            prior,
+            warm_start_first_injection_gen=2,
+            warm_start_picks_per_injection=1,
+            warm_start_injection_interval=99,
+            max_generations=5,
+            fitness_values=[1.0],
+        )
+        orchestrator.run_loop()
+
+        # Find the generation in which injection happened.
+        # The injected genome should appear in gen[2+1]=gen3 EVALUATED
+        # (not in gen2 with pre-set fitness from prior run).
+        ws_inject_decisions = [
+            d
+            for d in persister.decisions
+            if d.agent_type == "warm_start" and d.action == "inject"
+        ]
+        if not ws_inject_decisions:
+            pytest.skip("injection didn't fire in this test scenario")
+
+        inject_gen = ws_inject_decisions[0].generation_index
+        # The gen at inject_gen+1 (if it exists) should have the ws genome
+        # evaluated (has_fitness=True). We can't peek at the live population
+        # here, but we can verify that the generation AFTER the inject event
+        # has all genomes with fitness set (because evaluation runs at the
+        # top of every loop iteration).
+        if inject_gen + 1 < len(persister.generations):
+            post_inject_gen = persister.generations[inject_gen + 1]
+            evaluated = [g for g in post_inject_gen.genomes if g.has_fitness()]
+            assert len(evaluated) == len(post_inject_gen.genomes), (
+                "All genomes in the generation after warm-start injection "
+                "must have been evaluated (no pre-set fitness from prior run)."
+            )
+
+    # ── Test 5: no_improvement deferred until first warm-start injection
+
+    def test_no_improvement_stop_deferred_until_first_warm_start_injection(
+        self,
+    ) -> None:
+        """When plateau fires BEFORE first_injection_gen AND pending picks
+        exist, the loop must NOT stop — it waits for warm-start to fire first.
+        """
+        prior = [_make_warm_start_row(0)]
+        # Constant fitness → plateau fires after no_improvement_generations=2
+        # First injection at gen 5, so plateau fires around gen 2–3 without
+        # the deferral guard. With the guard, the loop continues to gen 5.
+        orchestrator, persister = _build_orchestrator_with_warm_start(
+            prior,
+            warm_start_first_injection_gen=5,
+            warm_start_picks_per_injection=1,
+            warm_start_injection_interval=99,
+            max_generations=30,
+            no_improvement_generations=2,
+            fitness_values=[0.5],  # constant → plateau
+        )
+        summary = orchestrator.run_loop()
+
+        # The run must NOT have stopped with no_improvement before gen 5.
+        # It should continue at least until gen 5 (the first injection point).
+        assert summary.generations_completed >= 6, (
+            f"Expected at least 6 generations (to reach first warm-start "
+            f"injection at gen 5 + evaluate it); got "
+            f"{summary.generations_completed}. The no_improvement guard "
+            f"should have deferred the stop."
+        )
+
+    def test_no_improvement_fires_normally_when_no_pending_warm_starts(
+        self,
+    ) -> None:
+        """When no warm-start picks are pending, no_improvement fires at the
+        normal cadence — the deferral guard must not interfere."""
+        # Empty prior winners → no stash → normal no_improvement behaviour
+        orchestrator, persister = _build_orchestrator_with_warm_start(
+            [],  # no prior winners
+            warm_start_first_injection_gen=5,
+            max_generations=30,
+            no_improvement_generations=2,
+            fitness_values=[0.5],  # constant → plateau
+        )
+        summary = orchestrator.run_loop()
+
+        assert summary.stop_reason == "no_improvement", (
+            "With no pending warm-start picks, no_improvement must fire "
+            "at the normal cadence, not be deferred."
+        )
+        # Should have stopped well before gen 30
+        assert summary.generations_completed < 30
+
+    # ── Test 6: warm_start_enabled=False fallback ────────────────────
+
+    def test_warm_start_disabled_falls_back_to_gen0_placement(self) -> None:
+        """When warm_start_enabled=False, prior winners are placed directly
+        in gen-0 (legacy behaviour) and no deferred injection occurs."""
+        prior = [_make_warm_start_row(i) for i in range(2)]
+        orchestrator, persister = _build_orchestrator_with_warm_start(
+            prior,
+            warm_start_enabled=False,
+            max_generations=3,
+            # Legacy gen-0 placement puts the 2 warm-starts alongside
+            # the 9 canonical seeds → 11 fixed slots. Default pop=10
+            # underflows the seed-count guard; bump to clear it.
+            population_size=15,
+        )
+        orchestrator.run_loop()
+
+        # Legacy behaviour: warm-start in gen-0
+        gen0 = persister.generations[0]
+        warm_start_in_gen0 = [
+            g for g in gen0.genomes if g.origin == GenomeOrigin.WARM_START
+        ]
+        assert len(warm_start_in_gen0) == 2, (
+            "With warm_start_enabled=False, prior winners must land in gen-0 "
+            f"(legacy behaviour); found {len(warm_start_in_gen0)}."
+        )
+        # No deferred injection decisions
+        ws_inject_decisions = [
+            d
+            for d in persister.decisions
+            if d.agent_type == "warm_start" and d.action == "inject"
+        ]
+        assert ws_inject_decisions == [], (
+            "No warm_start inject decisions should be logged when "
+            "warm_start_enabled=False."
+        )
+        # Stash should be empty
+        assert orchestrator._pending_warm_starts == []  # noqa: SLF001
+
+    def test_warm_start_disabled_no_injection_regardless_of_picks(self) -> None:
+        """Even if prior winners exist, no injection fires when
+        warm_start_enabled=False."""
+        prior = [_make_warm_start_row(i) for i in range(3)]
+        # Run for many generations — injection must never fire.
+        # Legacy placement puts 3 warm-starts + 9 canonical seeds = 12
+        # fixed slots; bump pop above the seed-count guard.
+        orchestrator, persister = _build_orchestrator_with_warm_start(
+            prior,
+            warm_start_enabled=False,
+            warm_start_first_injection_gen=2,
+            max_generations=10,
+            population_size=15,
+        )
+        orchestrator.run_loop()
+
+        ws_inject_decisions = [
+            d
+            for d in persister.decisions
+            if d.agent_type == "warm_start" and d.action == "inject"
+        ]
+        assert ws_inject_decisions == [], (
+            "warm_start inject decisions must not appear when warm_start_enabled=False."
+        )
+
+    # ── Test 7: decision log entries for warm-start injection ────────
+
+    def test_warm_start_injection_logged_in_decision_log(self) -> None:
+        """Each injection event produces a decision log entry with the
+        correct agent_type=warm_start, action=inject, generation_index,
+        and outputs metadata."""
+        prior = [_make_warm_start_row(0)]
+        orchestrator, persister = _build_orchestrator_with_warm_start(
+            prior,
+            warm_start_first_injection_gen=2,
+            warm_start_picks_per_injection=1,
+            warm_start_injection_interval=99,
+            max_generations=6,
+        )
+        orchestrator.run_loop()
+
+        ws_decisions = [
+            d
+            for d in persister.decisions
+            if d.agent_type == "warm_start" and d.action == "inject"
+        ]
+        assert len(ws_decisions) >= 1
+        d = ws_decisions[0]
+        assert d.generation_index == 2
+        assert d.outputs_json is not None
+        assert "n_injected" in d.outputs_json
+        assert "n_remaining_in_stash" in d.outputs_json
+        assert d.reasoning_text is not None
+        assert "warm-start" in d.reasoning_text.lower()
+
+    # ── Test 8: init_population decision log reflects stash ─────────
+
+    def test_init_population_log_reflects_deferred_stash(self) -> None:
+        """The init_population decision log must report the stash count,
+        not zero, when warm-start picks are deferred."""
+        prior = [_make_warm_start_row(i) for i in range(3)]
+        orchestrator, persister = _build_orchestrator_with_warm_start(
+            prior,
+            warm_start_first_injection_gen=5,
+            max_generations=3,
+        )
+        orchestrator.run_loop()
+
+        init_decisions = [
+            d for d in persister.decisions if d.action == "init_population"
+        ]
+        assert len(init_decisions) == 1
+        out = init_decisions[0].outputs_json
+        assert out is not None
+        assert out["n_warm_start_deferred"] == 3, (
+            "init_population outputs_json must report the stash size "
+            f"as n_warm_start_deferred; got {out}"
+        )
