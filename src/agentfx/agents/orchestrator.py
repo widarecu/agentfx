@@ -154,6 +154,29 @@ class OrchestratorConfig:
     # on the Start New Run modal to flip this per-run.
     auto_stop_on_regime_mismatch: bool = False
 
+    # ── Deferred warm-start injection (v0.6.0) ─────────────────────────
+    # Prior-run winners are no longer placed in gen-0. Instead they are
+    # stashed and injected periodically once the canonical-seed population
+    # has had time to evolve to a comparable fitness level. This prevents
+    # warm-start picks (fitness ~0.55 from prior run) from dominating gen-0
+    # elitism and culling new canonical seeds before they can compete.
+    #
+    # Background: Run 1's clean-slate trajectory (UAT 2026-06-25) shows
+    # canonical seeds reaching fitness 0.25–0.50 by gen 5–8, at which point
+    # a 0.55 warm-start pick is a competitor (1.1–1.8×), not a 5× inheritor
+    # that auto-dominates elitism. Initial default was gen 5; empirical
+    # observation across UAT runs on 2026-06-26/27 showed that's still too
+    # early — canonical seeds need more like 8–12 gens to actually compete
+    # with a 0.55-fitness warm-start. Default raised to 10.
+    warm_start_enabled: bool = True
+    warm_start_first_injection_gen: int = (
+        10  # earliest gen at which warm-start CAN be injected
+    )
+    warm_start_injection_interval: int = 3  # gens between subsequent injections
+    warm_start_picks_per_injection: int = (
+        2  # number of warm-start picks per injection event
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Persistence Protocol
@@ -326,6 +349,13 @@ class OrchestratorAgent(BaseAgent):
         # into the next LLM call so the model can avoid re-proposing
         # shapes that already failed.
         self._all_llm_origin_genomes: list[Genome] = []
+
+        # Deferred warm-start stash (v0.6.0). Prior-run winners are no
+        # longer placed in gen-0; instead they are stashed here and
+        # injected periodically once canonical seeds have evolved to a
+        # comparable fitness level. Populated in run_loop() from
+        # find_prior_winners() results.
+        self._pending_warm_starts: list[dict] = []
 
         # Hall of fame: every distinct genome that has been evaluated
         # this run, keyed by canonical spec JSON so elite carry-overs
@@ -525,23 +555,57 @@ class OrchestratorAgent(BaseAgent):
                     e,
                 )
                 prior = []
-            for row in prior:
-                try:
-                    spec = StrategySpec.model_validate(row["dsl_json"])
-                    composite_seed_genomes.append(
-                        Genome(
-                            spec=spec,
-                            origin=GenomeOrigin.WARM_START,
-                            parent_ids=[row["id"]] if row.get("id") else [],
+
+            if self.config.warm_start_enabled and prior:
+                # v0.6.0 deferred warm-start: stash picks for periodic
+                # injection instead of placing them in gen-0. Warm-start
+                # picks inherited fitness ~0.55 from prior runs; canonical
+                # seeds start at ~0.1 and need gen 5–8 to evolve up to a
+                # comparable level. Placing warm-starts in gen-0 lets them
+                # dominate elitism from the start, preventing new strategies
+                # from getting evolution time to compete. Deferring to
+                # warm_start_first_injection_gen (default 5) levels the field.
+                for row in prior:
+                    try:
+                        # Pre-validate the spec so bad rows fail at stash
+                        # time rather than at injection time mid-loop.
+                        StrategySpec.model_validate(row["dsl_json"])
+                        self._pending_warm_starts.append(row)
+                    except Exception as e:
+                        logger.warning(
+                            "warm-start spec %s failed validation (%s); "
+                            "dropping from stash.",
+                            row.get("id"),
+                            e,
                         )
-                    )
-                    warm_start_count += 1
-                except Exception as e:
-                    logger.warning(
-                        "warm-start spec %s failed validation (%s); skipping.",
-                        row.get("id"),
-                        e,
-                    )
+                warm_start_count = len(self._pending_warm_starts)
+                logger.info(
+                    "warm-start: stashed %d prior winners for deferred "
+                    "injection (first injection at gen %d).",
+                    warm_start_count,
+                    self.config.warm_start_first_injection_gen,
+                )
+            elif prior:
+                # warm_start_enabled=False: legacy path — place directly
+                # in gen-0 (backwards-compatible for any caller that
+                # explicitly disables the new scheduling).
+                for row in prior:
+                    try:
+                        spec = StrategySpec.model_validate(row["dsl_json"])
+                        composite_seed_genomes.append(
+                            Genome(
+                                spec=spec,
+                                origin=GenomeOrigin.WARM_START,
+                                parent_ids=[row["id"]] if row.get("id") else [],
+                            )
+                        )
+                        warm_start_count += 1
+                    except Exception as e:
+                        logger.warning(
+                            "warm-start spec %s failed validation (%s); skipping.",
+                            row.get("id"),
+                            e,
+                        )
 
         llm_gen0_proposals: list[Genome] = []
         if (
@@ -603,6 +667,7 @@ class OrchestratorAgent(BaseAgent):
             mutate_fn=mutate_spec,
             run_id=self.run_id,
         )
+        n_deferred = len(self._pending_warm_starts)
         self.persister.log_decision(
             self.run_id,
             agent_type="orchestrator",
@@ -611,13 +676,30 @@ class OrchestratorAgent(BaseAgent):
                 "population_size": len(population),
                 "n_canonical_seeds": len(self._seed_specs),
                 "n_warm_start_winners": warm_start_count,
+                "n_warm_start_deferred": n_deferred,
                 "n_llm_gen0_proposals": llm_seed_count,
+                "warm_start_first_injection_gen": (
+                    self.config.warm_start_first_injection_gen
+                    if n_deferred > 0
+                    else None
+                ),
             },
             reasoning_text=(
                 f"Initialised generation 0 with {len(self._seed_specs)} canonical "
-                f"seeds + {warm_start_count} prior winners + {llm_seed_count} LLM "
-                f"proposals + "
-                f"{len(population) - len(composite_seed_genomes)} mutated copies."
+                f"seeds"
+                + (
+                    f" + {warm_start_count} prior winners placed in gen-0"
+                    if warm_start_count > 0 and n_deferred == 0
+                    else ""
+                )
+                + (
+                    f" ({n_deferred} warm-start picks deferred to gen "
+                    f"{self.config.warm_start_first_injection_gen}+)"
+                    if n_deferred > 0
+                    else ""
+                )
+                + f" + {llm_seed_count} LLM proposals"
+                + f" + {len(population) - len(composite_seed_genomes)} mutated copies."
             ),
         )
 
@@ -752,6 +834,18 @@ class OrchestratorAgent(BaseAgent):
                     best_fitness_history=best_fitness_history,
                 )
                 pending_llm_invoked = pending_llm_call_id is not None
+
+            # ── Deferred warm-start injection ──────────────────────────
+            # Injected AFTER evolve (same pattern as LLM injection): the
+            # warm-start picks enter the freshly-evolved population so their
+            # fitness is evaluated at the top of the next iteration.
+            # No elite-tag is added — they compete via normal tournament
+            # selection from gen N+1 onward, just like any other genome.
+            self._maybe_inject_warm_start(
+                population=population,
+                gen_index=gen_index,
+                best_fitness_history=best_fitness_history,
+            )
 
         # ── Validation ───────────────────────────────────────────────
         validated_count = self._validate_top_genomes(best_genome_overall)
@@ -1098,6 +1192,133 @@ class OrchestratorAgent(BaseAgent):
 
         return result.call_id
 
+    def _maybe_inject_warm_start(
+        self,
+        population: Population,
+        gen_index: int,
+        best_fitness_history: list[float],
+    ) -> None:
+        """Trigger a deferred warm-start injection if the schedule allows.
+
+        Called once per generation (after ``gen_index`` has been incremented
+        past the completed generation). Does nothing when:
+
+        - ``warm_start_enabled`` is False
+        - ``_pending_warm_starts`` is empty
+        - ``gen_index`` hasn't reached ``warm_start_first_injection_gen``
+        - The generation cadence check fails
+
+        When it fires, delegates to ``_inject_warm_start_picks`` which
+        replaces the bottom-K genomes exactly as the LLM injection path does.
+        """
+        if not self.config.warm_start_enabled:
+            return
+        if not self._pending_warm_starts:
+            return
+
+        first = self.config.warm_start_first_injection_gen
+        interval = self.config.warm_start_injection_interval
+
+        if gen_index < first:
+            return
+        if (gen_index - first) % interval != 0:
+            return
+
+        self._inject_warm_start_picks(
+            population=population,
+            gen_index=gen_index,
+            best_fitness_history=best_fitness_history,
+        )
+
+    def _inject_warm_start_picks(
+        self,
+        population: Population,
+        gen_index: int,
+        best_fitness_history: list[float],
+    ) -> None:
+        """Replace the bottom-K genomes with warm-start picks.
+
+        Mirrors the LLM injection pattern (``_inject_llm_proposals``):
+        sort by ascending fitness, drop the bottom-K, append warm-start
+        picks with origin=WARM_START. Picks are consumed from
+        ``_pending_warm_starts`` (FIFO) so repeated injection cadences
+        drain the stash naturally.
+
+        No fitness is set on the injected genomes — they enter with
+        fitness=-inf and are evaluated at the top of the next iteration.
+        This is intentional: warm-start picks compete in gen N+1 via
+        normal tournament selection, not via elitism. Their prior-run
+        fitness is irrelevant in the new run's evaluation context; they
+        earn their place just like any other genome.
+        """
+        n_to_inject = min(
+            self.config.warm_start_picks_per_injection,
+            len(self._pending_warm_starts),
+        )
+        if n_to_inject == 0:
+            return
+
+        picks = self._pending_warm_starts[:n_to_inject]
+        self._pending_warm_starts = self._pending_warm_starts[n_to_inject:]
+
+        new_genomes: list[Genome] = []
+        actually_injected = 0
+        for row in picks:
+            try:
+                spec = StrategySpec.model_validate(row["dsl_json"])
+            except Exception as e:
+                logger.warning(
+                    "warm-start deferred injection: spec %s failed "
+                    "re-validation at gen %d (%s); skipping.",
+                    row.get("id"),
+                    gen_index,
+                    e,
+                )
+                continue
+            new_genomes.append(
+                Genome(
+                    spec=spec,
+                    origin=GenomeOrigin.WARM_START,
+                    parent_ids=[row["id"]] if row.get("id") else [],
+                )
+            )
+            actually_injected += 1
+
+        if not new_genomes:
+            return
+
+        # Replace the bottom-K by fitness (same as LLM injection).
+        n_replace = min(len(new_genomes), len(population.genomes))
+        population.genomes.sort(
+            key=lambda g: (g.fitness_value if g.has_fitness() else float("-inf"))
+        )
+        population.genomes = population.genomes[n_replace:] + new_genomes
+
+        current_best = max(best_fitness_history) if best_fitness_history else None
+        self.persister.log_decision(
+            self.run_id,
+            agent_type="warm_start",
+            action="inject",
+            generation_index=gen_index,
+            outputs_json={
+                "n_injected": actually_injected,
+                "n_remaining_in_stash": len(self._pending_warm_starts),
+                "current_best_fitness": current_best,
+            },
+            reasoning_text=(
+                f"Deferred warm-start injection at gen {gen_index}: "
+                f"{actually_injected} prior-run picks injected into "
+                f"population bottom (replacing lowest-fitness genomes). "
+                f"{len(self._pending_warm_starts)} picks remain in stash."
+            ),
+        )
+        logger.info(
+            "warm-start injection at gen %d: %d picks injected, %d remaining in stash.",
+            gen_index,
+            actually_injected,
+            len(self._pending_warm_starts),
+        )
+
     def _check_stop_conditions(
         self,
         gen_index: int,
@@ -1129,7 +1350,27 @@ class OrchestratorAgent(BaseAgent):
             recent = best_fitness_history[-(k + 1) :]
             # Any improvement over the last k+1 generations (incl. current)?
             if max(recent) <= recent[0]:
-                return _StopDecision(True, "no_improvement")
+                # Deferred warm-start guard: if warm-start is enabled and
+                # there are still pending picks, do not allow no_improvement
+                # to fire before the first injection has had a chance to
+                # contribute. The minimum safe gen for stopping is
+                # warm_start_first_injection_gen + 1 so at least one
+                # injection event has been evaluated.
+                if (
+                    self.config.warm_start_enabled
+                    and self._pending_warm_starts
+                    and gen_index <= self.config.warm_start_first_injection_gen
+                ):
+                    logger.info(
+                        "no_improvement plateau detected at gen %d but "
+                        "deferring stop: %d warm-start picks not yet "
+                        "injected (first injection gen=%d).",
+                        gen_index,
+                        len(self._pending_warm_starts),
+                        self.config.warm_start_first_injection_gen,
+                    )
+                else:
+                    return _StopDecision(True, "no_improvement")
 
         # 5. LLM budget exhausted (only triggers if injector is configured
         # AND budget has actually run out — non-LLM runs ignore this).

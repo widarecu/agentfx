@@ -111,6 +111,14 @@ class OrchestratorConfigSchema(BaseModel):
     # mismatch info either way; this just flips it from warning to gate.
     auto_stop_on_regime_mismatch: bool = False
 
+    # v0.6.0 deferred warm-start injection. Prior-run winners are stashed
+    # instead of placed in gen-0 and injected periodically once canonical
+    # seeds have had time to evolve to a comparable fitness level.
+    warm_start_enabled: bool = True
+    warm_start_first_injection_gen: int = Field(default=10, ge=0)
+    warm_start_injection_interval: int = Field(default=3, ge=1)
+    warm_start_picks_per_injection: int = Field(default=2, ge=1)
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Evolution run
