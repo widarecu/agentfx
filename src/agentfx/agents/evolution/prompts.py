@@ -241,6 +241,28 @@ regime", "fitness has plateaued for 3 generations, try a tighter stop".
 {_example_spec_json()}
 ```
 
+# Fitness function (UPDATED 2026-06-28)
+
+Each genome receives a "Gate-B-proximity" fitness score: a weighted sum
+of how close its metrics are to passing Gate B thresholds. Thresholds:
+
+- Sharpe ≥ 1.0      (weight 0.20)
+- CAGR ≥ 15%        (weight 0.35  ← highest priority: consistent profitability)
+- Hit Rate ≥ 48%    (weight 0.10)
+- Max Drawdown ≤ 10% (weight 0.25)
+- Trade Count ≥ 300  (weight 0.10)
+
+Each criterion contributes a term that is 0 when the metric equals the
+threshold, positive when exceeding, negative when failing (clamped).
+Fitness ≥ 0 means the genome is roughly passing or close to passing Gate
+B on a weighted-average basis.
+
+Propose strategies that aim to clear ALL thresholds, not just maximise
+Sharpe. A strategy with Sharpe 0.6, hit rate 50%, CAGR 18%, MDD 8% will
+score HIGHER than a strategy with Sharpe 1.5, hit rate 30%, CAGR 5%,
+MDD 15% — because the first one is closer to passing all five criteria,
+even though its raw Sharpe is lower.
+
 # What you are NOT being asked to do
 
 - Do not write Python code; only emit structured JSON conforming to the
