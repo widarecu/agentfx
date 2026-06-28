@@ -905,15 +905,29 @@ class TestFindPriorWinnersAntiCascade:
             "elite is what caused the staging cascade."
         )
 
-    def test_genuine_no_improvement_with_mutation_origin_still_surfaces(
+    def test_genuine_no_improvement_with_mutation_origin_excluded_by_layer2(
         self, db: Session
     ) -> None:
-        """User-raised scenario: a run starts from canonical seeds at
-        fitness 0.3, the GA + LLM push to 1.2 across many generations,
-        then plateaus at gen 37 → no_improvement. The elite's origin
-        is `mutation` (or crossover / llm / seed) — genuine GA
-        discovery, NOT inherited from warm_start. This run's elite
-        IS worth preserving; the picker must include it.
+        """Layer 2 (2026-06-25 loophole fix) supersedes the old Layer-1-only
+        semantics for this scenario.
+
+        OLD behaviour (Layer 1 only): a run that hits no_improvement with a
+        mutation-origin elite was NOT plateau-excluded because Layer 1 keys
+        on origin == warm_start. This allowed the spec to launder into the
+        next run's warm-start pool.
+
+        NEW behaviour (Layer 2 added): ANY spec that was the best genome of
+        a no_improvement run — regardless of origin — is added to
+        `plateau_spec_keys` and excluded from the candidate pool. A
+        mutation-origin elite that plateaued is a local optimum just as much
+        as a warm_start-origin one.  Layer 1 still does NOT add this run to
+        `plateau_run_ids` (origin is mutation, not warm_start) — the
+        run-level exclusion is origin-keyed. But Layer 2 blocks the spec
+        itself via `_add_until_full`'s `plateau_spec_keys` check.
+
+        Net effect: the picker returns [] for a fresh run, correctly sending
+        the orchestrator to canonical seeds rather than recycling a spec the
+        GA already proved it cannot escape from.
         """
         from agentfx.api.models import GenomeOrigin
 
@@ -932,14 +946,27 @@ class TestFindPriorWinnersAntiCascade:
         rows = evolution_service.find_prior_winners(
             db, instrument="EUR_USD", granularity="M1", limit=3
         )
-        assert len(rows) == 1
-        assert rows[0]["fitness"] == pytest.approx(1.2)
+        # Layer 2 blocks the spec — mutation elite of a no_improvement run
+        # is a proven local optimum; the orchestrator should use canonical
+        # seeds instead.
+        assert rows == [], (
+            "Layer 2 must block any spec that was the best genome of a "
+            "no_improvement run, regardless of origin.  A mutation-origin "
+            "elite that plateaued is still a local optimum."
+        )
 
-    def test_no_improvement_with_crossover_origin_still_surfaces(
+    def test_no_improvement_with_crossover_origin_excluded_by_layer2(
         self, db: Session
     ) -> None:
-        """Same as the mutation case — crossover origin is also genuine
-        GA work, not an inherited starting point."""
+        """Same as the mutation case — crossover origin is genuine GA work,
+        but if that work ended in a plateau (no_improvement), the spec
+        itself is a local optimum. Layer 2 blocks it.
+
+        This is specifically the UAT 2026-06-25 loophole case: Run 1 found
+        a crossover elite, hit no_improvement. Under Layer 1 only, the
+        spec survived.  Layer 2 closes that loophole by keying on the spec,
+        not the origin.
+        """
         from agentfx.api.models import GenomeOrigin
 
         run = self._make_run(db)
@@ -957,8 +984,11 @@ class TestFindPriorWinnersAntiCascade:
         rows = evolution_service.find_prior_winners(
             db, instrument="EUR_USD", granularity="M1", limit=3
         )
-        assert len(rows) == 1
-        assert rows[0]["fitness"] == pytest.approx(0.8)
+        # Layer 2 blocks the crossover-origin plateau spec.
+        assert rows == [], (
+            "Layer 2 must exclude the crossover-origin plateau spec — "
+            "this is the exact loophole from the UAT 2026-06-25 cascade."
+        )
 
     def test_validator_passed_bypasses_plateau_exclusion(self, db: Session) -> None:
         """Hypothetical: a run hits no_improvement, its elite is
@@ -1111,6 +1141,242 @@ class TestFindPriorWinnersAntiCascade:
         # validator-passed (0.5) + run B tier-2 pick (0.9)
         assert fitnesses[0] == pytest.approx(0.5)
         assert fitnesses[1] == pytest.approx(0.9)
+
+    # ─────────────────────────────────────────────────────────────
+    # Layer 2: canonical-spec exclusion (UAT 2026-06-25 loophole fix)
+    # ─────────────────────────────────────────────────────────────
+
+    def test_crossover_origin_no_improvement_spec_not_recycled(
+        self, db: Session
+    ) -> None:
+        """UAT cascade 2026-06-25 loophole: Run 1 stops with
+        no_improvement; its best genome has origin=crossover (genuine GA
+        work, not warm_start), so Layer 1 (origin-keyed) does NOT exclude
+        Run 1 from the pool.  Run 2 is seeded with that same DSL spec
+        as a warm_start and also hits no_improvement → Layer 1 filters
+        Run 2.  But Run 1's crossover genome is still a candidate and
+        would be selected as warm_start for Run 3.
+
+        Layer 2 fix: the crossover spec is in plateau_spec_keys (it was
+        the best genome of a no_improvement run), so it must be rejected
+        even when it appears in an otherwise-eligible run.  The picker
+        must return [] for the new run.
+        """
+        from agentfx.api.models import GenomeOrigin
+
+        plateau_dsl = MA_CROSSOVER_SEED.model_dump(mode="json")
+        plateau_dsl["entry"]["long"]["lhs"]["args"] = [99.0]
+        plateau_dsl["entry"]["short"]["lhs"]["args"] = [99.0]
+
+        # Run 1: crossover origin, no_improvement (Layer 1 does NOT filter
+        # this run — origin is crossover, not warm_start).
+        run1 = self._make_run(db)
+        elite1 = self._seed(
+            db,
+            run=run1,
+            fitness=0.558,
+            idx=0,
+            origin=GenomeOrigin.CROSSOVER,
+            dsl_json=plateau_dsl,
+        )
+        self._terminate(
+            db, run=run1, stop_reason="no_improvement", best_genome_id=elite1.id
+        )
+
+        # Run 2: a different run that also holds the same DSL (e.g. it
+        # was warm-started from Run 1's elite). Its genome has a
+        # different origin but the same spec — Layer 2 must catch it.
+        run2 = self._make_run(db)
+        self._seed(
+            db,
+            run=run2,
+            fitness=0.558,
+            idx=0,
+            origin=GenomeOrigin.SEED,
+            dsl_json=plateau_dsl,
+        )
+        # Run 2 is NOT terminated with no_improvement — it's just a
+        # completed run that happens to carry the same spec. Its genome
+        # would survive Layer 1, but Layer 2 must block it because the
+        # spec itself is plateau'd.
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        assert rows == [], (
+            "Layer 2 must exclude any candidate whose canonical spec "
+            "matches a no_improvement run's best genome, regardless of "
+            "which run the candidate came from or what its origin is."
+        )
+
+    def test_uat_cascade_four_run_scenario(self, db: Session) -> None:
+        """Exact reproduction of the UAT 2026-06-25 production cascade.
+
+        Run 1 (clean slate): origin=crossover, fitness=0.558,
+                             stop_reason=no_improvement.
+        Runs 2/3/4: best genome = Run 1's DSL (warm_start origin),
+                    stop_reason=no_improvement each time.
+        Layer 1 filters Runs 2/3/4 (warm_start + no_improvement).
+        Layer 1 does NOT filter Run 1 (crossover, not warm_start).
+        Layer 2 must filter Run 1's spec from the candidate pool.
+
+        After the fix, find_prior_winners for a 5th run returns [].
+        """
+        from agentfx.api.models import GenomeOrigin
+
+        plateau_dsl = MA_CROSSOVER_SEED.model_dump(mode="json")
+        plateau_dsl["entry"]["long"]["lhs"]["args"] = [55.0]
+        plateau_dsl["entry"]["short"]["lhs"]["args"] = [55.0]
+
+        # Run 1: genuine GA discovery, hits no_improvement.
+        run1 = self._make_run(db)
+        elite1 = self._seed(
+            db,
+            run=run1,
+            fitness=0.558,
+            idx=0,
+            origin=GenomeOrigin.CROSSOVER,
+            dsl_json=plateau_dsl,
+        )
+        self._terminate(
+            db, run=run1, stop_reason="no_improvement", best_genome_id=elite1.id
+        )
+
+        # Runs 2, 3, 4: each warm-starts from Run 1's elite, each stops
+        # at no_improvement. Best genome in each has same dsl_json.
+        for run_n in range(2, 5):
+            run = self._make_run(db)
+            elite = self._seed(
+                db,
+                run=run,
+                fitness=0.558,
+                idx=0,
+                origin=GenomeOrigin.WARM_START,
+                dsl_json=plateau_dsl,
+            )
+            self._terminate(
+                db, run=run, stop_reason="no_improvement", best_genome_id=elite.id
+            )
+
+        # A 5th run is about to start. Before the fix, Run 1's elite
+        # would be selected as warm-start (origin=crossover survives
+        # Layer 1). After the fix, Layer 2 blocks it.
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        assert rows == [], (
+            f"UAT 2026-06-25 cascade: expected empty warm-start pool "
+            f"(all specs are plateau'd), got {rows}"
+        )
+
+    def test_layer2_does_not_block_different_spec_from_same_run(
+        self, db: Session
+    ) -> None:
+        """Layer 2 is spec-keyed, not run-keyed. A no_improvement run's
+        OTHER genomes (not the best_genome) that have a different DSL
+        are NOT in plateau_spec_keys and must still be selectable.
+
+        In practice, the picker filters by fitness > 0 and source-run
+        diversity anyway, but the spec-exclusion itself must be surgical:
+        only the exact plateau'd spec is excluded, not the entire run.
+        """
+        from agentfx.api.models import GenomeOrigin
+
+        plateau_dsl = MA_CROSSOVER_SEED.model_dump(mode="json")
+        plateau_dsl["entry"]["long"]["lhs"]["args"] = [77.0]
+        plateau_dsl["entry"]["short"]["lhs"]["args"] = [77.0]
+
+        other_dsl = MA_CROSSOVER_SEED.model_dump(mode="json")
+        other_dsl["entry"]["long"]["lhs"]["args"] = [88.0]
+        other_dsl["entry"]["short"]["lhs"]["args"] = [88.0]
+
+        # Run A: no_improvement. Its best genome has the plateau DSL.
+        # A different genome in the same run has a distinct DSL.
+        run_a = self._make_run(db)
+        elite_a = self._seed(
+            db,
+            run=run_a,
+            fitness=0.3,
+            idx=0,
+            origin=GenomeOrigin.CROSSOVER,
+            dsl_json=plateau_dsl,
+        )
+        # A second genome in the same run, with a better fitness and a
+        # different spec. Not the best_genome, so NOT in plateau_spec_keys.
+        self._seed(
+            db,
+            run=run_a,
+            fitness=0.9,
+            gen_index=1,
+            idx=0,
+            origin=GenomeOrigin.MUTATION,
+            dsl_json=other_dsl,
+        )
+        self._terminate(
+            db, run=run_a, stop_reason="no_improvement", best_genome_id=elite_a.id
+        )
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        # The plateau_dsl (best_genome of the no_improvement run) is
+        # excluded by Layer 2. The other_dsl genome from the same run
+        # is NOT excluded — it wasn't the best genome.
+        # However: Run A is now in seen_source_runs from… wait — Layer 1
+        # does NOT exclude Run A (origin=crossover, not warm_start).
+        # Layer 2 excludes the plateau_dsl spec only.
+        # The other_dsl genome from Run A has fitness 0.9 and a distinct
+        # spec → it should surface as the single tier-2 pick.
+        assert len(rows) == 1
+        assert rows[0]["fitness"] == pytest.approx(0.9)
+
+    def test_validator_passed_bypasses_layer2_spec_exclusion(self, db: Session) -> None:
+        """A validator_passed genome whose DSL matches a plateau spec
+        must still be picked — Gate B clearance overrides Layer 2 just
+        as it overrides Layer 1.
+        """
+        from agentfx.api.models import GenomeOrigin
+
+        plateau_dsl = MA_CROSSOVER_SEED.model_dump(mode="json")
+        plateau_dsl["entry"]["long"]["lhs"]["args"] = [42.0]
+        plateau_dsl["entry"]["short"]["lhs"]["args"] = [42.0]
+
+        # Run A: crossover, no_improvement. Puts plateau_dsl into
+        # plateau_spec_keys.
+        run_a = self._make_run(db)
+        elite_a = self._seed(
+            db,
+            run=run_a,
+            fitness=0.4,
+            idx=0,
+            origin=GenomeOrigin.CROSSOVER,
+            dsl_json=plateau_dsl,
+        )
+        self._terminate(
+            db, run=run_a, stop_reason="no_improvement", best_genome_id=elite_a.id
+        )
+
+        # Run B: a separate run that has the same DSL BUT with
+        # validator_passed=True. Gate B clearance is real OOS edge.
+        run_b = self._make_run(db)
+        self._seed(
+            db,
+            run=run_b,
+            fitness=0.4,
+            idx=0,
+            origin=GenomeOrigin.SEED,
+            validator_passed=True,
+            dsl_json=plateau_dsl,
+        )
+        # Run B is completed without no_improvement — it ran fully.
+
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        # validator_passed bypasses Layer 2 — the spec is plateau'd but
+        # Gate B clearance is real edge.
+        assert len(rows) == 1
+        assert rows[0]["fitness"] == pytest.approx(0.4)
 
     # ─────────────────────────────────────────────────────────────
     # Integration with config-match (already existing)

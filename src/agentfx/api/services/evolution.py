@@ -112,16 +112,34 @@ def find_prior_winners(
     monoculture bug (`b60473a`) and the June-17 cross-config bug
     (`16d086d`), different mechanism. Two structural changes:
 
-      A. PLATEAU EXCLUSION. Skip a run from the candidate pool when
-         `stop_reason == 'no_improvement'` AND that run's
+      A. PLATEAU EXCLUSION. Two-layer defence against spec recycling:
+
+         Layer 1 (run-level, PR #11): skip a run from the candidate
+         pool when `stop_reason == 'no_improvement'` AND that run's
          `best_genome.origin == 'warm_start'`. Semantic: this run's
          GA inherited a starting point and couldn't improve on it —
          passing the same elite forward just re-creates the plateau.
          Runs whose `best_genome.origin` is `mutation` / `crossover`
          / `llm` / `seed` represent genuine GA discovery (even if
          they later plateaued) — those still warm-start the next run.
-         Genomes with `validator_passed=True` ALWAYS bypass this
-         filter — Gate B clearance is real edge regardless of how
+
+         Layer 2 (spec-level, 2026-06-25 loophole fix): collect the
+         canonical dsl_json keys of ALL `no_improvement` runs' best
+         genomes, regardless of origin. Any candidate genome in the
+         picker whose canonical spec matches one of those keys is
+         excluded even if its source run is not Layer-1-excluded.
+         This closes the "laundering" loophole: Run 1 stops with
+         no_improvement, best genome is origin=crossover (not
+         warm_start), so Layer 1 leaves Run 1 in the pool. Runs
+         2/3/4 warm-start from Run 1's elite, also hit
+         no_improvement (filtered by Layer 1), but Run 1's crossover
+         genome keeps laundering as a warm-start candidate for
+         every subsequent run. Layer 2 stops this by keying on the
+         spec itself, not the origin (UAT cascade 2026-06-25:
+         runs 11f90484 → d266f133 → 9902de96 → b5f74e0e).
+
+         Genomes with `validator_passed=True` ALWAYS bypass BOTH
+         layers — Gate B clearance is real edge regardless of how
          the surrounding run terminated.
 
       B. SOURCE-RUN DIVERSITY. After the elite-spec dedupe (`b60473a`
@@ -226,14 +244,50 @@ def find_prior_winners(
             return []  # no run matches the rubric; no warm-start
         base_filters.append(models.EvolutionRun.id.in_(matching_ids))
 
-    # Anti-cascade: identify runs whose elite was inherited via warm-start
-    # AND that hit `no_improvement`. Those runs' best genomes are by
-    # definition local optima the GA couldn't escape from — passing them
-    # forward re-creates the same plateau in the next run (staging
-    # 2026-06-19 cascade). Genomes with `validator_passed=True` bypass
-    # this filter, since Gate B clearance is real edge regardless of
-    # the surrounding run's termination state.
+    # Anti-cascade: two-layer plateau exclusion (UAT 2026-06-25 cascade
+    # loophole fix).
+    #
+    # LAYER 1 — run-level exclusion (origin-keyed, PR #11):
+    #   Identify runs whose best genome's origin is `warm_start` AND that
+    #   hit `no_improvement`. Those runs' best genomes are by definition
+    #   local optima the GA inherited and couldn't escape — passing them
+    #   forward re-creates the same plateau (staging 2026-06-19 cascade).
+    #
+    # LAYER 2 — spec-level exclusion (canonical-keyed, 2026-06-25 fix):
+    #   The loophole: a run can stop with `no_improvement` while its best
+    #   genome has origin=`crossover` / `mutation` / `llm` / `seed` (i.e.
+    #   genuine GA work). Layer 1 correctly leaves that run's elite in the
+    #   candidate pool. But if a *subsequent* run warm-starts from that
+    #   elite and also hits `no_improvement`, Layer 1 filters the
+    #   subsequent run — yet the ORIGINAL run's elite is still visible and
+    #   selectable as a warm-start for yet another run. The cascade
+    #   continues indefinitely: Runs 2/3/4 are filtered but Run 1's
+    #   crossover genome keeps laundering through. Fix: collect the
+    #   canonical spec keys of ALL `no_improvement` runs' best genomes
+    #   (regardless of origin) into `plateau_spec_keys`, then filter any
+    #   candidate whose spec key appears in that set. Layer 1 is retained
+    #   as secondary safety (overlapping coverage; existing tests rely on
+    #   it). Genomes with `validator_passed=True` bypass both layers.
+    import json as _json
+
+    def _canonical_spec_key(dsl: Any) -> str:
+        """Canonical JSON key for plateau-spec comparison.
+
+        Normalises both str and already-parsed dict forms (the JSON
+        column comes back differently depending on the DB driver) so
+        two genomes with byte-identical DSLs always produce the same
+        key regardless of map order."""
+        if isinstance(dsl, str):
+            try:
+                obj = _json.loads(dsl)
+            except (TypeError, ValueError):
+                return dsl
+        else:
+            obj = dsl
+        return _json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
     plateau_run_ids: set[str] = set()
+    plateau_spec_keys: set[str] = set()
     candidate_runs_for_plateau = (
         db.query(
             models.EvolutionRun.id,
@@ -251,6 +305,8 @@ def find_prior_winners(
     )
     if candidate_runs_for_plateau:
         best_ids = [r.best_genome_id for r in candidate_runs_for_plateau]
+
+        # Layer 1: origin-keyed run exclusion (PR #11 behaviour preserved).
         warm_start_best = (
             db.query(models.StrategyGenome.id)
             .filter(
@@ -265,13 +321,36 @@ def find_prior_winners(
             for r in candidate_runs_for_plateau
             if r.best_genome_id in warm_start_best_ids
         }
+
+        # Layer 2: canonical-spec exclusion (2026-06-25 loophole fix).
+        # Fetch dsl_json for ALL no_improvement best genomes, not just
+        # warm_start ones — any spec that a no_improvement run peaked at
+        # is a proven local optimum we should not recycle.
+        all_best_genomes = (
+            db.query(models.StrategyGenome.id, models.StrategyGenome.dsl_json)
+            .filter(models.StrategyGenome.id.in_(best_ids))
+            .all()
+        )
+        plateau_spec_keys = {
+            _canonical_spec_key(row.dsl_json)
+            for row in all_best_genomes
+            if row.dsl_json is not None
+        }
+
         if plateau_run_ids:
             logger.info(
                 "warm-start: plateau-excluding %d run(s) whose elite was "
                 "inherited via warm-start and the GA hit no_improvement "
-                "(cascade prevention): %s",
+                "(cascade prevention, layer 1): %s",
                 len(plateau_run_ids),
                 sorted(plateau_run_ids),
+            )
+        if plateau_spec_keys:
+            logger.info(
+                "warm-start: plateau-spec-excluding %d canonical spec(s) "
+                "that appeared as the best genome in a no_improvement run "
+                "(cascade prevention, layer 2 — UAT 2026-06-25 loophole fix)",
+                len(plateau_spec_keys),
             )
 
     def _query(extra_filters: list, *, allow_plateau_runs: bool = False):
@@ -283,12 +362,22 @@ def find_prior_winners(
         exclusion suppress it. Every other tier respects the plateau
         filter.
 
+        Plateau exclusion has two layers:
+          - Layer 1 (run-level): drop entire runs whose best genome has
+            origin=warm_start AND stop_reason=no_improvement.
+          - Layer 2 (spec-level): post-query Python filter; any candidate
+            whose canonical dsl_json key matches a no_improvement run's
+            best genome is skipped in `_add_until_full`, regardless of
+            which run the candidate came from. This catches the laundering
+            loophole where Run 1's crossover elite is plateau'd but
+            survives Layer 1 because its origin is not warm_start.
+
         Pulls a wider pool than `limit` so the Python-side dedupe +
-        source-run-diversity rules below have room to drop duplicates
-        without exhausting candidates. 20× the limit is generous: real
-        population sizes are ≤ 30, so even a fully-carryover-dominated
-        prior run can't produce more than ~30 duplicates per generation,
-        and we usually want only 3–5.
+        source-run-diversity + spec-level plateau rules below have room
+        to drop candidates without exhausting the pool. 20× the limit is
+        generous: real population sizes are ≤ 30, so even a
+        fully-carryover-dominated prior run can't produce more than ~30
+        duplicates per generation, and we usually want only 3–5.
         """
         q = (
             db.query(
@@ -333,7 +422,12 @@ def find_prior_winners(
     seen_specs: set[str] = set()  # canonical DSL keys we've already added
     seen_source_runs: set[str] = set()  # source_run_ids we've already added
 
-    def _add_until_full(candidates, *, enforce_source_diversity: bool) -> None:
+    def _add_until_full(
+        candidates,
+        *,
+        enforce_source_diversity: bool,
+        allow_plateau_specs: bool = False,
+    ) -> None:
         """Append `candidates` into `rows`, skipping any whose canonical
         spec we've already seen. Order is preserved (highest fitness
         first within the candidate list), so the strongest representative
@@ -345,7 +439,15 @@ def find_prior_winners(
         dominant lineage cannot fill all the warm-start slots.
         Validator-passed genomes call this with the rule OFF, since
         multiple Gate B clearances from the same run are all real
-        winners worth preserving."""
+        winners worth preserving.
+
+        When `allow_plateau_specs=False` (the default), also skip any
+        candidate whose canonical dsl_json key appears in
+        `plateau_spec_keys` — Layer 2 of the cascade prevention logic
+        (UAT 2026-06-25 loophole fix). Validator-passed genomes set
+        `allow_plateau_specs=True` so Gate B clearance always wins
+        regardless of plateau history.
+        """
         for r in candidates:
             if len(rows) >= limit:
                 return
@@ -354,30 +456,34 @@ def find_prior_winners(
                 continue
             if enforce_source_diversity and r.run_id in seen_source_runs:
                 continue
+            if not allow_plateau_specs and key in plateau_spec_keys:
+                continue
             seen_specs.add(key)
             seen_source_runs.add(r.run_id)
             rows.append(r)
 
     # Tier 1: genomes that passed validation (Gate B on OOS). The gold
-    # standard for inheritance — bypasses plateau exclusion AND
-    # source-run diversity (real winners trump heuristics).
+    # standard for inheritance — bypasses BOTH layers of plateau exclusion
+    # AND source-run diversity (real winners trump heuristics).
     _add_until_full(
         _query(
             [models.StrategyGenome.validator_passed.is_(True)],
             allow_plateau_runs=True,
         ).all(),
         enforce_source_diversity=False,
+        allow_plateau_specs=True,
     )
 
     # Tier 2: genomes with positive training fitness (real Sharpe > 0,
     # not the zero-trade penalty floor of −100 nor the legacy
     # fitness=0.0 degenerate cases that re-compute as -100 today).
-    # Top up to `limit` if tier 1 didn't fill. Subject to plateau
-    # exclusion + source-run diversity.
+    # Top up to `limit` if tier 1 didn't fill. Subject to BOTH layers of
+    # plateau exclusion + source-run diversity.
     if len(rows) < limit:
         _add_until_full(
             _query([models.StrategyGenome.fitness > 0]).all(),
             enforce_source_diversity=True,
+            allow_plateau_specs=False,
         )
 
     # Audit log when the picker came up short — the orchestrator falls
