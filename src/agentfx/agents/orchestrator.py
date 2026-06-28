@@ -52,7 +52,7 @@ from agentfx.agents.evolution.llm_client import (
     InjectionResult,
     LLMHypothesisInjector,
 )
-from agentfx.agents.validator import FoldEvaluation, ValidatorAgent
+from agentfx.agents.validator import FoldEvaluation, ValidationResult, ValidatorAgent
 from agentfx.api.models import GenomeOrigin
 from agentfx.core.dsl import StrategySpec
 from agentfx.core.dsl.seeds import SEED_SPECS
@@ -110,7 +110,14 @@ class OrchestratorConfig:
     llm_injection_every_n: int = 3
     n_llm_proposals: int = 5  # how many genomes the LLM injects per call
     n_validation_folds: int = 4
-    top_n_to_validate: int = 5
+    # Number of unique-spec genomes to run the validator on at end-of-run.
+    # Bumped from 5 → 15 (2026-06-27) so the champion-by-OOS picker has a
+    # wider pool of candidates to choose from — the GA's #1 by training
+    # fitness frequently isn't the OOS-best (empirically: 3 of 10 recent
+    # UAT runs had a non-#1 with materially better OOS). Each validation
+    # = 8 backtests, so 5 → 15 adds ~80 backtests per run (~5-15 min at
+    # H1; negligible vs the GA's thousands).
+    top_n_to_validate: int = 15
     crossover_prob: float = 0.6
     mutation_prob: float = 0.3
     elite_fraction: float = 0.10
@@ -848,7 +855,45 @@ class OrchestratorAgent(BaseAgent):
             )
 
         # ── Validation ───────────────────────────────────────────────
-        validated_count = self._validate_top_genomes(best_genome_overall)
+        validated_count, oos_champion = self._validate_top_genomes(best_genome_overall)
+
+        # Champion-by-OOS (2026-06-27): the GA crowned `best_genome_overall`
+        # purely by training fitness, but the validator has now produced
+        # OOS metrics for the top-K. If the OOS robustness leader differs
+        # from the training-fitness leader, OOS wins — the run's
+        # `best_genome_id` reflects the genome that actually generalises,
+        # not the one with the best in-sample number. Falls back to the
+        # training-fitness leader when validation produced no usable
+        # results (defensive).
+        final_best = oos_champion or best_genome_overall
+        if (
+            oos_champion is not None
+            and best_genome_overall is not None
+            and oos_champion.id is not None
+            and best_genome_overall.id is not None
+            and oos_champion.id != best_genome_overall.id
+        ):
+            self.persister.log_decision(
+                self.run_id,
+                agent_type="orchestrator",
+                action="champion_swap",
+                outputs_json={
+                    "training_fitness_leader_id": best_genome_overall.id,
+                    "training_fitness_leader_fitness": (
+                        best_genome_overall.fitness_value
+                    ),
+                    "oos_champion_id": oos_champion.id,
+                    "oos_champion_training_fitness": oos_champion.fitness_value,
+                },
+                reasoning_text=(
+                    f"Champion-by-OOS overrode the training-fitness leader: "
+                    f"{best_genome_overall.id} (training fit "
+                    f"{best_genome_overall.fitness_value:.3f}) → "
+                    f"{oos_champion.id} (training fit "
+                    f"{oos_champion.fitness_value:.3f}). The OOS-best had "
+                    f"better Gate-B robustness on the validator's OOS folds."
+                ),
+            )
 
         completed_at = datetime.now(UTC)
         duration_seconds = self._clock() - loop_start
@@ -858,7 +903,7 @@ class OrchestratorAgent(BaseAgent):
             status="completed",
             stop_reason=stop_reason or "max_generations",
             completed_at=completed_at,
-            best_genome_id=(best_genome_overall.id if best_genome_overall else None),
+            best_genome_id=(final_best.id if final_best else None),
             llm_cost_usd=(
                 self.llm_injector.cost_used_usd if self.llm_injector else 0.0
             ),
@@ -870,8 +915,11 @@ class OrchestratorAgent(BaseAgent):
             outputs_json={
                 "stop_reason": stop_reason,
                 "validated_count": validated_count,
-                "best_fitness": (
-                    best_genome_overall.fitness_value if best_genome_overall else None
+                "best_fitness": (final_best.fitness_value if final_best else None),
+                "champion_swap_applied": (
+                    final_best is not None
+                    and best_genome_overall is not None
+                    and final_best.id != best_genome_overall.id
                 ),
             },
             reasoning_text=(
@@ -884,10 +932,8 @@ class OrchestratorAgent(BaseAgent):
             run_id=self.run_id,
             generations_completed=gen_index + 1,
             stop_reason=stop_reason or "max_generations",
-            best_genome_id=(best_genome_overall.id if best_genome_overall else None),
-            best_fitness=(
-                best_genome_overall.fitness_value if best_genome_overall else None
-            ),
+            best_genome_id=(final_best.id if final_best else None),
+            best_fitness=(final_best.fitness_value if final_best else None),
             llm_cost_usd=(
                 self.llm_injector.cost_used_usd if self.llm_injector else 0.0
             ),
@@ -1379,10 +1425,54 @@ class OrchestratorAgent(BaseAgent):
 
         return _StopDecision(False)
 
-    def _validate_top_genomes(self, best_genome_overall: Genome | None) -> int:
+    @staticmethod
+    def _oos_robustness_score(
+        result: ValidationResult,
+    ) -> tuple[int, float, int]:
+        """Score a validated genome on OOS robustness for champion selection.
+
+        Returns a tuple ``(n_gate_b_criteria_passed, median_oos_sharpe,
+        total_oos_trades)`` — Python's tuple comparison gives lexicographic
+        ranking: more Gate B criteria passed wins first; ties broken by
+        OOS Sharpe; further ties broken by trade count (statistical
+        confidence).
+
+        Why this composite rather than just OOS Sharpe: we observed (UAT
+        2026-06-26) that the GA's #1 by training fitness often has
+        catastrophic OOS while a runner-up in the validated top-K has
+        materially better OOS (e.g. f51422ce: crowned −2.09, validated
+        runner-up +0.61). Using a tuple keyed on Gate B clearance gives
+        a graceful ordering: when no genome passes, we rank by how close
+        to passing they are; when some genomes pass, those rank above
+        non-passers automatically.
+
+        Five Gate B criteria are tracked in ``validation_failures`` as
+        human-readable strings; the count of NON-failures is
+        ``5 - len(failures)``.
+        """
+        # The validation_failures list contains one string per failed
+        # criterion (sharpe / max_dd / hit_rate / n_trades / cagr).
+        # 5 total criteria; non-failing count = 5 - len(failures).
+        # Use a generous denominator so future Gate B additions don't
+        # break the score; pass-count is the primary discriminator
+        # regardless.
+        n_passed = 5 - len(result.validation_failures)
+        agg = result.oos_aggregate_metrics or {}
+        median_sharpe = float(agg.get("sharpe", float("-inf")))
+        total_trades = int(agg.get("n_trades", 0) or 0)
+        return (n_passed, median_sharpe, total_trades)
+
+    def _validate_top_genomes(
+        self, best_genome_overall: Genome | None
+    ) -> tuple[int, Genome | None]:
         """Run the validator on the top-K genomes by training fitness and
-        persist each result. Returns the count of genomes that passed
-        validation.
+        persist each result. Returns ``(passed_count, oos_champion)``.
+
+        ``oos_champion`` is the validated genome with the best OOS
+        robustness score (see ``_oos_robustness_score``) — used by
+        ``run_loop`` to override ``best_genome_id`` when a non-#1-by-
+        training-fitness candidate has materially better OOS. Returns
+        ``None`` when no genome was successfully validated (defensive).
 
         K = ``config.top_n_to_validate``. Genomes are drawn from the
         cross-generation hall of fame (deduped by spec content), so an
@@ -1412,6 +1502,13 @@ class OrchestratorAgent(BaseAgent):
             top_k = [best_genome_overall]
 
         passed = 0
+        # Track best-by-OOS for champion-by-OOS selection (2026-06-27).
+        # We collect (score_tuple, genome) pairs as each validation
+        # completes; the best after the loop becomes the run's champion
+        # if it differs from best_genome_overall (the training-fitness
+        # leader). See _oos_robustness_score for the score definition.
+        best_oos_score: tuple[int, float, int] | None = None
+        oos_champion: Genome | None = None
         for rank, genome in enumerate(top_k, start=1):
             if genome.id is None:
                 logger.warning(
@@ -1487,7 +1584,13 @@ class OrchestratorAgent(BaseAgent):
             if result.validator_passed:
                 passed += 1
 
-        return passed
+            # Track for champion-by-OOS selection.
+            score = self._oos_robustness_score(result)
+            if best_oos_score is None or score > best_oos_score:
+                best_oos_score = score
+                oos_champion = genome
+
+        return passed, oos_champion
 
 
 __all__ = [

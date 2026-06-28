@@ -875,6 +875,266 @@ class TestValidation:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Champion-by-OOS (2026-06-27): the orchestrator's `best_genome_id` must
+# reflect OOS robustness, not just training fitness, when the validator
+# has produced metrics for the top-K. UAT 2026-06-26 evidence: 3 of 10
+# recent runs had a non-#1-by-training-fitness with materially better
+# OOS; this group verifies the picker now uses that information.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _fold_evals_with_metrics(
+    spec: StrategySpec, sharpe: float, n_trades: int = 500
+) -> list[FoldEvaluation]:
+    """Build 4 fold evaluations with a configurable Sharpe (and trade
+    count) — used by champion-by-OOS tests to vary OOS quality per
+    validated genome."""
+    from agentfx.core.validation import make_walk_forward_folds
+
+    folds = make_walk_forward_folds(
+        start=datetime(2024, 1, 1, tzinfo=UTC),
+        end=datetime(2024, 5, 1, tzinfo=UTC),
+        k=4,
+    )
+    return [
+        FoldEvaluation(
+            fold=f,
+            metrics={
+                "sharpe": sharpe,
+                "max_drawdown": 0.05,
+                "hit_rate": 0.55,
+                "n_trades": n_trades,
+                "cagr": 0.10,
+            },
+            passed_gate_b=False,
+            gate_b_failures=[],
+        )
+        for f in folds
+    ]
+
+
+class TestChampionByOOS:
+    """Verify the orchestrator's end-of-run champion selection uses OOS
+    robustness, not just training fitness."""
+
+    def test_oos_runner_up_wins_when_training_fitness_leader_fails_more(
+        self,
+    ) -> None:
+        """When the top-K validation surfaces a runner-up (by training
+        fitness) whose OOS aggregate has fewer Gate B failures than the
+        #1, the orchestrator's `best_genome_id` reflects the OOS-best."""
+        validator = ValidatorAgent(k=4)
+
+        # Side effect: each successive validator.validate() call returns
+        # a different ValidationResult — first call (highest fitness)
+        # gets MANY failures; second call (runner-up) gets FEWER.
+        def _validate_side_effect(spec: StrategySpec, **_kw) -> ValidationResult:
+            n_calls = validator.validate.call_count
+            if n_calls == 1:
+                # The training-fitness leader fails 4 of 5 Gate B criteria.
+                return ValidationResult(
+                    spec=spec,
+                    folds=_fold_evals_with_metrics(spec, sharpe=-1.5),
+                    validator_passed=False,
+                    validation_failures=[
+                        "Sharpe -1.5 < 1.0",
+                        "Hit Rate 30% < 48%",
+                        "Trade Count 200 < 300",
+                        "CAGR -25% < 15%",
+                    ],
+                    oos_aggregate_metrics={"sharpe": -1.5, "n_trades": 200},
+                )
+            else:
+                # Runner-up by fitness fails only 2 of 5 Gate B criteria.
+                return ValidationResult(
+                    spec=spec,
+                    folds=_fold_evals_with_metrics(spec, sharpe=0.85),
+                    validator_passed=False,
+                    validation_failures=[
+                        "Sharpe 0.85 < 1.0",
+                        "Hit Rate 45% < 48%",
+                    ],
+                    oos_aggregate_metrics={"sharpe": 0.85, "n_trades": 350},
+                )
+
+        validator.validate = MagicMock(side_effect=_validate_side_effect)
+
+        # Distinct fitnesses so the top-K ordering is deterministic and
+        # multiple specs get into the hall of fame.
+        fitness_fn = FixedFitnessFn([5.0, 4.0, 3.0, 2.0, 1.0, 0.5, 0.4, 0.3, 0.2, 0.1])
+        config = OrchestratorConfig(
+            instrument="EUR_USD",
+            granularity="M1",
+            population_size=10,
+            llm_injection_every_n=99,
+            n_validation_folds=4,
+            rng_seed=42,
+            top_n_to_validate=5,
+            warm_start_enabled=False,
+        )
+        orchestrator, persister = _build_orchestrator(
+            validator=validator,
+            fitness_fn=fitness_fn,
+            config=config,
+            stop_conditions=StopConditions(
+                max_generations=1,  # one gen is enough for hall-of-fame > 1
+                max_wall_clock_seconds=86400,
+                target_fitness=999.0,
+                no_improvement_generations=99,
+            ),
+        )
+        summary = orchestrator.run_loop()
+
+        # Validator was called at least twice (we have a population of 10
+        # with varied fitness, so top-K=5 should give multiple validations).
+        assert validator.validate.call_count >= 2
+
+        # The final update_run carries the OOS-champion id, NOT the
+        # training-fitness leader (call #1 to validator was the leader,
+        # which failed 4 criteria; call #2 was runner-up which failed
+        # only 2 — runner-up wins).
+        final_update = persister.run_updates[-1]
+        assert final_update.get("status") == "completed"
+        # The OOS-best genome's id should be set as best_genome_id.
+        # It should NOT be the training-fitness leader.
+        best_id = final_update.get("best_genome_id")
+        assert best_id is not None
+        # summary's best_genome_id should match the orchestrator's final
+        # update — both reflect the OOS champion.
+        assert summary.best_genome_id == best_id
+
+    def test_champion_swap_decision_logged_when_swap_happens(self) -> None:
+        """When champion-by-OOS overrides the training-fitness leader, a
+        `champion_swap` decision must be emitted with both genome ids."""
+        validator = ValidatorAgent(k=4)
+
+        # Same pattern as above — first validation fails badly, second
+        # has clearly better OOS.
+        def _validate_side_effect(spec: StrategySpec, **_kw) -> ValidationResult:
+            n_calls = validator.validate.call_count
+            if n_calls == 1:
+                return ValidationResult(
+                    spec=spec,
+                    folds=_fold_evals_with_metrics(spec, sharpe=-2.0),
+                    validator_passed=False,
+                    validation_failures=[
+                        "Sharpe -2.0 < 1.0",
+                        "Hit Rate 25% < 48%",
+                        "CAGR -30% < 15%",
+                    ],
+                    oos_aggregate_metrics={"sharpe": -2.0, "n_trades": 150},
+                )
+            return ValidationResult(
+                spec=spec,
+                folds=_fold_evals_with_metrics(spec, sharpe=0.5),
+                validator_passed=False,
+                validation_failures=["Sharpe 0.5 < 1.0"],
+                oos_aggregate_metrics={"sharpe": 0.5, "n_trades": 400},
+            )
+
+        validator.validate = MagicMock(side_effect=_validate_side_effect)
+
+        fitness_fn = FixedFitnessFn([5.0, 4.0, 3.0, 2.0, 1.0, 0.5, 0.4, 0.3, 0.2, 0.1])
+        config = OrchestratorConfig(
+            instrument="EUR_USD",
+            granularity="M1",
+            population_size=10,
+            llm_injection_every_n=99,
+            n_validation_folds=4,
+            rng_seed=42,
+            top_n_to_validate=5,
+            warm_start_enabled=False,
+        )
+        orchestrator, persister = _build_orchestrator(
+            validator=validator,
+            fitness_fn=fitness_fn,
+            config=config,
+            stop_conditions=StopConditions(
+                max_generations=1,
+                max_wall_clock_seconds=86400,
+                target_fitness=999.0,
+                no_improvement_generations=99,
+            ),
+        )
+        orchestrator.run_loop()
+
+        swap_decisions = [d for d in persister.decisions if d.action == "champion_swap"]
+        assert len(swap_decisions) == 1, (
+            "Expected exactly one champion_swap decision when OOS-best "
+            f"differs from training-fitness leader; got {len(swap_decisions)}"
+        )
+        d = swap_decisions[0]
+        assert d.outputs_json["training_fitness_leader_id"] is not None
+        assert d.outputs_json["oos_champion_id"] is not None
+        assert (
+            d.outputs_json["training_fitness_leader_id"]
+            != d.outputs_json["oos_champion_id"]
+        )
+
+    def test_no_swap_decision_when_oos_best_equals_training_best(self) -> None:
+        """When the training-fitness leader IS also the OOS champion (e.g.
+        all validations return identical results), no champion_swap
+        decision should be logged and best_genome_id matches the
+        training-fitness leader."""
+        # All validations return the same Gate-B-failing result.
+        validator = _make_validator_returning(
+            validator_passed=False, failures=["Sharpe 0.5 < 1.0"]
+        )
+        # The mocked validator returns the same ValidationResult every
+        # time — so the OOS robustness score is identical across all
+        # validated genomes, and the FIRST one validated (= training
+        # fitness leader) becomes the OOS champion via the strict-greater
+        # tie-break in the picker.
+        orchestrator, persister = _build_orchestrator(validator=validator)
+        orchestrator.run_loop()
+
+        swap_decisions = [d for d in persister.decisions if d.action == "champion_swap"]
+        assert swap_decisions == [], (
+            "No champion_swap decision should fire when OOS-best is the "
+            f"training-fitness leader; got {len(swap_decisions)} swaps"
+        )
+
+    def test_oos_robustness_score_ranking(self) -> None:
+        """Direct unit test of `_oos_robustness_score` — tuple ordering
+        gives: more Gate B criteria passed wins first; ties on
+        criteria-passed broken by OOS Sharpe; further ties broken by
+        trade count."""
+        from agentfx.core.dsl.seeds import MA_CROSSOVER_SEED
+
+        result_2_failures = ValidationResult(
+            spec=MA_CROSSOVER_SEED,
+            folds=[],
+            validator_passed=False,
+            validation_failures=["a", "b"],  # 2 failures = 3 passed
+            oos_aggregate_metrics={"sharpe": 0.5, "n_trades": 100},
+        )
+        result_4_failures = ValidationResult(
+            spec=MA_CROSSOVER_SEED,
+            folds=[],
+            validator_passed=False,
+            validation_failures=["a", "b", "c", "d"],  # 4 failures = 1 passed
+            oos_aggregate_metrics={"sharpe": 2.0, "n_trades": 500},
+        )
+
+        # Even though result_4_failures has much higher OOS Sharpe and
+        # trade count, fewer-failures wins on the primary axis.
+        s1 = OrchestratorAgent._oos_robustness_score(result_2_failures)
+        s2 = OrchestratorAgent._oos_robustness_score(result_4_failures)
+        assert s1 > s2
+
+        # Tie on criteria-passed — Sharpe wins.
+        result_better_sharpe = ValidationResult(
+            spec=MA_CROSSOVER_SEED,
+            folds=[],
+            validator_passed=False,
+            validation_failures=["a", "b"],
+            oos_aggregate_metrics={"sharpe": 1.0, "n_trades": 100},
+        )
+        s3 = OrchestratorAgent._oos_robustness_score(result_better_sharpe)
+        assert s3 > s1
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Decision log
 # ─────────────────────────────────────────────────────────────────────────
 

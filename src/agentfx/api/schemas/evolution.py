@@ -71,7 +71,7 @@ class OrchestratorConfigSchema(BaseModel):
     llm_injection_every_n: int = Field(default=3, ge=1)
     n_llm_proposals: int = Field(default=5, ge=1, le=10)
     n_validation_folds: int = Field(default=4, ge=2, le=10)
-    top_n_to_validate: int = Field(default=5, ge=1)
+    top_n_to_validate: int = Field(default=15, ge=1)
     crossover_prob: float = Field(default=0.6, ge=0.0, le=1.0)
     mutation_prob: float = Field(default=0.3, ge=0.0, le=1.0)
     elite_fraction: float = Field(default=0.10, ge=0.0, le=0.5)
