@@ -191,19 +191,19 @@ describe('buildProximityTerms — five rows with correct structure', () => {
     expect(mdd.threshold).toBe('≤ 10%');
   });
 
-  it('Sharpe term shows threshold ≥ 0.5', () => {
+  it('Sharpe term shows threshold ≥ 1.0', () => {
     const [, , sharpe] = buildProximityTerms(PASSING_TERMS, PASSING_METRICS);
-    expect(sharpe.threshold).toBe('≥ 0.5');
+    expect(sharpe.threshold).toBe('≥ 1.0');
   });
 
-  it('Hit Rate term shows threshold ≥ 45%', () => {
+  it('Hit Rate term shows threshold ≥ 48%', () => {
     const [, , , hit] = buildProximityTerms(PASSING_TERMS, PASSING_METRICS);
-    expect(hit.threshold).toBe('≥ 45%');
+    expect(hit.threshold).toBe('≥ 48%');
   });
 
-  it('Trades term shows threshold ≥ 30', () => {
+  it('Trades term shows threshold ≥ 300', () => {
     const [, , , , trades] = buildProximityTerms(PASSING_TERMS, PASSING_METRICS);
-    expect(trades.threshold).toBe('≥ 30');
+    expect(trades.threshold).toBe('≥ 300');
   });
 
   it('formats trade count as an integer string (no decimal)', () => {

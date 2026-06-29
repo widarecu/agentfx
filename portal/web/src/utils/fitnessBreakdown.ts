@@ -4,12 +4,15 @@
  * Extracted from FitnessBreakdown.tsx so the business logic is testable in
  * the Vitest node environment without a DOM or React renderer.
  *
- * Gate B thresholds (v0.6.0 defaults):
+ * Gate B thresholds (mirror of backend `core/gates.py:GATE_B_THRESHOLDS` —
+ * if those change, update both sides; the backend's `_gate_b_proximity_score`
+ * uses the same denominators internally so the term VALUES are computed
+ * correctly server-side regardless of what these display strings say):
  *   CAGR    ≥ 15%   weight 0.35
  *   MDD     ≤ 10%   weight 0.25
- *   Sharpe  ≥  0.5  weight 0.20
- *   Hit     ≥ 45%   weight 0.10
- *   Trades  ≥ 30    weight 0.10
+ *   Sharpe  ≥  1.0  weight 0.20
+ *   Hit     ≥ 48%   weight 0.10
+ *   Trades  ≥ 300   weight 0.10
  */
 
 export interface GateBTermWeights {
@@ -133,7 +136,7 @@ export function buildProximityTerms(
 
   const sharpe: ProximityTerm = {
     label: 'Sharpe',
-    threshold: '≥ 0.5',
+    threshold: '≥ 1.0',
     metricValue: metrics.sharpe ?? null,
     metricFormatted: fmtNum(metrics.sharpe),
     termValue: proximityTerms.sharpe_term,
@@ -144,7 +147,7 @@ export function buildProximityTerms(
 
   const hit: ProximityTerm = {
     label: 'Hit Rate',
-    threshold: '≥ 45%',
+    threshold: '≥ 48%',
     metricValue: metrics.hit_rate ?? null,
     metricFormatted: fmtPct(metrics.hit_rate),
     termValue: proximityTerms.hit_term,
@@ -155,7 +158,7 @@ export function buildProximityTerms(
 
   const trades: ProximityTerm = {
     label: 'Trades',
-    threshold: '≥ 30',
+    threshold: '≥ 300',
     metricValue: metrics.n_trades ?? null,
     metricFormatted:
       metrics.n_trades != null && Number.isFinite(metrics.n_trades)
