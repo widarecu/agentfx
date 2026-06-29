@@ -31,6 +31,7 @@ import {
 } from 'lucide-react';
 
 import DslTree from '../components/DslTree';
+import FitnessBreakdown from '../components/FitnessBreakdown';
 import GenomeLineageStrip from '../components/GenomeLineageStrip';
 import LineageExplainer from '../components/LineageExplainer';
 import WalkForwardFoldTable from '../components/WalkForwardFoldTable';
@@ -354,20 +355,15 @@ export default function GenomeDetail() {
           </Section>
         )}
 
-      {/* ── 4b. Fitness breakdown (raw → penalties → final) ──────── */}
+      {/* ── 4b. Fitness breakdown (Gate-B-proximity terms → penalties → final) */}
       {genome.metrics_json?.penalty_breakdown && (
         <Section
           title="Fitness breakdown"
-          subtitle="The chain that turned the raw training-window signal into the final fitness the GA used for selection. Additive deductions are subtracted first; multiplicative dilution factors are applied after."
+          subtitle="How the GA scored this genome: five Gate-B-proximity terms (weighted by priority) minus a fold-consistency penalty, then any hard penalties."
         >
           <FitnessBreakdown
             breakdown={genome.metrics_json.penalty_breakdown}
-            consistency={{
-              meanFoldSharpe: genome.metrics_json.mean_fold_sharpe,
-              foldConsistencyStd: genome.metrics_json.fold_consistency_std,
-              foldConsistencyLambda:
-                genome.metrics_json.fold_consistency_lambda,
-            }}
+            metricsJson={genome.metrics_json}
           />
         </Section>
       )}
@@ -483,145 +479,4 @@ function TrainingFoldTable({
   );
 }
 
-// ── Fitness breakdown panel ─────────────────────────────────────────
-// Visualises the chain: raw fitness → each additive penalty →
-// multiplicative dilution → final. Lets the user see at a glance
-// whether the GA's signal was killed by a Gate-B miss, a drawdown
-// breach, the diversity penalty, or the v0.5.0 fold-consistency
-// variance penalty.
-
-function FitnessBreakdown({
-  breakdown,
-  consistency,
-}: {
-  breakdown: NonNullable<
-    NonNullable<StrategyGenome['metrics_json']>['penalty_breakdown']
-  >;
-  consistency: {
-    meanFoldSharpe?: number;
-    foldConsistencyStd?: number;
-    foldConsistencyLambda?: number;
-  };
-}) {
-  const fmt = (v: number, digits = 3) =>
-    Number.isFinite(v) ? (v >= 0 ? '+' : '') + v.toFixed(digits) : '—';
-  const dim = 'text-slate-500 dark:text-slate-400';
-
-  // Build the explanation rows. Penalties with 0 deduction still render
-  // so the user can see what *would* have been applied — fades them out
-  // so it's clear nothing actually happened there.
-  const rows: Array<{
-    label: string;
-    detail: string;
-    value: number;
-    op: '+' | '×' | '=';
-    active: boolean;
-  }> = [
-    {
-      label: 'Raw fitness',
-      detail:
-        consistency.foldConsistencyStd != null &&
-        consistency.foldConsistencyLambda != null &&
-        consistency.meanFoldSharpe != null
-          ? `mean(per-fold Sharpe) − ${consistency.foldConsistencyLambda} × std(per-fold Sharpe) = ${consistency.meanFoldSharpe.toFixed(3)} − ${(consistency.foldConsistencyLambda * consistency.foldConsistencyStd).toFixed(3)}`
-          : 'training-window Sharpe (single-window mode)',
-      value: breakdown.raw_fitness,
-      op: '=',
-      active: true,
-    },
-    {
-      label: 'Zero-trade hard floor',
-      detail: 'flat −100 if the genome opened 0 trades on any fold',
-      value: breakdown.zero_trade_penalty,
-      op: '+',
-      active: breakdown.zero_trade_penalty !== 0,
-    },
-    {
-      label: 'Trade-shortfall penalty',
-      detail:
-        'scales 0 → −10 as trade count drops from the Gate-B minimum to 0',
-      value: breakdown.trade_shortfall_penalty,
-      op: '+',
-      active: breakdown.trade_shortfall_penalty !== 0,
-    },
-    {
-      label: 'Drawdown breach penalty',
-      detail: '(max_drawdown − 10% cap) × 50 — only when MaxDD breaches Gate B',
-      value: breakdown.drawdown_breach_penalty,
-      op: '+',
-      active: breakdown.drawdown_breach_penalty !== 0,
-    },
-    {
-      label: 'Gate-B dilution',
-      detail:
-        'halves positive fitness when ANY Gate-B threshold fails (Sharpe / Hit / Trades / CAGR)',
-      value: breakdown.gate_b_dilution_factor,
-      op: '×',
-      active: breakdown.gate_b_dilution_factor !== 1.0,
-    },
-    {
-      label: 'Diversity penalty',
-      detail:
-        'halves fitness when the genome is within edit-distance 2 of an elite from this generation',
-      value: breakdown.diversity_penalty_factor,
-      op: '×',
-      active: breakdown.diversity_penalty_factor !== 1.0,
-    },
-  ];
-
-  return (
-    <div className="space-y-2 text-sm">
-      {rows.map((r, i) => (
-        <div
-          key={i}
-          className={`flex items-start justify-between gap-3 py-1.5 ${
-            r.active ? '' : 'opacity-50'
-          }`}
-        >
-          <div className="min-w-0 flex-1">
-            <div className="font-medium text-slate-800 dark:text-slate-200">
-              {r.op === '+' && r.active ? '➖ ' : ''}
-              {r.op === '×' && r.active ? '✖ ' : ''}
-              {r.label}
-              {!r.active && (
-                <span className={`ml-2 text-xs font-normal ${dim}`}>
-                  (not applied)
-                </span>
-              )}
-            </div>
-            <div className={`text-xs ${dim} mt-0.5`}>{r.detail}</div>
-          </div>
-          <div className="font-mono text-right shrink-0 w-28">
-            <span
-              className={
-                r.op === '×'
-                  ? 'text-slate-700 dark:text-slate-300'
-                  : r.value < 0
-                    ? 'text-rose-700 dark:text-rose-400'
-                    : r.value > 0
-                      ? 'text-emerald-700 dark:text-emerald-400'
-                      : 'text-slate-700 dark:text-slate-300'
-              }
-            >
-              {r.op === '×' ? `× ${r.value.toFixed(2)}` : fmt(r.value)}
-            </span>
-          </div>
-        </div>
-      ))}
-      <div className="border-t border-slate-200 dark:border-slate-700 pt-3 mt-3 flex items-center justify-between font-mono text-sm">
-        <span className="text-slate-700 dark:text-slate-200 font-semibold">
-          Final fitness
-        </span>
-        <span
-          className={
-            breakdown.final_fitness > 0
-              ? 'text-emerald-700 dark:text-emerald-400 font-semibold'
-              : 'text-rose-700 dark:text-rose-400 font-semibold'
-          }
-        >
-          {breakdown.final_fitness.toFixed(3)}
-        </span>
-      </div>
-    </div>
-  );
-}
+// FitnessBreakdown is now in src/components/FitnessBreakdown.tsx
