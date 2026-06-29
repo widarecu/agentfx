@@ -247,7 +247,10 @@ export default function EvolutionRunDetail() {
       </Section>
 
       {/* ── 4. Fitness chart ───────────────────────────────────────── */}
-      <Section title="Best Fitness by Generation">
+      <Section
+        title="Best Fitness by Generation"
+        subtitle="Fitness is now a Gate-B-proximity score: 0 means roughly passing Gate B, positive means exceeding thresholds, negative means failing. (Prior to 2026-06-28, fitness was mean-per-fold Sharpe with a consistency penalty; values from older runs are on the old scale.)"
+      >
         <FitnessCurveChart points={fitnessPoints} target={targetFitness} />
       </Section>
 

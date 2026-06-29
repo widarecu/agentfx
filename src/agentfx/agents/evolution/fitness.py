@@ -1,8 +1,9 @@
 """Fitness evaluation for evolved genomes.
 
-A genome's fitness is its **training-window Sharpe** with five penalties
-applied additively or multiplicatively. The training window is the
-concatenation of walk-forward folds 0..K-2 (constructed by the
+A genome's fitness is a **Gate-B-proximity score** — a weighted sum of
+how close its aggregated training metrics are to passing Gate B
+thresholds — plus a fold-consistency penalty.  The training window is
+the concatenation of walk-forward folds 0..K-2 (constructed by the
 orchestrator in `_training_range()`); the final fold (K-1) is held out
 as OOS and is *only* evaluated by the validator at the end of the run.
 The GA never sees the OOS fold during evolution — that's the whole
@@ -12,35 +13,40 @@ point of the walk-forward setup.
 the implementation correctly trains on the held-in folds and reserves
 OOS for the validator's Gate-B verdict.)
 
+Gate-B-proximity scoring (2026-06-28):
+
+Raw fitness = weighted sum of "distance from Gate B threshold" terms:
+  - CAGR ≥ 15%       weight 0.35  ← user's top priority: consistent profitability
+  - MDD ≤ 10%        weight 0.25  ← capital protection
+  - Sharpe ≥ 1.0     weight 0.20  ← risk-adjusted quality
+  - Hit Rate ≥ 48%   weight 0.10  ← consistency signal
+  - Trade Count ≥ 300 weight 0.10 ← statistical significance
+  - Fold-variance penalty: − 0.5 · std(per-fold Sharpe)
+
+Each term is 0 at its threshold, +1 when the metric reaches 2× the
+threshold, and capped per-term so no single terrible metric dominates.
+A raw fitness ≥ 0 means the genome is roughly passing Gate B on a
+weighted-average basis.
+
 Penalties, in order of application:
 
 1. **Zero-trade hard penalty** (additive, -100): a genome that opens
    zero trades on the training window is degenerate (typically: long
    and short DSL conditions are identical, so neither side ever fires
-   exclusive of the other). Without this hard floor, raw Sharpe = 0.0
-   would beat any active losing strategy with Sharpe < 0, and the
-   GA's elitism would lock in do-nothing genomes from gen 2 onward.
+   exclusive of the other). Gate-B-proximity's trades_term only
+   contributes −0.10 for zero trades (weight 0.10 × clamp −1), which
+   is nowhere near enough to prevent degenerate genomes from winning
+   tournaments over active losers. Hard floor at -100 guarantees that.
 
-2. **Trade-shortfall penalty** (additive, scales 0 → -10): for genomes
-   that *do* trade but produce fewer than Gate B's 300-trade minimum.
-   Scale chosen so an active losing strategy with sharpe ~ -15 still
-   ranks above a 100-trade strategy at Sharpe -5 (because trade count
-   is a signal of strategy viability, not just final P&L).
-
-3. **Drawdown breach penalty** (additive): if max_drawdown exceeds
-   the Gate B 10% cap, subtract `(max_dd - 0.10) × 50`. A 30% DD
-   strategy loses 10 points of fitness.
-
-4. **Gate B dilution** (multiplicative, × 0.5): if *any* Gate B
-   threshold fails AND fitness is currently positive, halve the
-   fitness. The additive penalties (1–3) already handle the negative
-   case, so this only fires for "passes most thresholds but not all"
-   strategies that nonetheless cleared training.
-
-5. **Diversity penalty** (multiplicative, × 0.5): if the genome is
+2. **Diversity penalty** (multiplicative, × 0.5): if the genome is
    within edit-distance 2 of a current elite (a previously-evaluated
    genome in the top 10%), halve the fitness. Stops the population
    converging on a single archetype too quickly.
+
+(Penalties removed in v0.6.0: trade-shortfall, drawdown-breach, and
+Gate-B-dilution — all three are now covered by the proximity score
+terms. The breakdown keys are kept with no-op values for portal
+backward-compat; see _apply_penalties.)
 
 The fitness function delegates the actual backtest to an injectable
 callable (`backtest_fn`) so unit tests can mock it without needing a
@@ -56,7 +62,6 @@ from typing import Any, Protocol
 
 from agentfx.core.dsl import StrategySpec
 from agentfx.core.dsl.compiler import CompilerError
-from agentfx.core.gates import GATE_B_THRESHOLDS, evaluate_gate_b
 
 logger = logging.getLogger(__name__)
 
@@ -161,23 +166,79 @@ DIVERSITY_PENALTY_FACTOR = 0.5
 
 # Zero-trade hard penalty: a strategy that produces literally zero trades
 # isn't trading at all — it's a degenerate genome (typically: long and
-# short DSL conditions are identical, or both never fire on the data). A
-# proportional shortfall penalty isn't enough; a real losing strategy with
-# 100 trades at sharpe=-15 gets penalty -22 (worse than a 0-trade genome
-# at -10), so the GA's elitism would keep picking the do-nothing genome.
-# Hard floor at -100 guarantees zero-trade genomes always lose tournaments.
-# (See v0.3.0 acceptance run #6: this is the regression that uncovered it.)
+# short DSL conditions are identical, or both never fire on the data).
+# Gate-B-proximity's trades_term only contributes −0.10 for zero trades,
+# which is nowhere near enough to prevent degenerate genomes from winning
+# tournaments over active losers. Hard floor at -100 guarantees zero-trade
+# genomes always lose. (See v0.3.0 acceptance run #6 for the regression.)
 ZERO_TRADE_HARD_PENALTY = 100.0
 
-# Trade-count shortfall penalty: linear additive penalty for strategies
-# that DO trade but produce fewer than Gate B's minimum (300 OOS). Scale
-# is intentionally lower than the zero-trade penalty so an active losing
-# strategy can still recover via mutation/crossover with more trades.
+# Kept for reference; no longer applied as of v0.6.0 — covered by
+# trades_term and mdd_term in the Gate-B-proximity score.
 TRADE_SHORTFALL_PENALTY_SCALE = 10.0
-
-# Drawdown breach penalty: additive, scales with how far over the cap.
-# Per Gate B threshold (10%), a strategy at 30% drawdown gets -10.0 added.
 DRAWDOWN_BREACH_PENALTY_SCALE = 50.0
+
+
+def _gate_b_proximity_score(
+    metrics: dict[str, Any],
+    fold_std_sharpe: float,
+) -> tuple[float, dict[str, float]]:
+    """Score = distance from Gate B thresholds, signed, weighted, clamped.
+
+    Each term is 0 when the metric equals its Gate B threshold, positive
+    when exceeding it, and negative when failing it.  Terms are clamped
+    individually so no single terrible metric can dominate the weighted sum.
+
+    Weights reflect user priority: CAGR > MDD > Sharpe > Hit/Trades.
+
+    Gate B thresholds:
+      - Sharpe  ≥ 1.0      weight 0.20
+      - CAGR    ≥ 15%      weight 0.35  ← highest: consistent profitability
+      - Hit Rate ≥ 48%     weight 0.10
+      - MDD     ≤ 10%      weight 0.25
+      - Trades  ≥ 300      weight 0.10
+
+    The fold-variance penalty (−0.5·std) punishes regime-fragile strategies
+    whose per-fold Sharpes vary widely — same rationale as the old formula.
+
+    Returns:
+        (raw_fitness, term_values) where term_values holds the per-criterion
+        contributions for portal transparency.
+    """
+
+    def clamp(x: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, x))
+
+    sharpe = metrics.get("sharpe", 0.0) or 0.0
+    cagr = metrics.get("cagr", 0.0) or 0.0
+    hit = metrics.get("hit_rate", 0.0) or 0.0
+    mdd = abs(metrics.get("max_drawdown", 0.0) or 0.0)
+    n_trades = metrics.get("n_trades", 0) or 0
+
+    # Each term: 0 at threshold, positive when exceeding, negative when
+    # failing. Clamped so one terrible metric can't dominate the weighted sum.
+    sharpe_term = clamp((sharpe / 1.0) - 1, -2, +2)
+    cagr_term = clamp((cagr / 0.15) - 1, -2, +2)
+    hit_term = clamp((hit / 0.48) - 1, -1, +1)
+    mdd_term = clamp(1 - (mdd / 0.10), -2, +1)  # inverted: smaller MDD = better
+    trades_term = clamp((n_trades / 300) - 1, -1, +1)
+
+    raw = (
+        0.35 * cagr_term  # user's stated top priority
+        + 0.25 * mdd_term  # capital protection
+        + 0.20 * sharpe_term  # risk-adjusted quality
+        + 0.10 * hit_term  # consistency signal
+        + 0.10 * trades_term  # statistical significance
+    )
+    # Fold-consistency penalty: punish fold-to-fold Sharpe variance.
+    score = raw - 0.5 * fold_std_sharpe
+    return score, {
+        "sharpe_term": sharpe_term,
+        "cagr_term": cagr_term,
+        "hit_term": hit_term,
+        "mdd_term": mdd_term,
+        "trades_term": trades_term,
+    }
 
 
 def _apply_penalties(
@@ -188,69 +249,44 @@ def _apply_penalties(
     diversity_threshold: int,
     gate_b_overrides: dict[str, float] | None = None,
 ) -> tuple[float, dict[str, Any]]:
-    """Apply Gate B and diversity penalties to a raw fitness value.
+    """Apply hard-floor and diversity penalties to a Gate-B-proximity fitness.
 
     Returns ``(final_fitness, breakdown)`` where ``breakdown`` is a dict
-    with the per-step deductions so the caller can show the user
-    exactly what got applied. The portal renders this as a chain:
-    raw → zero-trade → shortfall → drawdown → ×gate_b → ×diversity →
-    final. Zero-cost (the values are computed anyway) — we just stopped
-    throwing them away.
+    with the per-step deductions so the caller can show the user exactly what
+    got applied.  The portal renders this as a chain: raw → zero-trade →
+    ×diversity → final.
 
-    Penalty order (additive, then multiplicative):
-      1. Trade-count shortfall: additive penalty that scales 0 → -10 as
-         n_trades drops from the Gate B minimum to 0. This is what keeps
-         zero-trade degenerate genomes from winning tournaments — without
-         it, raw_sharpe=0 beats real-but-losing strategies.
-      2. Drawdown breach: additive penalty proportional to how far over
-         the Gate B max_drawdown the strategy went.
-      3. Gate B dilution: halves *positive* fitness when Gate B fails.
-         The additive penalties above already handle the negative case.
-      4. Diversity penalty: halves fitness for genomes too close to an
-         elite, preventing premature convergence.
+    As of v0.6.0:
+      - trade_shortfall_penalty, drawdown_breach_penalty, gate_b_dilution_factor
+        are kept in the breakdown dict with no-op values (0 / 1.0) for portal
+        backward-compat; they are NOT applied.  These effects are now baked into
+        the Gate-B-proximity score terms (trades_term, mdd_term).
+      - zero_trade hard penalty is kept: Gate-B-proximity's trades_term only
+        contributes −0.10 for zero trades, which is nowhere near enough to
+        prevent degenerate do-nothing genomes from winning tournaments.
+      - diversity penalty is kept: orthogonal to Gate B; still discourages
+        premature convergence on a single archetype.
     """
     fitness = raw_fitness
     breakdown: dict[str, Any] = {
         "raw_fitness": float(raw_fitness),
         "zero_trade_penalty": 0.0,
+        # Kept as no-op keys for portal backward-compat (v0.6.0 removal).
         "trade_shortfall_penalty": 0.0,
         "drawdown_breach_penalty": 0.0,
         "gate_b_dilution_factor": 1.0,
         "diversity_penalty_factor": 1.0,
     }
 
-    # 1a. Zero-trade hard penalty — for genuinely degenerate genomes that
-    # never open a position. Without this hard floor, the proportional
-    # shortfall penalty alone lets do-nothing genomes beat active losers.
+    # 1. Zero-trade hard penalty — for genuinely degenerate genomes that
+    # never open a position. Gate-B-proximity's trades_term contributes at
+    # most −0.10; not nearly enough to outrank active-but-losing strategies.
     n_trades = metrics.get("n_trades", 0) or 0
     if n_trades == 0:
         fitness -= ZERO_TRADE_HARD_PENALTY
         breakdown["zero_trade_penalty"] = -float(ZERO_TRADE_HARD_PENALTY)
-    else:
-        # 1b. Proportional shortfall — for strategies that DO trade but
-        # come up short of Gate B's minimum.
-        min_trades = GATE_B_THRESHOLDS["min_trades"]
-        if n_trades < min_trades:
-            shortfall_ratio = (min_trades - n_trades) / min_trades
-            deduction = shortfall_ratio * TRADE_SHORTFALL_PENALTY_SCALE
-            fitness -= deduction
-            breakdown["trade_shortfall_penalty"] = -float(deduction)
 
-    # 2. Drawdown breach — additive, proportional to over-cap excess.
-    max_dd = metrics.get("max_drawdown", 0) or 0
-    if max_dd > GATE_B_THRESHOLDS["max_drawdown"]:
-        breach = max_dd - GATE_B_THRESHOLDS["max_drawdown"]
-        deduction = breach * DRAWDOWN_BREACH_PENALTY_SCALE
-        fitness -= deduction
-        breakdown["drawdown_breach_penalty"] = -float(deduction)
-
-    # 3. Gate B dilution: halve positive fitness if any threshold breached.
-    passes_gate_b, _ = evaluate_gate_b(metrics, overrides=gate_b_overrides)
-    if not passes_gate_b and fitness > 0:
-        fitness = fitness * GATE_B_FAILURE_DILUTION
-        breakdown["gate_b_dilution_factor"] = float(GATE_B_FAILURE_DILUTION)
-
-    # 4. Diversity penalty: halve fitness if too close to an elite.
+    # 2. Diversity penalty: halve fitness if too close to an elite.
     if (
         candidate is not None
         and elite_specs
@@ -268,19 +304,15 @@ def _aggregate_fold_metrics(
     *,
     fold_consistency_lambda: float,
 ) -> tuple[float, dict[str, Any]]:
-    """Combine per-fold backtest metrics into one (raw_sharpe, aggregated_metrics)
-    pair that the existing penalty stack can score.
+    """Combine per-fold backtest metrics into one (raw_fitness, aggregated_metrics)
+    pair that the penalty stack can score.
 
-    The raw Sharpe used for fitness is **`mean(fold_sharpes) − λ × std(fold_sharpes)`**.
-    Per-fold Sharpe variance is a direct proxy for "regime-fragile"
-    strategies — the ones that look fine on training average but
-    collapse OOS because their wins came from one good fold. The
-    variance penalty pushes the GA away from those without taking the
-    extreme step of `min(folds)` (which can be so strict that nothing
-    ever clears).
+    As of v0.6.0, ``raw_fitness`` is the Gate-B-proximity score (see
+    ``_gate_b_proximity_score``) rather than ``mean − λ·std(sharpe)``.
+    The fold-variance penalty is embedded inside the proximity scorer.
 
-    Other Gate-B-relevant fields are aggregated for the penalty
-    function as follows:
+    Aggregation rules:
+      - ``sharpe``: **mean** per-fold Sharpe (actual metric, not the score).
       - ``max_drawdown``: **worst** (largest-magnitude) per-fold value —
         if any fold has a 30% DD, the strategy is risky overall, regardless
         of the other folds.
@@ -288,10 +320,10 @@ def _aggregate_fold_metrics(
       - ``n_trades``: **sum** across folds (total training trades).
       - ``cagr``: **mean** across folds.
 
-    The returned `aggregated_metrics["per_fold_sharpe"]` and
-    `["fold_consistency_std"]` are passed through for visibility in the
-    portal (no schema change yet — they ride on the existing metrics
-    dict).
+    The returned ``aggregated_metrics["per_fold_sharpe"]`` and
+    ``["fold_consistency_std"]`` are passed through for visibility in the
+    portal (no schema change — they ride on the existing metrics dict).
+    ``gate_b_proximity_terms`` and ``raw_fitness`` are added for transparency.
     """
     if not per_fold_metrics:
         return float("-inf"), {}
@@ -318,8 +350,6 @@ def _aggregate_fold_metrics(
     else:
         std_sharpe = 0.0
 
-    raw_fitness = mean_sharpe - fold_consistency_lambda * std_sharpe
-
     # Worst-case max_drawdown (max magnitude, i.e. most negative since
     # MDD is negative-or-zero by convention from `summarize_from_trade_ledger`).
     dds = _f("max_drawdown")
@@ -329,33 +359,12 @@ def _aggregate_fold_metrics(
     cagrs = _f("cagr")
     trade_counts = [int(m.get("n_trades", 0) or 0) for m in per_fold_metrics]
 
-    # Full per-fold projection — kept lightweight (just the fields the
-    # portal's WF-style table renders). The full metrics dict per fold
-    # would balloon the row size; this is the audit trail the user needs.
-    per_fold_summary = [
-        {
-            "sharpe": (float(m.get("sharpe")) if m.get("sharpe") is not None else None),
-            "max_drawdown": (
-                float(m.get("max_drawdown"))
-                if m.get("max_drawdown") is not None
-                else None
-            ),
-            "hit_rate": (
-                float(m.get("hit_rate")) if m.get("hit_rate") is not None else None
-            ),
-            "n_trades": int(m.get("n_trades", 0) or 0),
-            "cagr": float(m.get("cagr")) if m.get("cagr") is not None else None,
-            "total_return": (
-                float(m.get("total_return"))
-                if m.get("total_return") is not None
-                else None
-            ),
-        }
-        for m in per_fold_metrics
-    ]
-
-    aggregated = {
-        "sharpe": raw_fitness,
+    aggregated: dict[str, Any] = {
+        # Use the actual mean Sharpe — NOT raw_fitness — so the penalty
+        # stack sees the real Sharpe signal rather than the composite score.
+        # (Pre-v0.6.0 bug: aggregated["sharpe"] == raw_fitness, which
+        # confused any consumer that expected a Sharpe value here.)
+        "sharpe": mean_sharpe,
         "max_drawdown": worst_dd,
         "hit_rate": sum(hit_rates) / len(hit_rates) if hit_rates else 0.0,
         "cagr": sum(cagrs) / len(cagrs) if cagrs else 0.0,
@@ -364,11 +373,40 @@ def _aggregate_fold_metrics(
         # dict so the portal can render "training fold by fold" the same
         # way the validator's OOS WF table renders the final fold.
         "per_fold_sharpe": sharpes,
-        "per_fold_training_metrics": per_fold_summary,
+        "per_fold_training_metrics": [
+            {
+                "sharpe": (
+                    float(m.get("sharpe")) if m.get("sharpe") is not None else None
+                ),
+                "max_drawdown": (
+                    float(m.get("max_drawdown"))
+                    if m.get("max_drawdown") is not None
+                    else None
+                ),
+                "hit_rate": (
+                    float(m.get("hit_rate")) if m.get("hit_rate") is not None else None
+                ),
+                "n_trades": int(m.get("n_trades", 0) or 0),
+                "cagr": float(m.get("cagr")) if m.get("cagr") is not None else None,
+                "total_return": (
+                    float(m.get("total_return"))
+                    if m.get("total_return") is not None
+                    else None
+                ),
+            }
+            for m in per_fold_metrics
+        ],
         "fold_consistency_std": std_sharpe,
         "fold_consistency_lambda": fold_consistency_lambda,
         "mean_fold_sharpe": mean_sharpe,
     }
+
+    # Gate-B-proximity score: replaces the old mean − λ·std formula.
+    # The fold-variance penalty (−0.5·std) is embedded inside the scorer.
+    raw_fitness, term_values = _gate_b_proximity_score(aggregated, std_sharpe)
+    aggregated["gate_b_proximity_terms"] = term_values
+    aggregated["raw_fitness"] = raw_fitness
+
     return raw_fitness, aggregated
 
 
@@ -489,10 +527,13 @@ def compute_fitness(
             )
 
             metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
-            raw_sharpe = metrics.get("sharpe")
-            if raw_sharpe is None:
-                raw_sharpe = float("-inf")
-            raw_fitness = float(raw_sharpe)
+
+            # Apply Gate-B-proximity scoring on the single window.
+            # fold_std_sharpe=0.0 because there is no fold variance in
+            # single-window mode (same rationale as λ=0 / consistent folds).
+            raw_fitness, term_values = _gate_b_proximity_score(metrics, 0.0)
+            metrics["gate_b_proximity_terms"] = term_values
+            metrics["raw_fitness"] = raw_fitness
     except CompilerError as e:
         # Genome's DSL passed grammar validation but fails the compiler's
         # semantic checks (typically arg-arity mismatch from a mutation or

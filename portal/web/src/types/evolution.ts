@@ -345,6 +345,30 @@ export interface GenomeMetrics {
     diversity_penalty_factor: number;
     final_fitness: number;
   };
+  /**
+   * Gate-B-proximity composite (v0.6.0+).
+   *
+   * The actual value the GA optimises: a weighted sum of five normalised
+   * "distance from Gate B threshold" terms minus a fold-consistency penalty.
+   * Replaces the old raw_fitness = mean(per-fold Sharpe) − λ·std reading.
+   * `aggregated["sharpe"]` still equals the true mean per-fold Sharpe ratio
+   * (the semantic shifted — it is no longer equal to raw_fitness).
+   */
+  raw_fitness?: number;
+  /**
+   * Per-term breakdown of the Gate-B-proximity composite (v0.6.0+).
+   *
+   * Each term is a normalised score in roughly [−2, +2]:
+   *   0 = at threshold, +1 ≈ double the threshold, −1 ≈ missing by as much
+   *   as the threshold value itself.
+   */
+  gate_b_proximity_terms?: {
+    sharpe_term: number;
+    cagr_term: number;
+    hit_term: number;
+    mdd_term: number;
+    trades_term: number;
+  };
   // Any other backend-computed fields ride here (avg_win, avg_loss,
   // profit_factor, cost breakdown, etc.). Loosely typed so backend
   // additions don't break the frontend.
