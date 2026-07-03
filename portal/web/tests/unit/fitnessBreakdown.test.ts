@@ -377,6 +377,91 @@ describe('buildFitnessBreakdownData — legacy genome (gate_b_proximity_terms ab
     expect(data.diversityPenaltyActive).toBe(true);
     expect(data.finalFitness).toBe(-100);
   });
+
+  it('leaves weightedSum / foldConsistencyPenalty null on legacy rows', () => {
+    const data = buildFitnessBreakdownData({
+      metricsJson: legacyMetricsJson,
+      penaltyBreakdown: BASELINE_PENALTY_BREAKDOWN,
+    });
+    // Without gate_b_proximity_terms we can't reconstruct these — null
+    // signals the UI to hide the penalty row entirely.
+    expect(data.weightedSum).toBeNull();
+    expect(data.foldConsistencyPenalty).toBeNull();
+    expect(data.foldConsistencyStd).toBeNull();
+  });
+});
+
+describe('buildFitnessBreakdownData — fold-consistency penalty derivation', () => {
+  it('derives foldConsistencyPenalty as raw_fitness − weighted_sum', () => {
+    // Concrete scenario matching the UAT 2026-07-02 screenshot:
+    //   Weighted sum = +1.2392
+    //   Raw fitness  = +0.872
+    //   ⇒ fold-consistency penalty ≈ −0.367
+    //   ⇒ std(fold Sharpe) ≈ 0.734
+    const data = buildFitnessBreakdownData({
+      metricsJson: {
+        cagr: 0.662,
+        max_drawdown: 0.061,
+        sharpe: 2.74,
+        hit_rate: 0.498,
+        n_trades: 570,
+        raw_fitness: 0.872,
+        gate_b_proximity_terms: {
+          // Backend-computed terms; contributions = weight × term:
+          //   0.35 × 2.000 = 0.7000
+          //   0.25 × 0.391 = 0.0978
+          //   0.20 × 1.738 = 0.3476
+          //   0.10 × 0.037 = 0.0037
+          //   0.10 × 0.900 = 0.0900
+          //   sum ≈ +1.2391
+          cagr_term: 2.0,
+          mdd_term: 0.391,
+          sharpe_term: 1.738,
+          hit_term: 0.037,
+          trades_term: 0.9,
+        },
+      },
+      penaltyBreakdown: {
+        ...BASELINE_PENALTY_BREAKDOWN,
+        raw_fitness: 0.872,
+        final_fitness: 0.872,
+      },
+    });
+
+    expect(data.weightedSum).not.toBeNull();
+    expect(data.weightedSum!).toBeCloseTo(1.2391, 3);
+    expect(data.foldConsistencyPenalty).not.toBeNull();
+    expect(data.foldConsistencyPenalty!).toBeCloseTo(-0.3671, 3);
+    expect(data.foldConsistencyStd).not.toBeNull();
+    // 0.5 × std = 0.3671 ⇒ std ≈ 0.734
+    expect(data.foldConsistencyStd!).toBeCloseTo(0.734, 2);
+  });
+
+  it('foldConsistencyPenalty is 0 when raw_fitness equals weighted sum (no variance)', () => {
+    // All folds identical Sharpe ⇒ std=0 ⇒ no penalty
+    const data = buildFitnessBreakdownData({
+      metricsJson: {
+        cagr: 0.15,
+        max_drawdown: 0.10,
+        sharpe: 1.0,
+        hit_rate: 0.48,
+        n_trades: 300,
+        raw_fitness: 0.0,
+        gate_b_proximity_terms: {
+          cagr_term: 0,
+          mdd_term: 0,
+          sharpe_term: 0,
+          hit_term: 0,
+          trades_term: 0,
+        },
+      },
+      penaltyBreakdown: BASELINE_PENALTY_BREAKDOWN,
+    });
+
+    expect(data.weightedSum).toBeCloseTo(0.0, 5);
+    expect(data.foldConsistencyPenalty).toBeCloseTo(0.0, 5);
+    expect(data.foldConsistencyStd).toBeCloseTo(0.0, 5);
+  });
 });
 
 describe('buildFitnessBreakdownData — gate_b_proximity_terms explicitly null', () => {
