@@ -1,9 +1,20 @@
 name: Deploy
 
+# `paths-ignore` skips the entire deploy job (E2E + Railway + Vercel-via-Actions)
+# when every changed path in a merge to main is docs. Prevents Railway backend
+# rebuilds and Vercel frontend rebuilds for planning-only merges. The Vercel
+# GitHub integration (Preview + Production) is separately gated by the
+# `ignoreCommand` in portal/web/vercel.json.
 on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'planning/**'
+      - '**/*.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - 'portal/web/wireframes/**'
 
 concurrency:
   group: deploy-production
