@@ -1,13 +1,30 @@
 name: CI
 
+# `paths-ignore` skips the whole workflow when EVERY changed path matches
+# one of the patterns. A PR that touches planning docs AND code still runs
+# CI (as it should); a PR that ONLY changes docs skips the ~4-min CI cost.
+# The workflow files themselves are deliberately NOT ignored so edits to
+# ci.yml re-run to verify the new config.
 on:
   pull_request:
     branches:
       - main
       - "feature/**"
+    paths-ignore:
+      - 'planning/**'
+      - '**/*.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - 'portal/web/wireframes/**'
   push:
     branches:
       - main
+    paths-ignore:
+      - 'planning/**'
+      - '**/*.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - 'portal/web/wireframes/**'
 
 # Cancel in-flight runs for the same ref so PRs don't queue up redundant jobs.
 concurrency:

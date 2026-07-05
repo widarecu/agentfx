@@ -158,35 +158,42 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 
 ---
 
-## v0.4.0 - Capability Expansion + Regime-Aware Validation (IN PROGRESS)
+## v0.4.0 - Regime-Aware Validation + Core Anti-Overfitting (FUNCTIONALLY COMPLETE)
 
-**Theme:** Two goals at once — (a) close v0.3.0 acceptance #3 by fixing the validator's regime fragility; (b) grow the discovery surface so genomes have more to express.
+**Theme:** Close v0.3.0 acceptance #3 by fixing the validator's regime fragility and the fitness function's Sharpe-only optimisation bias. DSL / TOD / multi-symbol expansion has been re-scoped to v0.7.0 — the regime + fitness work turned out to be the binding constraint, not DSL surface.
 
-**Why both:** The 2026-06-07 analysis of 9 recent UAT M10 runs revealed that training-fold Sharpes of +1.5 to +3 routinely become OOS Sharpes of −0.4 to −1.8 on the same Apr-Jul 2024 OOS slice. Three independent runs with different RNG seeds all lost on the same OOS slice — a regime-shift signature, not random GA overfit. Expanding the DSL alone wouldn't close the gap; we need to change *how we validate* in parallel with *what we can express*.
+**Why the re-scope:** Empirically the GA didn't need more indicators — with the OLD regime-blind fitness function it produced high-training-Sharpe genomes that catastrophically failed OOS regardless of DSL depth. Fixing the validation and fitness pipeline unlocked more value than expanding the search space. Grammar expansion returns in v0.7.0 once we have paper-trading data on the current DSL.
 
-**Already shipped (May-June 2026):**
-- Per-pair configurable spread snapshot at run-start; `min_hold_bars` DSL field
-- OOS-split tabs + per-trade cost columns + trade-ledger metrics
-- Cost-model rewrite to OANDA AU 21:00 UTC schedule + slippage default 0.0 (PR #6)
-- Delete invalid evolution runs from UI; scrollable form modal; CI E2E fixes (PRs #6/#7/#8)
+**Delivered (PRs #10 – #19, June 2026):**
+- Rolling walk-forward validator: 3 training + 5 OOS folds (was fixed-25%-tail single fold)
+- Per-fold regime tagging: volatility × trend × direction, correctly working on M1 (bug fix PR #12 — the classifier previously returned "choppy" for every M1 window)
+- Warm-start cascade fix trilogy: canonical-spec exclusion (PR #13) + deferred injection at gen 10 (PR #16) + champion-by-OOS end-of-run pick (PR #17). Closes the multi-run laundering loop empirically observed on UAT 2026-06-25 through 2026-06-28.
+- Gate-B-proximity fitness function (PR #18): raw fitness = weighted sum of Gate B distance terms (CAGR 0.35, MDD 0.25, Sharpe 0.20, Hit 0.10, Trades 0.10) − 0.5·std(fold Sharpe). Backend + LLM prompt + UI updated in one PR; 966 backend + 111 frontend tests pass.
+- Fold-consistency penalty row surfaced in `FitnessBreakdown` panel (PR #19).
+- Earlier v0.4.0 work: per-pair spread snapshot at run-start; `min_hold_bars` DSL field; OOS-split tabs; per-trade cost columns; trade-ledger metrics; cost-model rewrite to OANDA AU 21:00 UTC schedule + slippage default 0.0 (PR #6); scrollable form modal; CI E2E fixes (PRs #6–#8).
 
-**Planned Capabilities:**
-- *Regime-aware validation* — rolling walk-forward instead of fixed-25%-tail OOS; per-fold regime tagging (vol quintile + trend strength); early-reject runs where train/OOS regimes disagree
-- *Expanded DSL* — 5 new indicators (MACD, stochastic, ADX, OBV, ichimoku); time-of-day entry filter; multi-timeframe references
-- *Multi-symbol portfolios* — within a single evolution run (design decision pending)
-- *Regime tags as LLM prompt context* — surfaces train/OOS regime asymmetry to the proposer
-- *Optional Bayesian late-stage refiner* — repurpose `BayesianOptimizerAgent` to fine-tune numeric thresholds inside winning genome shapes after GA selection
+**Open regime work carrying into v0.6.0 / v0.7.0:**
+- Bootstrap-consistency penalty on training folds (~1 day, deferred pending paper-trading feedback)
+- Combinatorial Purged Cross-Validation (López de Prado ch. 7 / ch. 12) — reserved for v0.7.0 if paper trading confirms overfitting still dominates after Gate-B-proximity
+- Regime-conditioned strategies (specialist per regime + runtime switcher) — reserved for v1.0.0
+
+**Deferred to v0.7.0 (Capability Expansion):**
+- Expanded DSL — 5+ new indicators, time-of-day entry filter, multi-timeframe references
+- Multi-symbol portfolios within a single evolution run
+- Optional Bayesian late-stage refiner (`BayesianOptimizerAgent` repurposed as post-GA fine-tuner)
 
 **Exit Criteria:**
-- [ ] At least one VALIDATED genome clears Gate B on a real nightly run (closes v0.3.0 acceptance #3)
-- [ ] DSL grammar covers ≥ 12 indicators and time-of-day filters
-- [ ] Rolling walk-forward produces a stable median OOS Sharpe across ≥ 3 non-overlapping data slices
-- [ ] Evolution runs can target a portfolio of 3+ pairs simultaneously
-- [ ] Per-pair spread accuracy verified against historical OANDA spread data on EUR_USD + GBP_USD + USD_JPY
+- [x] Rolling walk-forward produces a stable median OOS Sharpe across 5 non-overlapping folds
+- [x] Regime classifier correctly labels sub-daily granularities (per PR #12 — verified against known-directional windows including Q2 2025 EUR/USD rally)
+- [x] Gate-B-proximity fitness rewards balanced strategies over Sharpe-max ones (verified: balanced A `0.6 Sharpe / 18% CAGR / 8% MDD / 50% hit` scores +0.113 vs Sharpe-max B `1.5 Sharpe / 5% CAGR / 15% MDD / 30% hit` at −0.493)
+- [x] Warm-start no longer cascades exhausted specs across runs (per PRs #13/#16/#17)
+- [ ] At least one VALIDATED genome clears Gate B on OOS — **carries into v0.6.0 paper-trading feedback**. As of the June-28 → July-4 batch, best OOS Sharpe is +0.84 (H1 50f984c8), still below the 1.0 threshold. Paper trading is expected to inform whether the remaining gap is a fitness-function issue or a calibration issue.
 
 ---
 
-## v0.5.0 - Self-Improvement + Diagnostic Evaluation Agent (IN PROGRESS)
+## v0.5.0 - Self-Improvement + Diagnostic Evaluation Agent (IN PROGRESS, runs in parallel with v0.6.0)
+
+**Runs alongside v0.6.0:** the diagnostic agent doesn't block paper trading — it *feeds* it. A genome only becomes paper-eligible when both `validator_passed` (v0.4.0) and a diagnostic pass (v0.5.0) accept it, but the paper-trading pipeline can ship first with `validator_passed` as the sole gate, then have the diagnostic pass added as a second condition when v0.5.0 lands.
 
 **Theme:** The platform learns *across* runs and *diagnoses why* strategies fail, closing the feedback loop with intentional next-iteration guidance rather than blind re-evolution.
 
@@ -229,22 +236,42 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 
 ---
 
-## v0.6.0 - Paper Trading
+## v0.6.0 - Paper Trading MVP — UX-first, multi-tenant, per-user credentials
 
-**Theme:** Promote VALIDATED genomes to OANDA Practice with human approval gate. (Was previously v0.5.0; pushed down a slot by the v0.3.0 reframe.)
+**Theme:** Any TRADER user can securely deploy any of their VALIDATED genomes to their own OANDA Practice account, monitor live P&L vs backtest, and kill-switch the run — with zero cross-user data leakage.
 
-**Goal:** Bring real-money-shaped feedback into the loop without risking real money.
+**Why this shape.** Six weeks of fitness function work (v0.4.0) reduced but did not eliminate the training-OOS gap. Every further backtest sophistication is a *guess* without live feedback. Paper trading is the only signal that tells us whether our cost model, execution timing, and metric definitions correlate with what really happens in a real broker account. Everything after paper (bootstrap consistency, CPCV, regime conditioning) is better informed by paper feedback than by another round of backtest experiments.
+
+**Why multi-tenant / RBAC from day one.** The codebase currently has a live security bug — `list_runs()` and `list_jobs()` do not filter by `created_by`, so any authenticated user sees all other users' data. Introducing paper trading (with a real broker account) without fixing that leak amplifies it to real capital exposure. RBAC + per-user isolation is therefore inside v0.6.0, not deferred.
+
+**User Stories:** [US-017](requirements/US-017-paper-trading-ux-design.md), [US-018](requirements/US-018-rbac-user-isolation.md), [US-019](requirements/US-019-per-user-oanda-credentials.md), [US-020](requirements/US-020-oanda-order-execution.md), [US-021](requirements/US-021-paper-runner-service.md), [US-022](requirements/US-022-paper-trading-portal.md), [US-023](requirements/US-023-kill-switch-risk-controls.md)
 
 **Key Capabilities:**
-- Approval queue portal page — VALIDATED genomes awaiting human sign-off
-- Paper trading service executing approved genomes on OANDA Practice
-- Live performance comparison vs. validation metrics
-- Email/Slack notifications for approval requests
+- **UX-first delivery** — `trading-ux-designer` produces low-fidelity wireframes then clickable high-fidelity mockups for six flows (onboarding, approval queue, live monitoring, kill switch, credentials, multi-user visibility). Wilson signs off before any backend PR opens.
+- **RBAC + per-user isolation** — retrofit `list_runs`/`list_jobs`/read endpoints to filter by `created_by = current_user.id` for non-ADMIN; ADMIN gets `?scope=all`. Ship `<RequireRole>` frontend HOC.
+- **Per-user OANDA credentials** — new `user_oanda_credentials` table; Fernet encryption at rest via `cryptography` (already installed, unused today); 4 API endpoints; `CredentialsForm` in `/settings`. LIVE toggle disabled behind an ADMIN + v1.0.0 feature flag.
+- **OANDA order execution** — extend `OandaClient` (which today only reads candles + financing + spread) with `place_market_order`, `close_trade`, `close_all_positions`, `get_position`, `get_account_balance`, `get_open_trades`, `get_pricing`. Exponential backoff; circuit breaker on 5 consecutive failures.
+- **Approval queue** — VALIDATED genomes land in the owning user's `/paper/approvals`; the user explicitly approves each one (approval = human sign-off = deploy). No auto-deploy.
+- **Paper runner service** — mirrors `evolution_runner.py`'s subprocess + watchdog pattern. Loads user credentials via `secrets.decrypt_secret`, builds a scoped `OandaClient`, drives the signal→order loop at genome-granularity cadence, respects kill switch + risk controls. Decision loop p95 <1s.
+- **Kill switch** — big red button on `/paper/:id` with a 3-second undo toast. After the undo window closes the run halts (positions closed, `stop_reason=USER_KILL`).
+- **Live vs backtest overlay** — `LivePnLChart` on `/paper/:id` compares live equity vs the genome's original backtest OOS equity by relative timestamp from run start.
+
+**Schema decision — REUSE existing `runs/orders/trades` tables** (already in `src/agentfx/api/models/run.py` from v0.1, with `RunEnvironment{DEV, PAPER, LIVE}` already defined). A migration adds `strategy_genome_id` FK, `oanda_environment`, `user_id`, `approval_status`, `kill_requested_at`, `risk_config`. Alternative — parallel `paper_run/paper_trade` tables — rejected because it duplicates schema and blocks v1.0.0 live-trading reuse.
+
+**Deferred to v0.6.1+ (NOT in v0.6.0 MVP):**
+- Email / Slack notifications
+- OANDA v20 pricing stream (polling every 60s is sufficient for M1+ at MVP)
+- Fernet key rotation
+- ADMIN visibility of other users' masked credential status
+- Live trading toggle in credentials
 
 **Exit Criteria:**
-- [ ] Trader role can review a VALIDATED genome and promote it to paper
-- [ ] Paper trading service executes orders on OANDA Practice
-- [ ] Live vs. validation drift visible in portal
+- [ ] UX mockups signed off by Wilson before any backend PR opens (hard gate)
+- [ ] `list_runs`/`list_jobs` filter by `created_by` for non-ADMIN — integration tests confirm user A cannot see user B's runs, jobs, genomes, credentials, or paper runs at any endpoint
+- [ ] Per-user OANDA credentials encrypted at rest with Fernet; test-connection endpoint verifies against OANDA before setting `verified_at`
+- [ ] Approval queue delivers approved genomes to the paper runner; run row shows correct `approval_status` state transitions
+- [ ] Kill switch halts a running paper run in <5s (positions closed on OANDA, status `HALTED_MANUAL` in portal)
+- [ ] 30-day continuous paper deployment of at least one genome on UAT completes without unexplained crashes; daily drift between live P&L and backtest OOS P&L is bounded within ±30%
 
 ---
 
@@ -254,8 +281,10 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 
 **Goal:** Platform continuously discovers, evolves, validates, paper-trades, and (with human approval) live-trades a *regime-aware portfolio* of profitable strategies, hitting the North Star floor of 20–30% reliable monthly returns with minimal human oversight.
 
+**Dependency on v0.6.0:** Live trading reuses the per-user credential vault built in v0.6.0. `oanda_environment=LIVE` is a database column on `user_oanda_credentials` gated behind `settings.LIVE_TRADING_ENABLED` (feature flag, default false in v0.6.0) AND an ADMIN role AND a second approval flow. Fernet-encrypted at rest; same access pattern as PRACTICE credentials — the only real difference is the OANDA API host and the approval gates.
+
 **Key Capabilities:**
-- *Live trading integration* — OANDA Live with the second human approval gate (paper → live)
+- *Live trading integration* — OANDA Live with the second human approval gate (paper → live), building on the v0.6.0 credential vault
 - *Regime-aware portfolio activation engine* — multiple validated strategies on standby; each tagged with its preferred regime (from v0.4.0's conditional-edge classifier). At each tick, the engine computes the live regime tag for each pair, looks up which strategies should be active for that regime, and applies them at their assigned risk weight. A strategy with edge only in `low-vol-choppy-down` is in the portfolio but inactive unless that regime is live
 - *Capital allocation across activated strategies* — risk parity / equal weight / fitness-weighted, configurable, with hard caps so a single losing strategy can't take down the portfolio
 - *Performance monitoring dashboard* — live P&L per strategy, current regime per pair, which strategies are active vs dormant, drift alerts, regime context

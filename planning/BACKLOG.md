@@ -185,14 +185,15 @@ This backlog is organized by version milestone. Each item links to executable us
 
 ---
 
-## v0.4.0 - Capability Expansion (IN PROGRESS)
+## v0.4.0 - Regime-Aware Validation + Core Anti-Overfitting (FUNCTIONALLY COMPLETE)
 
-**Theme:** Two things at once — close v0.3.0 acceptance #3 (regime-aware validation) AND grow the discovery surface (richer DSL).
+**Theme:** Close v0.3.0 acceptance #3 (regime-aware validation) AND replace the Sharpe-only fitness function with something aligned to Gate B. DSL / TOD / multi-symbol expansion re-scoped to v0.7.0 — the regime + fitness work was the binding constraint, not DSL surface.
 
-**Status:** Partially shipped (per-pair spread snapshot, `min_hold_bars` field, OOS-split tabs, trade-ledger metrics, cost-model rewrite to OANDA AU schedule, deletable runs). Indicators / TOD / multi-symbol / regime-aware validation still to come.
+**Status:** Functionally complete for the v0.6.0 handoff. Gate-B clearance carries into v0.6.0 as the paper-trading acceptance signal.
 
-### Recently shipped (May-June 2026)
+### Shipped (PRs #6 – #19, May – June 2026)
 
+**Cost model + backtest baseline (PRs #6–#8):**
 - [x] `DONE` Per-pair configurable spread snapshot at run-start
 - [x] `DONE` `min_hold_bars` DSL field — minimum bars between flips
 - [x] `DONE` OOS-split tabs on backtest page + per-trade cost columns
@@ -202,41 +203,48 @@ This backlog is organized by version milestone. Each item links to executable us
 - [x] `DONE` Scrollable evolution form modal (PR #8) + EUR_USD form pin in CI (PR #7)
 - [x] `DONE` Read-only investigation script comparing current model against OANDA empirical fills (`scripts/investigate_cost_model_gap.py`)
 
-### P0 — Close the OOS gap (regime-aware validation)
+**Rolling walk-forward + regime work (PRs #9, #12):**
+- [x] `DONE` Rolling walk-forward validator: 3 training + 5 OOS folds instead of fixed-25%-tail single fold
+- [x] `DONE` Per-fold regime tagging on training AND OOS: `volatility × trend × direction` (vol quintiles low/med/high; trend strength ratio; direction ±0.5%)
+- [x] `DONE` Regime classifier bug fix on sub-daily granularities (PR #12) — trend ratio was dominated by tick noise on M1; now resampled to daily. Verified against known-directional windows including Q2 2025 EUR/USD +8.4% rally.
+- [x] `DONE` Aggregated-OOS Sharpe alongside per-fold median (both surfaced in `WalkForwardFoldTable`)
+- [x] `DONE` Sample-size badge on per-fold metrics — grays out per-fold Sharpe when trade count is below reliability threshold
 
-Surfaced by the 2026-06-07 fold analysis: the GA produces consistent training Sharpe but the *single* OOS fold systematically inverts when the most-recent 25% of the data is a different regime. Pure search-space expansion doesn't fix this — we need to change *how we validate*.
+**Warm-start cascade fix trilogy (PRs #13, #16, #17):**
+- [x] `DONE` PR #13 canonical-spec exclusion — `find_prior_winners` filters any spec matching a plateau-run best genome
+- [x] `DONE` PR #16 deferred warm-start injection — warm-start picks enter the population at gen 10 via periodic injection, not gen 0 elitism
+- [x] `DONE` PR #17 champion-by-OOS end-of-run selection — `best_genome_id` reflects OOS robustness, not just training fitness; `top_n_to_validate` bumped 5 → 15
+- [x] `DONE` Warm-start source diversification (originally deferred v0.5.0 item, subsumed by PR #16)
 
-- [ ] `TODO` Rolling walk-forward instead of fixed-25%-tail OOS
-  - Multiple overlapping OOS folds, e.g. 5 × {train 60% of window → validate next 10%, slide forward}
-  - Fitness = MEDIAN OOS Sharpe across folds, not mean training Sharpe
-  - **Direct fix for the "good train, bad OOS" pattern** — the average across overlapping OOS slices is less brittle than betting on one
-- [ ] `TODO` Regime tagging on training AND OOS folds
-  - Compute per-fold features at run-start: realised vol (quintile), trend strength (Hurst or ADX), session mix
-  - Reject runs early when train/OOS regime tags disagree past a threshold (saves 30 generations of wasted compute)
-- [ ] `TODO` Regime tags as LLM prompt context (was already on the backlog; promoted here)
-  - LLM sees "training period regime tag was X, OOS regime tag is Y, propose strategies whose edge survives both"
+**Gate-B-proximity fitness (PRs #18, #19):**
+- [x] `DONE` PR #18 fitness function rewrite — raw fitness = 0.35·CAGR_term + 0.25·MDD_term + 0.20·Sharpe_term + 0.10·Hit_term + 0.10·Trades_term − 0.5·std(fold Sharpe), each term normalised so 0 = at Gate B threshold. Retires the mean(sharpe) − λ·std formula.
+- [x] `DONE` PR #18 penalty stack cleanup: trade-shortfall / drawdown-breach / Gate-B-dilution removed (folded into proximity terms); zero-trade hard penalty and diversity penalty preserved.
+- [x] `DONE` PR #18 LLM prompt updated so proposers optimise against the new fitness definition.
+- [x] `DONE` PR #19 `FitnessBreakdown` UI shows explicit fold-consistency penalty row so `weighted sum → −0.5·std → raw fitness` arithmetic is visible.
 
-### P0 — Expand DSL surface
+### Deferred to v0.7.0 (Capability Expansion)
 
-- [ ] `TODO` 5 more indicators: MACD, stochastic, ADX, OBV, ichimoku
-- [ ] `TODO` Time-of-day entry filter — restrict entry signals to chosen UTC hour ranges (London/NY session, news-blackout)
-- [ ] `TODO` Multi-timeframe references — allow a M5 strategy to reference an H1 indicator value (richer signal hierarchy)
-
-### P1 — Should Have
-
-- [ ] `TODO` Multi-symbol portfolios within one evolution run — design decision pending (portfolio-of-strategies vs. generalised strategy applied per pair)
-- [ ] `TODO` Optional Bayesian late-stage refiner — repurpose the existing `BayesianOptimizerAgent` to fine-tune numeric thresholds inside a winning genome shape after the GA selects it
+- [ ] `DEFERRED to v0.7.0` 5+ new indicators (MACD/stochastic/ADX/OBV/ichimoku already shipped in PR #10 as part of grammar expansion; further indicators tracked as an extension)
+- [ ] `DEFERRED to v0.7.0` Time-of-day entry filter — restrict entry signals to chosen UTC hour ranges
+- [ ] `DEFERRED to v0.7.0` Multi-timeframe references — allow a M5 strategy to reference an H1 indicator value
+- [ ] `DEFERRED to v0.7.0` Multi-symbol portfolios within one evolution run
+- [ ] `DEFERRED to v0.7.0` Optional Bayesian late-stage refiner
+- [ ] `DEFERRED pending paper feedback` Bootstrap-consistency penalty on training folds — cheapest incremental anti-overfitting move. Deferred deliberately: further backtest sophistication is a guess without paper-trading feedback. Revisit as v0.6.1 or v0.7.0 based on what paper data reveals.
+- [ ] `DEFERRED to v0.7.0` Combinatorial Purged Cross-Validation (López de Prado ch. 7 / ch. 12) — reserved if paper trading confirms training-OOS gap still dominates after Gate-B-proximity + bootstrap-consistency
 
 ### Acceptance for "v0.4.0 done"
 
-1. At least one VALIDATED genome clears Gate B on a real nightly run (carries over v0.3.0 acceptance #3, finally closed).
-2. DSL grammar covers ≥ 12 indicators and time-of-day filters.
-3. Rolling walk-forward produces a stable median OOS Sharpe across at least 3 non-overlapping data slices.
-4. Per-pair spread accuracy verified against historical OANDA spread data on EUR_USD + GBP_USD + USD_JPY.
+1. [x] Rolling walk-forward produces a stable median OOS Sharpe across ≥ 3 non-overlapping folds (satisfied by PR #9 5-fold design)
+2. [x] Regime classifier correctly labels sub-daily granularities (PR #12)
+3. [x] Fitness function directly rewards Gate B clearance criteria (PR #18)
+4. [x] Warm-start no longer cascades exhausted specs across runs (PRs #13/#16/#17)
+5. [ ] **CARRIES INTO v0.6.0** — at least one VALIDATED genome clears Gate B on OOS. Best current UAT OOS Sharpe is +0.84 (H1 50f984c8), still below the 1.0 threshold. Paper trading is the informative next signal.
 
 ---
 
-## v0.5.0 - Self-Improvement (IN PROGRESS)
+## v0.5.0 - Self-Improvement (IN PROGRESS, runs in parallel with v0.6.0)
+
+**Runs alongside v0.6.0.** The diagnostic agent doesn't block paper trading — it *augments* it. A genome only needs `validator_passed` to enter the v0.6.0 paper approval queue. Once the diagnostic agent lands, it becomes a second condition (diagnosis must be `ok` or `regime_mismatch → route to conditional-edge portfolio`). Paper trading ships first with `validator_passed` as the sole gate.
 
 **Theme:** The platform learns across runs, not just within runs.
 
@@ -294,14 +302,35 @@ The current evolve → evaluate → repeat loop is optimization without learning
 
 ---
 
-## v0.6.0 - Paper Trading
+## v0.6.0 - Paper Trading MVP — UX-first, multi-tenant, per-user credentials
 
-**Theme:** Promote VALIDATED genomes to OANDA Practice with human approval gate. (Was previously v0.5.0; pushed down a slot by the v0.3.0 reframe.)
+**Theme:** Any TRADER user can securely deploy any of their VALIDATED genomes to their own OANDA Practice account, monitor live P&L vs backtest, and kill-switch the run — with zero cross-user data leakage.
 
-- [ ] `TODO` Approval queue portal page — VALIDATED genomes awaiting human sign-off
-- [ ] `TODO` Paper trading service — executes approved genomes on OANDA Practice
-- [ ] `TODO` Live performance comparison vs. validation metrics
-- [ ] `TODO` Email/Slack notifications for approval requests
+**Delivery order (hard-gated, sequential):** planning docs → UX design (mockups signed off) → RBAC/isolation refactor → per-user credential storage → OANDA order execution → paper runner service → portal pages → integration + E2E + UAT deploy. Backend PRs do not open until Wilson signs off on the UX mockups. See the plan in `/Users/wilson/.claude/plans/i-think-we-need-functional-pony.md` for phase-by-phase detail.
+
+**User-approved decisions** (locked before UX design):
+- Concurrent paper runs per user: **unlimited (soft cap)**
+- Approval workflow: **separate approval queue** (`VALIDATED → AWAITING_APPROVAL → APPROVED → RUNNING`)
+- Kill switch: **big red button + 3-second undo toast** (no modal, no type-name confirmation)
+- Notifications: **deferred to v0.6.1** (no Email / Slack in MVP)
+
+### User stories
+
+- [ ] `TODO` [US-017 — Paper Trading UX design lockdown](requirements/US-017-paper-trading-ux-design.md)
+- [ ] `TODO` [US-018 — Per-user RBAC filter on runs, jobs, genomes](requirements/US-018-rbac-user-isolation.md) — **also closes an existing security bug** where any authenticated user sees all runs, not just their own
+- [ ] `TODO` [US-019 — Per-user OANDA credentials, encrypted at rest](requirements/US-019-per-user-oanda-credentials.md)
+- [ ] `TODO` [US-020 — OANDA order-execution adapter methods](requirements/US-020-oanda-order-execution.md)
+- [ ] `TODO` [US-021 — Paper runner service + subprocess model](requirements/US-021-paper-runner-service.md)
+- [ ] `TODO` [US-022 — Paper trading portal pages (`/settings`, `/paper`, `/paper/approvals`, `/paper/:id`)](requirements/US-022-paper-trading-portal.md)
+- [ ] `TODO` [US-023 — Kill switch + risk controls + approval state machine](requirements/US-023-kill-switch-risk-controls.md)
+
+### Deferred to v0.6.1
+
+- [ ] `DEFERRED to v0.6.1` Email / Slack notifications for approval requests, kill events, risk-control triggers
+- [ ] `DEFERRED to v0.6.1` Live-vs-validation drift alerts as a separate UI surface (basic overlay chart is in MVP)
+- [ ] `DEFERRED to v0.6.1+` OANDA v20 pricing stream (WebSocket) — replaces 60s polling if latency becomes a blocker
+- [ ] `DEFERRED to v0.7.0` Fernet key rotation → `key_version=2` on `user_oanda_credentials`
+- [ ] `DEFERRED to v0.7.0` ADMIN visibility of other users' *masked* credential status (for support)
 
 ---
 
