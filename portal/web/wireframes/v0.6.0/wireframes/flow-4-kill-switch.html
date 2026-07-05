@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Flow 4 · Kill switch — Wireframe</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .wf-box { border: 1px dashed #6b7280; background: #f3f4f6; }
+    .wf-solid { border: 1px solid #374151; background: #ffffff; }
+    .wf-nav { background:#e5e7eb; border-bottom:1px solid #9ca3af; }
+    .wf-label { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.7rem; letter-spacing:0.05em; text-transform:uppercase; color:#4b5563; }
+    .annot { color:#6b7280; font-size:0.75rem; font-style: italic; }
+    .kill { background:#fecaca; border:1px solid #b91c1c; color:#7f1d1d; }
+    .toast { background:#7f1d1d; color:#fee2e2; border:1px solid #450a0a; }
+    .toast-progress { background:#fee2e2; height:4px; }
+    .toast-progress-fill { background:#dc2626; height:100%; }
+  </style>
+</head>
+<body class="bg-white text-slate-800 p-8">
+  <div class="max-w-6xl mx-auto">
+    <a href="./index.html" class="text-xs underline text-slate-600">◂ back to wireframe index</a>
+    <h1 class="text-xl font-bold mt-2">Flow 4 · Kill switch (big red button + 3s undo)</h1>
+    <p class="text-sm text-slate-600 mt-1">Goal: user halts a paper run in one click. Undo protects against accidents. No modal, no type-name-to-confirm — this is a SaaS-standard emergency stop.</p>
+
+    <!-- State 1 · idle -->
+    <section class="mt-8">
+      <div class="wf-label mb-2">State 1 · Idle (button armed, no click yet)</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded">
+            <div class="wf-nav px-4 py-2 text-xs">/paper/run_20260705_ab12 · RUNNING</div>
+            <div class="p-4 flex items-center justify-between">
+              <div>
+                <div class="text-sm font-semibold">EUR_USD M15 — 2026-07-05</div>
+                <div class="text-xs text-slate-500">Live P&amp;L +$142.30</div>
+              </div>
+              <div class="kill rounded px-4 py-2 text-sm font-bold cursor-pointer">[⚠ Kill switch]</div>
+            </div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Button lives permanently top-right of /paper/:id. Colour = high signal, size = large hit target.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- State 2 · countdown -->
+    <section class="mt-10">
+      <div class="wf-label mb-2">State 2 · Countdown toast (T+0 → T+3s)</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded relative">
+            <div class="wf-nav px-4 py-2 text-xs">/paper/run_20260705_ab12 · RUNNING</div>
+            <div class="p-4 flex items-center justify-between">
+              <div class="opacity-70">
+                <div class="text-sm font-semibold">EUR_USD M15 — 2026-07-05</div>
+                <div class="text-xs text-slate-500">Live P&amp;L +$142.30</div>
+              </div>
+              <div class="kill rounded px-4 py-2 text-sm font-bold opacity-50">[⚠ Kill switch]</div>
+            </div>
+
+            <!-- Toast overlay -->
+            <div class="absolute top-16 left-1/2 -translate-x-1/2 toast rounded shadow-lg px-4 py-3 flex items-center gap-4 min-w-[380px]">
+              <div class="text-lg font-bold">Halting run in 2…</div>
+              <div class="flex-1">
+                <div class="text-xs">Kill signal will fire in 2 seconds. Positions will close on OANDA.</div>
+                <div class="toast-progress rounded mt-2 overflow-hidden"><div class="toast-progress-fill" style="width: 40%;"></div></div>
+              </div>
+              <div class="wf-solid rounded px-3 py-1.5 text-xs font-semibold text-slate-900 cursor-pointer">[Undo]</div>
+            </div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Button greys out; toast takes centre stage.</p>
+          <p class="annot">◂ Countdown ticks visibly (3 → 2 → 1); progress bar fills; undo is always in reach.</p>
+          <p class="annot">◂ Toast dismisses if user clicks Undo — no side effect, no API call to kill.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- State 3 · halting -->
+    <section class="mt-10">
+      <div class="wf-label mb-2">State 3 · Halting (T+3s → POST /kill returns)</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded relative">
+            <div class="wf-nav px-4 py-2 text-xs">/paper/run_20260705_ab12 · HALTING…</div>
+            <div class="p-4 flex items-center justify-between">
+              <div class="opacity-70">
+                <div class="text-sm font-semibold">EUR_USD M15 — 2026-07-05</div>
+                <div class="text-xs text-slate-500">Live P&amp;L +$142.30 (frozen)</div>
+              </div>
+              <div class="kill rounded px-4 py-2 text-sm font-bold opacity-40">[⚠ Kill switch]</div>
+            </div>
+
+            <div class="absolute top-16 left-1/2 -translate-x-1/2 toast rounded shadow-lg px-4 py-3 flex items-center gap-3 min-w-[320px]">
+              <div class="wf-solid border-2 rounded-full w-5 h-5 flex items-center justify-center text-xs">⟳</div>
+              <div class="text-sm">Closing positions on OANDA…</div>
+            </div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Frontend fires POST /paper-runs/:id/kill, backend sets kill_requested_at.</p>
+          <p class="annot">◂ Runner sees flag within one loop cycle (≤ granularity seconds).</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- State 4 · halted -->
+    <section class="mt-10">
+      <div class="wf-label mb-2">State 4 · Halted (final)</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded">
+            <div class="wf-nav px-4 py-2 text-xs">/paper/run_20260705_ab12 · HALTED_MANUAL</div>
+            <div class="p-4 flex items-center justify-between">
+              <div>
+                <div class="flex items-center gap-2">
+                  <div class="wf-solid rounded-full px-2 py-0.5 text-xs font-semibold">■ HALTED_MANUAL</div>
+                  <div class="text-sm font-semibold">EUR_USD M15 — 2026-07-05</div>
+                </div>
+                <div class="text-xs text-slate-500 mt-0.5">Halted by user · stop_reason USER_KILL · 3s ago</div>
+              </div>
+              <div class="wf-box rounded px-4 py-2 text-sm font-bold opacity-40">[⚠ Kill switch]</div>
+            </div>
+            <div class="px-4 pb-4 text-xs text-slate-500">All OANDA positions closed. Final P&amp;L: +$142.30 realised. No further orders will be placed.</div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Kill button now permanently disabled (state transition irreversible).</p>
+          <p class="annot">◂ Final P&amp;L frozen; all metrics shift from live to historical.</p>
+        </div>
+      </div>
+    </section>
+
+    <div class="mt-10 p-4 border-l-4 border-slate-400 bg-slate-50 text-xs text-slate-700">
+      <span class="font-semibold">Timeline:</span>
+      Click → State 2 (T+0) → State 2 (T+2, countdown ticking) → if no undo → State 3 (T+3, POST /kill fires) → State 4 (positions closed).
+      <br/>
+      <span class="font-semibold">Undo path:</span> from State 2, Undo → back to State 1. No API call was ever made.
+    </div>
+  </div>
+</body>
+</html>

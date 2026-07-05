@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>AgentFX v0.6.0 · Paper Trading — Mockups (Pass B)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-100">
+  <div class="max-w-6xl mx-auto px-6 py-10">
+    <div class="mb-8">
+      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Pass B — clickable high-fi mockups</div>
+      <h1 class="text-3xl font-bold mt-1">AgentFX v0.6.0 · Paper Trading</h1>
+      <p class="text-sm text-slate-600 dark:text-slate-400 mt-3 max-w-3xl">
+        Real Tailwind classes, real colors, realistic fake data, wired click-through where it matters.
+        Every screen matches a wireframe under <code class="text-xs bg-slate-200 dark:bg-slate-800 px-1 rounded">../wireframes/</code>.
+        Open any mockup in a browser — it self-loads via Tailwind CDN, no build step.
+      </p>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+
+      <a href="./paper-empty.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">1 · Paper — empty state (onboarding)</div>
+          <div class="text-xs text-slate-500">Flow 1</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Landing after sign-in when no credentials set. Prominent credentials-required banner.</div>
+      </a>
+
+      <a href="./settings-credentials.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">2 · Settings · Credentials + accounts</div>
+          <div class="text-xs text-slate-500">Flow 5</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">API-key form + read-only table of OANDA sub-accounts fetched via <code class="text-xs">/v3/accounts</code>. Balances are live.</div>
+      </a>
+
+      <a href="./paper-approvals.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">3 · Approval queue</div>
+          <div class="text-xs text-slate-500">Flow 2</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Cards for each pending VALIDATED genome with Gate-B coloured metrics + Approve / Reject CTAs.</div>
+      </a>
+
+      <a href="./paper-approvals-empty.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">3b · Approval queue — empty</div>
+          <div class="text-xs text-slate-500">Flow 2</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Positive empty state ("your queue is empty") + recent-activity strip so users see prior decisions.</div>
+      </a>
+
+      <a href="./deploy-modal.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">4 · Deploy paper modal</div>
+          <div class="text-xs text-slate-500">Flow 2</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Pick OANDA sub-account (live balances) → set max position / thresholds. Snapshot balance is read from the account at run start; no manual "initial balance".</div>
+      </a>
+
+      <a href="./reject-modal.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">5 · Reject-with-reason modal</div>
+          <div class="text-xs text-slate-500">Flow 2</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Reason field is <span class="font-semibold">required</span> (≥ 10 chars). Quick-pick chips + counter. Feeds the Evolution agent's next variations.</div>
+      </a>
+
+      <a href="./paper-runs.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">6 · Runs list (11 active — concurrency banner)</div>
+          <div class="text-xs text-slate-500">Flow 3</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Aggregate P&L header, compact per-run rows with account badges, 10+-run amber warning banner explaining broker quotas.</div>
+      </a>
+
+      <a href="./paper-run-detail.html" class="block bg-white dark:bg-slate-800 border-2 border-emerald-400 rounded-lg p-5 hover:shadow-lg transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">7 · Run detail — the money view ★</div>
+          <div class="text-xs text-slate-500">Flow 3</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">OANDA account context, live balance + snapshot, dual-axis Live-vs-backtest chart, trades table with <span class="font-semibold">signal reason</span> column, decision log.</div>
+      </a>
+
+      <a href="./kill-switch-countdown.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">8 · Kill switch — 3-second undo toast</div>
+          <div class="text-xs text-slate-500">Flow 4</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Toast countdown state with undo affordance. Click the button to see it fire.</div>
+      </a>
+
+      <a href="./admin-view.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">9 · ADMIN view · scope toggle</div>
+          <div class="text-xs text-slate-500">Flow 6</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">"My runs / All runs" toggle. Owner email + OANDA account badges on rows. Fleet-wide 10+ concurrency banner.</div>
+      </a>
+
+    </div>
+
+    <!-- v2 changelog -->
+    <div class="mt-10 bg-white dark:bg-slate-800 border border-emerald-300 dark:border-emerald-700 rounded-lg p-5">
+      <div class="text-sm font-semibold mb-2 flex items-center gap-2">
+        <span class="bg-emerald-500 text-white text-xs px-2 py-0.5 rounded">v2</span>
+        Changes from Wilson's answers (2026-07-05)
+      </div>
+      <ul class="text-xs text-slate-600 dark:text-slate-400 space-y-1 list-disc list-inside">
+        <li><span class="font-semibold text-slate-800 dark:text-slate-200">Accounts concept added.</span> Credentials store the OANDA API key; the accounts under that key are fetched via <code class="text-xs">/v3/accounts</code>. Deploy modal picks an account and reads its balance live. AgentFX never asks the user for an "initial balance" — that's set inside OANDA.</li>
+        <li><span class="font-semibold text-slate-800 dark:text-slate-200">Snapshot balance.</span> Run's P&L % denominator is the account balance <em>at the moment the paper runner starts</em>, not a user-typed number.</li>
+        <li><span class="font-semibold text-slate-800 dark:text-slate-200">Trades table gains a Signal reason column.</span> DSL entry rule + exit cause (TP / SL / opposite / kill) per trade.</li>
+        <li><span class="font-semibold text-slate-800 dark:text-slate-200">LivePnLChart is now dual-x-axis.</span> Bottom = relative hours since run start; top = actual UTC timestamp.</li>
+        <li><span class="font-semibold text-slate-800 dark:text-slate-200">Reject reason is required</span> (≥ 10 chars) with quick-pick chips.</li>
+        <li><span class="font-semibold text-slate-800 dark:text-slate-200">Approval queue empty state</span> added as a positive affirmation with recent-activity strip.</li>
+        <li><span class="font-semibold text-slate-800 dark:text-slate-200">Concurrency indicator</span> — amber banner appears at 10+ concurrent paper runs, explains broker quota headroom.</li>
+        <li>Nav placement unchanged (fine per Wilson); owner badge stays indigo.</li>
+      </ul>
+    </div>
+
+    <div class="mt-10 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
+      <div class="text-sm font-semibold mb-2">Design language notes</div>
+      <ul class="text-xs text-slate-600 dark:text-slate-400 space-y-1 list-disc list-inside">
+        <li>Palette: slate for chrome; emerald for pass / positive P&L; rose for fail / kill switch; amber for warnings.</li>
+        <li>Dark-mode support baked in via <code>dark:</code> variants — matches the existing portal.</li>
+        <li>Reused components are called out by name (KillSwitchButton, LivePnLChart, CredentialsForm, TradesTable, StrategyChart, MetricsCard, ApprovalQueueCard, DeployPaperModal) — see the README component inventory.</li>
+        <li>Fake data is deterministic across mockups so numbers are consistent room-to-room.</li>
+      </ul>
+    </div>
+  </div>
+</body>
+</html>

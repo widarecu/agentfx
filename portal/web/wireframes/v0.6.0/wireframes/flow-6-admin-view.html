@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Flow 6 · Multi-user visibility (ADMIN) — Wireframe</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .wf-box { border: 1px dashed #6b7280; background: #f3f4f6; }
+    .wf-solid { border: 1px solid #374151; background: #ffffff; }
+    .wf-nav { background:#e5e7eb; border-bottom:1px solid #9ca3af; }
+    .wf-label { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.7rem; letter-spacing:0.05em; text-transform:uppercase; color:#4b5563; }
+    .annot { color:#6b7280; font-size:0.75rem; font-style: italic; }
+    .owner { background:#e0e7ff; border:1px solid #6366f1; font-family: ui-monospace; }
+  </style>
+</head>
+<body class="bg-white text-slate-800 p-8">
+  <div class="max-w-6xl mx-auto">
+    <a href="./index.html" class="text-xs underline text-slate-600">◂ back to wireframe index</a>
+    <h1 class="text-xl font-bold mt-2">Flow 6 · Multi-user visibility (ADMIN)</h1>
+    <p class="text-sm text-slate-600 mt-1">Goal: ADMIN can toggle between "My runs" (own only, default) and "All runs" (system-wide). TRADER never sees the toggle and only sees own data.</p>
+
+    <!-- Screen 1 · TRADER default -->
+    <section class="mt-8">
+      <div class="wf-label mb-2">Screen 1 · TRADER view (baseline — no toggle, no owner badges)</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded">
+            <div class="wf-nav px-4 py-2 flex items-center justify-between text-xs">
+              <span>AgentFX · … · <span class="font-semibold underline">Paper</span></span>
+              <span>trader@example.com ▾</span>
+            </div>
+            <div class="p-6 space-y-4">
+              <div class="flex items-center justify-between">
+                <div>
+                  <div class="text-lg font-semibold">Paper Trading</div>
+                  <div class="text-xs text-slate-500">2 running · aggregate live P&amp;L +$318.50</div>
+                </div>
+                <div class="flex gap-2 text-xs">
+                  <div class="wf-solid border-2 rounded px-3 py-1.5 font-semibold">[Runs]</div>
+                  <div class="wf-box rounded px-3 py-1.5">[Approvals · 1]</div>
+                </div>
+              </div>
+              <div class="wf-box rounded p-3 flex items-center justify-between">
+                <div class="flex items-center gap-3 text-xs">
+                  <div class="wf-solid rounded-full px-2 py-0.5 font-semibold">● RUNNING</div>
+                  <div class="font-semibold">EUR_USD M15 — 2026-07-05</div>
+                  <div class="text-slate-500">·  Live P&amp;L +$142.30</div>
+                </div>
+              </div>
+              <div class="wf-box rounded p-3 flex items-center justify-between">
+                <div class="flex items-center gap-3 text-xs">
+                  <div class="wf-solid rounded-full px-2 py-0.5 font-semibold">● RUNNING</div>
+                  <div class="font-semibold">GBP_USD H1 — 2026-07-04</div>
+                  <div class="text-slate-500">·  Live P&amp;L +$176.20</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ TRADER sees NO scope toggle. Backend always filters by created_by=self.</p>
+          <p class="annot">◂ Owner badges are absent — every row is theirs by definition.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Screen 2 · ADMIN, scope=my -->
+    <section class="mt-10">
+      <div class="wf-label mb-2">Screen 2 · ADMIN view · scope = "My runs" (default)</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded">
+            <div class="wf-nav px-4 py-2 flex items-center justify-between text-xs">
+              <span>AgentFX · … · <span class="font-semibold underline">Paper</span></span>
+              <span>admin@example.com <span class="wf-label ml-1">ADMIN</span> ▾</span>
+            </div>
+            <div class="p-6 space-y-4">
+              <div class="flex items-center justify-between">
+                <div>
+                  <div class="text-lg font-semibold">Paper Trading</div>
+                  <div class="text-xs text-slate-500">1 running · aggregate live P&amp;L +$88.10</div>
+                </div>
+                <div class="flex items-center gap-4">
+                  <div class="flex gap-1 text-xs wf-box rounded p-0.5">
+                    <div class="wf-solid border-2 rounded px-3 py-1 font-semibold">My runs</div>
+                    <div class="px-3 py-1">All runs</div>
+                  </div>
+                  <div class="flex gap-2 text-xs">
+                    <div class="wf-solid border-2 rounded px-3 py-1.5 font-semibold">[Runs]</div>
+                    <div class="wf-box rounded px-3 py-1.5">[Approvals]</div>
+                  </div>
+                </div>
+              </div>
+              <div class="wf-box rounded p-3 flex items-center justify-between">
+                <div class="flex items-center gap-3 text-xs">
+                  <div class="wf-solid rounded-full px-2 py-0.5 font-semibold">● RUNNING</div>
+                  <div class="font-semibold">AUD_USD M15 — 2026-07-04</div>
+                  <div class="text-slate-500">· Live P&amp;L +$88.10</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Scope toggle appears in the header only for ADMIN role.</p>
+          <p class="annot">◂ Default is "My runs" — a fresh ADMIN session shows only own data (prevents accidental oversharing).</p>
+          <p class="annot">◂ Same list rendering as TRADER when in this state.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Screen 3 · ADMIN, scope=all -->
+    <section class="mt-10">
+      <div class="wf-label mb-2">Screen 3 · ADMIN view · scope = "All runs"</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded">
+            <div class="wf-nav px-4 py-2 flex items-center justify-between text-xs">
+              <span>AgentFX · … · <span class="font-semibold underline">Paper</span></span>
+              <span>admin@example.com <span class="wf-label ml-1">ADMIN</span> ▾</span>
+            </div>
+            <div class="p-6 space-y-4">
+              <div class="flex items-center justify-between">
+                <div>
+                  <div class="text-lg font-semibold">Paper Trading</div>
+                  <div class="text-xs text-slate-500">4 running across 3 users · aggregate live P&amp;L +$406.60</div>
+                </div>
+                <div class="flex items-center gap-4">
+                  <div class="flex gap-1 text-xs wf-box rounded p-0.5">
+                    <div class="px-3 py-1">My runs</div>
+                    <div class="wf-solid border-2 rounded px-3 py-1 font-semibold">All runs</div>
+                  </div>
+                  <div class="flex gap-2 text-xs">
+                    <div class="wf-solid border-2 rounded px-3 py-1.5 font-semibold">[Runs]</div>
+                    <div class="wf-box rounded px-3 py-1.5">[Approvals]</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="wf-box rounded p-3">
+                <div class="flex items-center gap-3 text-xs">
+                  <div class="wf-solid rounded-full px-2 py-0.5 font-semibold">● RUNNING</div>
+                  <div class="font-semibold">EUR_USD M15 — 2026-07-05</div>
+                  <div class="text-slate-500">· Live P&amp;L +$142.30</div>
+                  <div class="ml-auto owner rounded px-2 py-0.5 text-xs">trader@example.com</div>
+                </div>
+              </div>
+              <div class="wf-box rounded p-3">
+                <div class="flex items-center gap-3 text-xs">
+                  <div class="wf-solid rounded-full px-2 py-0.5 font-semibold">● RUNNING</div>
+                  <div class="font-semibold">GBP_USD H1 — 2026-07-04</div>
+                  <div class="text-slate-500">· Live P&amp;L +$176.20</div>
+                  <div class="ml-auto owner rounded px-2 py-0.5 text-xs">trader@example.com</div>
+                </div>
+              </div>
+              <div class="wf-box rounded p-3">
+                <div class="flex items-center gap-3 text-xs">
+                  <div class="wf-solid rounded-full px-2 py-0.5 font-semibold">● RUNNING</div>
+                  <div class="font-semibold">AUD_USD M15 — 2026-07-04</div>
+                  <div class="text-slate-500">· Live P&amp;L +$88.10</div>
+                  <div class="ml-auto owner rounded px-2 py-0.5 text-xs">admin@example.com</div>
+                </div>
+              </div>
+              <div class="wf-box rounded p-3">
+                <div class="flex items-center gap-3 text-xs">
+                  <div class="wf-solid rounded-full px-2 py-0.5 font-semibold">● RUNNING</div>
+                  <div class="font-semibold">USD_JPY M30 — 2026-07-03</div>
+                  <div class="text-slate-500">· Live P&amp;L +$0.00</div>
+                  <div class="ml-auto owner rounded px-2 py-0.5 text-xs">quant2@example.com</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Owner email badge appears on every row. Distinct colour so ADMIN scans quickly.</p>
+          <p class="annot">◂ Backend enforces the scope: TRADER sending ?scope=all → 403.</p>
+          <p class="annot">◂ Same treatment on /paper/approvals (approvals list) and /paper/:id detail (owner badge in header).</p>
+        </div>
+      </div>
+    </section>
+
+    <div class="mt-10 p-4 border-l-4 border-slate-400 bg-slate-50 text-xs text-slate-700">
+      <span class="font-semibold">Isolation guarantee:</span>
+      RBAC filter (US-018) is enforced at the query layer; the toggle only widens what ADMIN can see, it cannot elevate a TRADER.
+    </div>
+
+    <div class="mt-4 p-4 border-l-4 border-amber-500 bg-amber-50 text-xs text-slate-700">
+      <span class="font-semibold">Concurrency banner (10+ runs):</span>
+      Rendered above the list. Text: "N concurrent paper runs across the fleet. Broker connection quotas apply per API key — filter by owner to inspect throttling risk." Amber, dismissable per user for 24h.
+    </div>
+  </div>
+</body>
+</html>

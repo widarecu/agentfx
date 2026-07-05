@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Paper · Approval Queue</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-100">
+  <div class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
+    <div class="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between text-sm">
+      <div class="flex items-center gap-6">
+        <div class="font-bold">AgentFX</div>
+        <a class="text-slate-500">Market data</a><a class="text-slate-500">Evolution</a>
+        <a class="text-emerald-600 dark:text-emerald-400 font-semibold border-b-2 border-emerald-500 pb-3 -mb-3">Paper</a>
+        <a class="text-slate-500">Settings</a>
+      </div>
+      <div class="text-xs text-slate-600 dark:text-slate-400">trader@example.com ▾</div>
+    </div>
+  </div>
+
+  <div class="max-w-6xl mx-auto px-6 py-8">
+    <div class="flex items-start justify-between mb-6">
+      <div>
+        <h1 class="text-2xl font-bold">Approval Queue</h1>
+        <div class="text-sm text-slate-500 dark:text-slate-400 mt-1">Validated genomes waiting for your sign-off. Approve to deploy to paper.</div>
+      </div>
+      <div class="flex gap-1 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-0.5">
+        <a href="./paper-runs.html" class="text-slate-500 rounded px-3 py-1.5">Runs</a>
+        <button class="bg-emerald-500 text-white rounded px-3 py-1.5 font-semibold">Approvals · 3</button>
+      </div>
+    </div>
+
+    <div class="space-y-4">
+
+      <!-- Card 1 — closest to Gate B -->
+      <div class="bg-white dark:bg-slate-800 border-2 border-emerald-400 dark:border-emerald-600 rounded-lg p-5">
+        <div class="flex items-start justify-between">
+          <div class="flex-1">
+            <div class="flex items-baseline gap-3 mb-1">
+              <div class="text-sm font-semibold">USD_JPY M30</div>
+              <span class="bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-300 text-xs font-semibold px-2 py-0.5 rounded">Clears Gate B</span>
+            </div>
+            <div class="text-xs text-slate-500 dark:text-slate-400 font-mono mb-3">genome_gen_evorun_20260704_b3e2d888_017_008</div>
+            <div class="grid grid-cols-5 gap-4">
+              <div>
+                <div class="text-xs uppercase tracking-wide text-slate-500">OOS Sharpe</div>
+                <div class="mt-1 text-sm font-mono text-emerald-700 dark:text-emerald-400 font-semibold">+1.03</div>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wide text-slate-500">Hit rate</div>
+                <div class="mt-1 text-sm font-mono text-emerald-700 dark:text-emerald-400 font-semibold">52.8%</div>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wide text-slate-500">Trades</div>
+                <div class="mt-1 text-sm font-mono text-emerald-700 dark:text-emerald-400 font-semibold">344</div>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wide text-slate-500">CAGR</div>
+                <div class="mt-1 text-sm font-mono text-emerald-700 dark:text-emerald-400 font-semibold">21.1%</div>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wide text-slate-500">Max DD</div>
+                <div class="mt-1 text-sm font-mono text-emerald-700 dark:text-emerald-400 font-semibold">−6.7%</div>
+              </div>
+            </div>
+            <a class="text-xs underline text-slate-500 mt-3 inline-block">View genome details ↗</a>
+          </div>
+          <div class="flex flex-col gap-2 ml-6">
+            <button class="bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold px-4 py-2 rounded shadow">Approve →</button>
+            <button class="text-sm text-slate-500 dark:text-slate-400 px-4 py-2 hover:text-rose-700 dark:hover:text-rose-400">Reject</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Card 2 — borderline -->
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
+        <div class="flex items-start justify-between">
+          <div class="flex-1">
+            <div class="flex items-baseline gap-3 mb-1">
+              <div class="text-sm font-semibold">EUR_USD M15</div>
+              <span class="bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300 text-xs font-semibold px-2 py-0.5 rounded">Borderline · Sharpe below 1.0</span>
+            </div>
+            <div class="text-xs text-slate-500 dark:text-slate-400 font-mono mb-3">genome_gen_evorun_20260702_fbd5bcb2_021_001</div>
+            <div class="grid grid-cols-5 gap-4">
+              <div>
+                <div class="text-xs uppercase tracking-wide text-slate-500">OOS Sharpe</div>
+                <div class="mt-1 text-sm font-mono text-amber-700 dark:text-amber-400">+0.84</div>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wide text-slate-500">Hit rate</div>
+                <div class="mt-1 text-sm font-mono text-emerald-700 dark:text-emerald-400">51.2%</div>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wide text-slate-500">Trades</div>
+                <div class="mt-1 text-sm font-mono text-emerald-700 dark:text-emerald-400">312</div>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wide text-slate-500">CAGR</div>
+                <div class="mt-1 text-sm font-mono text-amber-700 dark:text-amber-400">14.2%</div>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wide text-slate-500">Max DD</div>
+                <div class="mt-1 text-sm font-mono text-emerald-700 dark:text-emerald-400">−8.1%</div>
+              </div>
+            </div>
+            <a class="text-xs underline text-slate-500 mt-3 inline-block">View genome details ↗</a>
+          </div>
+          <div class="flex flex-col gap-2 ml-6">
+            <button class="bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold px-4 py-2 rounded">Approve →</button>
+            <button class="text-sm text-slate-500 dark:text-slate-400 px-4 py-2 hover:text-rose-700 dark:hover:text-rose-400">Reject</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Card 3 — fails one metric -->
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
+        <div class="flex items-start justify-between">
+          <div class="flex-1">
+            <div class="flex items-baseline gap-3 mb-1">
+              <div class="text-sm font-semibold">GBP_USD H1</div>
+              <span class="bg-rose-100 dark:bg-rose-900/40 text-rose-800 dark:text-rose-300 text-xs font-semibold px-2 py-0.5 rounded">Fails Trade Count</span>
+            </div>
+            <div class="text-xs text-slate-500 dark:text-slate-400 font-mono mb-3">genome_gen_evorun_20260703_a9c7f145_014_022</div>
+            <div class="grid grid-cols-5 gap-4">
+              <div>
+                <div class="text-xs uppercase tracking-wide text-slate-500">OOS Sharpe</div>
+                <div class="mt-1 text-sm font-mono text-amber-700 dark:text-amber-400">+0.72</div>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wide text-slate-500">Hit rate</div>
+                <div class="mt-1 text-sm font-mono text-emerald-700 dark:text-emerald-400">48.9%</div>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wide text-slate-500">Trades</div>
+                <div class="mt-1 text-sm font-mono text-rose-700 dark:text-rose-400 font-semibold">289 ✗</div>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wide text-slate-500">CAGR</div>
+                <div class="mt-1 text-sm font-mono text-emerald-700 dark:text-emerald-400">18.3%</div>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wide text-slate-500">Max DD</div>
+                <div class="mt-1 text-sm font-mono text-emerald-700 dark:text-emerald-400">−9.4%</div>
+              </div>
+            </div>
+            <a class="text-xs underline text-slate-500 mt-3 inline-block">View genome details ↗</a>
+          </div>
+          <div class="flex flex-col gap-2 ml-6">
+            <button class="bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold px-4 py-2 rounded">Approve →</button>
+            <button class="text-sm text-slate-500 dark:text-slate-400 px-4 py-2 hover:text-rose-700 dark:hover:text-rose-400">Reject</button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="mt-8 text-xs text-slate-500 dark:text-slate-400 space-y-1">
+      <div>Approving opens <a href="./deploy-modal.html" class="underline">the deploy configuration modal</a>. Rejecting opens <a href="./reject-modal.html" class="underline">a required-reason modal</a> and removes the genome from this queue.</div>
+      <div>See also: <a href="./paper-approvals-empty.html" class="underline">empty-state variant</a> (when the queue has 0 pending items).</div>
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Reject Genome — Reason required</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-100 dark:bg-slate-900 text-slate-800 dark:text-slate-100 min-h-screen flex items-center justify-center p-4">
+  <div class="fixed inset-0 bg-black/50"></div>
+
+  <div class="relative bg-white dark:bg-slate-800 rounded-xl shadow-2xl max-w-md w-full">
+    <div class="p-6 border-b border-slate-200 dark:border-slate-700">
+      <div class="text-lg font-semibold">Reject genome</div>
+      <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+        GBP_USD · H1 · <span class="font-mono">…a9c7f145_014_022</span>
+      </div>
+    </div>
+
+    <div class="p-6 space-y-4">
+      <div>
+        <label class="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
+          Reason <span class="text-rose-600">*</span> <span class="normal-case text-slate-400 tracking-normal">required</span>
+        </label>
+        <textarea
+          rows="4"
+          minlength="10"
+          maxlength="500"
+          class="mt-1 w-full px-3 py-2 border border-slate-300 dark:border-slate-600 dark:bg-slate-900 rounded text-sm"
+          placeholder="Why is this genome not fit for paper trading? Example: trade count marginal, want to see a re-evolution first."
+        >Trade count marginal, want to see a re-evolution first.</textarea>
+        <div class="flex items-center justify-between mt-1">
+          <div class="text-xs text-slate-500">Persisted to decision log; the Evolution agent uses these when generating future variations.</div>
+          <div class="text-xs text-slate-400 font-mono">48 / 500</div>
+        </div>
+      </div>
+
+      <div class="flex flex-wrap gap-1.5 text-xs">
+        <span class="text-slate-500 mr-1">Quick-pick:</span>
+        <button class="border border-slate-200 dark:border-slate-700 rounded-full px-2 py-0.5 hover:bg-slate-100 dark:hover:bg-slate-700">Trade count too low</button>
+        <button class="border border-slate-200 dark:border-slate-700 rounded-full px-2 py-0.5 hover:bg-slate-100 dark:hover:bg-slate-700">Sharpe borderline</button>
+        <button class="border border-slate-200 dark:border-slate-700 rounded-full px-2 py-0.5 hover:bg-slate-100 dark:hover:bg-slate-700">Overfit to regime</button>
+        <button class="border border-slate-200 dark:border-slate-700 rounded-full px-2 py-0.5 hover:bg-slate-100 dark:hover:bg-slate-700">Similar to running genome</button>
+        <button class="border border-slate-200 dark:border-slate-700 rounded-full px-2 py-0.5 hover:bg-slate-100 dark:hover:bg-slate-700">Wait for re-evolution</button>
+      </div>
+
+      <div class="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded p-3 text-xs">
+        <div class="font-semibold text-amber-800 dark:text-amber-300">Rejecting removes this genome from the queue.</div>
+        <div class="text-amber-700 dark:text-amber-400 mt-1">It stays visible in <code class="text-xs">/evolution/…</code>. You can send it back to the queue anytime from GenomeDetail.</div>
+      </div>
+    </div>
+
+    <div class="p-6 border-t border-slate-200 dark:border-slate-700 flex items-center justify-end gap-2">
+      <a href="./paper-approvals.html" class="px-4 py-2 border border-slate-200 dark:border-slate-700 rounded text-sm hover:bg-slate-50 dark:hover:bg-slate-700">Cancel</a>
+      <a href="./paper-approvals.html" class="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded text-sm font-semibold shadow">Reject with reason</a>
+    </div>
+    <div class="px-6 pb-4 text-xs text-slate-500 dark:text-slate-400">
+      Reject is disabled when the reason field has fewer than 10 characters. Cancel closes the modal without side effect.
+    </div>
+  </div>
+</body>
+</html>

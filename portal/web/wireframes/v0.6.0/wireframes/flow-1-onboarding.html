@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Flow 1 · Onboarding — Wireframe</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .wf-box { border: 1px dashed #6b7280; background: #f3f4f6; }
+    .wf-solid { border: 1px solid #374151; background: #ffffff; }
+    .wf-nav { background:#e5e7eb; border-bottom:1px solid #9ca3af; }
+    .wf-label { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.7rem; letter-spacing:0.05em; text-transform:uppercase; color:#4b5563; }
+    .annot { color:#6b7280; font-size:0.75rem; font-style: italic; }
+    .arrow { font-family: ui-monospace; color:#4b5563; }
+  </style>
+</head>
+<body class="bg-white text-slate-800 p-8">
+  <div class="max-w-6xl mx-auto">
+    <a href="./index.html" class="text-xs underline text-slate-600">◂ back to wireframe index</a>
+    <h1 class="text-xl font-bold mt-2">Flow 1 · First-time TRADER onboarding</h1>
+    <p class="text-sm text-slate-600 mt-1">Goal: get a new TRADER from "just signed in" to "OANDA verified, ready to approve a genome" in under a minute.</p>
+
+    <!-- ── Screen 1 · Empty /paper (no creds) ─────────────────────── -->
+    <section class="mt-8">
+      <div class="wf-label mb-2">Screen 1 · /paper (no runs, no verified credentials)</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded">
+            <div class="wf-nav px-4 py-2 flex items-center justify-between text-xs">
+              <span>AgentFX · Market data · Evolution · <span class="font-semibold underline">Paper</span> · Settings</span>
+              <span>trader@example.com ▾</span>
+            </div>
+            <div class="p-6 space-y-4">
+              <div class="flex items-center justify-between">
+                <div>
+                  <div class="text-lg font-semibold">Paper Trading</div>
+                  <div class="text-xs text-slate-500">Deploy validated genomes to your OANDA Practice account.</div>
+                </div>
+                <div class="wf-box rounded px-3 py-1.5 text-xs">[+ Deploy from queue] <span class="text-slate-500">(disabled)</span></div>
+              </div>
+
+              <!-- Banner: credentials needed -->
+              <div class="wf-solid border-2 rounded p-4">
+                <div class="flex items-start gap-3">
+                  <div class="wf-box w-8 h-8 rounded-full flex items-center justify-center text-xs">⚠</div>
+                  <div class="flex-1">
+                    <div class="font-semibold">Set OANDA credentials before deploying</div>
+                    <div class="text-xs text-slate-500 mt-0.5">Paper runs execute against your own OANDA Practice account. Add your account ID and API key to continue.</div>
+                  </div>
+                  <div class="wf-solid border-2 rounded px-3 py-1.5 text-xs font-semibold">[Set up credentials →]</div>
+                </div>
+              </div>
+
+              <!-- Empty state -->
+              <div class="wf-box rounded p-10 text-center">
+                <div class="wf-label mb-2">Empty state</div>
+                <div class="text-sm">No paper runs yet.</div>
+                <div class="text-xs text-slate-500 mt-1">Deploy a validated genome from the approval queue to see it here.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Banner is the ONLY affordance on this screen. Deploy CTA is intentionally disabled — verified creds are a hard precondition.</p>
+          <p class="annot">◂ Clicking "Set up credentials" navigates to <code>/settings</code> with the OANDA tab preselected.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Screen 2 · /settings (OANDA tab, form filled) ───────────── -->
+    <section class="mt-10">
+      <div class="wf-label mb-2">Screen 2 · /settings · OANDA Credentials tab (form)</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded">
+            <div class="wf-nav px-4 py-2 text-xs">AgentFX · … · Paper · <span class="font-semibold underline">Settings</span></div>
+            <div class="p-6">
+              <div class="text-lg font-semibold mb-4">Settings</div>
+              <div class="flex gap-6 border-b border-slate-300 mb-4 text-sm">
+                <div class="pb-2 text-slate-500">Profile</div>
+                <div class="pb-2 border-b-2 border-slate-800 font-semibold">OANDA Credentials</div>
+                <div class="pb-2 text-slate-400">(future) </div>
+              </div>
+
+              <div class="grid grid-cols-2 gap-4 max-w-2xl">
+                <div>
+                  <div class="wf-label">OANDA Account ID</div>
+                  <div class="wf-box rounded h-8 mt-1 px-2 flex items-center text-xs">101-004-12345678-001</div>
+                </div>
+                <div>
+                  <div class="wf-label">API Key <span class="text-slate-500">(masked)</span></div>
+                  <div class="wf-box rounded h-8 mt-1 px-2 flex items-center text-xs">•••••••••••••••••••• [👁]</div>
+                </div>
+                <div class="col-span-2">
+                  <div class="wf-label mb-1">Environment</div>
+                  <div class="flex gap-4 text-sm">
+                    <label class="flex items-center gap-1"><input type="radio" checked /> PRACTICE</label>
+                    <label class="flex items-center gap-1 text-slate-400"><input type="radio" disabled /> LIVE <span class="text-xs">(v1.0.0)</span></label>
+                  </div>
+                </div>
+              </div>
+
+              <div class="flex gap-2 mt-6">
+                <div class="wf-solid border-2 rounded px-3 py-1.5 text-xs font-semibold">[Save credentials]</div>
+                <div class="wf-box rounded px-3 py-1.5 text-xs">[Cancel]</div>
+              </div>
+              <div class="mt-3 wf-box rounded px-3 py-1.5 inline-block text-xs">[Test connection] <span class="annot">appears after save</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Save disabled until all fields non-empty.</p>
+          <p class="annot">◂ LIVE radio disabled with tooltip: "Live trading requires ADMIN approval and enables in v1.0.0."</p>
+          <p class="annot">◂ Password-style input with 👁 visibility toggle.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Screen 3 · Verified state ──────────────────────────────── -->
+    <section class="mt-10">
+      <div class="wf-label mb-2">Screen 3 · Verified — back to /paper</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded">
+            <div class="wf-nav px-4 py-2 text-xs">AgentFX · … · <span class="font-semibold underline">Paper</span></div>
+            <div class="p-6 space-y-4">
+              <div class="flex items-center justify-between">
+                <div class="text-lg font-semibold">Paper Trading</div>
+                <div class="wf-solid border-2 rounded px-3 py-1.5 text-xs font-semibold">[+ Deploy from queue]</div>
+              </div>
+              <div class="wf-box rounded p-4 flex items-center gap-3">
+                <div class="wf-solid border rounded-full w-6 h-6 flex items-center justify-center text-xs">✓</div>
+                <div class="flex-1 text-sm">
+                  <span class="font-semibold">You're set up.</span>
+                  <span class="text-slate-500">OANDA Practice · verified 2 minutes ago.</span>
+                </div>
+              </div>
+              <div class="wf-box rounded p-10 text-center">
+                <div class="text-sm">No paper runs yet.</div>
+                <div class="text-xs text-slate-500 mt-1">Head to the <u>approval queue</u> to deploy a validated genome.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Verified badge is the ONLY visual change from Screen 1 — reduces the "did I do the right thing?" question.</p>
+          <p class="annot">◂ Empty-state copy now points to the approval queue instead of settings.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Sequence footer -->
+    <div class="mt-10 p-4 border-l-4 border-slate-400 bg-slate-50 text-xs text-slate-700">
+      <span class="font-semibold">Click sequence:</span>
+      Sign in → land on /paper (Screen 1) → click "Set up credentials" → /settings (Screen 2) → fill form → Save →
+      "Test connection" → success → click Paper in nav → /paper (Screen 3).
+      <br/><span class="font-semibold">Verified precondition:</span> paper deploy CTA is disabled without a verified credential row.
+    </div>
+  </div>
+</body>
+</html>

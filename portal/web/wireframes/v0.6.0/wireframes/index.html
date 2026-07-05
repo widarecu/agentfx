@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>AgentFX v0.6.0 · Paper Trading — Wireframes (Pass A)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .card { background:#f3f4f6; border:1px dashed #9ca3af; }
+    .thumb { background:#e5e7eb; border:1px dashed #9ca3af; height:120px; display:flex; align-items:center; justify-content:center; color:#6b7280; font-size:0.75rem; }
+  </style>
+</head>
+<body class="bg-white text-slate-800 p-8">
+  <div class="max-w-5xl mx-auto">
+    <div class="mb-8">
+      <p class="text-xs uppercase tracking-wider text-slate-500">Pass A — Low-fi wireframes</p>
+      <h1 class="text-2xl font-bold mt-1">AgentFX v0.6.0 · Paper Trading</h1>
+      <p class="text-sm text-slate-600 mt-2 max-w-3xl">
+        Grayscale, annotated wireframes for the six flows that ship in v0.6.0. Purpose: lock information hierarchy,
+        page sequence, and interaction states before we invest in visual polish or backend engineering. Every flow has
+        a matching high-fidelity mockup in the <code>../mockups/</code> directory.
+      </p>
+    </div>
+
+    <ol class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <li class="card p-4 rounded">
+        <div class="thumb rounded mb-3">[ empty /paper → banner → /settings → verified ]</div>
+        <div class="flex items-baseline justify-between">
+          <a href="./flow-1-onboarding.html" class="font-semibold text-slate-900 underline">Flow 1 · First-time TRADER onboarding</a>
+          <span class="text-xs text-slate-500">3 screens</span>
+        </div>
+        <p class="text-xs text-slate-600 mt-1">Empty state → set OANDA credentials → verified → nudge to approval queue.</p>
+      </li>
+
+      <li class="card p-4 rounded">
+        <div class="thumb rounded mb-3">[ cards per VALIDATED genome → Approve → Deploy modal ]</div>
+        <div class="flex items-baseline justify-between">
+          <a href="./flow-2-approval-queue.html" class="font-semibold text-slate-900 underline">Flow 2 · Approval queue</a>
+          <span class="text-xs text-slate-500">2 screens</span>
+        </div>
+        <p class="text-xs text-slate-600 mt-1">Queue of AWAITING_APPROVAL genomes → deploy modal collecting name / balance / risk knobs.</p>
+      </li>
+
+      <li class="card p-4 rounded">
+        <div class="thumb rounded mb-3">[ header · metrics grid · live-vs-backtest chart · panels ]</div>
+        <div class="flex items-baseline justify-between">
+          <a href="./flow-3-live-monitoring.html" class="font-semibold text-slate-900 underline">Flow 3 · Live monitoring (the money view)</a>
+          <span class="text-xs text-slate-500">1 dense screen</span>
+        </div>
+        <p class="text-xs text-slate-600 mt-1">Status pill, kill button, metrics grid, live-vs-backtest equity overlay, positions, trades, decisions.</p>
+      </li>
+
+      <li class="card p-4 rounded">
+        <div class="thumb rounded mb-3">[ big red button → toast 3s countdown → HALTED ]</div>
+        <div class="flex items-baseline justify-between">
+          <a href="./flow-4-kill-switch.html" class="font-semibold text-slate-900 underline">Flow 4 · Kill switch</a>
+          <span class="text-xs text-slate-500">3 states</span>
+        </div>
+        <p class="text-xs text-slate-600 mt-1">Idle → 3-second undo toast → HALTED_MANUAL transition.</p>
+      </li>
+
+      <li class="card p-4 rounded">
+        <div class="thumb rounded mb-3">[ tabs: Profile · OANDA Credentials · (coming soon) ]</div>
+        <div class="flex items-baseline justify-between">
+          <a href="./flow-5-settings.html" class="font-semibold text-slate-900 underline">Flow 5 · Settings / credentials</a>
+          <span class="text-xs text-slate-500">3 credential states</span>
+        </div>
+        <p class="text-xs text-slate-600 mt-1">Empty → set-not-verified → set-and-verified. Form with masked API key and PRACTICE-only radio.</p>
+      </li>
+
+      <li class="card p-4 rounded">
+        <div class="thumb rounded mb-3">[ ADMIN toggle: My runs / All runs · owner badges ]</div>
+        <div class="flex items-baseline justify-between">
+          <a href="./flow-6-admin-view.html" class="font-semibold text-slate-900 underline">Flow 6 · Multi-user visibility (ADMIN)</a>
+          <span class="text-xs text-slate-500">1 screen, 2 modes</span>
+        </div>
+        <p class="text-xs text-slate-600 mt-1">Scope toggle in the header. Owner email badges surfaced on rows, detail header, and queue cards.</p>
+      </li>
+    </ol>
+
+    <div class="mt-10 p-4 border-l-4 border-slate-400 bg-slate-50 text-sm text-slate-700">
+      <div class="font-semibold text-slate-900 mb-1">Wireframe conventions</div>
+      <ul class="list-disc list-inside space-y-1 text-xs">
+        <li>Dashed borders = placeholder region. Solid borders = final container.</li>
+        <li>Boxed uppercase text like <code>[STATUS]</code> = dynamic content.</li>
+        <li>Annotations sit in the right margin, prefixed with <span class="text-slate-500">◂</span>.</li>
+        <li>Colors are grayscale on purpose — semantic red/green comes in Pass B mockups.</li>
+      </ul>
+    </div>
+  </div>
+</body>
+</html>
