@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Flow 2 · Approval queue — Wireframe</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .wf-box { border: 1px dashed #6b7280; background: #f3f4f6; }
+    .wf-solid { border: 1px solid #374151; background: #ffffff; }
+    .wf-nav { background:#e5e7eb; border-bottom:1px solid #9ca3af; }
+    .wf-label { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.7rem; letter-spacing:0.05em; text-transform:uppercase; color:#4b5563; }
+    .annot { color:#6b7280; font-size:0.75rem; font-style: italic; }
+  </style>
+</head>
+<body class="bg-white text-slate-800 p-8">
+  <div class="max-w-6xl mx-auto">
+    <a href="./index.html" class="text-xs underline text-slate-600">◂ back to wireframe index</a>
+    <h1 class="text-xl font-bold mt-2">Flow 2 · Approval queue</h1>
+    <p class="text-sm text-slate-600 mt-1">Goal: user reviews VALIDATED genomes they sent to the queue and explicitly approves the ones they want to paper-trade. Approval opens the deploy modal.</p>
+
+    <!-- ── Screen 1 · Approval queue with 3 cards ──────────────────── -->
+    <section class="mt-8">
+      <div class="wf-label mb-2">Screen 1 · /paper/approvals (queue with 3 pending)</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded">
+            <div class="wf-nav px-4 py-2 flex items-center justify-between text-xs">
+              <span>AgentFX · … · <span class="font-semibold underline">Paper</span> · Settings</span>
+              <span>trader@example.com ▾</span>
+            </div>
+            <div class="p-6 space-y-4">
+              <div class="flex items-center justify-between">
+                <div>
+                  <div class="text-lg font-semibold">Approval Queue</div>
+                  <div class="text-xs text-slate-500">Validated genomes waiting for your sign-off. Approve to deploy to paper.</div>
+                </div>
+                <div class="flex gap-2 text-xs">
+                  <div class="wf-box rounded px-3 py-1.5">[Runs]</div>
+                  <div class="wf-solid border-2 rounded px-3 py-1.5 font-semibold">[Approvals · 3]</div>
+                </div>
+              </div>
+
+              <!-- Card 1 -->
+              <div class="wf-solid rounded p-4">
+                <div class="flex items-start justify-between">
+                  <div class="flex-1">
+                    <div class="flex items-baseline gap-2">
+                      <div class="font-semibold">genome_gen_evorun_20260702_fbd5bcb2_021_001</div>
+                      <div class="wf-label">EUR_USD · M15</div>
+                    </div>
+                    <div class="mt-2 grid grid-cols-5 gap-3 text-xs">
+                      <div><div class="wf-label">OOS Sharpe</div><div class="font-mono">+0.84 ▲</div></div>
+                      <div><div class="wf-label">Hit rate</div><div class="font-mono">51.2%</div></div>
+                      <div><div class="wf-label">Trade count</div><div class="font-mono">312</div></div>
+                      <div><div class="wf-label">CAGR</div><div class="font-mono">14.2%</div></div>
+                      <div><div class="wf-label">MDD</div><div class="font-mono">-8.1%</div></div>
+                    </div>
+                    <a class="text-xs underline mt-2 inline-block">View genome details ↗</a>
+                  </div>
+                  <div class="flex flex-col gap-2 ml-4">
+                    <div class="wf-solid border-2 rounded px-3 py-1.5 text-xs font-semibold text-center w-24">[Approve]</div>
+                    <div class="wf-box rounded px-3 py-1.5 text-xs text-center w-24">[Reject]</div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Card 2 -->
+              <div class="wf-solid rounded p-4">
+                <div class="flex items-start justify-between">
+                  <div class="flex-1">
+                    <div class="flex items-baseline gap-2">
+                      <div class="font-semibold">genome_gen_evorun_20260703_a9c7f145_014_022</div>
+                      <div class="wf-label">GBP_USD · H1</div>
+                    </div>
+                    <div class="mt-2 grid grid-cols-5 gap-3 text-xs">
+                      <div><div class="wf-label">OOS Sharpe</div><div class="font-mono">+0.72</div></div>
+                      <div><div class="wf-label">Hit rate</div><div class="font-mono">48.9%</div></div>
+                      <div><div class="wf-label">Trade count</div><div class="font-mono">289 <span class="text-red-600">✗</span></div></div>
+                      <div><div class="wf-label">CAGR</div><div class="font-mono">18.3% ▲</div></div>
+                      <div><div class="wf-label">MDD</div><div class="font-mono">-9.4%</div></div>
+                    </div>
+                    <a class="text-xs underline mt-2 inline-block">View genome details ↗</a>
+                  </div>
+                  <div class="flex flex-col gap-2 ml-4">
+                    <div class="wf-solid border-2 rounded px-3 py-1.5 text-xs font-semibold text-center w-24">[Approve]</div>
+                    <div class="wf-box rounded px-3 py-1.5 text-xs text-center w-24">[Reject]</div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Card 3 -->
+              <div class="wf-solid rounded p-4">
+                <div class="flex items-start justify-between">
+                  <div class="flex-1">
+                    <div class="flex items-baseline gap-2">
+                      <div class="font-semibold">genome_gen_evorun_20260704_b3e2d888_017_008</div>
+                      <div class="wf-label">USD_JPY · M30</div>
+                    </div>
+                    <div class="mt-2 grid grid-cols-5 gap-3 text-xs">
+                      <div><div class="wf-label">OOS Sharpe</div><div class="font-mono">+1.03 ▲</div></div>
+                      <div><div class="wf-label">Hit rate</div><div class="font-mono">52.8% ▲</div></div>
+                      <div><div class="wf-label">Trade count</div><div class="font-mono">344 ▲</div></div>
+                      <div><div class="wf-label">CAGR</div><div class="font-mono">21.1% ▲</div></div>
+                      <div><div class="wf-label">MDD</div><div class="font-mono">-6.7%</div></div>
+                    </div>
+                    <a class="text-xs underline mt-2 inline-block">View genome details ↗</a>
+                  </div>
+                  <div class="flex flex-col gap-2 ml-4">
+                    <div class="wf-solid border-2 rounded px-3 py-1.5 text-xs font-semibold text-center w-24">[Approve]</div>
+                    <div class="wf-box rounded px-3 py-1.5 text-xs text-center w-24">[Reject]</div>
+                  </div>
+                </div>
+              </div>
+
+            </div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Metrics are Gate-B thresholds coloured — ▲ = exceeding, ✗ = failing. Users see WHY a genome is here and whether it's borderline.</p>
+          <p class="annot">◂ Cards are clickable regions but explicit Approve/Reject buttons are primary CTAs.</p>
+          <p class="annot">◂ Genome ID uses monospace and truncates in narrower viewports.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Screen 2 · Deploy modal ─────────────────────────────────── -->
+    <section class="mt-10">
+      <div class="wf-label mb-2">Screen 2 · Deploy paper modal (opened from Approve button)</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded p-8 relative">
+            <div class="absolute inset-0 bg-slate-200 opacity-70 rounded"></div>
+            <div class="wf-solid rounded p-6 max-w-lg mx-auto bg-white relative z-10">
+              <div class="text-lg font-semibold mb-1">Deploy to paper</div>
+              <div class="text-xs text-slate-500 mb-4">EUR_USD · M15 · genome …fbd5bcb2_021_001</div>
+
+              <div class="space-y-3">
+                <div>
+                  <div class="wf-label">Deployment name</div>
+                  <div class="wf-box rounded h-8 px-2 mt-1 flex items-center text-xs">EUR_USD M15 — 2026-07-05</div>
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                  <div>
+                    <div class="wf-label">Initial balance (USD)</div>
+                    <div class="wf-box rounded h-8 px-2 mt-1 flex items-center text-xs">10,000</div>
+                  </div>
+                  <div>
+                    <div class="wf-label">Max position size (units)</div>
+                    <div class="wf-box rounded h-8 px-2 mt-1 flex items-center text-xs">10,000 <span class="text-slate-500 text-xs">(1 lot)</span></div>
+                  </div>
+                  <div>
+                    <div class="wf-label">Daily loss threshold (% of balance)</div>
+                    <div class="wf-box rounded h-8 px-2 mt-1 flex items-center text-xs">2.0%</div>
+                  </div>
+                  <div>
+                    <div class="wf-label">Kill-switch threshold (max DD)</div>
+                    <div class="wf-box rounded h-8 px-2 mt-1 flex items-center text-xs">5.0%</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="flex justify-end gap-2 mt-6">
+                <div class="wf-box rounded px-3 py-1.5 text-xs">[Cancel]</div>
+                <div class="wf-solid border-2 rounded px-3 py-1.5 text-xs font-semibold">[Confirm deploy]</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Modal defaults from the last successful deploy of the same instrument/granularity if any; otherwise sensible fresh defaults.</p>
+          <p class="annot">◂ On Confirm: 202 Accepted → row transitions AWAITING_APPROVAL → APPROVED → RUNNING; redirect to /paper/:id.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Screen 3 · Reject modal ─────────────────────────────────── -->
+    <section class="mt-10">
+      <div class="wf-label mb-2">Screen 3 · Reject reason modal</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded p-8 relative">
+            <div class="absolute inset-0 bg-slate-200 opacity-70 rounded"></div>
+            <div class="wf-solid rounded p-6 max-w-md mx-auto bg-white relative z-10">
+              <div class="text-lg font-semibold mb-1">Reject genome</div>
+              <div class="text-xs text-slate-500 mb-4">Optional but helpful for the audit trail.</div>
+              <div>
+                <div class="wf-label">Reason (optional)</div>
+                <div class="wf-box rounded h-20 px-2 pt-2 mt-1 text-xs">Trade count marginal, want to see a re-evolution first.</div>
+              </div>
+              <div class="flex justify-end gap-2 mt-6">
+                <div class="wf-box rounded px-3 py-1.5 text-xs">[Cancel]</div>
+                <div class="wf-solid border-2 rounded px-3 py-1.5 text-xs font-semibold">[Reject]</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Reason field is optional but persisted to decision log so a future re-evolution has context.</p>
+          <p class="annot">◂ Rejected rows disappear from /approvals; still visible in the genome's history if you go back to /evolution/…</p>
+        </div>
+      </div>
+    </section>
+
+    <div class="mt-10 p-4 border-l-4 border-slate-400 bg-slate-50 text-xs text-slate-700">
+      <span class="font-semibold">Click sequence (approve path):</span>
+      /paper/approvals → Approve on card → Deploy modal → Confirm deploy → redirect to /paper/:id (RUNNING).
+      <br/>
+      <span class="font-semibold">Click sequence (reject path):</span>
+      /paper/approvals → Reject on card → Reason modal → Reject → row leaves the queue.
+    </div>
+  </div>
+</body>
+</html>

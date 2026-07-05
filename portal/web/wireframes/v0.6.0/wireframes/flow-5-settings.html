@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Flow 5 · Settings / credentials — Wireframe</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .wf-box { border: 1px dashed #6b7280; background: #f3f4f6; }
+    .wf-solid { border: 1px solid #374151; background: #ffffff; }
+    .wf-nav { background:#e5e7eb; border-bottom:1px solid #9ca3af; }
+    .wf-label { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.7rem; letter-spacing:0.05em; text-transform:uppercase; color:#4b5563; }
+    .annot { color:#6b7280; font-size:0.75rem; font-style: italic; }
+  </style>
+</head>
+<body class="bg-white text-slate-800 p-8">
+  <div class="max-w-6xl mx-auto">
+    <a href="./index.html" class="text-xs underline text-slate-600">◂ back to wireframe index</a>
+    <h1 class="text-xl font-bold mt-2">Flow 5 · Settings / credentials</h1>
+    <p class="text-sm text-slate-600 mt-1">Goal: user manages their OANDA credentials — three states (empty, unverified, verified). Live radio disabled behind a tooltip.</p>
+
+    <!-- State 1 · empty -->
+    <section class="mt-8">
+      <div class="wf-label mb-2">State 1 · Empty state (no credentials set)</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded">
+            <div class="wf-nav px-4 py-2 text-xs">/settings · OANDA Credentials</div>
+            <div class="p-6">
+              <div class="text-lg font-semibold mb-4">Settings</div>
+              <div class="flex gap-6 border-b border-slate-300 mb-4 text-sm">
+                <div class="pb-2 text-slate-500">Profile</div>
+                <div class="pb-2 border-b-2 border-slate-800 font-semibold">OANDA Credentials</div>
+                <div class="pb-2 text-slate-400">(future) </div>
+              </div>
+              <div class="wf-box rounded p-10 text-center">
+                <div class="wf-label mb-2">Empty state</div>
+                <div class="text-sm">You haven't set OANDA credentials yet.</div>
+                <div class="text-xs text-slate-500 mt-1">Paper runs execute against your own OANDA Practice account.</div>
+                <div class="wf-solid border-2 rounded px-3 py-1.5 text-xs font-semibold inline-block mt-4">[+ Add credentials]</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Empty state deliberately spartan — nothing to configure yet.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- State 2 · form -->
+    <section class="mt-10">
+      <div class="wf-label mb-2">State 2 · Add / Edit form</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded">
+            <div class="wf-nav px-4 py-2 text-xs">/settings · OANDA Credentials</div>
+            <div class="p-6">
+              <div class="flex gap-6 border-b border-slate-300 mb-4 text-sm">
+                <div class="pb-2 text-slate-500">Profile</div>
+                <div class="pb-2 border-b-2 border-slate-800 font-semibold">OANDA Credentials</div>
+                <div class="pb-2 text-slate-400">(future) </div>
+              </div>
+              <div class="grid grid-cols-2 gap-4 max-w-2xl">
+                <div>
+                  <div class="wf-label">OANDA Account ID</div>
+                  <div class="wf-box rounded h-8 mt-1 px-2 flex items-center text-xs">101-004-12345678-001</div>
+                </div>
+                <div>
+                  <div class="wf-label">API Key <span class="text-slate-500">(masked)</span></div>
+                  <div class="wf-box rounded h-8 mt-1 px-2 flex items-center text-xs">•••••••••••••••••••• [👁]</div>
+                </div>
+                <div class="col-span-2">
+                  <div class="wf-label mb-1">Environment</div>
+                  <div class="flex gap-4 text-sm">
+                    <label class="flex items-center gap-1"><input type="radio" checked /> PRACTICE</label>
+                    <label class="flex items-center gap-1 text-slate-400"><input type="radio" disabled /> LIVE <span class="text-xs">(v1.0.0)</span></label>
+                  </div>
+                </div>
+              </div>
+              <div class="flex gap-2 mt-6">
+                <div class="wf-solid border-2 rounded px-3 py-1.5 text-xs font-semibold">[Save credentials]</div>
+                <div class="wf-box rounded px-3 py-1.5 text-xs">[Cancel]</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Save disabled until all three fields have a value.</p>
+          <p class="annot">◂ LIVE radio has hover tooltip: "Live trading requires ADMIN + enables in v1.0.0."</p>
+          <p class="annot">◂ API key is password-style; visibility toggle for accessibility.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- State 3 · unverified -->
+    <section class="mt-10">
+      <div class="wf-label mb-2">State 3 · Set but not verified</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded">
+            <div class="wf-nav px-4 py-2 text-xs">/settings · OANDA Credentials</div>
+            <div class="p-6">
+              <div class="flex gap-6 border-b border-slate-300 mb-4 text-sm">
+                <div class="pb-2 text-slate-500">Profile</div>
+                <div class="pb-2 border-b-2 border-slate-800 font-semibold">OANDA Credentials</div>
+                <div class="pb-2 text-slate-400">(future) </div>
+              </div>
+              <div class="wf-box rounded p-4 max-w-2xl">
+                <div class="flex items-center justify-between">
+                  <div>
+                    <div class="wf-label">Account ID</div>
+                    <div class="font-mono text-sm">***-001</div>
+                  </div>
+                  <div>
+                    <div class="wf-label">Environment</div>
+                    <div class="text-sm">PRACTICE</div>
+                  </div>
+                  <div>
+                    <div class="wf-label">Status</div>
+                    <div class="text-sm text-amber-700">⏸ Verification pending</div>
+                  </div>
+                </div>
+                <div class="flex gap-2 mt-4">
+                  <div class="wf-solid border-2 rounded px-3 py-1.5 text-xs font-semibold">[Test connection]</div>
+                  <div class="wf-box rounded px-3 py-1.5 text-xs">[Edit]</div>
+                  <div class="wf-box rounded px-3 py-1.5 text-xs">[Delete]</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Test connection is the primary CTA — no verified badge means paper deploy is gated.</p>
+          <p class="annot">◂ Save clears verified_at; a re-verify is required after any edit.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- State 4 · verified -->
+    <section class="mt-10">
+      <div class="wf-label mb-2">State 4 · Set and verified</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9">
+          <div class="wf-solid rounded">
+            <div class="wf-nav px-4 py-2 text-xs">/settings · OANDA Credentials</div>
+            <div class="p-6">
+              <div class="flex gap-6 border-b border-slate-300 mb-4 text-sm">
+                <div class="pb-2 text-slate-500">Profile</div>
+                <div class="pb-2 border-b-2 border-slate-800 font-semibold">OANDA Credentials</div>
+                <div class="pb-2 text-slate-400">(future) </div>
+              </div>
+              <div class="wf-box rounded p-4 max-w-2xl">
+                <div class="flex items-center justify-between">
+                  <div>
+                    <div class="wf-label">Account ID</div>
+                    <div class="font-mono text-sm">***-001</div>
+                  </div>
+                  <div>
+                    <div class="wf-label">Environment</div>
+                    <div class="text-sm">PRACTICE</div>
+                  </div>
+                  <div>
+                    <div class="wf-label">Status</div>
+                    <div class="text-sm text-emerald-700">✓ Verified · 2m ago</div>
+                  </div>
+                </div>
+                <div class="flex gap-2 mt-4">
+                  <div class="wf-box rounded px-3 py-1.5 text-xs">[Edit]</div>
+                  <div class="wf-box rounded px-3 py-1.5 text-xs">[Re-verify]</div>
+                  <div class="wf-box rounded px-3 py-1.5 text-xs text-red-700">[Delete]</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Test button is gone; Re-verify is now the manual refresh path.</p>
+          <p class="annot">◂ Delete gets a danger colour (red) to differentiate it from the safe actions.</p>
+        </div>
+      </div>
+    </section>
+
+    <div class="mt-10 p-4 border-l-4 border-slate-400 bg-slate-50 text-xs text-slate-700">
+      <span class="font-semibold">Notes:</span>
+      Deleting credentials while a paper run is active triggers immediate halt with stop_reason=CREDENTIALS_REVOKED. Warn the user in the delete confirmation if there are active runs.
+    </div>
+  </div>
+</body>
+</html>

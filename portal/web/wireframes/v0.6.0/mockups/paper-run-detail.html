@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Paper Run Detail — Live Monitoring</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-100">
+
+  <!-- Top nav -->
+  <div class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
+    <div class="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between text-sm">
+      <div class="flex items-center gap-6">
+        <div class="font-bold">AgentFX</div>
+        <a class="text-slate-500 hover:text-slate-900 dark:hover:text-white">Market data</a>
+        <a class="text-slate-500 hover:text-slate-900 dark:hover:text-white">Evolution</a>
+        <a class="text-emerald-600 dark:text-emerald-400 font-semibold border-b-2 border-emerald-500 pb-3 -mb-3">Paper</a>
+        <a class="text-slate-500 hover:text-slate-900 dark:hover:text-white">Settings</a>
+      </div>
+      <div class="text-xs text-slate-600 dark:text-slate-400">trader@example.com ▾</div>
+    </div>
+  </div>
+
+  <div class="max-w-7xl mx-auto px-6 py-8">
+    <a href="./paper-runs.html" class="text-xs text-slate-500 hover:text-slate-900 dark:hover:text-white">◂ back to Runs</a>
+
+    <!-- STICKY HEADER (kill switch always visible) -->
+    <div class="mt-4 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 flex items-center justify-between sticky top-4 z-10 shadow-sm">
+      <div>
+        <div class="flex items-center gap-2">
+          <span class="inline-flex items-center gap-1.5 bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-300 text-xs font-semibold px-2 py-0.5 rounded-full">
+            <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span>
+            RUNNING
+          </span>
+          <div class="text-lg font-semibold">EUR_USD M15 — 2026-07-05</div>
+        </div>
+        <div class="text-xs text-slate-500 dark:text-slate-400 mt-1 font-mono">
+          genome_gen_evorun_20260702_fbd5bcb2_021_001 · started 2h 14m ago
+        </div>
+      </div>
+      <div class="flex items-center gap-6">
+        <div class="text-right">
+          <div class="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Live P&amp;L</div>
+          <div class="text-2xl font-bold font-mono text-emerald-700 dark:text-emerald-400">+$142.30</div>
+          <div class="text-xs text-emerald-700 dark:text-emerald-400 font-mono">+1.42%</div>
+        </div>
+        <button class="bg-rose-600 hover:bg-rose-700 text-white font-bold px-5 py-3 rounded-lg shadow-md flex items-center gap-2">
+          <span>⚠</span> Kill switch
+        </button>
+      </div>
+    </div>
+
+    <!-- METRICS GRID -->
+    <div class="mt-6 grid grid-cols-2 md:grid-cols-6 gap-3">
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-4">
+        <div class="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Live P&amp;L $</div>
+        <div class="text-lg font-mono font-semibold mt-1 text-emerald-700 dark:text-emerald-400">+142.30</div>
+      </div>
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-4">
+        <div class="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">P&amp;L %</div>
+        <div class="text-lg font-mono font-semibold mt-1 text-emerald-700 dark:text-emerald-400">+1.42%</div>
+      </div>
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-4">
+        <div class="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Realised / Unreal.</div>
+        <div class="text-sm font-mono mt-1">+98.10 / +44.20</div>
+      </div>
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-4">
+        <div class="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Hit rate (live)</div>
+        <div class="text-lg font-mono font-semibold mt-1">54.2%</div>
+      </div>
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-4">
+        <div class="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Sharpe (rolling)</div>
+        <div class="text-lg font-mono font-semibold mt-1">+0.71</div>
+      </div>
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-4">
+        <div class="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Drawdown</div>
+        <div class="text-lg font-mono font-semibold mt-1 text-rose-700 dark:text-rose-400">-0.6%</div>
+      </div>
+    </div>
+
+    <!-- LIVE VS BACKTEST OVERLAY CHART -->
+    <div class="mt-6 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
+      <div class="flex items-center justify-between mb-3">
+        <div>
+          <div class="text-sm font-semibold">Live vs backtest equity</div>
+          <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">Component: <code class="bg-slate-100 dark:bg-slate-700 px-1 rounded">LivePnLChart</code> — relative timestamp from run start</div>
+        </div>
+        <div class="flex gap-4 text-xs">
+          <span class="flex items-center gap-1"><span class="w-3 h-0.5 bg-emerald-500 inline-block"></span> Live</span>
+          <span class="flex items-center gap-1 text-slate-500"><span class="w-3 h-0.5 bg-slate-400 inline-block" style="border-top:1px dashed #94a3b8;"></span> Backtest OOS</span>
+        </div>
+      </div>
+      <!-- Placeholder chart with SVG -->
+      <div class="relative h-64 bg-slate-50 dark:bg-slate-900 rounded border border-slate-100 dark:border-slate-700">
+        <svg viewBox="0 0 600 200" class="w-full h-full">
+          <!-- axes -->
+          <line x1="30" y1="180" x2="580" y2="180" stroke="#94a3b8" stroke-width="0.5"/>
+          <line x1="30" y1="20" x2="30" y2="180" stroke="#94a3b8" stroke-width="0.5"/>
+          <!-- backtest OOS (dashed gray) -->
+          <path d="M30,150 Q120,140 200,120 T400,80 T580,60"
+                fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="4,3"/>
+          <!-- live (solid emerald) -->
+          <path d="M30,150 Q100,145 180,130 T350,95 T500,75"
+                fill="none" stroke="#10b981" stroke-width="2"/>
+          <!-- current point -->
+          <circle cx="500" cy="75" r="4" fill="#10b981"/>
+          <!-- labels -->
+          <text x="10" y="25" font-size="9" fill="#64748b">Equity</text>
+          <text x="540" y="195" font-size="9" fill="#64748b">hours</text>
+        </svg>
+      </div>
+      <div class="mt-2 text-xs text-slate-500 dark:text-slate-400">Live is tracking backtest within ~0.4% drift. Positive divergence — live slightly outperforming.</div>
+    </div>
+
+    <!-- POSITION + RECENT TRADES + STRATEGY CHART side-by-side -->
+    <div class="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+      <!-- Current position -->
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
+        <div class="text-sm font-semibold mb-3">Current position</div>
+        <dl class="space-y-2 text-sm">
+          <div class="flex justify-between"><dt class="text-slate-500">Instrument</dt><dd class="font-mono">EUR_USD</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-500">Direction · units</dt><dd class="font-mono">LONG · 10,000</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-500">Avg entry price</dt><dd class="font-mono">1.09342</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-500">Unrealised P&amp;L</dt><dd class="font-mono text-emerald-700 dark:text-emerald-400">+$44.20</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-500">Stop-loss</dt><dd class="font-mono">1.09122 (−22 pips)</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-500">Take-profit</dt><dd class="font-mono">1.09742 (+40 pips)</dd></div>
+        </dl>
+      </div>
+
+      <!-- Today's summary -->
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
+        <div class="text-sm font-semibold mb-3">Today's activity</div>
+        <dl class="space-y-2 text-sm">
+          <div class="flex justify-between"><dt class="text-slate-500">Trades</dt><dd class="font-mono">7</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-500">Wins / Losses</dt><dd class="font-mono">4 / 3</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-500">Avg win / loss</dt><dd class="font-mono">+18p / −11p</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-500">Last signal</dt><dd class="font-mono text-xs">MACD ↑ · 12m ago</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-500">Broker latency (p95)</dt><dd class="font-mono">340ms</dd></div>
+        </dl>
+      </div>
+
+      <!-- Risk config -->
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
+        <div class="text-sm font-semibold mb-3">Risk config</div>
+        <dl class="space-y-2 text-sm">
+          <div class="flex justify-between"><dt class="text-slate-500">Initial balance</dt><dd class="font-mono">$10,000</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-500">Max position</dt><dd class="font-mono">10,000 units</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-500">Daily loss cap</dt><dd class="font-mono">2.0%</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-500">Kill-switch DD</dt><dd class="font-mono">5.0%</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-500">Approved</dt><dd class="font-mono text-xs">2h 14m ago</dd></div>
+        </dl>
+      </div>
+    </div>
+
+    <!-- RECENT TRADES TABLE -->
+    <div class="mt-6 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg overflow-hidden">
+      <div class="p-5 flex items-center justify-between">
+        <div>
+          <div class="text-sm font-semibold">Recent trades</div>
+          <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">Component: <code class="bg-slate-100 dark:bg-slate-700 px-1 rounded">TradesTable</code> (extended with origin badge)</div>
+        </div>
+        <div class="text-xs text-slate-500">Last 20 · 5s polling</div>
+      </div>
+      <table class="w-full text-sm">
+        <thead class="bg-slate-50 dark:bg-slate-900 text-xs uppercase tracking-wide text-slate-500">
+          <tr>
+            <th class="text-left px-5 py-2 font-medium">Trade ID</th>
+            <th class="text-left px-5 py-2 font-medium">Origin</th>
+            <th class="text-left px-5 py-2 font-medium">Direction</th>
+            <th class="text-left px-5 py-2 font-medium">Entry / Exit</th>
+            <th class="text-right px-5 py-2 font-medium">Pips</th>
+            <th class="text-right px-5 py-2 font-medium">P&amp;L $</th>
+            <th class="text-right px-5 py-2 font-medium">Closed</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-100 dark:divide-slate-700">
+          <tr>
+            <td class="px-5 py-2 font-mono text-xs">t_00147</td>
+            <td class="px-5 py-2"><span class="bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-300 text-xs font-semibold px-2 py-0.5 rounded">live</span></td>
+            <td class="px-5 py-2">LONG</td>
+            <td class="px-5 py-2 font-mono text-xs">1.09210 → 1.09425</td>
+            <td class="px-5 py-2 text-right font-mono text-emerald-700 dark:text-emerald-400">+21.5</td>
+            <td class="px-5 py-2 text-right font-mono text-emerald-700 dark:text-emerald-400">+$21.50</td>
+            <td class="px-5 py-2 text-right text-xs text-slate-500">12m ago</td>
+          </tr>
+          <tr>
+            <td class="px-5 py-2 font-mono text-xs">t_00146</td>
+            <td class="px-5 py-2"><span class="bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-300 text-xs font-semibold px-2 py-0.5 rounded">live</span></td>
+            <td class="px-5 py-2">SHORT</td>
+            <td class="px-5 py-2 font-mono text-xs">1.09480 → 1.09540</td>
+            <td class="px-5 py-2 text-right font-mono text-rose-700 dark:text-rose-400">−6.0</td>
+            <td class="px-5 py-2 text-right font-mono text-rose-700 dark:text-rose-400">−$6.00</td>
+            <td class="px-5 py-2 text-right text-xs text-slate-500">34m ago</td>
+          </tr>
+          <tr>
+            <td class="px-5 py-2 font-mono text-xs">t_00145</td>
+            <td class="px-5 py-2"><span class="bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-300 text-xs font-semibold px-2 py-0.5 rounded">live</span></td>
+            <td class="px-5 py-2">LONG</td>
+            <td class="px-5 py-2 font-mono text-xs">1.09305 → 1.09475</td>
+            <td class="px-5 py-2 text-right font-mono text-emerald-700 dark:text-emerald-400">+17.0</td>
+            <td class="px-5 py-2 text-right font-mono text-emerald-700 dark:text-emerald-400">+$17.00</td>
+            <td class="px-5 py-2 text-right text-xs text-slate-500">58m ago</td>
+          </tr>
+          <tr class="text-slate-400">
+            <td colspan="7" class="text-center px-5 py-3 text-xs">… 17 more rows</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- STRATEGY CHART -->
+    <div class="mt-6 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
+      <div class="text-sm font-semibold mb-3">Candles + live &amp; backtest markers</div>
+      <div class="text-xs text-slate-500 dark:text-slate-400 mb-3">Component: <code class="bg-slate-100 dark:bg-slate-700 px-1 rounded">StrategyChart</code> — extended to overlay live-trade markers on top of backtest-would-have-done markers.</div>
+      <div class="h-56 bg-slate-50 dark:bg-slate-900 border border-slate-100 dark:border-slate-700 rounded flex items-center justify-center text-sm text-slate-500">
+        [ candlestick chart · ▲ live long entry · ▼ live short entry · faded markers = backtest ]
+      </div>
+    </div>
+
+    <!-- DECISION LOG STREAM -->
+    <div class="mt-6 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-semibold">Decision log</div>
+        <div class="text-xs text-slate-500">latest first · 5s refresh</div>
+      </div>
+      <div class="font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-100 dark:border-slate-700 rounded p-3 space-y-1 max-h-56 overflow-y-auto text-slate-700 dark:text-slate-300">
+        <div><span class="text-slate-500">15:04:12</span> · SIGNAL_COMPUTED · MACD cross ↑ · confidence 0.68</div>
+        <div><span class="text-slate-500">15:04:13</span> · ORDER_PLACED · EUR_USD LONG 10,000 · SL 22p TP 40p</div>
+        <div><span class="text-slate-500">15:04:13</span> · ORDER_FILLED · avg 1.09342</div>
+        <div><span class="text-slate-500">14:38:02</span> · SIGNAL_COMPUTED · signal flip → SHORT</div>
+        <div><span class="text-slate-500">14:38:03</span> · POSITION_CLOSED · +17.0 pips realised · $17.00</div>
+        <div><span class="text-slate-500">14:38:04</span> · ORDER_PLACED · EUR_USD SHORT 10,000</div>
+        <div class="text-slate-400">… stream continues</div>
+      </div>
+    </div>
+
+  </div>
+</body>
+</html>

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Paper Runs — List</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-100">
+  <div class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
+    <div class="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between text-sm">
+      <div class="flex items-center gap-6">
+        <div class="font-bold">AgentFX</div>
+        <a class="text-slate-500">Market data</a><a class="text-slate-500">Evolution</a>
+        <a class="text-emerald-600 dark:text-emerald-400 font-semibold border-b-2 border-emerald-500 pb-3 -mb-3">Paper</a>
+        <a class="text-slate-500">Settings</a>
+      </div>
+      <div class="text-xs text-slate-600 dark:text-slate-400">trader@example.com ▾</div>
+    </div>
+  </div>
+
+  <div class="max-w-7xl mx-auto px-6 py-8">
+    <div class="flex items-start justify-between mb-6">
+      <div>
+        <h1 class="text-2xl font-bold">Paper Trading</h1>
+        <div class="text-sm text-slate-500 dark:text-slate-400 mt-1">2 running · 5 completed · aggregate live P&amp;L <span class="font-mono text-emerald-700 dark:text-emerald-400 font-semibold">+$318.50</span></div>
+      </div>
+      <div class="flex gap-2">
+        <div class="flex gap-1 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-0.5">
+          <button class="bg-emerald-500 text-white rounded px-3 py-1.5 font-semibold">Runs</button>
+          <button class="text-slate-500 rounded px-3 py-1.5">Approvals · 1</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex items-center gap-3 mb-4 text-sm">
+      <select class="px-3 py-1.5 border border-slate-200 dark:border-slate-700 dark:bg-slate-800 rounded">
+        <option>All statuses</option><option>RUNNING</option><option>HALTED_MANUAL</option><option>COMPLETED</option>
+      </select>
+      <select class="px-3 py-1.5 border border-slate-200 dark:border-slate-700 dark:bg-slate-800 rounded">
+        <option>All instruments</option><option>EUR_USD</option><option>GBP_USD</option>
+      </select>
+      <div class="ml-auto text-xs text-slate-500 dark:text-slate-400 flex items-center gap-1.5">
+        <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span>
+        Live · refreshing every 5s
+      </div>
+    </div>
+
+    <div class="space-y-3">
+
+      <a href="./paper-run-detail.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:shadow-md transition">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-4">
+            <span class="inline-flex items-center gap-1.5 bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-300 text-xs font-semibold px-2 py-0.5 rounded-full">
+              <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span> RUNNING
+            </span>
+            <div>
+              <div class="font-semibold">EUR_USD M15 — 2026-07-05</div>
+              <div class="text-xs text-slate-500 dark:text-slate-400 font-mono">…fbd5bcb2_021_001 · 2h 14m</div>
+            </div>
+          </div>
+          <div class="flex items-center gap-6 text-sm">
+            <div class="text-right">
+              <div class="text-xs text-slate-500">Live P&amp;L</div>
+              <div class="font-mono font-semibold text-emerald-700 dark:text-emerald-400">+$142.30 (+1.42%)</div>
+            </div>
+            <div class="text-right">
+              <div class="text-xs text-slate-500">Trades today</div>
+              <div class="font-mono">7</div>
+            </div>
+            <div class="text-right">
+              <div class="text-xs text-slate-500">Hit / DD</div>
+              <div class="font-mono">54.2% / −0.6%</div>
+            </div>
+            <div class="text-slate-400">›</div>
+          </div>
+        </div>
+      </a>
+
+      <a class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:shadow-md transition">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-4">
+            <span class="inline-flex items-center gap-1.5 bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-300 text-xs font-semibold px-2 py-0.5 rounded-full">
+              <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span> RUNNING
+            </span>
+            <div>
+              <div class="font-semibold">GBP_USD H1 — 2026-07-04</div>
+              <div class="text-xs text-slate-500 dark:text-slate-400 font-mono">…a9c7f145_014_022 · 1d 3h</div>
+            </div>
+          </div>
+          <div class="flex items-center gap-6 text-sm">
+            <div class="text-right">
+              <div class="text-xs text-slate-500">Live P&amp;L</div>
+              <div class="font-mono font-semibold text-emerald-700 dark:text-emerald-400">+$176.20 (+1.76%)</div>
+            </div>
+            <div class="text-right">
+              <div class="text-xs text-slate-500">Trades today</div>
+              <div class="font-mono">4</div>
+            </div>
+            <div class="text-right">
+              <div class="text-xs text-slate-500">Hit / DD</div>
+              <div class="font-mono">50.0% / −1.1%</div>
+            </div>
+            <div class="text-slate-400">›</div>
+          </div>
+        </div>
+      </a>
+
+      <div class="mt-6 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Completed / halted</div>
+
+      <a class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:shadow-md transition opacity-90">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-4">
+            <span class="inline-flex items-center gap-1.5 bg-rose-100 dark:bg-rose-900/40 text-rose-800 dark:text-rose-300 text-xs font-semibold px-2 py-0.5 rounded-full">
+              ■ HALTED_MANUAL
+            </span>
+            <div>
+              <div class="font-semibold">USD_JPY M30 — 2026-07-01</div>
+              <div class="text-xs text-slate-500 dark:text-slate-400 font-mono">…b3e2d888_017_008 · halted 3d 2h ago</div>
+            </div>
+          </div>
+          <div class="flex items-center gap-6 text-sm">
+            <div class="text-right">
+              <div class="text-xs text-slate-500">Final P&amp;L</div>
+              <div class="font-mono font-semibold text-emerald-700 dark:text-emerald-400">+$54.10 (+0.54%)</div>
+            </div>
+            <div class="text-right">
+              <div class="text-xs text-slate-500">Trades</div>
+              <div class="font-mono">31</div>
+            </div>
+            <div class="text-right">
+              <div class="text-xs text-slate-500">Stop reason</div>
+              <div class="text-xs">USER_KILL</div>
+            </div>
+            <div class="text-slate-400">›</div>
+          </div>
+        </div>
+      </a>
+
+      <a class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:shadow-md transition opacity-90">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-4">
+            <span class="inline-flex items-center gap-1.5 bg-slate-100 dark:bg-slate-700 text-slate-800 dark:text-slate-200 text-xs font-semibold px-2 py-0.5 rounded-full">
+              ✓ COMPLETED
+            </span>
+            <div>
+              <div class="font-semibold">EUR_USD H1 — 2026-06-28</div>
+              <div class="text-xs text-slate-500 dark:text-slate-400 font-mono">…5b8faab2_013_027 · completed 6d ago</div>
+            </div>
+          </div>
+          <div class="flex items-center gap-6 text-sm">
+            <div class="text-right">
+              <div class="text-xs text-slate-500">Final P&amp;L</div>
+              <div class="font-mono font-semibold text-emerald-700 dark:text-emerald-400">+$210.40 (+2.10%)</div>
+            </div>
+            <div class="text-right">
+              <div class="text-xs text-slate-500">Trades</div>
+              <div class="font-mono">89</div>
+            </div>
+            <div class="text-right">
+              <div class="text-xs text-slate-500">Duration</div>
+              <div class="text-xs">3d 14h</div>
+            </div>
+            <div class="text-slate-400">›</div>
+          </div>
+        </div>
+      </a>
+
+      <a class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:shadow-md transition opacity-90">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-4">
+            <span class="inline-flex items-center gap-1.5 bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300 text-xs font-semibold px-2 py-0.5 rounded-full">
+              ⚠ ERROR
+            </span>
+            <div>
+              <div class="font-semibold">AUD_USD M5 — 2026-06-24</div>
+              <div class="text-xs text-slate-500 dark:text-slate-400 font-mono">…7cb14ee5_022_009 · crashed 10d ago</div>
+            </div>
+          </div>
+          <div class="flex items-center gap-6 text-sm">
+            <div class="text-right">
+              <div class="text-xs text-slate-500">Final P&amp;L</div>
+              <div class="font-mono">−$8.20</div>
+            </div>
+            <div class="text-right">
+              <div class="text-xs text-slate-500">Trades</div>
+              <div class="font-mono">3</div>
+            </div>
+            <div class="text-right">
+              <div class="text-xs text-slate-500">Stop reason</div>
+              <div class="text-xs">process_crashed</div>
+            </div>
+            <div class="text-slate-400">›</div>
+          </div>
+        </div>
+      </a>
+    </div>
+
+    <div class="mt-6 text-center text-xs text-slate-500 dark:text-slate-400">Showing 5 of 7 · <a class="underline">load more</a></div>
+  </div>
+</body>
+</html>

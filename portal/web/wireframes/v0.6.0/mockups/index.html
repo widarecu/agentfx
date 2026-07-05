@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>AgentFX v0.6.0 · Paper Trading — Mockups (Pass B)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-100">
+  <div class="max-w-6xl mx-auto px-6 py-10">
+    <div class="mb-8">
+      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Pass B — clickable high-fi mockups</div>
+      <h1 class="text-3xl font-bold mt-1">AgentFX v0.6.0 · Paper Trading</h1>
+      <p class="text-sm text-slate-600 dark:text-slate-400 mt-3 max-w-3xl">
+        Real Tailwind classes, real colors, realistic fake data, wired click-through where it matters.
+        Every screen matches a wireframe under <code class="text-xs bg-slate-200 dark:bg-slate-800 px-1 rounded">../wireframes/</code>.
+        Open any mockup in a browser — it self-loads via Tailwind CDN, no build step.
+      </p>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+
+      <a href="./paper-empty.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">1 · Paper — empty state (onboarding)</div>
+          <div class="text-xs text-slate-500">Flow 1</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Landing after sign-in when no credentials set. Prominent credentials-required banner.</div>
+      </a>
+
+      <a href="./settings-credentials.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">2 · Settings · OANDA Credentials</div>
+          <div class="text-xs text-slate-500">Flow 5</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Three credential states (empty, unverified, verified). Add / Edit form with PRACTICE-only radio.</div>
+      </a>
+
+      <a href="./paper-approvals.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">3 · Approval queue</div>
+          <div class="text-xs text-slate-500">Flow 2</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Cards for each pending VALIDATED genome with Gate-B coloured metrics + Approve / Reject CTAs.</div>
+      </a>
+
+      <a href="./deploy-modal.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">4 · Deploy paper modal</div>
+          <div class="text-xs text-slate-500">Flow 2</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Modal collecting name / initial balance / max position / daily-loss / kill-switch threshold.</div>
+      </a>
+
+      <a href="./reject-modal.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">5 · Reject-with-reason modal</div>
+          <div class="text-xs text-slate-500">Flow 2</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Optional reason field persisted to decision log.</div>
+      </a>
+
+      <a href="./paper-runs.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">6 · Runs list (many rows)</div>
+          <div class="text-xs text-slate-500">Flow 3</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Aggregate P&L header, compact per-run rows, filters, 5s polling indicator.</div>
+      </a>
+
+      <a href="./paper-run-detail.html" class="block bg-white dark:bg-slate-800 border-2 border-emerald-400 rounded-lg p-5 hover:shadow-lg transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">7 · Run detail — the money view ★</div>
+          <div class="text-xs text-slate-500">Flow 3</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Live P&L vs backtest overlay chart, kill switch, position panel, trades table, decision log. The page that matters most.</div>
+      </a>
+
+      <a href="./kill-switch-countdown.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">8 · Kill switch — 3-second undo toast</div>
+          <div class="text-xs text-slate-500">Flow 4</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Toast countdown state with undo affordance. Click the button to see it fire.</div>
+      </a>
+
+      <a href="./admin-view.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">9 · ADMIN view · scope toggle</div>
+          <div class="text-xs text-slate-500">Flow 6</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">"My runs / All runs" toggle for ADMIN role. Owner email badges on rows.</div>
+      </a>
+
+    </div>
+
+    <div class="mt-10 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
+      <div class="text-sm font-semibold mb-2">Design language notes</div>
+      <ul class="text-xs text-slate-600 dark:text-slate-400 space-y-1 list-disc list-inside">
+        <li>Palette: slate for chrome; emerald for pass / positive P&L; rose for fail / kill switch; amber for warnings.</li>
+        <li>Dark-mode support baked in via <code>dark:</code> variants — matches the existing portal.</li>
+        <li>Reused components are called out by name (KillSwitchButton, LivePnLChart, CredentialsForm, TradesTable, StrategyChart, MetricsCard, ApprovalQueueCard, DeployPaperModal) — see the README component inventory.</li>
+        <li>Fake data is deterministic across mockups so numbers are consistent room-to-room.</li>
+      </ul>
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Kill Switch — 3-Second Countdown Toast</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-100">
+  <div class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
+    <div class="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between text-sm">
+      <div class="flex items-center gap-6">
+        <div class="font-bold">AgentFX</div>
+        <a class="text-slate-500">Market data</a><a class="text-slate-500">Evolution</a>
+        <a class="text-emerald-600 dark:text-emerald-400 font-semibold border-b-2 border-emerald-500 pb-3 -mb-3">Paper</a>
+        <a class="text-slate-500">Settings</a>
+      </div>
+      <div class="text-xs text-slate-600 dark:text-slate-400">trader@example.com ▾</div>
+    </div>
+  </div>
+
+  <!-- Toast that overlays the run detail -->
+  <div class="fixed top-20 left-1/2 -translate-x-1/2 z-50 bg-rose-700 text-rose-50 rounded-lg shadow-2xl p-4 flex items-center gap-4 min-w-[420px] border border-rose-900">
+    <div class="text-3xl font-bold font-mono" id="count">2</div>
+    <div class="flex-1">
+      <div class="text-sm font-semibold">Halting run in 2 seconds…</div>
+      <div class="text-xs opacity-80 mt-0.5">Positions will close on OANDA. This cannot be undone once complete.</div>
+      <div class="mt-2 h-1.5 bg-rose-900 rounded overflow-hidden">
+        <div class="h-full bg-rose-300" style="width: 40%;"></div>
+      </div>
+    </div>
+    <button class="bg-white text-rose-900 hover:bg-rose-100 font-bold text-sm px-4 py-2 rounded shadow shrink-0">Undo</button>
+  </div>
+
+  <!-- Underlying run detail (dimmed) -->
+  <div class="max-w-7xl mx-auto px-6 py-8 opacity-60 pointer-events-none">
+    <a class="text-xs text-slate-500">◂ back to Runs</a>
+
+    <div class="mt-4 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 flex items-center justify-between">
+      <div>
+        <div class="flex items-center gap-2">
+          <span class="inline-flex items-center gap-1.5 bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-300 text-xs font-semibold px-2 py-0.5 rounded-full">
+            <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span> RUNNING
+          </span>
+          <div class="text-lg font-semibold">EUR_USD M15 — 2026-07-05</div>
+        </div>
+        <div class="text-xs text-slate-500 dark:text-slate-400 mt-1 font-mono">genome_gen_evorun_20260702_fbd5bcb2_021_001 · 2h 14m ago</div>
+      </div>
+      <div class="flex items-center gap-6">
+        <div class="text-right">
+          <div class="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Live P&amp;L</div>
+          <div class="text-2xl font-bold font-mono text-emerald-700 dark:text-emerald-400">+$142.30</div>
+        </div>
+        <!-- Disabled kill button while toast is up -->
+        <button disabled class="bg-rose-600 text-white font-bold px-5 py-3 rounded-lg opacity-40 cursor-not-allowed flex items-center gap-2">
+          <span>⚠</span> Kill switch
+        </button>
+      </div>
+    </div>
+
+    <div class="mt-6 grid grid-cols-2 md:grid-cols-6 gap-3">
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-4">
+        <div class="text-xs uppercase text-slate-500">P&amp;L $</div>
+        <div class="text-lg font-mono font-semibold mt-1">+142.30</div>
+      </div>
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-4">
+        <div class="text-xs uppercase text-slate-500">Hit</div>
+        <div class="text-lg font-mono font-semibold mt-1">54.2%</div>
+      </div>
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-4">
+        <div class="text-xs uppercase text-slate-500">Sharpe</div>
+        <div class="text-lg font-mono font-semibold mt-1">+0.71</div>
+      </div>
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-4">
+        <div class="text-xs uppercase text-slate-500">DD</div>
+        <div class="text-lg font-mono font-semibold mt-1">-0.6%</div>
+      </div>
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-4">
+        <div class="text-xs uppercase text-slate-500">Trades</div>
+        <div class="text-lg font-mono font-semibold mt-1">7</div>
+      </div>
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-4">
+        <div class="text-xs uppercase text-slate-500">Signal</div>
+        <div class="text-xs mt-1">MACD ↑ 12m ago</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Simple countdown animation -->
+  <script>
+    let n = 2;
+    const el = document.getElementById('count');
+    const iv = setInterval(() => {
+      n--;
+      if (n < 0) { clearInterval(iv); return; }
+      el.textContent = String(n);
+    }, 1000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Paper — Empty State (Onboarding)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-100">
+  <div class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
+    <div class="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between text-sm">
+      <div class="flex items-center gap-6">
+        <div class="font-bold">AgentFX</div>
+        <a class="text-slate-500">Market data</a><a class="text-slate-500">Evolution</a>
+        <a class="text-emerald-600 dark:text-emerald-400 font-semibold border-b-2 border-emerald-500 pb-3 -mb-3">Paper</a>
+        <a class="text-slate-500">Settings</a>
+      </div>
+      <div class="text-xs text-slate-600 dark:text-slate-400">trader@example.com ▾</div>
+    </div>
+  </div>
+
+  <div class="max-w-4xl mx-auto px-6 py-8">
+    <h1 class="text-2xl font-bold">Paper Trading</h1>
+    <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">Deploy validated genomes to your OANDA Practice account.</p>
+
+    <!-- Credentials banner (blocking) -->
+    <div class="mt-6 bg-amber-50 dark:bg-amber-900/20 border border-amber-300 dark:border-amber-700 rounded-lg p-5 flex items-start gap-4">
+      <div class="w-10 h-10 bg-amber-200 dark:bg-amber-800 rounded-full flex items-center justify-center text-amber-800 dark:text-amber-200 text-xl shrink-0">⚠</div>
+      <div class="flex-1">
+        <div class="font-semibold text-amber-900 dark:text-amber-200">Set OANDA credentials before deploying</div>
+        <div class="text-sm text-amber-800 dark:text-amber-300 mt-1">
+          Paper runs execute against your own OANDA Practice account. Add your account ID and API key to continue.
+          Encrypted at rest; never shared with other users.
+        </div>
+      </div>
+      <a href="./settings-credentials.html" class="bg-amber-600 hover:bg-amber-700 text-white font-semibold text-sm px-4 py-2 rounded shrink-0">Set up credentials →</a>
+    </div>
+
+    <!-- Empty state -->
+    <div class="mt-8 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-12 text-center">
+      <div class="w-16 h-16 bg-slate-100 dark:bg-slate-700 rounded-full mx-auto flex items-center justify-center text-3xl text-slate-400">
+        📊
+      </div>
+      <div class="text-lg font-semibold mt-4">No paper runs yet</div>
+      <div class="text-sm text-slate-500 dark:text-slate-400 mt-1 max-w-md mx-auto">
+        Approve a validated genome to deploy it here. Live P&amp;L will appear in this list once a run starts.
+      </div>
+      <a href="./paper-approvals.html" class="mt-6 inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm px-4 py-2 rounded opacity-50 cursor-not-allowed">
+        Go to approval queue →
+      </a>
+      <div class="text-xs text-slate-500 mt-2">Disabled until credentials verified.</div>
+    </div>
+
+    <!-- Progressive help -->
+    <div class="mt-8 grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-4">
+        <div class="font-semibold mb-1">1 · Credentials</div>
+        <div class="text-slate-500 dark:text-slate-400">Add your OANDA Practice API key in Settings. Test the connection.</div>
+      </div>
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-4">
+        <div class="font-semibold mb-1">2 · Approve a genome</div>
+        <div class="text-slate-500 dark:text-slate-400">Head to Evolution, find a validated genome, click "Send to approval queue".</div>
+      </div>
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-4">
+        <div class="font-semibold mb-1">3 · Deploy &amp; watch</div>
+        <div class="text-slate-500 dark:text-slate-400">Approve from this queue, set risk knobs, watch live P&amp;L vs backtest.</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

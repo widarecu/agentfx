@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Flow 3 · Live monitoring — Wireframe</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .wf-box { border: 1px dashed #6b7280; background: #f3f4f6; }
+    .wf-solid { border: 1px solid #374151; background: #ffffff; }
+    .wf-nav { background:#e5e7eb; border-bottom:1px solid #9ca3af; }
+    .wf-label { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.7rem; letter-spacing:0.05em; text-transform:uppercase; color:#4b5563; }
+    .annot { color:#6b7280; font-size:0.75rem; font-style: italic; }
+    .kill { background:#fecaca; border:1px solid #b91c1c; color:#7f1d1d; }
+  </style>
+</head>
+<body class="bg-white text-slate-800 p-8">
+  <div class="max-w-7xl mx-auto">
+    <a href="./index.html" class="text-xs underline text-slate-600">◂ back to wireframe index</a>
+    <h1 class="text-xl font-bold mt-2">Flow 3 · Live monitoring (the money view)</h1>
+    <p class="text-sm text-slate-600 mt-1">Goal: user watches a paper run and knows in one glance whether it's behaving like the backtest. Two overlaid P&L curves are the primary answer. Kill switch is always one click away.</p>
+
+    <section class="mt-8">
+      <div class="wf-label mb-2">Screen 1 · /paper/:id · RUNNING</div>
+      <div class="grid grid-cols-12 gap-4">
+        <div class="col-span-9 space-y-4">
+          <div class="wf-solid rounded">
+            <div class="wf-nav px-4 py-2 flex items-center justify-between text-xs">
+              <span>AgentFX · … · <span class="font-semibold underline">Paper</span> · Settings</span>
+              <span>trader@example.com ▾</span>
+            </div>
+
+            <!-- Sticky header row -->
+            <div class="p-4 border-b border-slate-300 flex items-center justify-between">
+              <div>
+                <div class="flex items-center gap-2">
+                  <div class="wf-solid rounded-full px-2 py-0.5 text-xs font-semibold">● RUNNING</div>
+                  <div class="text-sm font-semibold">EUR_USD M15 — 2026-07-05</div>
+                </div>
+                <div class="text-xs text-slate-500 mt-0.5">Genome …fbd5bcb2_021_001 · started 2h 14m ago</div>
+              </div>
+              <div class="flex items-center gap-4">
+                <div class="text-right">
+                  <div class="wf-label">Live P&amp;L</div>
+                  <div class="font-mono text-lg font-semibold">+$142.30 <span class="text-xs">(+1.42%)</span></div>
+                </div>
+                <div class="kill rounded px-4 py-2 text-sm font-bold">[⚠ Kill switch]</div>
+              </div>
+            </div>
+
+            <!-- Metrics grid -->
+            <div class="p-4 grid grid-cols-3 md:grid-cols-6 gap-2">
+              <div class="wf-box rounded p-3">
+                <div class="wf-label">Live P&amp;L $</div>
+                <div class="font-mono text-sm mt-1">+142.30</div>
+              </div>
+              <div class="wf-box rounded p-3">
+                <div class="wf-label">Live P&amp;L %</div>
+                <div class="font-mono text-sm mt-1">+1.42%</div>
+              </div>
+              <div class="wf-box rounded p-3">
+                <div class="wf-label">Realised / Unrealised</div>
+                <div class="font-mono text-sm mt-1">+98 / +44</div>
+              </div>
+              <div class="wf-box rounded p-3">
+                <div class="wf-label">Hit rate (live)</div>
+                <div class="font-mono text-sm mt-1">54.2%</div>
+              </div>
+              <div class="wf-box rounded p-3">
+                <div class="wf-label">Sharpe (rolling)</div>
+                <div class="font-mono text-sm mt-1">+0.71</div>
+              </div>
+              <div class="wf-box rounded p-3">
+                <div class="wf-label">Drawdown</div>
+                <div class="font-mono text-sm mt-1">-0.6%</div>
+              </div>
+            </div>
+
+            <!-- Live P&L overlay chart -->
+            <div class="p-4 border-t border-slate-300">
+              <div class="wf-label mb-2">LivePnLChart · live equity vs backtest OOS equity (relative timestamp)</div>
+              <div class="wf-box rounded h-56 flex items-center justify-center text-xs text-slate-500 relative">
+                <div class="absolute left-4 top-3 text-xs">Equity</div>
+                <div class="absolute right-4 top-3 text-xs flex gap-4">
+                  <span>━━ Live</span>
+                  <span class="text-slate-400">- - Backtest OOS</span>
+                </div>
+                [ chart: two curves diverging slightly; live tracks backtest within ~0.4% ]
+                <div class="absolute left-4 bottom-3 text-xs">hours since start</div>
+              </div>
+            </div>
+
+            <!-- Position panel -->
+            <div class="p-4 border-t border-slate-300 grid grid-cols-2 gap-4">
+              <div>
+                <div class="wf-label mb-2">Current position (OANDA)</div>
+                <div class="wf-box rounded p-3 text-xs space-y-1">
+                  <div class="flex justify-between"><span>Instrument</span><span class="font-mono">EUR_USD</span></div>
+                  <div class="flex justify-between"><span>Direction / Units</span><span class="font-mono">LONG · 10,000</span></div>
+                  <div class="flex justify-between"><span>Avg entry price</span><span class="font-mono">1.09342</span></div>
+                  <div class="flex justify-between"><span>Unrealised P&amp;L</span><span class="font-mono">+$44.20</span></div>
+                  <div class="flex justify-between"><span>Stop-loss</span><span class="font-mono">1.09122 (−22 pips)</span></div>
+                  <div class="flex justify-between"><span>Take-profit</span><span class="font-mono">1.09742 (+40 pips)</span></div>
+                </div>
+              </div>
+              <div>
+                <div class="wf-label mb-2">Recent activity summary</div>
+                <div class="wf-box rounded p-3 text-xs space-y-1">
+                  <div class="flex justify-between"><span>Trades today</span><span class="font-mono">7</span></div>
+                  <div class="flex justify-between"><span>Wins / Losses</span><span class="font-mono">4 / 3</span></div>
+                  <div class="flex justify-between"><span>Avg win / loss (pips)</span><span class="font-mono">+18 / −11</span></div>
+                  <div class="flex justify-between"><span>Last signal</span><span class="font-mono">MACD cross ↑ · 12m ago</span></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Trades table -->
+            <div class="p-4 border-t border-slate-300">
+              <div class="wf-label mb-2">Recent trades (last 20)</div>
+              <div class="wf-box rounded overflow-hidden">
+                <div class="grid grid-cols-6 text-xs bg-slate-200 px-3 py-2 font-semibold">
+                  <div>Trade ID</div><div>Origin</div><div>Direction</div><div>Entry / Exit</div><div>Pips</div><div>Closed</div>
+                </div>
+                <div class="grid grid-cols-6 text-xs px-3 py-2 border-t border-slate-300">
+                  <div class="font-mono">t_00147</div><div><span class="wf-solid rounded px-1 text-xs">live</span></div><div>LONG</div><div class="font-mono">1.09210 → 1.09425</div><div class="font-mono">+21.5</div><div>12m ago</div>
+                </div>
+                <div class="grid grid-cols-6 text-xs px-3 py-2 border-t border-slate-300">
+                  <div class="font-mono">t_00146</div><div><span class="wf-solid rounded px-1 text-xs">live</span></div><div>SHORT</div><div class="font-mono">1.09480 → 1.09540</div><div class="font-mono">-6.0</div><div>34m ago</div>
+                </div>
+                <div class="grid grid-cols-6 text-xs px-3 py-2 border-t border-slate-300">
+                  <div class="font-mono">t_00145</div><div><span class="wf-solid rounded px-1 text-xs">live</span></div><div>LONG</div><div class="font-mono">1.09305 → 1.09475</div><div class="font-mono">+17.0</div><div>58m ago</div>
+                </div>
+                <div class="text-center text-xs text-slate-500 py-2 border-t border-slate-300">[ … 17 more rows ]</div>
+              </div>
+            </div>
+
+            <!-- Strategy chart -->
+            <div class="p-4 border-t border-slate-300">
+              <div class="wf-label mb-2">StrategyChart · candles + live &amp; backtest markers</div>
+              <div class="wf-box rounded h-48 flex items-center justify-center text-xs text-slate-500">
+                [ candlestick chart · triangle markers = live entries · circle markers = live exits · faint markers = what backtest would have done ]
+              </div>
+            </div>
+
+            <!-- Decision log stream -->
+            <div class="p-4 border-t border-slate-300">
+              <div class="wf-label mb-2">Decision log (latest first)</div>
+              <div class="wf-box rounded p-3 font-mono text-xs space-y-1 max-h-48 overflow-y-auto">
+                <div>15:04:12 · SIGNAL_COMPUTED · MACD cross ↑ · confidence 0.68</div>
+                <div>15:04:13 · ORDER_PLACED · EUR_USD LONG 10000 · SL 22p TP 40p</div>
+                <div>15:04:13 · ORDER_FILLED · avg 1.09342</div>
+                <div>14:38:02 · SIGNAL_COMPUTED · signal flip → SHORT</div>
+                <div>14:38:03 · POSITION_CLOSED · +17.0 pips realised</div>
+                <div>14:38:04 · ORDER_PLACED · EUR_USD SHORT 10000</div>
+                <div class="text-slate-400">[ … stream continues, 5s refresh ]</div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+        <div class="col-span-3 text-xs text-slate-600 space-y-3 pt-4">
+          <p class="annot">◂ Sticky header keeps status + P&amp;L + kill switch always visible during scroll.</p>
+          <p class="annot">◂ LivePnLChart is THE money view. Live curve vs backtest curve at same relative time — a diverging pair is instantly readable.</p>
+          <p class="annot">◂ Trades table origin badge lets user cross-check whether backtest would have taken the same trade.</p>
+          <p class="annot">◂ 5-second polling refreshes P&amp;L / position / trades / decision log without page reloads.</p>
+        </div>
+      </div>
+    </section>
+
+    <div class="mt-10 p-4 border-l-4 border-slate-400 bg-slate-50 text-xs text-slate-700">
+      <span class="font-semibold">Notes:</span>
+      Everything on this page updates on 5s polling. Status pill transitions RUNNING → HALTED_MANUAL / ERROR / COMPLETED trigger the kill switch to disable and the header P&amp;L color to freeze.
+    </div>
+  </div>
+</body>
+</html>
