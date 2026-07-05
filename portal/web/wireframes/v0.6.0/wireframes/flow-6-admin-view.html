@@ -185,6 +185,11 @@
       <span class="font-semibold">Isolation guarantee:</span>
       RBAC filter (US-018) is enforced at the query layer; the toggle only widens what ADMIN can see, it cannot elevate a TRADER.
     </div>
+
+    <div class="mt-4 p-4 border-l-4 border-amber-500 bg-amber-50 text-xs text-slate-700">
+      <span class="font-semibold">Concurrency banner (10+ runs):</span>
+      Rendered above the list. Text: "N concurrent paper runs across the fleet. Broker connection quotas apply per API key — filter by owner to inspect throttling risk." Amber, dismissable per user for 24h.
+    </div>
   </div>
 </body>
 </html>

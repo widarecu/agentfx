@@ -37,7 +37,7 @@
                   <div class="wf-solid rounded-full px-2 py-0.5 text-xs font-semibold">● RUNNING</div>
                   <div class="text-sm font-semibold">EUR_USD M15 — 2026-07-05</div>
                 </div>
-                <div class="text-xs text-slate-500 mt-0.5">Genome …fbd5bcb2_021_001 · started 2h 14m ago</div>
+                <div class="text-xs text-slate-500 mt-0.5">Genome …fbd5bcb2_021_001 · started 2h 14m ago · OANDA account 101-004-…-001 (Primary · USD)</div>
               </div>
               <div class="flex items-center gap-4">
                 <div class="text-right">
@@ -76,17 +76,22 @@
               </div>
             </div>
 
-            <!-- Live P&L overlay chart -->
+            <!-- Live P&L overlay chart (dual x-axis) -->
             <div class="p-4 border-t border-slate-300">
-              <div class="wf-label mb-2">LivePnLChart · live equity vs backtest OOS equity (relative timestamp)</div>
+              <div class="wf-label mb-2">LivePnLChart · live equity vs backtest OOS · dual x-axis (relative hours + actual UTC)</div>
               <div class="wf-box rounded h-56 flex items-center justify-center text-xs text-slate-500 relative">
                 <div class="absolute left-4 top-3 text-xs">Equity</div>
                 <div class="absolute right-4 top-3 text-xs flex gap-4">
                   <span>━━ Live</span>
                   <span class="text-slate-400">- - Backtest OOS</span>
                 </div>
-                [ chart: two curves diverging slightly; live tracks backtest within ~0.4% ]
-                <div class="absolute left-4 bottom-3 text-xs">hours since start</div>
+                <div class="absolute inset-x-4 top-8 text-[10px] flex justify-between text-slate-400">
+                  <span>13:04 UTC</span><span>13:34</span><span>14:04</span><span>14:34</span><span>15:04</span>
+                </div>
+                [ two curves; live tracks backtest within ~0.4% ]
+                <div class="absolute inset-x-4 bottom-3 text-[10px] flex justify-between">
+                  <span>h0</span><span>h0.5</span><span>h1.0</span><span>h1.5</span><span>h2.0 · relative</span>
+                </div>
               </div>
             </div>
 
@@ -118,17 +123,17 @@
             <div class="p-4 border-t border-slate-300">
               <div class="wf-label mb-2">Recent trades (last 20)</div>
               <div class="wf-box rounded overflow-hidden">
-                <div class="grid grid-cols-6 text-xs bg-slate-200 px-3 py-2 font-semibold">
-                  <div>Trade ID</div><div>Origin</div><div>Direction</div><div>Entry / Exit</div><div>Pips</div><div>Closed</div>
+                <div class="grid grid-cols-7 text-xs bg-slate-200 px-3 py-2 font-semibold">
+                  <div>Trade ID</div><div>Origin</div><div>Direction</div><div>Signal reason</div><div>Entry / Exit</div><div>Pips</div><div>Closed</div>
                 </div>
-                <div class="grid grid-cols-6 text-xs px-3 py-2 border-t border-slate-300">
-                  <div class="font-mono">t_00147</div><div><span class="wf-solid rounded px-1 text-xs">live</span></div><div>LONG</div><div class="font-mono">1.09210 → 1.09425</div><div class="font-mono">+21.5</div><div>12m ago</div>
+                <div class="grid grid-cols-7 text-xs px-3 py-2 border-t border-slate-300">
+                  <div class="font-mono">t_00147</div><div><span class="wf-solid rounded px-1 text-xs">live</span></div><div>LONG</div><div class="font-mono text-xs">MACD ↑ · TP hit</div><div class="font-mono">1.09210 → 1.09425</div><div class="font-mono">+21.5</div><div>12m ago</div>
                 </div>
-                <div class="grid grid-cols-6 text-xs px-3 py-2 border-t border-slate-300">
-                  <div class="font-mono">t_00146</div><div><span class="wf-solid rounded px-1 text-xs">live</span></div><div>SHORT</div><div class="font-mono">1.09480 → 1.09540</div><div class="font-mono">-6.0</div><div>34m ago</div>
+                <div class="grid grid-cols-7 text-xs px-3 py-2 border-t border-slate-300">
+                  <div class="font-mono">t_00146</div><div><span class="wf-solid rounded px-1 text-xs">live</span></div><div>SHORT</div><div class="font-mono text-xs">RSI ≥ 70 · SL hit</div><div class="font-mono">1.09480 → 1.09540</div><div class="font-mono">-6.0</div><div>34m ago</div>
                 </div>
-                <div class="grid grid-cols-6 text-xs px-3 py-2 border-t border-slate-300">
-                  <div class="font-mono">t_00145</div><div><span class="wf-solid rounded px-1 text-xs">live</span></div><div>LONG</div><div class="font-mono">1.09305 → 1.09475</div><div class="font-mono">+17.0</div><div>58m ago</div>
+                <div class="grid grid-cols-7 text-xs px-3 py-2 border-t border-slate-300">
+                  <div class="font-mono">t_00145</div><div><span class="wf-solid rounded px-1 text-xs">live</span></div><div>LONG</div><div class="font-mono text-xs">MACD ↑ · opposite signal</div><div class="font-mono">1.09305 → 1.09475</div><div class="font-mono">+17.0</div><div>58m ago</div>
                 </div>
                 <div class="text-center text-xs text-slate-500 py-2 border-t border-slate-300">[ … 17 more rows ]</div>
               </div>

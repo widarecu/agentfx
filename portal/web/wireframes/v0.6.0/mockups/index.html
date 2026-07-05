@@ -29,10 +29,10 @@
 
       <a href="./settings-credentials.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
         <div class="flex items-baseline justify-between mb-1">
-          <div class="font-semibold">2 · Settings · OANDA Credentials</div>
+          <div class="font-semibold">2 · Settings · Credentials + accounts</div>
           <div class="text-xs text-slate-500">Flow 5</div>
         </div>
-        <div class="text-xs text-slate-600 dark:text-slate-400">Three credential states (empty, unverified, verified). Add / Edit form with PRACTICE-only radio.</div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">API-key form + read-only table of OANDA sub-accounts fetched via <code class="text-xs">/v3/accounts</code>. Balances are live.</div>
       </a>
 
       <a href="./paper-approvals.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
@@ -43,12 +43,20 @@
         <div class="text-xs text-slate-600 dark:text-slate-400">Cards for each pending VALIDATED genome with Gate-B coloured metrics + Approve / Reject CTAs.</div>
       </a>
 
+      <a href="./paper-approvals-empty.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
+        <div class="flex items-baseline justify-between mb-1">
+          <div class="font-semibold">3b · Approval queue — empty</div>
+          <div class="text-xs text-slate-500">Flow 2</div>
+        </div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Positive empty state ("your queue is empty") + recent-activity strip so users see prior decisions.</div>
+      </a>
+
       <a href="./deploy-modal.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
         <div class="flex items-baseline justify-between mb-1">
           <div class="font-semibold">4 · Deploy paper modal</div>
           <div class="text-xs text-slate-500">Flow 2</div>
         </div>
-        <div class="text-xs text-slate-600 dark:text-slate-400">Modal collecting name / initial balance / max position / daily-loss / kill-switch threshold.</div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Pick OANDA sub-account (live balances) → set max position / thresholds. Snapshot balance is read from the account at run start; no manual "initial balance".</div>
       </a>
 
       <a href="./reject-modal.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
@@ -56,15 +64,15 @@
           <div class="font-semibold">5 · Reject-with-reason modal</div>
           <div class="text-xs text-slate-500">Flow 2</div>
         </div>
-        <div class="text-xs text-slate-600 dark:text-slate-400">Optional reason field persisted to decision log.</div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Reason field is <span class="font-semibold">required</span> (≥ 10 chars). Quick-pick chips + counter. Feeds the Evolution agent's next variations.</div>
       </a>
 
       <a href="./paper-runs.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
         <div class="flex items-baseline justify-between mb-1">
-          <div class="font-semibold">6 · Runs list (many rows)</div>
+          <div class="font-semibold">6 · Runs list (11 active — concurrency banner)</div>
           <div class="text-xs text-slate-500">Flow 3</div>
         </div>
-        <div class="text-xs text-slate-600 dark:text-slate-400">Aggregate P&L header, compact per-run rows, filters, 5s polling indicator.</div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">Aggregate P&L header, compact per-run rows with account badges, 10+-run amber warning banner explaining broker quotas.</div>
       </a>
 
       <a href="./paper-run-detail.html" class="block bg-white dark:bg-slate-800 border-2 border-emerald-400 rounded-lg p-5 hover:shadow-lg transition">
@@ -72,7 +80,7 @@
           <div class="font-semibold">7 · Run detail — the money view ★</div>
           <div class="text-xs text-slate-500">Flow 3</div>
         </div>
-        <div class="text-xs text-slate-600 dark:text-slate-400">Live P&L vs backtest overlay chart, kill switch, position panel, trades table, decision log. The page that matters most.</div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">OANDA account context, live balance + snapshot, dual-axis Live-vs-backtest chart, trades table with <span class="font-semibold">signal reason</span> column, decision log.</div>
       </a>
 
       <a href="./kill-switch-countdown.html" class="block bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5 hover:border-emerald-400 hover:shadow transition">
@@ -88,9 +96,27 @@
           <div class="font-semibold">9 · ADMIN view · scope toggle</div>
           <div class="text-xs text-slate-500">Flow 6</div>
         </div>
-        <div class="text-xs text-slate-600 dark:text-slate-400">"My runs / All runs" toggle for ADMIN role. Owner email badges on rows.</div>
+        <div class="text-xs text-slate-600 dark:text-slate-400">"My runs / All runs" toggle. Owner email + OANDA account badges on rows. Fleet-wide 10+ concurrency banner.</div>
       </a>
 
+    </div>
+
+    <!-- v2 changelog -->
+    <div class="mt-10 bg-white dark:bg-slate-800 border border-emerald-300 dark:border-emerald-700 rounded-lg p-5">
+      <div class="text-sm font-semibold mb-2 flex items-center gap-2">
+        <span class="bg-emerald-500 text-white text-xs px-2 py-0.5 rounded">v2</span>
+        Changes from Wilson's answers (2026-07-05)
+      </div>
+      <ul class="text-xs text-slate-600 dark:text-slate-400 space-y-1 list-disc list-inside">
+        <li><span class="font-semibold text-slate-800 dark:text-slate-200">Accounts concept added.</span> Credentials store the OANDA API key; the accounts under that key are fetched via <code class="text-xs">/v3/accounts</code>. Deploy modal picks an account and reads its balance live. AgentFX never asks the user for an "initial balance" — that's set inside OANDA.</li>
+        <li><span class="font-semibold text-slate-800 dark:text-slate-200">Snapshot balance.</span> Run's P&L % denominator is the account balance <em>at the moment the paper runner starts</em>, not a user-typed number.</li>
+        <li><span class="font-semibold text-slate-800 dark:text-slate-200">Trades table gains a Signal reason column.</span> DSL entry rule + exit cause (TP / SL / opposite / kill) per trade.</li>
+        <li><span class="font-semibold text-slate-800 dark:text-slate-200">LivePnLChart is now dual-x-axis.</span> Bottom = relative hours since run start; top = actual UTC timestamp.</li>
+        <li><span class="font-semibold text-slate-800 dark:text-slate-200">Reject reason is required</span> (≥ 10 chars) with quick-pick chips.</li>
+        <li><span class="font-semibold text-slate-800 dark:text-slate-200">Approval queue empty state</span> added as a positive affirmation with recent-activity strip.</li>
+        <li><span class="font-semibold text-slate-800 dark:text-slate-200">Concurrency indicator</span> — amber banner appears at 10+ concurrent paper runs, explains broker quota headroom.</li>
+        <li>Nav placement unchanged (fine per Wilson); owner badge stays indigo.</li>
+      </ul>
     </div>
 
     <div class="mt-10 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">

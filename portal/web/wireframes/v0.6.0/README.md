@@ -17,6 +17,44 @@ Phase 2 of the v0.6.0 plan (see `~/.claude/plans/i-think-we-need-functional-pony
 
 Sign-off means: comment on the PR narrating any changes wanted, then explicit approval.
 
+## Answers received (Wilson · 2026-07-05)
+
+Wilson answered all 8 open questions on the initial PR. Mockups + wireframes have been revised on the same branch (`docs/v0.6.0-ux-wireframes`). Summary of what changed and why below.
+
+| # | Question | Answer | Change made |
+|---|---|---|---|
+| 1 | Trades table: add a signal reason column? | **Yes** | Added `Signal reason` column to `paper-run-detail.html` trades table + Flow 3 wireframe. Value = DSL entry rule + exit cause (TP / SL / opposite / kill). |
+| 2 | LivePnLChart x-axis: relative-only or dual? | **Relative + actuals** | SVG chart now has two x-axes: bottom = relative hours since run start, top = actual UTC timestamp. |
+| 3 | Approval queue empty state? | **Yes, meaningful** | New `paper-approvals-empty.html` mockup — positive "your queue is empty" + Gate B recap + recent-activity strip (last approve/reject events). |
+| 4 | Deploy modal defaults? | **Rethink — introduce accounts** | Removed the "Initial balance (USD)" field entirely (that's set inside OANDA when you open the account). Added an OANDA sub-account picker (radio list, live balances). Added a read-only "Snapshot balance" preview showing what will be captured at run start. Same treatment applied to Settings — see "OANDA account model" below. |
+| 5 | Reject reason required? | **Required** | `reject-modal.html` now requires ≥ 10 chars, adds quick-pick chips, char counter. Reject button disabled until valid. |
+| 6 | Nav placement of "Paper"? | **Fine** | Unchanged. |
+| 7 | Owner badge colour? | **Indigo** | Unchanged (mockups already indigo). |
+| 8 | Concurrency indicator at 10+ paper runs? | **Yes** | Amber banner appears above the list on `paper-runs.html` and `admin-view.html` when running count ≥ 10. Explains broker quota headroom + dismissible for 24h. |
+
+## OANDA account model (Wilson's answer #4, expanded)
+
+Wilson pointed out — correctly — that an "initial balance" is not something AgentFX can set. Balances live in OANDA. A user with an OANDA login can have multiple sub-accounts under one API key, each with its own currency, balance, and risk isolation. The revised model:
+
+- **Credentials store just the API key** (plus environment: `PRACTICE` for now, `LIVE` gated by v1.0.0).
+- **On verify** AgentFX calls OANDA `/v3/accounts` and lists the sub-accounts the token can access. Each row: account ID, alias, currency, balance, margin available. This list is shown read-only in `/settings` and cached in the DB (ID + alias + currency; balance always queried live).
+- **Deploy modal picks one sub-account** from that list. The account row is highlighted; other columns (max position, daily-loss %, kill-switch DD) are unchanged.
+- **Snapshot balance** — at the moment the paper runner subprocess starts, it queries the selected account's current balance and stores it on the `runs` row as `snapshot_balance`. That's the denominator for all P&L % numbers on the run detail page. It replaces the manual "initial balance" input.
+- **Run detail** shows both `snapshot_balance` and the **live** account balance from OANDA (polled every 5 s), so users can see both "how has this run performed" (delta from snapshot) and "what's actually in the account right now" (live).
+- **Concurrency banner mentions per-API-key quotas** because multiple runs on one key share the OANDA v20 REST rate limit (120 req/s). The admin banner calls this out explicitly.
+
+### Impact on US files (needs downstream update — flag in PR-1, act in PR-C)
+
+The following US files were written before the accounts concept and need revising before Phase 4 begins. Recorded here so they aren't forgotten:
+
+- **US-019** (`user_oanda_credentials`) — schema drops `oanda_account_id` from this table. Add new table `user_oanda_accounts` cached from `/v3/accounts` (columns: `id`, `user_credentials_id` FK, `oanda_account_id`, `alias`, `currency`, `last_seen_at`). Verify endpoint now returns the account list, not just a boolean.
+- **US-020** (`OandaClient` order-execution) — add `list_accounts()` returning the account list; `place_market_order()` etc. gain an `account_id` positional arg. Client is scoped to one API key, addressed by account ID per call.
+- **US-021** (paper runner) — `runs.oanda_account_id` column added (FK-less; validated against the cached table on start). `runs.snapshot_balance` column added. Loop snapshots balance on first tick before placing any order. `initial_balance` field on `runs` becomes non-nullable via backfill = `snapshot_balance` for consistency.
+- **US-022** (portal) — `DeployPaperModal` gains an account list; `CredentialsForm` shrinks to API key + environment only; `PaperRunDetail` shows account context + live balance vs snapshot.
+- **US-023** (risk controls + approval state machine) — daily loss cap is computed from `snapshot_balance` (not user input). Kill switch, DD threshold unchanged.
+
+These edits will land as part of PR-C (credentials schema + migration) — noting them here so the Phase 4 branch starts from the right shape.
+
 ## Wilson-approved decisions (locked before this UX pass began)
 
 | Decision | Choice | Rationale |
@@ -32,7 +70,7 @@ Sign-off means: comment on the PR narrating any changes wanted, then explicit ap
 
 **Goal**: get a new user from "just signed in" to "OANDA verified, ready to approve a genome" in under a minute.
 
-**Sequence**: land on empty `/paper` → prominent banner "Set OANDA credentials before deploying" → click Set-up-credentials → `/settings` OANDA tab → fill form (account ID + API key + PRACTICE) → Save → Test connection → verified badge appears with timestamp → return to `/paper` → empty state now says "You're set up. Go to the approval queue."
+**Sequence**: land on empty `/paper` → prominent banner "Set OANDA credentials before deploying" → click Set-up-credentials → `/settings` OANDA tab → paste API key + pick PRACTICE → Save → Test connection → OANDA returns account list → detected-accounts table appears → verified badge with timestamp → return to `/paper` → empty state now says "You're set up. Go to the approval queue."
 
 **Design decision**: paper-empty and approval-queue-empty states point at the *next action*, not at settings. Users shouldn't have to navigate manually.
 
@@ -42,7 +80,9 @@ Sign-off means: comment on the PR narrating any changes wanted, then explicit ap
 
 **Goal**: review VALIDATED genomes that the user (or an agent, later) has sent to their queue, and explicitly approve each one they want to paper-trade.
 
-**Sequence**: `/paper/approvals` → cards per pending genome with Gate-B-coloured metrics (green ▲ / rose ✗ / amber borderline) → Approve opens the Deploy Paper modal → configure name / initial balance / max position / thresholds → Confirm → redirect to `/paper/:new_id` where the paper runner has started.
+**Sequence**: `/paper/approvals` → cards per pending genome with Gate-B-coloured metrics (green ▲ / rose ✗ / amber borderline) → Approve opens the Deploy Paper modal → pick the OANDA sub-account (live balances shown) → configure name / max position / thresholds → Confirm → redirect to `/paper/:new_id` where the paper runner has started. The runner snapshots the account balance on its first tick; that value is the P&L % denominator for the whole run.
+
+**Empty state**: `paper-approvals-empty.html` — positive affirmation "your queue is empty", Gate B recap, recent-activity strip (last approve/reject events). Never a scolding tone.
 
 **Design decision**: metrics are coloured by *individual* Gate-B threshold status, not by overall pass/fail. Users see immediately why a genome is borderline vs solid. Cards for genomes that fully clear Gate B get a subtle green border to distinguish them.
 
@@ -58,9 +98,11 @@ Sign-off means: comment on the PR narrating any changes wanted, then explicit ap
 
 **Design decision**: sticky header keeps status + P&L + kill switch always visible while scrolling. Users must never have to scroll up to find the kill switch in an emergency.
 
-**Design decision**: LivePnLChart uses "relative timestamp from run start" for the x-axis, not calendar time. Aligns live-run-hour-0 with backtest-hour-0 so divergence over the same relative duration is visually obvious.
+**Design decision**: LivePnLChart is dual-x-axis. Bottom = relative hours since run start (aligns live-hour-0 with backtest-hour-0 so divergence over same relative duration is visually obvious). Top = actual UTC timestamp (so users can correlate spikes with real-world events).
 
-**Design decision**: Trades table's `origin: live | backtest` badge column lets users answer "did the strategy actually trade what the backtest said it would?" in a quick scan.
+**Design decision**: Trades table has three semantic columns beyond price/pips — Origin (`live | backtest`), Direction (`LONG | SHORT`), and **Signal reason** (DSL entry rule that fired + exit cause: TP hit / SL hit / opposite signal / kill). Signal reason lets users answer "which rule paid, and why did the trade close" without opening the DSL editor.
+
+**Design decision**: Account context is shown in the header (OANDA account ID + alias + currency) and the Account & Risk panel (snapshot balance + live balance). P&L % = (live balance − snapshot) / snapshot; balance is refetched from OANDA every 5s. Users never type an initial balance — it's read from the selected sub-account at run start.
 
 **Design decision**: Everything on this page updates on 5-second polling — matches the existing portal convention from `EvolutionRunDetail`. WebSocket streaming is a v0.6.2+ optimization.
 
@@ -80,7 +122,11 @@ Sign-off means: comment on the PR narrating any changes wanted, then explicit ap
 
 ### Flow 5 — Settings / credentials
 
-**Goal**: user manages their OANDA credentials — four states (empty, edit form, set-but-unverified, set-and-verified).
+**Goal**: user pastes an OANDA API key, verifies it, and sees the list of sub-accounts it can access. Four states (empty, edit form, set-but-unverified, set-and-verified) plus a fifth "detected accounts" panel that renders under the verified state.
+
+**Design decision**: form collects **only the API key** and environment. The account ID is not typed — it's discovered from OANDA on verify. This is the fix for Wilson's answer #4 — see the "OANDA account model" section above.
+
+**Design decision**: detected-accounts table is read-only. Columns: account ID, alias, currency, live balance, live margin available, open runs count. Balance always fetched live; AgentFX only persists the ID + alias + currency.
 
 **Design decision**: verified state gets a subtle emerald border to make "you're good to deploy" spatially unambiguous. The "Test connection" CTA disappears once verified — replaced by "Re-verify" as a manual refresh path.
 
@@ -100,7 +146,11 @@ Sign-off means: comment on the PR narrating any changes wanted, then explicit ap
 
 **Design decision**: in "All runs" mode, each row shows a distinct indigo owner-email badge. ADMIN badge in the top-right nav also colored indigo for role clarity.
 
+**Design decision**: rows also show an OANDA account badge (e.g. `acct …-001`) — support / oversight questions frequently involve "which account is this hitting". Same badge on the TRADER (`/paper`) list.
+
 **Design decision**: TRADER users don't see the toggle. Backend enforces `scope=all` → 403 when role != ADMIN (per US-018).
+
+**Concurrency banner**: when running-run count ≥ 10 (per-user for TRADER, fleet-wide for ADMIN), an amber banner appears above the list. Explains that OANDA v20 REST enforces 120 req/s per API key and calls out the user (in ADMIN scope) most at risk of throttling. Dismissible for 24h.
 
 **Mockup**: [`mockups/admin-view.html`](./mockups/admin-view.html)
 
@@ -126,10 +176,13 @@ Components labeled with their exact filename in `portal/web/src/components/` (ma
 |---|---|---|
 | `RequireRole.tsx` | Router | Role-gated route wrapper; composes with `ProtectedRoute` |
 | `KillSwitchButton.tsx` | Run detail page | Big red button + 3-second undo toast; owns the `kill_requested_at` API call |
-| `LivePnLChart.tsx` | Run detail page | Live equity curve overlaid on backtest OOS equity, relative-timestamp x-axis |
-| `CredentialsForm.tsx` | Settings page | 3 fields + test-connection button; password-style masked API key with visibility toggle |
-| `DeployPaperModal.tsx` | Approval queue | Modal collected from Approve action; validates client-side |
+| `LivePnLChart.tsx` | Run detail page | Live equity curve overlaid on backtest OOS equity, dual-x-axis (relative hours + actual UTC) |
+| `CredentialsForm.tsx` | Settings page | API-key + environment; test-connection triggers OANDA account discovery |
+| `OandaAccountsTable.tsx` | Settings page | Read-only table of detected sub-accounts + live balances; polled every 15s while page open |
+| `DeployPaperModal.tsx` | Approval queue | Modal from Approve action; account picker (radio list, live balances) + risk knobs; snapshot balance preview |
 | `ApprovalQueueCard.tsx` | Approval queue | Compact genome summary + Gate-B-colored metrics + Approve/Reject CTAs |
+| `RejectGenomeModal.tsx` | Approval queue | Required reason (≥ 10 chars) + quick-pick chip enum + counter |
+| `ConcurrencyBanner.tsx` | Runs list, admin view | Amber banner shown when running-run count ≥ 10 |
 
 ### New pages (proposed for US-022)
 
@@ -146,33 +199,25 @@ Components labeled with their exact filename in `portal/web/src/components/` (ma
 - `portal/web/src/router.tsx` — 4 new routes, all wrapped in `RequireRole allowed={['TRADER','ADMIN']}`
 - Nav (in `App.tsx` or nav component) — add "Paper" and "Settings" entries
 
-## Open questions for Wilson
+## Follow-ups after sign-off
 
-1. **Trades table columns.** The current mockup shows Trade ID / Origin / Direction / Entry-Exit / Pips / P&L $ / Closed. Do you want a "signal reason" column? A stop-hit vs target-hit vs opposite-signal indicator? Trades table currently reuses `TradesTable`; we can extend the column set here if you want.
+Small items outside the 8 answered questions that are worth calling out before Phase 3 begins:
 
-2. **LivePnLChart x-axis: relative vs calendar.** Mockup uses "hours since run start" so live and backtest curves align by duration. Alternative: dual-x — bottom axis relative hours, top axis actual timestamp. Adds complexity but more informative.
-
-3. **Approval queue when empty.** Mockup shows a populated queue. What about the empty state? A "Head to Evolution to find a validated genome" nudge, or a passive "no pending approvals" message? Recommend the nudge, but calling out.
-
-4. **Deploy modal defaults.** Currently: 10,000 initial balance, 10,000 max position (1 lot), 2% daily loss, 5% kill DD. Are these acceptable safe defaults for paper, or too aggressive / too conservative?
-
-5. **Reject-with-reason: required or optional?** Mockup shows optional. If required, it slows down the reject flow but produces cleaner audit history. My preference: optional (mockup), with a placeholder that nudges toward filling it in.
-
-6. **Nav placement of "Paper".** Currently between Evolution and Settings. Could also be at the top after Dashboard. Preference?
-
-7. **Owner badge colour in ADMIN view.** Currently indigo (matches ADMIN badge). Alternative: neutral slate to reduce visual weight. Which feels right?
-
-8. **Concurrency indicator.** Since unlimited concurrent runs, do we need a warning at some threshold (e.g., "you have 10+ paper runs; broker connection quotas apply")? Not in current mockup — flag if you'd want it.
+- **Rejection reasons feed the Evolution agent.** The quick-pick chips in `reject-modal.html` are UI sugar — they resolve to structured `reject_reason_code` values (e.g. `TRADE_COUNT_LOW`, `SHARPE_BORDERLINE`, `OVERFIT_TO_REGIME`, `WAIT_FOR_REEVOLUTION`, `SIMILAR_TO_RUNNING`, `OTHER`) plus the free-text `reject_reason_text`. Evolution agent V1 in v0.7.0 will bias its variation generator away from patterns tagged with the top rejection codes. Noted so the DB migration in PR-F picks the enum up front rather than adding it later.
+- **Snapshot balance is captured post-authorization but pre-first-order.** If OANDA is unreachable at that moment, the runner retries per its backoff policy; if it exhausts retries it transitions the run to `ERROR` with `stop_reason=BROKER_UNREACHABLE` and never places an order. No live orders exist without a snapshot.
+- **Concurrency banner threshold is a constant for MVP.** Hard-coded at 10 — no user setting yet. If Wilson later wants it per-user (some users have higher OANDA rate limits under premium tiers), we add `settings.concurrency_warn_threshold` in v0.6.1.
 
 ## Verification checklist for this mockup PR
 
 - [ ] Open `wireframes/index.html` — all 6 flows link out and back
-- [ ] Open `mockups/index.html` — all 9 mockups link out and back
+- [ ] Open `mockups/index.html` — all 10 mockups link out and back (including the new empty-state variant)
 - [ ] Kill switch mockup — countdown JS visibly ticks 2 → 1 → 0
-- [ ] Deploy modal → click "Approve & deploy" → lands on `paper-run-detail.html`
-- [ ] Approval queue → click Reject → lands on `reject-modal.html`
-- [ ] Settings verified state has visible emerald border to distinguish from unverified
-- [ ] ADMIN view shows scope toggle, owner email badges on rows
+- [ ] Deploy modal → account picker shows 3 accounts with live balances; Approve & deploy → `paper-run-detail.html`
+- [ ] Approval queue → click Reject → `reject-modal.html` with required reason + quick-pick chips
+- [ ] Settings shows API-key-only form + detected-accounts table
+- [ ] Run detail sticky header shows OANDA account context; trades table has Signal reason column; chart has dual x-axis
+- [ ] `paper-runs.html` and `admin-view.html` show the concurrency banner (running count ≥ 10)
+- [ ] `paper-approvals-empty.html` reachable from `paper-approvals.html`'s footer link
 - [ ] Every mockup is legible in browser dark mode (via `dark:` variants)
 
 ## After sign-off

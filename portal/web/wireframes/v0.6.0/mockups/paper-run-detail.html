@@ -34,8 +34,14 @@
           </span>
           <div class="text-lg font-semibold">EUR_USD M15 — 2026-07-05</div>
         </div>
-        <div class="text-xs text-slate-500 dark:text-slate-400 mt-1 font-mono">
-          genome_gen_evorun_20260702_fbd5bcb2_021_001 · started 2h 14m ago
+        <div class="text-xs text-slate-500 dark:text-slate-400 mt-1 font-mono flex flex-wrap items-center gap-x-3 gap-y-0.5">
+          <span>genome_gen_evorun_20260702_fbd5bcb2_021_001</span>
+          <span class="text-slate-300 dark:text-slate-600">·</span>
+          <span>started 2h 14m ago</span>
+          <span class="text-slate-300 dark:text-slate-600">·</span>
+          <span class="inline-flex items-center gap-1 bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 px-1.5 py-0.5 rounded normal-case">
+            OANDA account <span class="font-semibold">101-004-12345678-001</span> · Primary · USD
+          </span>
         </div>
       </div>
       <div class="flex items-center gap-6">
@@ -83,7 +89,7 @@
       <div class="flex items-center justify-between mb-3">
         <div>
           <div class="text-sm font-semibold">Live vs backtest equity</div>
-          <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">Component: <code class="bg-slate-100 dark:bg-slate-700 px-1 rounded">LivePnLChart</code> — relative timestamp from run start</div>
+          <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">Component: <code class="bg-slate-100 dark:bg-slate-700 px-1 rounded">LivePnLChart</code> — dual x-axis: relative hours (bottom) + actual timestamp (top)</div>
         </div>
         <div class="flex gap-4 text-xs">
           <span class="flex items-center gap-1"><span class="w-3 h-0.5 bg-emerald-500 inline-block"></span> Live</span>
@@ -92,24 +98,36 @@
       </div>
       <!-- Placeholder chart with SVG -->
       <div class="relative h-64 bg-slate-50 dark:bg-slate-900 rounded border border-slate-100 dark:border-slate-700">
-        <svg viewBox="0 0 600 200" class="w-full h-full">
-          <!-- axes -->
-          <line x1="30" y1="180" x2="580" y2="180" stroke="#94a3b8" stroke-width="0.5"/>
-          <line x1="30" y1="20" x2="30" y2="180" stroke="#94a3b8" stroke-width="0.5"/>
+        <svg viewBox="0 0 600 220" class="w-full h-full">
+          <!-- top x-axis (actual timestamps) -->
+          <line x1="30" y1="30" x2="580" y2="30" stroke="#94a3b8" stroke-width="0.5"/>
+          <text x="35" y="20" font-size="8" fill="#94a3b8">13:04 UTC</text>
+          <text x="180" y="20" font-size="8" fill="#94a3b8">13:34</text>
+          <text x="330" y="20" font-size="8" fill="#94a3b8">14:04</text>
+          <text x="480" y="20" font-size="8" fill="#94a3b8">14:34</text>
+          <text x="530" y="20" font-size="8" fill="#94a3b8">15:04</text>
+          <!-- bottom x-axis (relative hours) -->
+          <line x1="30" y1="190" x2="580" y2="190" stroke="#94a3b8" stroke-width="0.5"/>
+          <line x1="30" y1="30" x2="30" y2="190" stroke="#94a3b8" stroke-width="0.5"/>
           <!-- backtest OOS (dashed gray) -->
-          <path d="M30,150 Q120,140 200,120 T400,80 T580,60"
+          <path d="M30,160 Q120,150 200,130 T400,90 T580,70"
                 fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="4,3"/>
           <!-- live (solid emerald) -->
-          <path d="M30,150 Q100,145 180,130 T350,95 T500,75"
+          <path d="M30,160 Q100,155 180,140 T350,105 T500,85"
                 fill="none" stroke="#10b981" stroke-width="2"/>
           <!-- current point -->
-          <circle cx="500" cy="75" r="4" fill="#10b981"/>
+          <circle cx="500" cy="85" r="4" fill="#10b981"/>
           <!-- labels -->
-          <text x="10" y="25" font-size="9" fill="#64748b">Equity</text>
-          <text x="540" y="195" font-size="9" fill="#64748b">hours</text>
+          <text x="10" y="35" font-size="9" fill="#64748b">Equity</text>
+          <text x="35" y="205" font-size="8" fill="#64748b">h0</text>
+          <text x="180" y="205" font-size="8" fill="#64748b">h0.5</text>
+          <text x="330" y="205" font-size="8" fill="#64748b">h1.0</text>
+          <text x="480" y="205" font-size="8" fill="#64748b">h1.5</text>
+          <text x="530" y="205" font-size="8" fill="#64748b">h2.0</text>
+          <text x="290" y="218" font-size="8" fill="#94a3b8">hours since run start</text>
         </svg>
       </div>
-      <div class="mt-2 text-xs text-slate-500 dark:text-slate-400">Live is tracking backtest within ~0.4% drift. Positive divergence — live slightly outperforming.</div>
+      <div class="mt-2 text-xs text-slate-500 dark:text-slate-400">Live is tracking backtest within ~0.4% drift. Positive divergence — live slightly outperforming. Top axis shows actual UTC time; bottom axis anchors live-hour-N to backtest-hour-N.</div>
     </div>
 
     <!-- POSITION + RECENT TRADES + STRATEGY CHART side-by-side -->
@@ -140,16 +158,20 @@
         </dl>
       </div>
 
-      <!-- Risk config -->
+      <!-- OANDA account + risk config -->
       <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
-        <div class="text-sm font-semibold mb-3">Risk config</div>
+        <div class="text-sm font-semibold mb-3">Account &amp; risk</div>
         <dl class="space-y-2 text-sm">
-          <div class="flex justify-between"><dt class="text-slate-500">Initial balance</dt><dd class="font-mono">$10,000</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-500">OANDA account</dt><dd class="font-mono text-xs">101-004-…-001 · Primary</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-500">Balance <span class="text-xs text-slate-400">(live)</span></dt><dd class="font-mono text-emerald-700 dark:text-emerald-400">$10,142.30</dd></div>
+          <div class="flex justify-between"><dt class="text-slate-500">Snapshot at start</dt><dd class="font-mono text-slate-500">$10,000.00</dd></div>
           <div class="flex justify-between"><dt class="text-slate-500">Max position</dt><dd class="font-mono">10,000 units</dd></div>
           <div class="flex justify-between"><dt class="text-slate-500">Daily loss cap</dt><dd class="font-mono">2.0%</dd></div>
           <div class="flex justify-between"><dt class="text-slate-500">Kill-switch DD</dt><dd class="font-mono">5.0%</dd></div>
-          <div class="flex justify-between"><dt class="text-slate-500">Approved</dt><dd class="font-mono text-xs">2h 14m ago</dd></div>
         </dl>
+        <div class="mt-3 text-xs text-slate-500 dark:text-slate-400">
+          P&amp;L % = (balance − snapshot) / snapshot. Balance refetched from OANDA every 5s.
+        </div>
       </div>
     </div>
 
@@ -168,6 +190,7 @@
             <th class="text-left px-5 py-2 font-medium">Trade ID</th>
             <th class="text-left px-5 py-2 font-medium">Origin</th>
             <th class="text-left px-5 py-2 font-medium">Direction</th>
+            <th class="text-left px-5 py-2 font-medium">Signal reason</th>
             <th class="text-left px-5 py-2 font-medium">Entry / Exit</th>
             <th class="text-right px-5 py-2 font-medium">Pips</th>
             <th class="text-right px-5 py-2 font-medium">P&amp;L $</th>
@@ -179,6 +202,10 @@
             <td class="px-5 py-2 font-mono text-xs">t_00147</td>
             <td class="px-5 py-2"><span class="bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-300 text-xs font-semibold px-2 py-0.5 rounded">live</span></td>
             <td class="px-5 py-2">LONG</td>
+            <td class="px-5 py-2 text-xs">
+              <span class="font-mono">MACD ↑</span>
+              <span class="ml-1 text-slate-400">· TP hit</span>
+            </td>
             <td class="px-5 py-2 font-mono text-xs">1.09210 → 1.09425</td>
             <td class="px-5 py-2 text-right font-mono text-emerald-700 dark:text-emerald-400">+21.5</td>
             <td class="px-5 py-2 text-right font-mono text-emerald-700 dark:text-emerald-400">+$21.50</td>
@@ -188,6 +215,10 @@
             <td class="px-5 py-2 font-mono text-xs">t_00146</td>
             <td class="px-5 py-2"><span class="bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-300 text-xs font-semibold px-2 py-0.5 rounded">live</span></td>
             <td class="px-5 py-2">SHORT</td>
+            <td class="px-5 py-2 text-xs">
+              <span class="font-mono">RSI ≥ 70</span>
+              <span class="ml-1 text-rose-500">· SL hit</span>
+            </td>
             <td class="px-5 py-2 font-mono text-xs">1.09480 → 1.09540</td>
             <td class="px-5 py-2 text-right font-mono text-rose-700 dark:text-rose-400">−6.0</td>
             <td class="px-5 py-2 text-right font-mono text-rose-700 dark:text-rose-400">−$6.00</td>
@@ -197,16 +228,23 @@
             <td class="px-5 py-2 font-mono text-xs">t_00145</td>
             <td class="px-5 py-2"><span class="bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-300 text-xs font-semibold px-2 py-0.5 rounded">live</span></td>
             <td class="px-5 py-2">LONG</td>
+            <td class="px-5 py-2 text-xs">
+              <span class="font-mono">MACD ↑</span>
+              <span class="ml-1 text-slate-400">· opposite signal</span>
+            </td>
             <td class="px-5 py-2 font-mono text-xs">1.09305 → 1.09475</td>
             <td class="px-5 py-2 text-right font-mono text-emerald-700 dark:text-emerald-400">+17.0</td>
             <td class="px-5 py-2 text-right font-mono text-emerald-700 dark:text-emerald-400">+$17.00</td>
             <td class="px-5 py-2 text-right text-xs text-slate-500">58m ago</td>
           </tr>
           <tr class="text-slate-400">
-            <td colspan="7" class="text-center px-5 py-3 text-xs">… 17 more rows</td>
+            <td colspan="8" class="text-center px-5 py-3 text-xs">… 17 more rows</td>
           </tr>
         </tbody>
       </table>
+      <div class="px-5 py-2 text-xs text-slate-500 dark:text-slate-400 border-t border-slate-100 dark:border-slate-700">
+        Signal reason = the DSL rule that fired (entry) + the exit cause (TP / SL / opposite / kill). Persisted per trade so a re-evolution can see which rules paid.
+      </div>
     </div>
 
     <!-- STRATEGY CHART -->

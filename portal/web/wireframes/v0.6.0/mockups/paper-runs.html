@@ -22,7 +22,11 @@
     <div class="flex items-start justify-between mb-6">
       <div>
         <h1 class="text-2xl font-bold">Paper Trading</h1>
-        <div class="text-sm text-slate-500 dark:text-slate-400 mt-1">2 running · 5 completed · aggregate live P&amp;L <span class="font-mono text-emerald-700 dark:text-emerald-400 font-semibold">+$318.50</span></div>
+        <div class="text-sm text-slate-500 dark:text-slate-400 mt-1">
+          <span class="font-semibold">11</span> running · 5 completed · aggregate live P&amp;L
+          <span class="font-mono text-emerald-700 dark:text-emerald-400 font-semibold">+$846.20</span>
+          across <span class="font-semibold">3</span> OANDA accounts
+        </div>
       </div>
       <div class="flex gap-2">
         <div class="flex gap-1 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-0.5">
@@ -30,6 +34,21 @@
           <button class="text-slate-500 rounded px-3 py-1.5">Approvals · 1</button>
         </div>
       </div>
+    </div>
+
+    <!-- Concurrency banner: 10+ paper runs -->
+    <div class="mb-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-300 dark:border-amber-700 rounded-lg p-4 flex items-start gap-3">
+      <div class="w-8 h-8 bg-amber-200 dark:bg-amber-800 rounded-full flex items-center justify-center text-amber-800 dark:text-amber-200 text-sm shrink-0">⚠</div>
+      <div class="flex-1 text-sm">
+        <div class="font-semibold text-amber-900 dark:text-amber-200">You have 11 running paper deployments</div>
+        <div class="text-xs text-amber-800 dark:text-amber-300 mt-0.5">
+          Broker connection quotas start applying above 10 concurrent runs (OANDA v20 REST: 120 req/s per token, shared across all your runs).
+          Latency and hit rate on the newest runs may degrade. Consider halting any that have finished their evaluation window.
+        </div>
+      </div>
+      <button class="text-xs text-amber-800 dark:text-amber-300 border border-amber-300 dark:border-amber-700 rounded px-2 py-1 hover:bg-amber-100 dark:hover:bg-amber-900/40 shrink-0">
+        Dismiss for 24h
+      </button>
     </div>
 
     <div class="flex items-center gap-3 mb-4 text-sm">
@@ -55,7 +74,10 @@
             </span>
             <div>
               <div class="font-semibold">EUR_USD M15 — 2026-07-05</div>
-              <div class="text-xs text-slate-500 dark:text-slate-400 font-mono">…fbd5bcb2_021_001 · 2h 14m</div>
+              <div class="text-xs text-slate-500 dark:text-slate-400 font-mono flex items-center gap-1.5">
+                <span>…fbd5bcb2_021_001 · 2h 14m</span>
+                <span class="bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 px-1.5 py-0.5 rounded normal-case">acct …-001</span>
+              </div>
             </div>
           </div>
           <div class="flex items-center gap-6 text-sm">
@@ -84,7 +106,10 @@
             </span>
             <div>
               <div class="font-semibold">GBP_USD H1 — 2026-07-04</div>
-              <div class="text-xs text-slate-500 dark:text-slate-400 font-mono">…a9c7f145_014_022 · 1d 3h</div>
+              <div class="text-xs text-slate-500 dark:text-slate-400 font-mono flex items-center gap-1.5">
+                <span>…a9c7f145_014_022 · 1d 3h</span>
+                <span class="bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 px-1.5 py-0.5 rounded normal-case">acct …-002</span>
+              </div>
             </div>
           </div>
           <div class="flex items-center gap-6 text-sm">

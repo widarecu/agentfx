@@ -27,8 +27,9 @@
       <div>
         <h1 class="text-2xl font-bold">Paper Trading</h1>
         <div class="text-sm text-slate-500 dark:text-slate-400 mt-1">
-          4 running across 3 users · aggregate live P&amp;L
+          <span class="font-semibold">14</span> running across 3 users · aggregate live P&amp;L
           <span class="font-mono text-emerald-700 dark:text-emerald-400 font-semibold">+$406.60</span>
+          across 7 OANDA accounts
         </div>
       </div>
 
@@ -47,7 +48,22 @@
 
     <div class="text-xs text-indigo-700 dark:text-indigo-300 mb-3 flex items-center gap-2">
       <span class="w-1.5 h-1.5 bg-indigo-500 rounded-full"></span>
-      Viewing all users' runs (ADMIN scope). Owner email appears on each row.
+      Viewing all users' runs (ADMIN scope). Owner email + OANDA account appear on each row.
+    </div>
+
+    <!-- Concurrency banner: 10+ paper runs across the fleet -->
+    <div class="mb-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-300 dark:border-amber-700 rounded-lg p-4 flex items-start gap-3">
+      <div class="w-8 h-8 bg-amber-200 dark:bg-amber-800 rounded-full flex items-center justify-center text-amber-800 dark:text-amber-200 text-sm shrink-0">⚠</div>
+      <div class="flex-1 text-sm">
+        <div class="font-semibold text-amber-900 dark:text-amber-200">14 concurrent paper runs across the fleet</div>
+        <div class="text-xs text-amber-800 dark:text-amber-300 mt-0.5">
+          Above the soft cap of 10. Broker connection quotas apply per API key, so the <span class="font-mono">trader@example.com</span> account
+          (7 runs on one key) is at highest risk of throttling. Filter by owner to inspect.
+        </div>
+      </div>
+      <button class="text-xs text-amber-800 dark:text-amber-300 border border-amber-300 dark:border-amber-700 rounded px-2 py-1 hover:bg-amber-100 dark:hover:bg-amber-900/40 shrink-0">
+        Dismiss for 24h
+      </button>
     </div>
 
     <div class="space-y-3">
@@ -59,7 +75,10 @@
             </span>
             <div>
               <div class="font-semibold">EUR_USD M15 — 2026-07-05</div>
-              <div class="text-xs text-slate-500 font-mono">…fbd5bcb2_021_001 · 2h 14m</div>
+              <div class="text-xs text-slate-500 font-mono flex items-center gap-1.5">
+                <span>…fbd5bcb2_021_001 · 2h 14m</span>
+                <span class="bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 px-1.5 py-0.5 rounded normal-case">acct …-001</span>
+              </div>
             </div>
             <span class="text-xs bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 px-2 py-0.5 rounded font-mono">trader@example.com</span>
           </div>
@@ -78,7 +97,10 @@
             </span>
             <div>
               <div class="font-semibold">GBP_USD H1 — 2026-07-04</div>
-              <div class="text-xs text-slate-500 font-mono">…a9c7f145_014_022 · 1d 3h</div>
+              <div class="text-xs text-slate-500 font-mono flex items-center gap-1.5">
+                <span>…a9c7f145_014_022 · 1d 3h</span>
+                <span class="bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 px-1.5 py-0.5 rounded normal-case">acct …-002</span>
+              </div>
             </div>
             <span class="text-xs bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 px-2 py-0.5 rounded font-mono">trader@example.com</span>
           </div>
@@ -97,7 +119,10 @@
             </span>
             <div>
               <div class="font-semibold">AUD_USD M15 — 2026-07-04</div>
-              <div class="text-xs text-slate-500 font-mono">…d17bc4c5_009_012 · 1d 5h</div>
+              <div class="text-xs text-slate-500 font-mono flex items-center gap-1.5">
+                <span>…d17bc4c5_009_012 · 1d 5h</span>
+                <span class="bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 px-1.5 py-0.5 rounded normal-case">acct …-004</span>
+              </div>
             </div>
             <span class="text-xs bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 px-2 py-0.5 rounded font-mono">admin@example.com <span class="opacity-60">(you)</span></span>
           </div>
@@ -116,7 +141,10 @@
             </span>
             <div>
               <div class="font-semibold">USD_JPY M30 — 2026-07-03</div>
-              <div class="text-xs text-slate-500 font-mono">…b3e2d888_017_008 · 2d 12h</div>
+              <div class="text-xs text-slate-500 font-mono flex items-center gap-1.5">
+                <span>…b3e2d888_017_008 · 2d 12h</span>
+                <span class="bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 px-1.5 py-0.5 rounded normal-case">acct …-006</span>
+              </div>
             </div>
             <span class="text-xs bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 px-2 py-0.5 rounded font-mono">quant2@example.com</span>
           </div>
