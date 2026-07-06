@@ -11,6 +11,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
+from ..core import rbac
 from ..core.database import get_db
 from ..services import optimization as optimization_service
 from ..services import user as user_service
@@ -31,13 +32,21 @@ def list_optimization_jobs(
     strategy: str | None = None,
     pair: str | None = None,
     status: str | None = None,
+    scope: rbac.Scope = "my",
     db: Session = Depends(get_db),
     current_user: models.User = Depends(user_service.get_current_active_user),
 ):
     """
-    List all optimization jobs with optional filtering.
-    Requires VIEWER role or higher.
+    List optimization jobs.
+    - VIEWER / TRADER see their own jobs only.
+    - ADMIN sees own jobs by default; add `?scope=all` to see every job (US-018).
     """
+    rbac.require_admin_for_scope_all(current_user, scope)
+    created_by_filter = (
+        None
+        if current_user.role == models.UserRole.ADMIN and scope == "all"
+        else current_user.id
+    )
     skip = (page - 1) * page_size
     items, total = optimization_service.get_jobs(
         db,
@@ -46,6 +55,7 @@ def list_optimization_jobs(
         strategy=strategy,
         pair=pair,
         status=status,
+        created_by=created_by_filter,
     )
     return {
         "items": items,
@@ -113,6 +123,7 @@ def get_optimization_job(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Optimization job not found",
         )
+    rbac.require_owner_or_admin(db_job, current_user, resource="optimization job")
     return db_job
 
 
@@ -132,16 +143,7 @@ def delete_optimization_job(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Optimization job not found",
         )
-
-    # Check authorization
-    if (
-        db_job.created_by != current_user.id
-        and current_user.role != models.UserRole.ADMIN
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to delete this job",
-        )
+    rbac.require_owner_or_admin(db_job, current_user, resource="optimization job")
 
     optimization_service.delete_job(db, job_id=job_id)
     return {"success": True, "message": "Job deleted successfully"}
@@ -169,13 +171,14 @@ def list_job_trials(
     Ordered by Sharpe ratio (descending).
     Requires VIEWER role or higher.
     """
-    # Verify job exists
+    # Verify job exists + owned by caller (or caller is ADMIN)
     db_job = optimization_service.get_job(db, job_id=job_id)
     if not db_job:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Optimization job not found",
         )
+    rbac.require_owner_or_admin(db_job, current_user, resource="optimization job")
 
     items, total = optimization_service.get_trials(
         db,
@@ -206,13 +209,14 @@ def get_top_trials(
     Default returns top 3.
     Requires VIEWER role or higher.
     """
-    # Verify job exists
+    # Verify job exists + ownership
     db_job = optimization_service.get_job(db, job_id=job_id)
     if not db_job:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Optimization job not found",
         )
+    rbac.require_owner_or_admin(db_job, current_user, resource="optimization job")
 
     return optimization_service.get_top_trials(db, job_id=job_id, limit=limit)
 
@@ -229,7 +233,8 @@ def get_trial(
 ):
     """
     Get a specific trial by ID.
-    Requires VIEWER role or higher.
+    Requires VIEWER role or higher AND that the trial's parent job is
+    owned by the caller (or the caller is ADMIN).
     """
     db_trial = optimization_service.get_trial(db, trial_id=trial_id)
     if not db_trial or db_trial.job_id != job_id:
@@ -237,6 +242,13 @@ def get_trial(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Trial not found",
         )
+    db_job = optimization_service.get_job(db, job_id=job_id)
+    if not db_job:  # pragma: no cover — trial FK would have caught this
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Trial not found",
+        )
+    rbac.require_owner_or_admin(db_job, current_user, resource="optimization job")
     return db_trial
 
 
@@ -261,13 +273,20 @@ def list_trial_signals(
     Get trade signals for a trial (for chart visualization).
     Requires VIEWER role or higher.
     """
-    # Verify trial exists and belongs to job
+    # Verify trial exists and belongs to job + caller owns the job
     db_trial = optimization_service.get_trial(db, trial_id=trial_id)
     if not db_trial or db_trial.job_id != job_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Trial not found",
         )
+    db_job = optimization_service.get_job(db, job_id=job_id)
+    if not db_job:  # pragma: no cover — trial FK would have caught this
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Trial not found",
+        )
+    rbac.require_owner_or_admin(db_job, current_user, resource="optimization job")
 
     items, total = optimization_service.get_signals(
         db,
@@ -303,13 +322,20 @@ def list_trial_trades(
     Get individual trades for a trial with financing breakdown.
     Requires VIEWER role or higher.
     """
-    # Verify trial exists and belongs to job
+    # Verify trial exists and belongs to job + caller owns the job
     db_trial = optimization_service.get_trial(db, trial_id=trial_id)
     if not db_trial or db_trial.job_id != job_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Trial not found",
         )
+    db_job = optimization_service.get_job(db, job_id=job_id)
+    if not db_job:  # pragma: no cover — trial FK would have caught this
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Trial not found",
+        )
+    rbac.require_owner_or_admin(db_job, current_user, resource="optimization job")
 
     items, total = optimization_service.get_trades(
         db,

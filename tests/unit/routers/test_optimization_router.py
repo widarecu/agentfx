@@ -162,6 +162,7 @@ class TestListOptimizationJobs:
                 strategy="ma",
                 pair="EUR_USD",
                 status="completed",
+                created_by=mock_current_user.id,
             )
 
 
@@ -409,12 +410,16 @@ class TestGetTopTrials:
 class TestGetTrial:
     """Tests for GET /optimization-jobs/{job_id}/trials/{trial_id} endpoint."""
 
-    def test_get_trial_returns_trial(self, mock_db, mock_current_user, sample_trial):
+    def test_get_trial_returns_trial(
+        self, mock_db, mock_current_user, sample_job, sample_trial
+    ):
         """Test that get trial returns trial details."""
         with patch(
             "agentfx.api.routers.optimization.optimization_service"
         ) as mock_service:
             mock_service.get_trial.return_value = sample_trial
+            # RBAC ownership check requires loading the parent job
+            mock_service.get_job.return_value = sample_job
 
             result = optimization_router.get_trial(
                 job_id="optjob_123_abc",
@@ -467,13 +472,15 @@ class TestListTrialSignals:
     """Tests for GET /optimization-jobs/{job_id}/trials/{trial_id}/signals endpoint."""
 
     def test_list_signals_returns_signals(
-        self, mock_db, mock_current_user, sample_trial
+        self, mock_db, mock_current_user, sample_job, sample_trial
     ):
         """Test that list signals returns signal list."""
         with patch(
             "agentfx.api.routers.optimization.optimization_service"
         ) as mock_service:
             mock_service.get_trial.return_value = sample_trial
+            # RBAC ownership check on the parent job
+            mock_service.get_job.return_value = sample_job
             mock_signals = [Mock(), Mock()]
             mock_service.get_signals.return_value = (mock_signals, 2)
 
@@ -491,12 +498,16 @@ class TestListTrialSignals:
 class TestListTrialTrades:
     """Tests for GET /optimization-jobs/{job_id}/trials/{trial_id}/trades endpoint."""
 
-    def test_list_trades_returns_trades(self, mock_db, mock_current_user, sample_trial):
+    def test_list_trades_returns_trades(
+        self, mock_db, mock_current_user, sample_job, sample_trial
+    ):
         """Test that list trades returns trade list."""
         with patch(
             "agentfx.api.routers.optimization.optimization_service"
         ) as mock_service:
             mock_service.get_trial.return_value = sample_trial
+            # RBAC ownership check on the parent job
+            mock_service.get_job.return_value = sample_job
             mock_trades = [Mock(), Mock()]
             mock_service.get_trades.return_value = (mock_trades, 2)
 
