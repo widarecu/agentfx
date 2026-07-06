@@ -9,6 +9,7 @@ import React, { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Loader2, Plus, Trash2, X } from 'lucide-react';
 
+import { useAuth } from '../contexts/AuthContext';
 import {
   STATUS_BADGE_CLASSES,
   createEvolutionRun,
@@ -21,6 +22,12 @@ import type {
   EvolutionRun,
   EvolutionRunStatus,
 } from '../types/evolution';
+import {
+  canSeeScopeToggle,
+  normalizeRole,
+  resolveScope,
+  type Scope,
+} from '../utils/rbac';
 
 export default function EvolutionRuns() {
   const [runs, setRuns] = useState<EvolutionRun[]>([]);
@@ -34,13 +41,23 @@ export default function EvolutionRuns() {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
+  // ADMIN-only scope toggle (US-018). Default 'my' so a fresh ADMIN
+  // session shows only their own runs — flipping to 'all' widens the
+  // list. `resolveScope` fails closed for non-admins.
+  const { user } = useAuth();
+  const role = normalizeRole(user?.role);
+  const showScopeToggle = canSeeScopeToggle(role);
+  const [scope, setScope] = useState<Scope>('my');
+
   const navigate = useNavigate();
 
   async function fetchRuns(): Promise<void> {
     setLoading(true);
     setError(null);
     try {
-      const data = await listEvolutionRuns(page, pageSize);
+      const data = await listEvolutionRuns(page, pageSize, {
+        scope: resolveScope(role, scope),
+      });
       setRuns(data.items);
       setTotal(data.total);
     } catch (err) {
@@ -62,7 +79,7 @@ export default function EvolutionRuns() {
     }, 5000);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page]);
+  }, [page, scope]);
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
@@ -80,13 +97,18 @@ export default function EvolutionRuns() {
             subprocess; humans approve only the gate to paper trading.
           </p>
         </div>
-        <button
-          onClick={() => setShowCreateModal(true)}
-          className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md text-sm font-medium"
-        >
-          <Plus className="w-4 h-4" />
-          Start New Run
-        </button>
+        <div className="flex items-center gap-3">
+          {showScopeToggle && (
+            <ScopeToggle scope={scope} onChange={setScope} />
+          )}
+          <button
+            onClick={() => setShowCreateModal(true)}
+            className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md text-sm font-medium"
+          >
+            <Plus className="w-4 h-4" />
+            Start New Run
+          </button>
+        </div>
       </div>
 
       {/* Error banner */}
@@ -284,6 +306,57 @@ function RunsTable({
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+/**
+ * ADMIN-only scope toggle (US-018). Two-state segmented control:
+ * "My runs" (default) vs "All runs". The wireframes call for indigo
+ * highlighting when set to All so ADMIN visually distinguishes their
+ * widened view from a fresh session.
+ */
+function ScopeToggle({
+  scope,
+  onChange,
+}: {
+  scope: Scope;
+  onChange: (next: Scope) => void;
+}) {
+  const base =
+    'text-xs font-semibold rounded px-3 py-1.5 transition-colors';
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Run scope"
+      className="flex gap-0.5 p-0.5 rounded border border-indigo-300 dark:border-indigo-700 bg-white dark:bg-slate-800"
+    >
+      <button
+        type="button"
+        role="radio"
+        aria-checked={scope === 'my'}
+        onClick={() => onChange('my')}
+        className={`${base} ${
+          scope === 'my'
+            ? 'bg-indigo-600 text-white'
+            : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-200'
+        }`}
+      >
+        My runs
+      </button>
+      <button
+        type="button"
+        role="radio"
+        aria-checked={scope === 'all'}
+        onClick={() => onChange('all')}
+        className={`${base} ${
+          scope === 'all'
+            ? 'bg-indigo-600 text-white'
+            : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-200'
+        }`}
+      >
+        All runs
+      </button>
     </div>
   );
 }

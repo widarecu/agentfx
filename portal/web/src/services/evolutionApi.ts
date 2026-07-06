@@ -67,7 +67,17 @@ async function handleResponse<T>(res: Response): Promise<T> {
 export async function listEvolutionRuns(
   page = 1,
   pageSize = 10,
-  filters: { status?: EvolutionRunStatus; instrument?: string } = {},
+  filters: {
+    status?: EvolutionRunStatus;
+    instrument?: string;
+    /**
+     * US-018: `'all'` is ADMIN-only on the backend — a non-admin caller
+     * gets a 403. The UI only surfaces the toggle for ADMIN sessions
+     * (`canSeeScopeToggle`) so this param is generally safe to leave at
+     * `'my'`.
+     */
+    scope?: 'my' | 'all';
+  } = {},
 ): Promise<EvolutionRunListResponse> {
   const params = new URLSearchParams({
     page: String(page),
@@ -75,6 +85,7 @@ export async function listEvolutionRuns(
   });
   if (filters.status) params.set('status_filter', filters.status);
   if (filters.instrument) params.set('instrument', filters.instrument);
+  if (filters.scope) params.set('scope', filters.scope);
 
   const res = await fetch(`${API_BASE_URL}/evolution-runs?${params}`, {
     headers: authHeaders(),
