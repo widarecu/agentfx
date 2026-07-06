@@ -62,6 +62,16 @@ export default function App() {
                 >
                   Evolution
                 </Link>
+                {/* v0.6.0 — settings + credentials. Rendered for
+                    every role; RequireRole on the route gates the
+                    page (US-018 + PR-B). VIEWER users clicking the
+                    link get redirected home with a toast. */}
+                <Link
+                  to="/settings"
+                  className="text-sm text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
+                >
+                  Settings
+                </Link>
               </nav>
               {user && (
                 <div className="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400">

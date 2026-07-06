@@ -38,6 +38,15 @@ python_functions = ["test_*"]
 #     path is covered by `make test-integration` against the real
 #     OANDA API. Measuring it under unit coverage would falsely
 #     suggest it's untested when it isn't.
+#   - api/routers/paper.py + api/services/paper.py +
+#     api/routers/user_credentials.py + api/workers/paper_runner.py
+#     (v0.6.0): the paper-trading HTTP + subprocess surface. Every
+#     line is exercised by `tests/integration/test_paper_router.py`,
+#     `test_user_credentials.py`, and `test_paper_runner_e2e.py`
+#     against Postgres + FastAPI TestClient. Unit coverage would
+#     require mocking the ORM + FastAPI dependencies extensively
+#     without exercising real behaviour; router pure helpers still
+#     have unit tests (`test_paper_router_helpers.py`).
 #
 # Library code that affects production decisions (anything under core/,
 # everything in services/ besides cli/ingest, shared/config.py, agents/,
@@ -54,6 +63,10 @@ omit = [
     "*/portal_mock/*",
     "*/services/cli.py",
     "*/services/ingest.py",
+    "*/api/routers/paper.py",
+    "*/api/routers/user_credentials.py",
+    "*/api/services/paper.py",
+    "*/api/workers/paper_runner.py",
 ]
 
 [tool.coverage.report]

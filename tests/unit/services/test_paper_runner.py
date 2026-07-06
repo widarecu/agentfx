@@ -212,6 +212,45 @@ class TestExecuteLoop:
         assert run.status == RunStatus.ERROR
         assert run.stop_reason == "BROKER_CIRCUIT"
 
+    def test_client_circuit_open_caught_and_halts(self):
+        """PR-G robustness: OandaCircuitOpen from the client during
+        `get_account_balance` is caught inside the loop, not left to
+        crash the subprocess. Locks the `stop_reason=BROKER_CIRCUIT`
+        vocabulary the wireframes call for."""
+        from agentfx.adapters.oanda import OandaCircuitOpen
+        from agentfx.api.models import RunStatus
+
+        run = SimpleNamespace(
+            id="run_test",
+            pair="EUR_USD",
+            snapshot_balance=10_000.0,
+            current_balance=10_000.0,
+            pnl=0.0,
+            kill_requested_at=None,
+            risk_config={
+                "max_position_size_units": 10_000,
+                "daily_loss_pct": 2.0,
+                "kill_switch_dd_pct": 5.0,
+            },
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+        )
+        client = MagicMock()
+        client.get_account_balance.side_effect = OandaCircuitOpen("5 failures")
+        db = MagicMock()
+
+        _execute_loop(
+            db=db,
+            run=run,
+            client=client,
+            sleep_fn=MagicMock(),
+            max_iterations=1,
+        )
+
+        assert run.status == RunStatus.ERROR
+        assert run.stop_reason == "BROKER_CIRCUIT"
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Terminal state

@@ -12,7 +12,9 @@ import EvolutionRunDetail from './pages/EvolutionRunDetail'
 import GenomeDetail from './pages/GenomeDetail'
 import GenomeBacktest from './pages/GenomeBacktest'
 import ChartGallery from './pages/ChartGallery'
+import Settings from './pages/Settings'
 import { ProtectedRoute } from './components/ProtectedRoute'
+import { RequireRole } from './components/RequireRole'
 
 export const router = createBrowserRouter([
   {
@@ -41,6 +43,18 @@ export const router = createBrowserRouter([
       { path: 'evolution/:runId', element: <EvolutionRunDetail /> },
       { path: 'evolution/:runId/genomes/:genomeId', element: <GenomeDetail /> },
       { path: 'evolution/:runId/genomes/:genomeId/backtest', element: <GenomeBacktest /> },
+      // v0.6.0 — settings + credentials. `RequireRole` composes with
+      // the outer `ProtectedRoute` so VIEWER lands here → redirect
+      // home with a toast (US-018 + PR-B). Paper trading routes
+      // land in PR-I / PR-J.
+      {
+        path: 'settings',
+        element: (
+          <RequireRole allowed={['trader', 'admin']}>
+            <Settings />
+          </RequireRole>
+        ),
+      },
       // Dev-only verification gallery — renders every canonical seed
       // strategy on the same candle window so every indicator's chart
       // routing / tooltip / archetype can be visually swept at once.
