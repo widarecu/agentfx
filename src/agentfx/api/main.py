@@ -9,7 +9,15 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
 from .core.config import settings
-from .routers import auth, evolution, market_data, optimization, runs, strategies
+from .routers import (
+    auth,
+    evolution,
+    market_data,
+    optimization,
+    runs,
+    strategies,
+    user_credentials,
+)
 
 # Configure root logger to use stdout (so Railway tags normal logs as [inf], not [err])
 logging.basicConfig(
@@ -178,6 +186,11 @@ app.include_router(
     optimization.router, prefix=settings.API_V1_STR, tags=["optimization"]
 )
 app.include_router(evolution.router, prefix=settings.API_V1_STR, tags=["evolution"])
+app.include_router(
+    user_credentials.router,
+    prefix=settings.API_V1_STR,
+    tags=["user-credentials"],
+)
 
 
 @app.get("/")

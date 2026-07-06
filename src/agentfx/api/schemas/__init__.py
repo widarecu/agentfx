@@ -89,6 +89,13 @@ from .user import (
     UserLogin,
     UserUpdate,
 )
+from .user_credentials import (
+    UserOandaAccountPublic,
+    UserOandaAccountsList,
+    UserOandaCredentialsPublic,
+    UserOandaCredentialsUpsert,
+    VerifyCredentialsResponse,
+)
 
 # Make schemas available at the package level
 __all__ = [
@@ -177,4 +184,10 @@ __all__ = [
     "ValidationFoldPublic",
     "DecisionLogPublic",
     "DecisionLogList",
+    # User credentials (US-019 / v0.6.0)
+    "UserOandaCredentialsPublic",
+    "UserOandaCredentialsUpsert",
+    "UserOandaAccountPublic",
+    "UserOandaAccountsList",
+    "VerifyCredentialsResponse",
 ]

@@ -118,6 +118,43 @@ class Settings(BaseSettings):
         description="Algorithm used for JWT token encoding/decoding",
     )
 
+    # Fernet key for at-rest encryption of user-owned secrets
+    # (US-019: OANDA API keys stored per user). Must be a
+    # 32-byte-url-safe-base64 string — generate with:
+    #     python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # Empty in local/dev by default so tests can inject a fresh key;
+    # a `field_validator` below refuses empty in production/staging/UAT.
+    FERNET_KEY: str = Field(
+        default="",
+        env="FERNET_KEY",
+        description=(
+            "Fernet key (base64) for encrypting per-user OANDA credentials at rest. "
+            "REQUIRED in production/staging/UAT — generate a fresh one per environment "
+            "and store in the secrets vault. NEVER commit."
+        ),
+    )
+
+    @field_validator("FERNET_KEY", mode="after")
+    @classmethod
+    def validate_fernet_key(cls, v: str) -> str:
+        """
+        Fail fast at startup if `FERNET_KEY` isn't set in a persistent
+        environment. Local dev / test can leave it blank — the secrets
+        module will lazily generate a per-process ephemeral key for
+        those cases, which is safe because dev/test databases hold no
+        real user secrets.
+        """
+        import os
+
+        environment = os.getenv("ENVIRONMENT", "development").lower()
+        if not v and environment in ("production", "staging", "uat"):
+            raise ValueError(
+                "FERNET_KEY must be explicitly set in production/staging/UAT. "
+                "Generate one with: "
+                'python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
+            )
+        return v
+
     # Database
     DATABASE_URL: str = Field(
         default="postgresql://agentfx:agentfx@localhost:5432/agentfx_dev",

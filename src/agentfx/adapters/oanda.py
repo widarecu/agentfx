@@ -21,16 +21,55 @@ def to_oanda_instrument(symbol: str) -> str:
     return s
 
 
+#: Mapping from user-supplied environment name to OANDA v20 REST host.
+#: Kept explicit so a typo in `environment` fails at client construction
+#: rather than pointing at the wrong endpoint.
+_OANDA_ENV_TO_HOST: dict[str, str] = {
+    "practice": "api-fxpractice.oanda.com",
+    "live": "api-fxtrade.oanda.com",
+}
+
+
 class OandaClient:
     def __init__(
         self,
         api_key: str | None = None,
         host: str | None = None,
         account_id: str | None = None,
+        environment: str | None = None,
         timeout: int = 15,
     ):
+        """Build a client bound to one OANDA identity.
+
+        The v0.6.0 paper runner (US-021) passes `api_key` and
+        `environment` explicitly from a user's decrypted credentials —
+        the app-wide fallbacks (`oanda_api_key()` etc.) only fire when
+        NO explicit args are given, so the shared candle ingestion path
+        keeps working unchanged.
+
+        `account_id` is optional. The single-account fallback from the
+        shared config is kept for backwards compatibility with the
+        candle ingestion worker; per-user code paths pass the
+        `account_id` per request via the list-accounts → picker →
+        runner flow.
+        """
         self.api_key = api_key or oanda_api_key()
-        self.host = host or oanda_api_host()
+        # `environment` wins over `host` when both are set — matches
+        # the v0.6.0 mental model where callers think in "practice /
+        # live" not in hostnames. Unknown strings raise.
+        if environment is not None:
+            env = environment.lower()
+            if env not in _OANDA_ENV_TO_HOST:
+                raise OandaError(
+                    f"unknown OANDA environment '{environment}' "
+                    f"(expected one of {list(_OANDA_ENV_TO_HOST.keys())})"
+                )
+            self.host = _OANDA_ENV_TO_HOST[env]
+            self.environment = env
+        else:
+            self.host = host or oanda_api_host()
+            # Derive so callers can safely log `client.environment`.
+            self.environment = "practice" if "fxpractice" in self.host else "live"
         self.account_id = account_id or oanda_account_id()
         if not self.api_key:
             raise OandaError("OANDA_API_KEY is not set")
@@ -43,6 +82,55 @@ class OandaClient:
                 "Content-Type": "application/json",
             }
         )
+
+    # ─────────────────────────────────────────────────────────────
+    # v0.6.0 (US-019) — account discovery for the credentials flow.
+    # ─────────────────────────────────────────────────────────────
+
+    def list_accounts(self) -> list[dict]:
+        """Return the sub-accounts this API key can access.
+
+        Hits `GET /v3/accounts`. The Bearer token in `self.api_key`
+        identifies the OANDA login; the response is a list of accounts
+        (`id`, optional `tags`) that we normalise into `{account_id,
+        alias, currency, balance, margin_available, currency}` by
+        pairing each id with a follow-up `/accounts/{id}/summary`.
+
+        This is the minimal shape the credentials verify endpoint (and
+        later the deploy modal) needs. Per-account balance is queried
+        lazily — the caller decides whether to fetch it now (for a
+        picker) or later (for the run detail 5s polling).
+        """
+        list_resp = self._request("GET", "/accounts", params={})
+        raw_accounts = list_resp.get("accounts", []) or []
+        result: list[dict] = []
+        for acct in raw_accounts:
+            account_id = acct.get("id")
+            if not account_id:
+                continue
+            # Per OANDA v20 REST, the summary is the cheapest endpoint
+            # that gives alias + currency + balance in one shot. Errors
+            # here surface as OandaError from `_request`; callers wrap.
+            summary_resp = self._request(
+                "GET", f"/accounts/{account_id}/summary", params={}
+            )
+            summary = summary_resp.get("account", {})
+            result.append(
+                {
+                    "account_id": str(account_id),
+                    "alias": summary.get("alias") or None,
+                    "currency": summary.get("currency") or "USD",
+                    # Balance / margin are informational only. The
+                    # credentials verify endpoint doesn't persist
+                    # these — it just echoes them so the frontend can
+                    # render the detected-accounts table without a
+                    # follow-up round-trip. Cast to float defensively;
+                    # OANDA returns as strings.
+                    "balance": float(summary.get("balance", 0) or 0),
+                    "margin_available": float(summary.get("marginAvailable", 0) or 0),
+                }
+            )
+        return result
 
     def _request(self, method: str, path: str, params: dict[str, str]) -> dict:
         url = f"{self.base_url}{path}"
