@@ -23,6 +23,11 @@ from .optimization import (
 from .run import Order, Run, RunEnvironment, RunStatus, Trade
 from .strategy import Strategy
 from .user import User, UserRole
+from .user_credentials import (
+    OandaEnvironment,
+    UserOandaAccount,
+    UserOandaCredentials,
+)
 from .verified_gap import VerifiedEmptyGap
 
 # Make models available at the package level
@@ -56,4 +61,8 @@ __all__ = [
     "DecisionLog",
     "AgentType",
     "UserAction",
+    # User credentials (US-019 / v0.6.0)
+    "UserOandaCredentials",
+    "UserOandaAccount",
+    "OandaEnvironment",
 ]
