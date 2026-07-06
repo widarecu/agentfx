@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import random
 import time
+from collections import deque
 from datetime import UTC, datetime
 
 import requests  # type: ignore[import-untyped]
@@ -11,7 +13,75 @@ ISO8601 = "%Y-%m-%dT%H:%M:%S.%fZ"
 
 
 class OandaError(Exception):
-    pass
+    """Base exception for any OANDA v20 REST failure."""
+
+
+class OandaCircuitOpen(OandaError):
+    """Raised when the per-client circuit breaker is open.
+
+    Signals that too many consecutive failures have occurred in a
+    short window; the paper runner treats this as
+    `stop_reason=BROKER_CIRCUIT` and halts the run so a broken broker
+    doesn't burn account margin trying to place doomed orders.
+    """
+
+
+class OandaCircuitBreaker:
+    """Per-client failure gate (US-020).
+
+    Trips OPEN after `threshold` failures inside a rolling
+    `window_seconds` interval. Any success resets the failure trail.
+    Once OPEN, `should_reject()` returns True until the window has
+    elapsed since the last failure — no half-open state; the runner
+    catches `OandaCircuitOpen` and stops the run.
+
+    Kept as a plain class (no `functools.lru_cache`, no globals) so
+    each `OandaClient` has its own breaker — one user's OANDA outage
+    doesn't trip another user's client.
+    """
+
+    def __init__(self, threshold: int = 5, window_seconds: float = 60.0) -> None:
+        self.threshold = threshold
+        self.window_seconds = window_seconds
+        self._failures: deque[float] = deque()
+
+    def record_failure(self) -> None:
+        self._failures.append(time.monotonic())
+        # Drop stale entries so `should_reject` sees only the current
+        # window. Done here rather than lazily so the deque doesn't
+        # grow unbounded on a client that never checks state.
+        cutoff = time.monotonic() - self.window_seconds
+        while self._failures and self._failures[0] < cutoff:
+            self._failures.popleft()
+
+    def record_success(self) -> None:
+        self._failures.clear()
+
+    def should_reject(self) -> bool:
+        cutoff = time.monotonic() - self.window_seconds
+        while self._failures and self._failures[0] < cutoff:
+            self._failures.popleft()
+        return len(self._failures) >= self.threshold
+
+
+def _backoff_delay_seconds(
+    attempt: int,
+    *,
+    base_ms: int = 500,
+    cap_ms: int = 8000,
+) -> float:
+    """Exponential backoff with 25% jitter for retryable requests.
+
+    `attempt` starts at 0 for the first retry, so the sequence is
+    ~0.5s, ~1s, ~2s, ~4s, ~8s (capped). Jitter is uniform in
+    `[0, 0.25 * base_delay]` — the standard "decorrelated jitter"
+    variant would be denser here but adds complexity without changing
+    the correctness properties we care about (bounded, non-zero,
+    non-uniform-across-clients).
+    """
+    base = min(cap_ms, base_ms * (2**attempt))
+    jitter = random.uniform(0, base * 0.25)
+    return (base + jitter) / 1000.0
 
 
 def to_oanda_instrument(symbol: str) -> str:
@@ -19,6 +89,26 @@ def to_oanda_instrument(symbol: str) -> str:
     if "_" not in s and len(s) == 6:
         s = f"{s[:3]}_{s[3:]}"
     return s
+
+
+def _pips_to_price_distance(instrument: str, pips: float) -> str:
+    """Convert a pip distance to the OANDA v20 `distance` string.
+
+    OANDA's pip location varies by quote currency: 1 pip = 0.0001 for
+    most majors, 0.01 for JPY pairs. We resolve that here so the
+    caller (paper runner) can think in pips without knowing the
+    quirk. Returned as a str because the OANDA API expects
+    string-quoted decimals for money fields.
+
+    Not a full replacement for OANDA's per-instrument pipLocation
+    metadata — for the v0.6.0 majors set (EUR/GBP/AUD/USD_JPY etc.)
+    the two-tier heuristic is exact. If we broaden to exotics later
+    we'd fetch pipLocation from `/v3/accounts/{id}/instruments`
+    on client init.
+    """
+    _, quote = instrument.split("_")
+    pip_size = 0.01 if quote == "JPY" else 0.0001
+    return f"{pips * pip_size:.5f}"
 
 
 #: Mapping from user-supplied environment name to OANDA v20 REST host.
@@ -75,6 +165,10 @@ class OandaClient:
             raise OandaError("OANDA_API_KEY is not set")
         self.base_url = f"https://{self.host}/v3"
         self.timeout = timeout
+        # Per-instance circuit breaker so one user's OANDA outage
+        # doesn't trip another user's client. 5 failures / 60s window
+        # matches the paper runner's tolerance in US-023.
+        self.circuit_breaker = OandaCircuitBreaker(threshold=5, window_seconds=60.0)
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -132,28 +226,371 @@ class OandaClient:
             )
         return result
 
-    def _request(self, method: str, path: str, params: dict[str, str]) -> dict:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, str] | None = None,
+        json_body: dict | None = None,
+    ) -> dict:
+        """Issue a v20 REST call with retry + circuit-breaker semantics.
+
+        Retryable failures (network errors, HTTP 429, HTTP 5xx) burn
+        an attempt and sleep for an exponentially-growing delay with
+        jitter. Non-retryable failures (HTTP 4xx other than 429) fail
+        immediately — a 401 won't get better by trying again, and the
+        paper runner needs a fast signal so the user can fix creds.
+
+        The circuit breaker is checked BEFORE each attempt. Any
+        failure that reaches the retry cap records to the breaker;
+        any successful response resets it. Once the breaker trips,
+        the next call raises `OandaCircuitOpen` and the runner
+        halts.
+        """
+        if self.circuit_breaker.should_reject():
+            raise OandaCircuitOpen(
+                "OANDA circuit breaker open — "
+                f"{self.circuit_breaker.threshold} failures within "
+                f"{self.circuit_breaker.window_seconds:.0f}s"
+            )
+
         url = f"{self.base_url}{path}"
+        params = params or {}
+        last_error: Exception | None = None
+
         for attempt in range(5):
             try:
                 resp = self.session.request(
-                    method, url, params=params, timeout=self.timeout
+                    method,
+                    url,
+                    params=params,
+                    json=json_body,
+                    timeout=self.timeout,
                 )
             except (
                 requests.exceptions.Timeout,
                 requests.exceptions.ConnectionError,
             ) as e:
+                last_error = e
                 if attempt < 4:
-                    time.sleep(1 + attempt)
+                    time.sleep(_backoff_delay_seconds(attempt))
                     continue
+                self.circuit_breaker.record_failure()
                 raise OandaError(f"connection_error: {e}") from e
-            if resp.status_code == 429:
-                time.sleep(1 + attempt)
-                continue
+
+            # Retry-eligible responses. 429 is explicit rate-limit;
+            # 5xx is server-side transient. Both burn an attempt and
+            # back off before the next try.
+            if resp.status_code == 429 or resp.status_code >= 500:
+                last_error = OandaError(f"{resp.status_code} {resp.text[:200]}")
+                if attempt < 4:
+                    time.sleep(_backoff_delay_seconds(attempt))
+                    continue
+                self.circuit_breaker.record_failure()
+                raise last_error
+
+            # Non-retryable client errors — surface immediately.
             if resp.status_code >= 400:
-                raise OandaError(f"{resp.status_code} {resp.text}")
+                self.circuit_breaker.record_failure()
+                raise OandaError(f"{resp.status_code} {resp.text[:500]}")
+
+            # Success — clear the breaker.
+            self.circuit_breaker.record_success()
+            # Some OANDA responses (order fills at the exact edge of
+            # a rejection) return 200 with an empty body; be defensive.
+            if not resp.content:
+                return {}
             return resp.json()
+
+        # Exhausted attempts — record failure and raise the last error.
+        self.circuit_breaker.record_failure()
+        if last_error is not None:
+            raise (
+                last_error
+                if isinstance(last_error, OandaError)
+                else OandaError(str(last_error))
+            )
         raise OandaError("Rate limited repeatedly by OANDA")
+
+    def _resolve_account_id(self, account_id: str | None) -> str:
+        """Pick the account id to use for a per-account call.
+
+        Per-call `account_id` wins; falls back to the one wired at
+        construction. Missing on both surfaces as an `OandaError` so
+        the runner can't accidentally hit /positions on a client that
+        has no account context.
+        """
+        aid = account_id or self.account_id
+        if not aid:
+            raise OandaError(
+                "account_id required — pass explicitly or set at "
+                "OandaClient construction"
+            )
+        return aid
+
+    # ─────────────────────────────────────────────────────────────
+    # v0.6.0 (US-020) — order execution.
+    # ─────────────────────────────────────────────────────────────
+
+    def place_market_order(
+        self,
+        instrument: str,
+        units: int,
+        *,
+        stop_loss_pips: float | None = None,
+        take_profit_pips: float | None = None,
+        account_id: str | None = None,
+    ) -> dict:
+        """Place a market order.
+
+        `units` is signed OANDA convention — positive = long, negative
+        = short. Stop-loss / take-profit are optional and specified in
+        pips relative to the fill price; the client computes the price
+        levels from the fill so the caller doesn't need to know pip
+        location.
+
+        Returns
+        -------
+        dict with keys:
+            - `order_id`: transaction id of the create
+            - `trade_id`: id of the trade opened by the fill (or None if
+              the order failed to fill — e.g. spread went outside the
+              guaranteed range)
+            - `fill_price`: fill price as a float
+            - `units`: units actually filled (signed)
+        """
+        aid = self._resolve_account_id(account_id)
+        instrument_norm = to_oanda_instrument(instrument)
+
+        order: dict = {
+            "type": "MARKET",
+            "instrument": instrument_norm,
+            "units": str(int(units)),
+            "positionFill": "DEFAULT",
+            "timeInForce": "FOK",
+        }
+        # Stop-loss / take-profit as ON_FILL order specs. Distance is
+        # in price units (not pips) per the OANDA v20 API — we pass
+        # `distance` in the account's home price representation, which
+        # the OANDA server converts against the fill's mid.
+        if stop_loss_pips is not None:
+            order["stopLossOnFill"] = {
+                "distance": _pips_to_price_distance(instrument_norm, stop_loss_pips),
+                "timeInForce": "GTC",
+            }
+        if take_profit_pips is not None:
+            order["takeProfitOnFill"] = {
+                "distance": _pips_to_price_distance(instrument_norm, take_profit_pips),
+                "timeInForce": "GTC",
+            }
+
+        resp = self._request(
+            "POST",
+            f"/accounts/{aid}/orders",
+            json_body={"order": order},
+        )
+
+        create = resp.get("orderCreateTransaction") or {}
+        fill = resp.get("orderFillTransaction") or {}
+        trade_opened = fill.get("tradeOpened") or {}
+        return {
+            "order_id": create.get("id"),
+            "trade_id": trade_opened.get("tradeID"),
+            "fill_price": float(fill["price"]) if "price" in fill else None,
+            "units": (
+                int(trade_opened["units"]) if "units" in trade_opened else int(units)
+            ),
+        }
+
+    def close_trade(
+        self,
+        trade_id: str,
+        units: str | int = "ALL",
+        *,
+        account_id: str | None = None,
+    ) -> dict:
+        """Close (or partially close) a trade by its OANDA trade id.
+
+        Returns the realized P/L of the close as reported by OANDA.
+        """
+        aid = self._resolve_account_id(account_id)
+        body: dict = {"units": str(units) if not isinstance(units, str) else units}
+        resp = self._request(
+            "PUT",
+            f"/accounts/{aid}/trades/{trade_id}/close",
+            json_body=body,
+        )
+        fill = resp.get("orderFillTransaction") or {}
+        return {
+            "trade_id": trade_id,
+            "realized_pnl": float(fill["pl"]) if "pl" in fill else 0.0,
+            "closed_units": int(fill["units"]) if "units" in fill else 0,
+            "close_price": float(fill["price"]) if "price" in fill else None,
+        }
+
+    def close_all_positions(
+        self,
+        instrument: str,
+        *,
+        account_id: str | None = None,
+    ) -> dict:
+        """Flatten both sides of an instrument position.
+
+        OANDA's v20 API distinguishes long and short — a hedged
+        instrument can have both open at once. We close both in a
+        single request. Sides with no exposure are silently skipped
+        by OANDA (they return 200 with no fill), so this is safe on a
+        flat account.
+        """
+        aid = self._resolve_account_id(account_id)
+        instrument_norm = to_oanda_instrument(instrument)
+        resp = self._request(
+            "PUT",
+            f"/accounts/{aid}/positions/{instrument_norm}/close",
+            json_body={"longUnits": "ALL", "shortUnits": "ALL"},
+        )
+        long_fill = resp.get("longOrderFillTransaction") or {}
+        short_fill = resp.get("shortOrderFillTransaction") or {}
+        return {
+            "long_realized_pnl": float(long_fill["pl"]) if "pl" in long_fill else 0.0,
+            "short_realized_pnl": (
+                float(short_fill["pl"]) if "pl" in short_fill else 0.0
+            ),
+            "long_units_closed": int(long_fill.get("units", 0)),
+            "short_units_closed": int(short_fill.get("units", 0)),
+        }
+
+    # ─────────────────────────────────────────────────────────────
+    # v0.6.0 (US-020) — account + position inspection.
+    # ─────────────────────────────────────────────────────────────
+
+    def get_position(
+        self,
+        instrument: str,
+        *,
+        account_id: str | None = None,
+    ) -> dict:
+        """Return the current position for one instrument.
+
+        Both sides may be non-zero on OANDA (hedging accounts). The
+        paper runner uses this to compute the net exposure it needs
+        to place a signal-driven order.
+        """
+        aid = self._resolve_account_id(account_id)
+        instrument_norm = to_oanda_instrument(instrument)
+        resp = self._request(
+            "GET",
+            f"/accounts/{aid}/positions/{instrument_norm}",
+        )
+        position = resp.get("position") or {}
+        long_side = position.get("long") or {}
+        short_side = position.get("short") or {}
+        long_units = int(long_side.get("units", 0) or 0)
+        short_units = int(short_side.get("units", 0) or 0)
+        return {
+            "instrument": instrument_norm,
+            "long_units": long_units,
+            "short_units": short_units,
+            "net_units": long_units + short_units,  # short_units is negative
+            "unrealized_pnl": float(position.get("unrealizedPL", 0) or 0),
+            "avg_long_price": (
+                float(long_side["averagePrice"])
+                if long_side.get("averagePrice")
+                else None
+            ),
+            "avg_short_price": (
+                float(short_side["averagePrice"])
+                if short_side.get("averagePrice")
+                else None
+            ),
+        }
+
+    def get_account_balance(
+        self,
+        *,
+        account_id: str | None = None,
+    ) -> dict:
+        """Return the caller's live balance summary.
+
+        Used by the paper-runner snapshot (US-021) at run start and
+        the run-detail 5s polling for the live-vs-snapshot P&L card.
+        """
+        aid = self._resolve_account_id(account_id)
+        resp = self._request("GET", f"/accounts/{aid}/summary")
+        account = resp.get("account") or {}
+        return {
+            "balance": float(account.get("balance", 0) or 0),
+            "nav": float(account.get("NAV", 0) or 0),
+            "margin_used": float(account.get("marginUsed", 0) or 0),
+            "margin_available": float(account.get("marginAvailable", 0) or 0),
+            "currency": account.get("currency") or "USD",
+            "unrealized_pnl": float(account.get("unrealizedPL", 0) or 0),
+        }
+
+    def get_open_trades(
+        self,
+        *,
+        account_id: str | None = None,
+    ) -> list[dict]:
+        """List the account's currently-open trades.
+
+        Shape mirrors OANDA's — id, instrument, units, price, unrealized
+        PL — but casts to native Python types so the runner doesn't
+        have to reparse strings.
+        """
+        aid = self._resolve_account_id(account_id)
+        resp = self._request("GET", f"/accounts/{aid}/openTrades")
+        result: list[dict] = []
+        for raw in resp.get("trades") or []:
+            result.append(
+                {
+                    "trade_id": raw.get("id"),
+                    "instrument": raw.get("instrument"),
+                    "units": int(raw.get("currentUnits", 0) or 0),
+                    "open_price": float(raw.get("price", 0) or 0),
+                    "unrealized_pnl": float(raw.get("unrealizedPL", 0) or 0),
+                    "open_time": raw.get("openTime"),
+                }
+            )
+        return result
+
+    def get_pricing(
+        self,
+        instruments: list[str] | str,
+        *,
+        account_id: str | None = None,
+    ) -> list[dict]:
+        """Return the current bid/ask/spread for one or more instruments.
+
+        The paper runner queries this on every decision-loop tick to
+        cost-check a candidate order (avoid firing when spread has
+        widened past the expected cost model).
+        """
+        aid = self._resolve_account_id(account_id)
+        if isinstance(instruments, str):
+            instruments = [instruments]
+        instrument_norm = ",".join(to_oanda_instrument(i) for i in instruments)
+        resp = self._request(
+            "GET",
+            f"/accounts/{aid}/pricing",
+            params={"instruments": instrument_norm},
+        )
+        prices: list[dict] = []
+        for raw in resp.get("prices") or []:
+            bids = raw.get("bids") or []
+            asks = raw.get("asks") or []
+            bid = float(bids[0]["price"]) if bids else 0.0
+            ask = float(asks[0]["price"]) if asks else 0.0
+            prices.append(
+                {
+                    "instrument": raw.get("instrument"),
+                    "bid": bid,
+                    "ask": ask,
+                    "spread": ask - bid,
+                    "time": raw.get("time"),
+                }
+            )
+        return prices
 
     def get_candles(
         self,
