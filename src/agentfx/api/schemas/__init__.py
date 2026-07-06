@@ -89,6 +89,18 @@ from .user import (
     UserLogin,
     UserUpdate,
 )
+from .paper import (
+    ApprovalQueueItem,
+    ApprovalQueueList,
+    DeployPaperRequest,
+    KillPaperRunResponse,
+    PaperRunApproval,
+    PaperRunList,
+    PaperRunListItem,
+    PaperRunPublic,
+    RejectGenomeRequest,
+    RiskConfig,
+)
 from .user_credentials import (
     UserOandaAccountPublic,
     UserOandaAccountsList,
@@ -190,4 +202,15 @@ __all__ = [
     "UserOandaAccountPublic",
     "UserOandaAccountsList",
     "VerifyCredentialsResponse",
+    # Paper trading (US-021 / US-023 / v0.6.0)
+    "RiskConfig",
+    "DeployPaperRequest",
+    "RejectGenomeRequest",
+    "PaperRunApproval",
+    "PaperRunPublic",
+    "PaperRunListItem",
+    "PaperRunList",
+    "ApprovalQueueItem",
+    "ApprovalQueueList",
+    "KillPaperRunResponse",
 ]
