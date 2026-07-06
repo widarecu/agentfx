@@ -350,7 +350,11 @@ class DecisionLog(Base):
     run_id = Column(
         String(50),
         ForeignKey("evolution_runs.id", ondelete="CASCADE"),
-        nullable=False,
+        # Nullable since v0.6.0 (US-023): user-initiated audit rows
+        # (paper-run kill / credential update / deploy paper) aren't
+        # attached to a specific evolution run. Legacy agent-authored
+        # rows still populate it via the FK.
+        nullable=True,
         index=True,
     )
     generation_id = Column(

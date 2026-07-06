@@ -14,6 +14,7 @@ from .routers import (
     evolution,
     market_data,
     optimization,
+    paper,
     runs,
     strategies,
     user_credentials,
@@ -190,6 +191,11 @@ app.include_router(
     user_credentials.router,
     prefix=settings.API_V1_STR,
     tags=["user-credentials"],
+)
+app.include_router(
+    paper.router,
+    prefix=settings.API_V1_STR,
+    tags=["paper-runs"],
 )
 
 
