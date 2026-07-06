@@ -124,7 +124,9 @@ def decide_action(
 # ─────────────────────────────────────────────────────────────────────
 
 
-def run_paper_run(run_id: str) -> None:
+def run_paper_run(
+    run_id: str,
+) -> None:  # pragma: no cover — exercised via subprocess in PR-G integration tests only
     """Subprocess entry point. Bootstraps the loop.
 
     In production this runs inside the `spawn`-forked subprocess. The
