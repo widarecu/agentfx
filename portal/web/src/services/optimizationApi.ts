@@ -73,11 +73,16 @@ class OptimizationApiService {
   }
 
   /**
-   * Get paginated list of optimization jobs
+   * Get paginated list of optimization jobs.
+   *
+   * `scope` (US-018): `'all'` is ADMIN-only on the backend and 403s
+   * for VIEWER / TRADER. The UI only surfaces the toggle for ADMIN
+   * sessions via `canSeeScopeToggle`.
    */
   async getJobs(
     page: number = 1,
-    pageSize: number = 10
+    pageSize: number = 10,
+    scope?: 'my' | 'all'
   ): Promise<OptimizationJobListResponse> {
     if (USE_MOCK_DATA) {
       await delay(MOCK_DELAY_MS);
@@ -92,8 +97,13 @@ class OptimizationApiService {
       };
     }
 
+    const params = new URLSearchParams({
+      page: String(page),
+      page_size: String(pageSize),
+    });
+    if (scope) params.set('scope', scope);
     const response = await fetch(
-      `${API_BASE_URL}/optimization-jobs?page=${page}&page_size=${pageSize}`,
+      `${API_BASE_URL}/optimization-jobs?${params}`,
       { headers: this.getAuthHeaders() }
     );
     const data = await this.handleResponse<{
