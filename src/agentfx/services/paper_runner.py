@@ -204,6 +204,7 @@ def _execute_loop(
     `max_iterations=None` (unbounded) and rely on `kill_requested_at`
     or a terminal risk-gate refusal to exit.
     """
+    from agentfx.adapters.oanda import OandaCircuitOpen
     from agentfx.api.models import RunStatus
     from agentfx.services.paper_policy import RiskState, evaluate_all
 
@@ -228,8 +229,19 @@ def _execute_loop(
             _flatten_and_halt(db, run, client, reason="USER_KILL")
             return
 
-        # Fetch account state.
-        balance = client.get_account_balance()
+        # Fetch account state. A broker circuit-open here means the
+        # OANDA client is refusing to hit the network — treat as a
+        # terminal halt with the specific reason instead of letting
+        # the exception escalate to a process crash. We still call
+        # `_flatten_and_halt` (best-effort close) even though the
+        # first request will bounce; the runner logs the failure and
+        # the run row still transitions to ERROR.
+        try:
+            balance = client.get_account_balance()
+        except OandaCircuitOpen:
+            logger.warning("paper runner: %s got OandaCircuitOpen; halting", run.id)
+            _flatten_and_halt(db, run, client, reason="BROKER_CIRCUIT")
+            return
         run.current_balance = balance["balance"]
         run.pnl = balance["balance"] - (run.snapshot_balance or 0.0)
         db.commit()
