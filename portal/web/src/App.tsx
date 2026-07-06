@@ -62,10 +62,16 @@ export default function App() {
                 >
                   Evolution
                 </Link>
-                {/* v0.6.0 — settings + credentials. Rendered for
-                    every role; RequireRole on the route gates the
-                    page (US-018 + PR-B). VIEWER users clicking the
-                    link get redirected home with a toast. */}
+                {/* v0.6.0 — paper trading + settings. Rendered for
+                    every role; RequireRole on the routes gates the
+                    pages (US-018 + PR-B). VIEWER users clicking the
+                    links get redirected home with a toast. */}
+                <Link
+                  to="/paper"
+                  className="text-sm text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
+                >
+                  Paper
+                </Link>
                 <Link
                   to="/settings"
                   className="text-sm text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
