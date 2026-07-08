@@ -543,3 +543,136 @@ class TestListAndOwnership:
             f"/api/v1/paper-runs/{run.id}", headers=headers
         )
         assert resp.status_code == 200
+
+
+class TestResume:
+    """POST /paper-runs/:id/resume — un-halt a HALTED_MANUAL run."""
+
+    def _seed_halted(self, db_session, user_id: int, *, kill_ts=None):
+        from datetime import UTC, datetime
+        from src.agentfx.api.models import Run, RunEnvironment, RunStatus
+
+        run = Run(
+            id=_mk_id("run"),
+            strategy_id=None,
+            pair="EUR_USD",
+            environment=RunEnvironment.PAPER,
+            status=RunStatus.HALTED_MANUAL,
+            parameters={"granularity": "M1"},
+            initial_balance=0,
+            current_balance=10_000,
+            pnl=0,
+            user_id=user_id,
+            oanda_account_id="101-011-99999-001",
+            snapshot_balance=10_000,
+            stop_reason="USER_KILL",
+            kill_requested_at=kill_ts or datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+        )
+        db_session.add(run)
+        db_session.commit()
+        db_session.refresh(run)
+        return run
+
+    def test_resume_clears_kill_flag_and_resets_state(
+        self, test_client_with_db, db_session, paper_users
+    ):
+        # Patch the runner's schedule call so the real subprocess
+        # doesn't spawn during the test. We don't assert on the mock
+        # call — starlette TestClient doesn't run BackgroundTasks
+        # synchronously in every version, so that assertion would
+        # flap. The `BackgroundTasks.add_task` line is a static
+        # one-liner in the router, so its presence is a code check
+        # not a runtime one.
+        from unittest.mock import patch
+        from src.agentfx.api.models import RunStatus
+
+        run = self._seed_halted(db_session, paper_users["alice"]["user"].id)
+        headers = _auth_headers(
+            test_client_with_db,
+            paper_users["alice"]["email"],
+            paper_users["alice"]["password"],
+        )
+        with patch("agentfx.api.workers.paper_runner.schedule_paper_run"):
+            resp = test_client_with_db.post(
+                f"/api/v1/paper-runs/{run.id}/resume", headers=headers
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "APPROVED"
+        assert body["kill_requested_at"] is None
+        assert body["stop_reason"] is None
+        assert body["completed_at"] is None
+        # snapshot preserved so P&L % stays anchored across the boundary
+        assert body["snapshot_balance"] == 10_000
+
+        db_session.refresh(run)
+        assert run.status == RunStatus.APPROVED
+        assert run.kill_requested_at is None
+
+    def test_resume_writes_audit_log(
+        self, test_client_with_db, db_session, paper_users
+    ):
+        from unittest.mock import patch
+        from src.agentfx.api.models import DecisionLog
+
+        run = self._seed_halted(db_session, paper_users["alice"]["user"].id)
+        headers = _auth_headers(
+            test_client_with_db,
+            paper_users["alice"]["email"],
+            paper_users["alice"]["password"],
+        )
+        with patch("agentfx.api.workers.paper_runner.schedule_paper_run"):
+            test_client_with_db.post(
+                f"/api/v1/paper-runs/{run.id}/resume", headers=headers
+            )
+        logs = (
+            db_session.query(DecisionLog)
+            .filter_by(user_id=paper_users["alice"]["user"].id)
+            .all()
+        )
+        assert any(l.action == "user_resume_paper" for l in logs)
+
+    def test_resume_running_run_returns_409(
+        self, test_client_with_db, db_session, paper_users
+    ):
+        from src.agentfx.api.models import Run, RunEnvironment, RunStatus
+
+        # A non-halted run — resume must refuse.
+        run = Run(
+            id=_mk_id("run"),
+            strategy_id=None,
+            pair="EUR_USD",
+            environment=RunEnvironment.PAPER,
+            status=RunStatus.RUNNING,
+            parameters={"granularity": "M1"},
+            initial_balance=0,
+            current_balance=0,
+            pnl=0,
+            user_id=paper_users["alice"]["user"].id,
+        )
+        db_session.add(run)
+        db_session.commit()
+
+        headers = _auth_headers(
+            test_client_with_db,
+            paper_users["alice"]["email"],
+            paper_users["alice"]["password"],
+        )
+        resp = test_client_with_db.post(
+            f"/api/v1/paper-runs/{run.id}/resume", headers=headers
+        )
+        assert resp.status_code == 409
+        assert "HALTED_MANUAL" in resp.json()["detail"]
+
+    def test_resume_not_owner_403(self, test_client_with_db, db_session, paper_users):
+        run = self._seed_halted(db_session, paper_users["bob"]["user"].id)
+        headers = _auth_headers(
+            test_client_with_db,
+            paper_users["alice"]["email"],
+            paper_users["alice"]["password"],
+        )
+        resp = test_client_with_db.post(
+            f"/api/v1/paper-runs/{run.id}/resume", headers=headers
+        )
+        assert resp.status_code == 403

@@ -289,6 +289,54 @@ def request_kill(
     return run
 
 
+def resume_paper_run(
+    db: Session,
+    run: models.Run,
+    *,
+    current_user: models.User,
+) -> models.Run:
+    """Reverse a HALTED_MANUAL run so the runner picks it up again.
+
+    Clears `kill_requested_at`, `stop_reason`, and `completed_at`;
+    transitions status to APPROVED so `schedule_paper_run` treats it
+    the same way as a fresh approval. `snapshot_balance` is
+    preserved intentionally — the P&L % denominator stays anchored
+    to the original run start so the metric is coherent across the
+    halt boundary. If the user wanted a fresh snapshot they'd
+    redeploy from the queue, not resume.
+
+    Refuses (raises ValueError) if the run isn't in HALTED_MANUAL —
+    the router translates that into 409. Resuming an ERRORed run is
+    a separate feature (v0.6.1): those halts encode real problems
+    (broker circuit, decrypt failure) that resume alone can't fix.
+    """
+    if run.status != models.RunStatus.HALTED_MANUAL:
+        raise ValueError(
+            f"Run is {run.status.value if hasattr(run.status, 'value') else run.status}; "
+            "only HALTED_MANUAL runs can be resumed"
+        )
+
+    run.status = models.RunStatus.APPROVED
+    run.kill_requested_at = None
+    run.stop_reason = None
+    run.completed_at = None
+    run.process_pid = None
+
+    db.add(
+        models.DecisionLog(
+            id=uuid.uuid4().hex,
+            run_id=None,
+            agent_type=models.AgentType.USER.value,
+            action=models.UserAction.USER_RESUME_PAPER.value,
+            user_id=current_user.id,
+            inputs_json={"paper_run_id": run.id},
+        )
+    )
+    db.commit()
+    db.refresh(run)
+    return run
+
+
 def delete_paper_run(db: Session, run: models.Run) -> None:
     """Delete a paper run row.
 
@@ -403,4 +451,5 @@ __all__ = [
     "list_paper_runs",
     "reject_genome",
     "request_kill",
+    "resume_paper_run",
 ]

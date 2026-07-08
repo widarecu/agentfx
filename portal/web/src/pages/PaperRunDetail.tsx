@@ -19,11 +19,16 @@ import { AlertCircle, ChevronLeft, Loader2 } from 'lucide-react';
 
 import { useToast } from '../contexts/ToastContext';
 import { KillSwitchButton } from '../components/KillSwitchButton';
+import { Play } from 'lucide-react';
 import {
   LivePnLChart,
   type EquityPoint,
 } from '../components/LivePnLChart';
-import { getPaperRun, killPaperRun } from '../services/paperApi';
+import {
+  getPaperRun,
+  killPaperRun,
+  resumePaperRun,
+} from '../services/paperApi';
 import {
   isTerminal,
   STATUS_PILL_CLASSES,
@@ -91,6 +96,20 @@ export default function PaperRunDetail() {
     }
   }
 
+  async function handleResume() {
+    if (!runId) return;
+    try {
+      await resumePaperRun(runId);
+      showToast(
+        'Resumed — the runner is being re-scheduled.',
+        'success',
+      );
+      void load();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : String(err), 'error');
+    }
+  }
+
   if (loading && !run) {
     return (
       <div className="container mx-auto px-4 py-8 flex items-center justify-center h-40">
@@ -143,6 +162,7 @@ export default function PaperRunDetail() {
       <StickyHeader
         run={run}
         pnl={pnl}
+        onResume={handleResume}
         pnlPct={pnlPct}
         onKill={handleKill}
       />
@@ -239,17 +259,25 @@ function StickyHeader({
   pnl,
   pnlPct,
   onKill,
+  onResume,
 }: {
   run: PaperRunPublic;
   pnl: number;
   pnlPct: number;
   onKill: () => Promise<void>;
+  onResume: () => Promise<void>;
 }) {
   const disabledReason = useMemo(() => {
     if (run.kill_requested_at) return 'Kill already requested';
     if (isTerminal(run.status)) return `Run is ${run.status.toLowerCase()}`;
     return null;
   }, [run.kill_requested_at, run.status]);
+
+  // Only HALTED_MANUAL is resumable. ERROR runs stay terminal because
+  // their failure encodes a real problem the runner can't fix by
+  // itself (broker circuit, credentials revoked). COMPLETED runs
+  // wouldn't be reached here — the user would redeploy.
+  const canResume = run.status === 'HALTED_MANUAL';
 
   const pnlColor =
     pnl >= 0
@@ -290,9 +318,42 @@ function StickyHeader({
             {pnlPct.toFixed(2)}%
           </div>
         </div>
-        <KillSwitchButton onKill={onKill} disabledReason={disabledReason} />
+        {canResume ? (
+          <ResumeButton onResume={onResume} />
+        ) : (
+          <KillSwitchButton onKill={onKill} disabledReason={disabledReason} />
+        )}
       </div>
     </div>
+  );
+}
+
+function ResumeButton({ onResume }: { onResume: () => Promise<void> }) {
+  const [submitting, setSubmitting] = useState(false);
+  async function handleClick() {
+    if (submitting) return;
+    setSubmitting(true);
+    try {
+      await onResume();
+    } finally {
+      setSubmitting(false);
+    }
+  }
+  return (
+    <button
+      type="button"
+      onClick={handleClick}
+      disabled={submitting}
+      className="inline-flex items-center gap-2 px-5 py-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-bold shadow-md disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
+      title="Un-halt this run — clears the kill flag and re-schedules the runner subprocess"
+    >
+      {submitting ? (
+        <Loader2 className="w-4 h-4 animate-spin" />
+      ) : (
+        <Play className="w-4 h-4" />
+      )}
+      Resume
+    </button>
   );
 }
 

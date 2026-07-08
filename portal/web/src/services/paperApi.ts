@@ -145,6 +145,21 @@ export async function killPaperRun(
   return handleResponse(res);
 }
 
+/**
+ * Un-halt a HALTED_MANUAL run. Backend clears the kill flag, resets
+ * status to APPROVED, and re-schedules the runner subprocess. Snapshot
+ * balance is preserved so P&L % stays anchored to the original start.
+ */
+export async function resumePaperRun(
+  runId: string,
+): Promise<PaperRunPublic> {
+  const res = await fetch(`${API_BASE_URL}/paper-runs/${runId}/resume`, {
+    method: 'POST',
+    headers: authHeaders(),
+  });
+  return handleResponse(res);
+}
+
 export async function deletePaperRun(
   runId: string,
 ): Promise<{ success: boolean; message: string }> {

@@ -270,6 +270,42 @@ def kill_paper_run(
     )
 
 
+@router.post(
+    "/paper-runs/{run_id}/resume",
+    response_model=schemas.PaperRunPublic,
+)
+def resume_paper_run_endpoint(
+    run_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> schemas.PaperRunPublic:
+    """Un-halt a HALTED_MANUAL run and re-schedule the runner subprocess.
+
+    Snapshot balance is preserved so the P&L % denominator stays
+    coherent across the halt boundary. If the user wanted a fresh
+    baseline they'd redeploy from /paper/approvals instead.
+    """
+    _ensure_trader(current_user)
+    run = paper_service.get_paper_run(db, run_id)
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Paper run not found"
+        )
+    _require_paper_run_owner(run, current_user)
+    try:
+        updated = paper_service.resume_paper_run(db, run, current_user=current_user)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+
+    # Re-schedule the subprocess — lazy import so tests that patch the
+    # scheduler can intercept.
+    from ..workers.paper_runner import schedule_paper_run
+
+    background_tasks.add_task(schedule_paper_run, updated.id)
+    return _to_public(updated)
+
+
 @router.delete("/paper-runs/{run_id}")
 def delete_paper_run(
     run_id: str,

@@ -99,6 +99,7 @@ class UserAction(str, Enum):
     USER_REJECT_GENOME = "user_reject_genome"
     USER_DEPLOY_PAPER = "user_deploy_paper"
     USER_KILL_PAPER = "user_kill_paper"
+    USER_RESUME_PAPER = "user_resume_paper"
     USER_UPDATE_CREDENTIALS = "user_update_credentials"
 
 
