@@ -56,9 +56,20 @@ export function LivePnLChart({
     : runStartMs;
   const spanMs = Math.max(now - runStartMs, 60_000); // Min 1min so the axis is legible on brand-new runs.
 
+  // Anchor the live line at (runStartMs, snapshotBalance). Without
+  // this, the curve only starts wherever the user opened the tab —
+  // any run older than that shows a floating line detached from
+  // h0.00 which is misleading. Only prepend when there ISN'T
+  // already an equity sample near the run start (within 30s).
+  const anchoredSeries: EquityPoint[] =
+    liveSeries.length === 0 ||
+    liveSeries[0].timestampMs - runStartMs > 30_000
+      ? [{ timestampMs: runStartMs, balance: snapshotBalance }, ...liveSeries]
+      : liveSeries;
+
   const allBalances = [
     snapshotBalance,
-    ...liveSeries.map((p) => p.balance),
+    ...anchoredSeries.map((p) => p.balance),
     ...backtestSeries.map((p) => p.balance),
   ];
   const minBalance = Math.min(...allBalances) - snapshotBalance * 0.005;
@@ -70,7 +81,7 @@ export function LivePnLChart({
   const scaleY = (balance: number) =>
     _scaleY(balance, minBalance, balanceRange, PADDING_TOP, PLOT_HEIGHT);
 
-  const livePath = pointsToPath(liveSeries, scaleX, scaleY);
+  const livePath = pointsToPath(anchoredSeries, scaleX, scaleY);
   const backtestPath = pointsToPath(backtestSeries, scaleX, scaleY);
 
   // Bottom axis ticks — 5 evenly spaced relative-hour labels.
