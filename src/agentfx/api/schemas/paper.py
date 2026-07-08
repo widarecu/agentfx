@@ -102,6 +102,10 @@ class PaperRunPublic(BaseSchema):
     id: str
     status: str
     strategy_genome_id: str | None = None
+    # Parent evolution run — resolved server-side so the frontend can
+    # link back to `/evolution/{evolution_run_id}/genomes/{strategy_genome_id}`
+    # without a follow-up query. Null when the genome has been deleted.
+    evolution_run_id: str | None = None
     instrument: str
     granularity: str
     oanda_account_id: str | None = None

@@ -19,7 +19,7 @@ import { AlertCircle, ChevronLeft, Loader2 } from 'lucide-react';
 
 import { useToast } from '../contexts/ToastContext';
 import { KillSwitchButton } from '../components/KillSwitchButton';
-import { Play } from 'lucide-react';
+import { ExternalLink, Play } from 'lucide-react';
 import {
   LivePnLChart,
   type EquityPoint,
@@ -304,6 +304,24 @@ function StickyHeader({
             </>
           )}
         </div>
+        {run.strategy_genome_id && (
+          <div className="text-xs text-slate-500 dark:text-slate-400 mt-1 font-mono flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="uppercase tracking-wide text-[10px] text-slate-400 normal-case">
+              Strategy:
+            </span>
+            <span className="truncate">{run.strategy_genome_id}</span>
+            {run.evolution_run_id && (
+              <Link
+                to={`/evolution/${run.evolution_run_id}/genomes/${run.strategy_genome_id}`}
+                className="inline-flex items-center gap-1 text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300 normal-case"
+                title="Inspect the DSL, entry conditions, and walk-forward metrics for this genome"
+              >
+                <ExternalLink className="w-3 h-3" />
+                View strategy
+              </Link>
+            )}
+          </div>
+        )}
       </div>
       <div className="flex items-center gap-6 shrink-0">
         <div className="text-right">

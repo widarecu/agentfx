@@ -64,6 +64,10 @@ export interface PaperRunPublic {
   id: string;
   status: PaperRunStatus;
   strategy_genome_id: string | null;
+  /** Parent evolution run — resolved server-side so the frontend can
+   *  link back to `/evolution/{evolution_run_id}/genomes/{strategy_genome_id}`.
+   *  Null when the genome or its parents have been deleted. */
+  evolution_run_id: string | null;
   instrument: string;
   granularity: string;
   oanda_account_id: string | null;

@@ -41,13 +41,48 @@ def _ensure_trader(current_user: models.User) -> None:
         )
 
 
-def _to_public(run: models.Run) -> schemas.PaperRunPublic:
+def _resolve_evolution_run_id(
+    db: Session,
+    strategy_genome_id: str | None,
+) -> str | None:
+    """Walk genome → generation → evolution run so the frontend can
+    render a link back to the DSL. Returns None if the genome or its
+    parents have been deleted since the paper run was approved."""
+    if not strategy_genome_id:
+        return None
+    row = (
+        db.query(models.EvolutionRun.id)
+        .join(
+            models.Generation,
+            models.Generation.run_id == models.EvolutionRun.id,
+        )
+        .join(
+            models.StrategyGenome,
+            models.StrategyGenome.generation_id == models.Generation.id,
+        )
+        .filter(models.StrategyGenome.id == strategy_genome_id)
+        .first()
+    )
+    return row[0] if row else None
+
+
+def _to_public(
+    run: models.Run,
+    *,
+    evolution_run_id: str | None = None,
+) -> schemas.PaperRunPublic:
     """Serialise a Run row into the public view. Handles both enum and
-    plain-string values so ORM refreshes don't fluctuate the shape."""
+    plain-string values so ORM refreshes don't fluctuate the shape.
+
+    `evolution_run_id` is passed by the caller — resolving it requires
+    a DB query, so we keep this helper pure and let the endpoint
+    decide whether to spend the roundtrip.
+    """
     return schemas.PaperRunPublic(
         id=run.id,
         status=run.status.value if hasattr(run.status, "value") else str(run.status),
         strategy_genome_id=run.strategy_genome_id,
+        evolution_run_id=evolution_run_id,
         instrument=run.pair,
         granularity=(run.parameters or {}).get("granularity")
         or (run.parameters or {}).get("timeframe")
@@ -236,7 +271,8 @@ def get_paper_run(
             status_code=status.HTTP_404_NOT_FOUND, detail="Paper run not found"
         )
     _require_paper_run_owner(run, current_user)
-    return _to_public(run)
+    evolution_run_id = _resolve_evolution_run_id(db, run.strategy_genome_id)
+    return _to_public(run, evolution_run_id=evolution_run_id)
 
 
 @router.post(
@@ -303,7 +339,8 @@ def resume_paper_run_endpoint(
     from ..workers.paper_runner import schedule_paper_run
 
     background_tasks.add_task(schedule_paper_run, updated.id)
-    return _to_public(updated)
+    evolution_run_id = _resolve_evolution_run_id(db, updated.strategy_genome_id)
+    return _to_public(updated, evolution_run_id=evolution_run_id)
 
 
 @router.delete("/paper-runs/{run_id}")
