@@ -143,7 +143,8 @@ class TestOptimizationJobCRUD:
         """Test that getting a job returns its details."""
         from src.agentfx.api.models.optimization import OptimizationJob
 
-        # Create a job directly in DB
+        # Create a job directly in DB — owned by the viewer so the
+        # US-018 RBAC filter permits them to read it.
         job = OptimizationJob(
             id=generate_job_id(),
             strategy="rsi",
@@ -157,6 +158,7 @@ class TestOptimizationJobCRUD:
             estimated_iterations=34,
             completed_iterations=34,
             best_sharpe=1.5,
+            created_by=test_users["viewer"]["user"].id,
         )
         db_session.add(job)
         db_session.commit()
@@ -187,7 +189,7 @@ class TestOptimizationJobCRUD:
         """Test that job list supports pagination."""
         from src.agentfx.api.models.optimization import OptimizationJob
 
-        # Create multiple jobs
+        # Create multiple jobs — all owned by viewer for the RBAC filter
         jobs = []
         for i in range(15):
             job = OptimizationJob(
@@ -201,6 +203,7 @@ class TestOptimizationJobCRUD:
                 position_size=10000,
                 data_years=1,
                 estimated_iterations=20,
+                created_by=test_users["viewer"]["user"].id,
             )
             db_session.add(job)
             jobs.append(job)
@@ -335,7 +338,7 @@ class TestOptimizationTrials:
             OptimizationTrial,
         )
 
-        # Create job with trials
+        # Create job with trials — viewer-owned for RBAC filter.
         job = OptimizationJob(
             id=generate_job_id(),
             strategy="donchian",
@@ -348,6 +351,7 @@ class TestOptimizationTrials:
             data_years=1,
             estimated_iterations=10,
             completed_iterations=10,
+            created_by=test_users["viewer"]["user"].id,
         )
         db_session.add(job)
         db_session.commit()
@@ -397,7 +401,7 @@ class TestOptimizationTrials:
             OptimizationTrial,
         )
 
-        # Create job with trials of varying Sharpe ratios
+        # Create job with trials of varying Sharpe ratios — viewer-owned.
         job = OptimizationJob(
             id=generate_job_id(),
             strategy="ma",
@@ -410,6 +414,7 @@ class TestOptimizationTrials:
             data_years=1,
             estimated_iterations=10,
             completed_iterations=10,
+            created_by=test_users["viewer"]["user"].id,
         )
         db_session.add(job)
         db_session.commit()
@@ -559,10 +564,10 @@ class TestOptimizationAuthorization:
         db_session.commit()
 
     def test_viewer_can_read_jobs(self, test_client_with_db, test_users, db_session):
-        """Test that viewer role can read optimization jobs."""
+        """Test that viewer role can read their own optimization jobs."""
         from src.agentfx.api.models.optimization import OptimizationJob
 
-        # Create a job
+        # Create a job owned by the viewer (RBAC filter admits their own).
         job = OptimizationJob(
             id=generate_job_id(),
             strategy="ma",
@@ -575,6 +580,7 @@ class TestOptimizationAuthorization:
             data_years=1,
             estimated_iterations=20,
             completed_iterations=20,
+            created_by=test_users["viewer"]["user"].id,
         )
         db_session.add(job)
         db_session.commit()

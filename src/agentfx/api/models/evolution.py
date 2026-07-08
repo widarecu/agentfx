@@ -76,6 +76,30 @@ class AgentType(str, Enum):
     GA = "ga"
     LLM = "llm"
     VALIDATOR = "validator"
+    # v0.6.0 (US-018): the caller isn't an autonomous agent — a real user
+    # explicitly acted (create/delete run, approve/reject genome, deploy
+    # paper, kill paper, update credentials). `user_id` on the row
+    # identifies which user; `action` names the specific verb.
+    USER = "user"
+
+
+class UserAction(str, Enum):
+    """Action strings written to DecisionLog when `agent_type == USER`.
+
+    New in v0.6.0 for US-018 and the paper-trading approval state
+    machine. `DecisionLog.action` is a plain String(40) so these values
+    are enforced at the write site (not at the DB level) — the enum is
+    the canonical vocabulary reviewers should match against.
+    """
+
+    USER_CREATE_RUN = "user_create_run"
+    USER_DELETE_RUN = "user_delete_run"
+    USER_STOP_RUN = "user_stop_run"
+    USER_APPROVE_GENOME = "user_approve_genome"
+    USER_REJECT_GENOME = "user_reject_genome"
+    USER_DEPLOY_PAPER = "user_deploy_paper"
+    USER_KILL_PAPER = "user_kill_paper"
+    USER_UPDATE_CREDENTIALS = "user_update_credentials"
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -342,12 +366,18 @@ class DecisionLog(Base):
     outputs_json = Column(JSON, nullable=True)
     reasoning_text = Column(Text, nullable=True)
     llm_call_id = Column(String(80), nullable=True)
+    # Populated when `agent_type == USER` so a full audit trail exists
+    # for human-initiated actions (US-018). Nullable for the pre-existing
+    # agent-authored rows and for legacy rows written before the v0.6.0
+    # migration ran.
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
 
     created_at = Column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     run = relationship("EvolutionRun", back_populates="decisions")
+    user = relationship("User", foreign_keys=[user_id])
 
     __table_args__ = (
         # Per-run timeline view in the portal — paginated by created_at desc.
@@ -367,5 +397,6 @@ __all__ = [
     "Generation",
     "GenomeOrigin",
     "StrategyGenome",
+    "UserAction",
     "ValidationFold",
 ]

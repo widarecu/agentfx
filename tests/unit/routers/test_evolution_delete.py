@@ -39,10 +39,16 @@ def viewer_user():
     return user
 
 
-def _make_run(status_value: models.EvolutionRunStatus) -> Mock:
+def _make_run(
+    status_value: models.EvolutionRunStatus, created_by: str = "user_trader"
+) -> Mock:
     run = Mock(spec=models.EvolutionRun)
     run.id = "evorun_test_001"
     run.status = status_value
+    # Owner tag is required after US-018 — router-level ownership check
+    # is `run.created_by == current_user.id`; defaults to the trader
+    # user id so happy-path tests continue to pass.
+    run.created_by = created_by
     return run
 
 

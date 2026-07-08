@@ -23,6 +23,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, s
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
+from ..core import rbac
 from ..core.database import get_db
 from ..services import evolution as evolution_service
 from ..services import user as user_service
@@ -160,16 +161,28 @@ def list_evolution_runs(
     page_size: int = 10,
     status_filter: str | None = None,
     instrument: str | None = None,
+    scope: rbac.Scope = "my",
     db: Session = Depends(get_db),
     current_user: models.User = Depends(user_service.get_current_active_user),
 ) -> schemas.EvolutionRunList:
+    rbac.require_admin_for_scope_all(current_user, scope)
     skip = (page - 1) * page_size
+    # ADMIN + scope=all → unfiltered listing; every other case is scoped
+    # to the caller's own rows (US-018). See rbac.scope_query_to_user for
+    # the equivalent query-layer helper — this endpoint uses the service
+    # layer's created_by kwarg because service.list_runs handles paging.
+    created_by_filter = (
+        None
+        if current_user.role == models.UserRole.ADMIN and scope == "all"
+        else current_user.id
+    )
     items, total = evolution_service.list_runs(
         db,
         skip=skip,
         limit=page_size,
         status=status_filter,
         instrument=instrument,
+        created_by=created_by_filter,
     )
     return schemas.EvolutionRunList(
         items=[schemas.EvolutionRunPublic.model_validate(r) for r in items],
@@ -190,6 +203,7 @@ def get_evolution_run(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Evolution run not found"
         )
+    rbac.require_owner_or_admin(run, current_user, resource="evolution run")
     return schemas.EvolutionRunPublic.model_validate(run)
 
 
@@ -211,6 +225,7 @@ def delete_evolution_run(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Evolution run not found"
         )
+    rbac.require_owner_or_admin(run, current_user, resource="evolution run")
     if run.status in (
         models.EvolutionRunStatus.QUEUED,
         models.EvolutionRunStatus.RUNNING,
@@ -234,6 +249,15 @@ def stop_evolution_run(
     it's running; if the run hasn't started yet, status flips to STOPPED
     immediately."""
     _ensure_trader(current_user)
+    # Ownership check must fire BEFORE the state transition so a
+    # non-owner cannot force-halt another user's run.
+    run_row = evolution_service.get_run(db, run_id)
+    if run_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Evolution run not found"
+        )
+    rbac.require_owner_or_admin(run_row, current_user, resource="evolution run")
+
     run = evolution_service.stop_run(db, run_id)
     if run is None:
         raise HTTPException(
@@ -268,6 +292,7 @@ def list_run_generations(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Evolution run not found"
         )
+    rbac.require_owner_or_admin(run, current_user, resource="evolution run")
 
     gens = evolution_service.list_generations(db, run_id)
     return schemas.GenerationList(
@@ -299,6 +324,7 @@ def list_run_genomes(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Evolution run not found"
         )
+    rbac.require_owner_or_admin(run, current_user, resource="evolution run")
 
     rows = evolution_service.list_run_genome_summaries(
         db,
@@ -323,6 +349,17 @@ def get_genome_detail(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(user_service.get_current_active_user),
 ) -> schemas.StrategyGenomePublic:
+    # Load the parent run first so we can enforce ownership at the run
+    # level — genome IDs are effectively opaque to the caller so a bare
+    # 404 here would leak nothing, but the run-level check keeps the
+    # invariant "no cross-user reads" consistent across every endpoint.
+    run = evolution_service.get_run(db, run_id)
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Evolution run not found"
+        )
+    rbac.require_owner_or_admin(run, current_user, resource="evolution run")
+
     detail = evolution_service.get_genome_with_lineage(db, run_id, genome_id)
     if detail is None:
         raise HTTPException(
@@ -385,6 +422,7 @@ def get_genome_backtest(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Evolution run not found"
         )
+    rbac.require_owner_or_admin(run, current_user, resource="evolution run")
 
     genome_detail = evolution_service.get_genome_with_lineage(db, run_id, genome_id)
     if genome_detail is None:
@@ -499,6 +537,7 @@ def list_run_decisions(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Evolution run not found"
         )
+    rbac.require_owner_or_admin(run, current_user, resource="evolution run")
 
     skip = (page - 1) * page_size
     items, total = evolution_service.list_decisions(

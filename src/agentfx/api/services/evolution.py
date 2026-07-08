@@ -522,13 +522,23 @@ def list_runs(
     limit: int = 10,
     status: str | None = None,
     instrument: str | None = None,
+    created_by: int | None = None,
 ) -> tuple[list[models.EvolutionRun], int]:
-    """Paginated listing. Returns (items, total)."""
+    """Paginated listing. Returns (items, total).
+
+    When `created_by` is provided, the query is filtered to that user's
+    runs — the routing layer sets this from `current_user.id` unless the
+    caller is ADMIN + `scope=all` (US-018). Callers that leave it as
+    None get an unfiltered listing; the router MUST NOT do so for
+    non-admin sessions.
+    """
     q = db.query(models.EvolutionRun)
     if status:
         q = q.filter(models.EvolutionRun.status == status)
     if instrument:
         q = q.filter(models.EvolutionRun.instrument == instrument)
+    if created_by is not None:
+        q = q.filter(models.EvolutionRun.created_by == created_by)
     total = q.count()
     items = (
         q.order_by(desc(models.EvolutionRun.created_at)).offset(skip).limit(limit).all()
