@@ -332,6 +332,16 @@ The current evolve → evaluate → repeat loop is optimization without learning
 - [ ] `DEFERRED to v0.7.0` Fernet key rotation → `key_version=2` on `user_oanda_credentials`
 - [ ] `DEFERRED to v0.7.0` ADMIN visibility of other users' *masked* credential status (for support)
 
+### v0.6.1 — Known gaps surfaced during UAT smoke-test (2026-07-08)
+
+The v0.6.0 backend + portal shipped clean, but the smoke-test on Wilson's real UAT data flushed out four follow-ups that are already noted in the PR-J placeholders and one new one from the approval-queue verification:
+
+- [ ] `NEEDS INVESTIGATION` **Validator never writes `validator_passed`** — Wilson's 17 UAT evolution runs have produced multiple genomes whose `metrics_json` clearly clears every Gate B threshold (Sharpe 2.6, MDD 6.7%, hit 50.4%, n_trades 600), yet every row has `validator_passed = NULL`. The evaluator agent isn't persisting the verdict. Impact: the approval queue is permanently empty for real users — the smoke-test only worked after a manual `UPDATE strategy_genomes SET validator_passed = true`. Fix path: audit `agentfx.agents.validator` + `evolution_runner` to find where the write-back is dropped, add an integration test that confirms passing metrics → `validator_passed = true` on the persisted row.
+- [ ] `NEEDS BACKEND` `GET /paper-runs/{id}/trades` endpoint + trades table on the detail page (Origin + Signal reason columns per Wilson's UX answer #1)
+- [ ] `NEEDS BACKEND` `GET /paper-runs/{id}/decisions` endpoint + decision log stream on the detail page — every gate refusal / order / kill is already persisted in `decision_logs`, just needs surfacing
+- [ ] `NEEDS BACKEND` `GET /paper-runs/{id}/equity` endpoint — persisted historical equity snapshots so LivePnLChart survives page reloads (currently it accumulates only while the tab is open)
+- [ ] `NEEDS BACKEND` Backtest OOS overlay data on `LivePnLChart` — right now the backtest curve is a placeholder; needs a source that returns the walk-forward OOS equity time series
+
 ---
 
 ## v1.0.0 - Live Trading + Portfolio
