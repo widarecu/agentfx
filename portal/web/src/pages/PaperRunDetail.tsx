@@ -203,7 +203,7 @@ export default function PaperRunDetail() {
               Live vs backtest equity
             </div>
             <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Dual x-axis: relative hours (bottom) + actual UTC (top). Live
+              Dual x-axis: relative hours (bottom) + local time (top). Live
               samples accumulate every 5s while this tab is open.
             </div>
           </div>
