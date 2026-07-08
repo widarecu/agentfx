@@ -316,15 +316,11 @@ export default function PaperRunDetail() {
         </div>
       </div>
 
-      <div className="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <AccountRiskPanel run={run} />
-        <RunLifecyclePanel run={run} />
-        <RiskConfigPanel run={run} />
-      </div>
-
       {/* Candles + indicators — same StrategyChart the backtest page
           uses, so all the indicator-scale + candle-alignment fixes
-          from that work carry over. */}
+          from that work carry over. Placed directly under the
+          backtest equity chart so the price context is right there
+          when reading the P&L curve. */}
       <section className="mt-6 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
         <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
           <div>
@@ -375,6 +371,22 @@ export default function PaperRunDetail() {
           />
         )}
       </section>
+
+      <div className="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <AccountRiskPanel run={run} />
+        <RunLifecyclePanel run={run} />
+        <RiskConfigPanel run={run} />
+      </div>
+
+      <div className="mt-6 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
+        <div className="text-sm font-semibold mb-2">Trades</div>
+        <div className="text-xs text-slate-500 dark:text-slate-400 italic">
+          Trades table (with Origin + Signal reason columns) wires up in
+          v0.6.1 alongside the /paper-runs/{`{id}`}/trades endpoint. For
+          now the run's live P&amp;L above is the source of truth and
+          the Price + indicators chart shows the strategy's DSL logic.
+        </div>
+      </div>
 
       <div className="mt-6 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
         <div className="text-sm font-semibold mb-2">Decision log</div>
