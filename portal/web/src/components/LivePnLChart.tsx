@@ -89,10 +89,11 @@ export function LivePnLChart({
   const currentLive = liveSeries[liveSeries.length - 1];
 
   return (
-    <div className="relative">
+    <div className="relative w-full h-full">
       <svg
         viewBox={`0 0 ${VIEWBOX_WIDTH} ${VIEWBOX_HEIGHT}`}
-        className="w-full h-full"
+        preserveAspectRatio="none"
+        className="w-full h-full block"
         role="img"
         aria-label="Live equity vs backtest overlay"
       >
@@ -212,13 +213,13 @@ export function LivePnLChart({
           hours since run start
         </text>
       </svg>
-
-      {backtestSeries.length === 0 && (
-        <div className="mt-2 text-xs text-slate-500 dark:text-slate-400 italic">
-          Backtest overlay wires up in v0.6.1 — for now the chart shows live
-          equity accumulated since you opened this page.
-        </div>
-      )}
+      {/* Backtest-not-wired-yet notice is intentionally dropped —
+          the parent card's subtitle already says "Live samples
+          accumulate every 5s while this tab is open" which covers
+          the same ground. Keeping it inside the chart wrapper
+          caused overflow into the panels below when the SVG
+          rendered at its intrinsic aspect ratio (viewBox 600×220
+          into a full-width parent). */}
     </div>
   );
 }
