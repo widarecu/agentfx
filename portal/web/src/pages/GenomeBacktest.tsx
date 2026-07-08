@@ -34,8 +34,8 @@ import {
 
 import StrategyChart from '../components/StrategyChart';
 import TradesTable from '../components/TradesTable';
-import { API_BASE_URL } from '../services/config';
 import { getEvolutionRun, getGenome, getGenomeBacktest } from '../services/evolutionApi';
+import { fetchCandles } from '../utils/candles';
 import { buildIndicatorsFromDsl } from '../utils/dslIndicators';
 import type {
   EvolutionRun,
@@ -58,10 +58,9 @@ import {
   formatSharpe,
 } from '../types/optimization';
 
-function authHeaders(): HeadersInit {
-  const token = localStorage.getItem('access_token');
-  return token ? { Authorization: `Bearer ${token}` } : {};
-}
+// authHeaders lived here for the local fetchCandles — that helper
+// moved to ../utils/candles. Keep this file focused on the backtest
+// page's mapping helpers.
 
 function mapTrade(t: Record<string, unknown>): Trade {
   return {
@@ -99,49 +98,10 @@ function mapSignal(s: Record<string, unknown>): TradeSignal {
   };
 }
 
-async function fetchCandles(
-  instrument: string,
-  granularity: string,
-  fromTime: string,
-  toTime: string,
-): Promise<CandleData[]> {
-  // Mirror TrialDetail's paginated fetch from market-data API.
-  const out: CandleData[] = [];
-  const pageSize = 10000;
-  let offset = 0;
-  let total = Infinity;
-  while (offset < total) {
-    const params = new URLSearchParams({
-      exchange: 'oanda',
-      instrument,
-      timeframe: granularity,
-      from_time: fromTime,
-      to_time: toTime,
-      limit: String(pageSize),
-      offset: String(offset),
-    });
-    const res = await fetch(`${API_BASE_URL}/market-data/candles?${params}`, {
-      headers: authHeaders(),
-    });
-    if (!res.ok) break;
-    const payload = await res.json();
-    total = payload.total ?? 0;
-    const items: CandleData[] = (payload.items ?? []).map(
-      (c: Record<string, unknown>) => ({
-        timestamp: c.timestamp as string,
-        open: c.open as number,
-        high: c.high as number,
-        low: c.low as number,
-        close: c.close as number,
-        volume: (c.volume as number) ?? 0,
-      }),
-    );
-    out.push(...items);
-    offset += pageSize;
-    if (items.length < pageSize) break;
-  }
-  return out;
-}
+// fetchCandles moved to `../utils/candles` so the paper run detail
+// page can reuse the exact same paginated-fetch semantics (Wilson's
+// ask: leverage the backtest chart work + defect fixes rather than
+// re-implement).
 
 export default function GenomeBacktest() {
   const { runId, genomeId } = useParams<{ runId: string; genomeId: string }>();

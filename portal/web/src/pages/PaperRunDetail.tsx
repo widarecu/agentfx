@@ -15,28 +15,41 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { AlertCircle, ChevronLeft, Loader2 } from 'lucide-react';
+import {
+  AlertCircle,
+  ChevronLeft,
+  ExternalLink,
+  Loader2,
+  Play,
+} from 'lucide-react';
 
 import { useToast } from '../contexts/ToastContext';
 import { KillSwitchButton } from '../components/KillSwitchButton';
-import { ExternalLink, Play } from 'lucide-react';
 import {
   LivePnLChart,
   type EquityPoint,
 } from '../components/LivePnLChart';
+import StrategyChart from '../components/StrategyChart';
 import {
   getPaperRun,
   killPaperRun,
   resumePaperRun,
 } from '../services/paperApi';
+import { getGenome } from '../services/evolutionApi';
 import {
   isTerminal,
   STATUS_PILL_CLASSES,
   type PaperRunPublic,
   type PaperRunStatus,
 } from '../types/paper';
+import type { CandleData, TradeSignal } from '../types/optimization';
+import type { StrategyGenome } from '../types/evolution';
+import { fetchRecentCandles } from '../utils/candles';
+import { buildIndicatorsFromDsl } from '../utils/dslIndicators';
 
 const POLL_INTERVAL_MS = 5_000;
+const CANDLES_POLL_INTERVAL_MS = 60_000; // fresh candles every minute
+const CHART_BARS = 1500;
 const MAX_LIVE_SAMPLES = 720; // ~1h at 5s cadence — plenty for the SVG.
 
 export default function PaperRunDetail() {
@@ -109,6 +122,83 @@ export default function PaperRunDetail() {
       showToast(err instanceof Error ? err.message : String(err), 'error');
     }
   }
+
+  // ─────────────────────────────────────────────────────────────
+  // Candle + genome fetch for the StrategyChart section.
+  //
+  // Reuses `fetchRecentCandles` and `buildIndicatorsFromDsl` from the
+  // backtest page (extracted to shared utils) so the indicator
+  // scaling + candle shape guarantees are identical — no
+  // reintroduced defects. Genome fetch happens once when the run
+  // loads; candles refresh every 60s so a fresh bar rolls in as it
+  // closes on the granularity boundary.
+  // ─────────────────────────────────────────────────────────────
+
+  const [genome, setGenome] = useState<StrategyGenome | null>(null);
+  const [candles, setCandles] = useState<CandleData[]>([]);
+  const [candlesLoading, setCandlesLoading] = useState(false);
+
+  useEffect(() => {
+    if (!run?.evolution_run_id || !run?.strategy_genome_id) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const g = await getGenome(
+          run.evolution_run_id!,
+          run.strategy_genome_id!,
+        );
+        if (!cancelled) setGenome(g);
+      } catch {
+        // Non-fatal — chart will still render candles without
+        // indicator overlays if the genome fetch fails.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [run?.evolution_run_id, run?.strategy_genome_id]);
+
+  useEffect(() => {
+    if (!run) return;
+    let cancelled = false;
+    const load = async () => {
+      setCandlesLoading(true);
+      try {
+        const c = await fetchRecentCandles(
+          run.instrument,
+          run.granularity,
+          CHART_BARS,
+        );
+        if (!cancelled) setCandles(c);
+      } finally {
+        if (!cancelled) setCandlesLoading(false);
+      }
+    };
+    void load();
+    // Only auto-refresh candles for non-terminal runs — a completed
+    // or halted run's chart doesn't need to keep pulling new bars.
+    if (run && isTerminal(run.status)) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    const interval = setInterval(load, CANDLES_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [run?.instrument, run?.granularity, run?.status]);
+
+  const indicators = useMemo(
+    () => buildIndicatorsFromDsl(genome?.dsl_json ?? null, candles),
+    [genome, candles],
+  );
+
+  // TradeSignal list is empty until the /paper-runs/:id/trades
+  // endpoint ships (tracked in v0.6.1). StrategyChart accepts an
+  // empty array — the chart just renders candles + indicators with
+  // no entry/exit markers.
+  const chartSignals: TradeSignal[] = useMemo(() => [], []);
 
   if (loading && !run) {
     return (
@@ -232,14 +322,59 @@ export default function PaperRunDetail() {
         <RiskConfigPanel run={run} />
       </div>
 
-      <div className="mt-6 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
-        <div className="text-sm font-semibold mb-2">Trades</div>
-        <div className="text-xs text-slate-500 dark:text-slate-400 italic">
-          Trades table (with Origin + Signal reason columns) wires up in
-          v0.6.1 alongside the /paper-runs/{`{id}`}/trades endpoint. For now
-          the run's live P&amp;L above is the source of truth.
+      {/* Candles + indicators — same StrategyChart the backtest page
+          uses, so all the indicator-scale + candle-alignment fixes
+          from that work carry over. */}
+      <section className="mt-6 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
+        <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+          <div>
+            <div className="text-sm font-semibold">
+              Price + indicators — {run.instrument} {run.granularity}
+            </div>
+            <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+              Live candles refresh every 60s. Indicators are computed from
+              the same DSL the runner executes. Entry / exit markers land
+              once the /paper-runs/{`{id}`}/trades endpoint ships in v0.6.1.
+            </div>
+          </div>
+          {candlesLoading && (
+            <span className="text-xs text-slate-500 dark:text-slate-400 inline-flex items-center gap-1">
+              <Loader2 className="w-3 h-3 animate-spin" />
+              refreshing…
+            </span>
+          )}
+          {!candlesLoading && candles.length > 0 && (
+            <span className="text-xs text-slate-500 dark:text-slate-400">
+              {candles.length.toLocaleString()} bars loaded
+            </span>
+          )}
         </div>
-      </div>
+        {candlesLoading && candles.length === 0 ? (
+          <div className="flex items-center justify-center h-[500px] border border-slate-200 dark:border-slate-700 rounded-lg">
+            <div className="flex flex-col items-center gap-2 text-sm text-slate-600 dark:text-slate-400">
+              <Loader2 className="w-6 h-6 animate-spin" />
+              Loading {run.granularity} candles for the chart…
+            </div>
+          </div>
+        ) : candles.length === 0 ? (
+          <div className="text-sm text-slate-500 dark:text-slate-400 italic py-8">
+            No candles returned for {run.instrument} {run.granularity} —
+            check that the ingestion worker has backfilled this
+            instrument/timeframe.
+          </div>
+        ) : (
+          <StrategyChart
+            candles={candles}
+            signals={chartSignals}
+            indicators={indicators}
+            instrument={run.instrument}
+            strategy="dsl"
+            params={{}}
+            timeframe={run.granularity}
+            defaultVisibleBars={1500}
+          />
+        )}
+      </section>
 
       <div className="mt-6 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
         <div className="text-sm font-semibold mb-2">Decision log</div>
