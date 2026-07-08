@@ -341,6 +341,7 @@ The v0.6.0 backend + portal shipped clean, but the smoke-test on Wilson's real U
 - [ ] `NEEDS BACKEND` `GET /paper-runs/{id}/decisions` endpoint + decision log stream on the detail page — every gate refusal / order / kill is already persisted in `decision_logs`, just needs surfacing
 - [ ] `NEEDS BACKEND` `GET /paper-runs/{id}/equity` endpoint — persisted historical equity snapshots so LivePnLChart survives page reloads (currently it accumulates only while the tab is open)
 - [ ] `NEEDS BACKEND` Backtest OOS overlay data on `LivePnLChart` — right now the backtest curve is a placeholder; needs a source that returns the walk-forward OOS equity time series
+- [ ] `UX POLISH` **LLM-suggested deployment name** on the DeployPaperModal — today the field pre-fills with `{instrument} {granularity} — {YYYY-MM-DD}` which is fine for one deployment but useless when the user has 10+ paper runs. Use the existing Anthropic integration (same one the evolution runner uses for genome hypotheses) to summarise the genome's DSL into a short, memorable identifier — e.g. `EUR_USD trend-MACD 20/50` or `USD_JPY RSI-oversold 14`. New backend endpoint `POST /paper-runs/generate-name` body `{strategy_genome_id}` → `{suggested_name}`. Frontend calls it when the deploy modal opens and shows the suggestion in the name field with an "AI" chip; user can still overwrite. Cheap LLM call — Haiku is fine given the DSL is small.
 
 ---
 
