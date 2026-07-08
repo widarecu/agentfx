@@ -28,6 +28,7 @@ import {
   ChevronRight,
   Loader2,
   AlertTriangle,
+  Send,
 } from 'lucide-react';
 
 import DslTree from '../components/DslTree';
@@ -269,7 +270,7 @@ export default function GenomeDetail() {
           </p>
         )}
 
-        <div className="mb-4">
+        <div className="mb-4 flex flex-wrap items-center gap-3">
           <Link
             to={`/evolution/${runId}/genomes/${genomeId}/backtest`}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium"
@@ -278,9 +279,24 @@ export default function GenomeDetail() {
             View full backtest detail
             <ChevronRight className="w-4 h-4" />
           </Link>
-          <span className="ml-3 text-xs text-slate-500 dark:text-slate-400">
-            Re-runs the backtest on demand to show every trade, signal, and
-            the price chart with markers.
+          {/* v0.6.0: shortcut to the approval queue for validated genomes.
+              The backend surfaces every validator-passed genome on the
+              user's queue automatically — this button just navigates
+              there so the user doesn't have to hunt for it in the nav. */}
+          {genome.validator_passed === true && (
+            <Link
+              to="/paper/approvals"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-medium"
+              title="Go to the approval queue where you can deploy this genome to paper"
+            >
+              <Send className="w-4 h-4" />
+              Send to approval queue
+              <ChevronRight className="w-4 h-4" />
+            </Link>
+          )}
+          <span className="text-xs text-slate-500 dark:text-slate-400">
+            Backtest re-runs on demand to show every trade + signal. Approval
+            queue is where you deploy this genome to paper trading.
           </span>
         </div>
 

@@ -108,9 +108,12 @@ class TestOandaAdapter:
 
     def test_request_success(self, oanda_client):
         """Test successful API request."""
-        # Mock successful response
+        # Mock successful response — `content` truthy so `resp.json()`
+        # is invoked (US-020 defensive-empty branch skips json when
+        # content is empty).
         mock_response = MagicMock()
         mock_response.status_code = 200
+        mock_response.content = b"non-empty"
         mock_response.json.return_value = {"data": "test_data"}
 
         oanda_client.session.request = MagicMock(return_value=mock_response)
@@ -118,10 +121,13 @@ class TestOandaAdapter:
         result = oanda_client._request("GET", "/test", {"param": "value"})
 
         assert result == {"data": "test_data"}
+        # After US-020: `_request` also forwards `json=None` for GETs
+        # and always passes `params` (even when empty).
         oanda_client.session.request.assert_called_once_with(
             "GET",
             "https://api-fxpractice.oanda.com/v3/test",
             params={"param": "value"},
+            json=None,
             timeout=15,
         )
 
@@ -130,32 +136,42 @@ class TestOandaAdapter:
         # Mock rate limit response followed by success
         rate_limit_response = MagicMock()
         rate_limit_response.status_code = 429
+        rate_limit_response.text = "rate limited"
 
         success_response = MagicMock()
         success_response.status_code = 200
+        success_response.content = b"non-empty"
         success_response.json.return_value = {"data": "success"}
 
         oanda_client.session.request = MagicMock(
             side_effect=[rate_limit_response, success_response]
         )
 
+        # US-020 backoff sleeps for an exponential + jitter value; the
+        # exact delay doesn't matter here — just that sleep is called
+        # exactly once (one retry) with a positive value.
         with patch("time.sleep") as mock_sleep:
             result = oanda_client._request("GET", "/test", {})
 
         assert result == {"data": "success"}
         assert oanda_client.session.request.call_count == 2
-        mock_sleep.assert_called_once_with(1)
+        assert mock_sleep.call_count == 1
+        assert mock_sleep.call_args.args[0] > 0
 
     def test_request_rate_limit_exhausted(self, oanda_client):
         """Test API request fails after maximum rate limit retries."""
-        # Mock continuous rate limit responses
+        # Mock continuous rate limit responses — US-020's message now
+        # surfaces the actual last-error info (`429 …`) instead of a
+        # generic "Rate limited repeatedly by OANDA" so the paper
+        # runner can log which status the broker returned last.
         rate_limit_response = MagicMock()
         rate_limit_response.status_code = 429
+        rate_limit_response.text = "rate limited"
 
         oanda_client.session.request = MagicMock(return_value=rate_limit_response)
 
         with patch("time.sleep"):
-            with pytest.raises(OandaError, match="Rate limited repeatedly by OANDA"):
+            with pytest.raises(OandaError, match="429"):
                 oanda_client._request("GET", "/test", {})
 
         assert oanda_client.session.request.call_count == 5

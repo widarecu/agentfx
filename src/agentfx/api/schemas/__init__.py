@@ -89,6 +89,25 @@ from .user import (
     UserLogin,
     UserUpdate,
 )
+from .paper import (
+    ApprovalQueueItem,
+    ApprovalQueueList,
+    DeployPaperRequest,
+    KillPaperRunResponse,
+    PaperRunApproval,
+    PaperRunList,
+    PaperRunListItem,
+    PaperRunPublic,
+    RejectGenomeRequest,
+    RiskConfig,
+)
+from .user_credentials import (
+    UserOandaAccountPublic,
+    UserOandaAccountsList,
+    UserOandaCredentialsPublic,
+    UserOandaCredentialsUpsert,
+    VerifyCredentialsResponse,
+)
 
 # Make schemas available at the package level
 __all__ = [
@@ -177,4 +196,21 @@ __all__ = [
     "ValidationFoldPublic",
     "DecisionLogPublic",
     "DecisionLogList",
+    # User credentials (US-019 / v0.6.0)
+    "UserOandaCredentialsPublic",
+    "UserOandaCredentialsUpsert",
+    "UserOandaAccountPublic",
+    "UserOandaAccountsList",
+    "VerifyCredentialsResponse",
+    # Paper trading (US-021 / US-023 / v0.6.0)
+    "RiskConfig",
+    "DeployPaperRequest",
+    "RejectGenomeRequest",
+    "PaperRunApproval",
+    "PaperRunPublic",
+    "PaperRunListItem",
+    "PaperRunList",
+    "ApprovalQueueItem",
+    "ApprovalQueueList",
+    "KillPaperRunResponse",
 ]

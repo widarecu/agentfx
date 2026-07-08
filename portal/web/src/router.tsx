@@ -12,7 +12,12 @@ import EvolutionRunDetail from './pages/EvolutionRunDetail'
 import GenomeDetail from './pages/GenomeDetail'
 import GenomeBacktest from './pages/GenomeBacktest'
 import ChartGallery from './pages/ChartGallery'
+import Settings from './pages/Settings'
+import PaperRuns from './pages/PaperRuns'
+import ApprovalQueue from './pages/ApprovalQueue'
+import PaperRunDetail from './pages/PaperRunDetail'
 import { ProtectedRoute } from './components/ProtectedRoute'
+import { RequireRole } from './components/RequireRole'
 
 export const router = createBrowserRouter([
   {
@@ -41,6 +46,43 @@ export const router = createBrowserRouter([
       { path: 'evolution/:runId', element: <EvolutionRunDetail /> },
       { path: 'evolution/:runId/genomes/:genomeId', element: <GenomeDetail /> },
       { path: 'evolution/:runId/genomes/:genomeId/backtest', element: <GenomeBacktest /> },
+      // v0.6.0 — settings + credentials. `RequireRole` composes with
+      // the outer `ProtectedRoute` so VIEWER lands here → redirect
+      // home with a toast (US-018 + PR-B).
+      {
+        path: 'settings',
+        element: (
+          <RequireRole allowed={['trader', 'admin']}>
+            <Settings />
+          </RequireRole>
+        ),
+      },
+      // v0.6.0 — paper trading. All trader/admin only. PR-J adds
+      // /paper/:id for the run detail page.
+      {
+        path: 'paper',
+        element: (
+          <RequireRole allowed={['trader', 'admin']}>
+            <PaperRuns />
+          </RequireRole>
+        ),
+      },
+      {
+        path: 'paper/approvals',
+        element: (
+          <RequireRole allowed={['trader', 'admin']}>
+            <ApprovalQueue />
+          </RequireRole>
+        ),
+      },
+      {
+        path: 'paper/:runId',
+        element: (
+          <RequireRole allowed={['trader', 'admin']}>
+            <PaperRunDetail />
+          </RequireRole>
+        ),
+      },
       // Dev-only verification gallery — renders every canonical seed
       // strategy on the same candle window so every indicator's chart
       // routing / tooltip / archetype can be visually swept at once.

@@ -24,6 +24,7 @@ import {
   BarChart3,
   Calendar,
 } from 'lucide-react';
+import { useAuth } from '../contexts/AuthContext';
 import { optimizationApi } from '../services/optimizationApi';
 import {
   OptimizationJob,
@@ -33,6 +34,12 @@ import {
   truncateJobId,
   formatSharpe,
 } from '../types/optimization';
+import {
+  canSeeScopeToggle,
+  normalizeRole,
+  resolveScope,
+  type Scope,
+} from '../utils/rbac';
 
 // Available forex pairs
 const FOREX_PAIRS = [
@@ -138,12 +145,22 @@ export default function Optimization() {
   const [formData, setFormData] = useState<NewOptimizationFormData>(getDefaultFormData('ma'));
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  // ADMIN-only scope toggle (US-018).
+  const { user } = useAuth();
+  const role = normalizeRole(user?.role);
+  const showScopeToggle = canSeeScopeToggle(role);
+  const [scope, setScope] = useState<Scope>('my');
+
   // Fetch jobs
   const fetchJobs = async () => {
     try {
       setIsLoading(true);
       setError(null);
-      const response = await optimizationApi.getJobs(page, pageSize);
+      const response = await optimizationApi.getJobs(
+        page,
+        pageSize,
+        resolveScope(role, scope),
+      );
       setJobs(response.items);
       setTotalPages(Math.ceil(response.total / pageSize));
     } catch (err) {
@@ -155,7 +172,7 @@ export default function Optimization() {
 
   useEffect(() => {
     fetchJobs();
-  }, [page]);
+  }, [page, scope]);
 
   // Handle strategy change - reset param ranges to defaults for new strategy
   const handleStrategyChange = (strategy: StrategyType) => {
@@ -292,6 +309,9 @@ export default function Optimization() {
           </p>
         </div>
         <div className="flex items-center gap-3">
+          {showScopeToggle && (
+            <ScopeToggle scope={scope} onChange={setScope} />
+          )}
           <button
             onClick={fetchJobs}
             disabled={isLoading}
@@ -809,6 +829,56 @@ export default function Optimization() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * ADMIN-only scope toggle (US-018) — segmented control identical in
+ * behaviour to the one on `EvolutionRuns`. Kept co-located so the two
+ * list pages don't drift; if a third page needs it we lift into
+ * `components/`.
+ */
+function ScopeToggle({
+  scope,
+  onChange,
+}: {
+  scope: Scope;
+  onChange: (next: Scope) => void;
+}) {
+  const base = 'text-xs font-semibold rounded px-3 py-1.5 transition-colors';
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Job scope"
+      className="flex gap-0.5 p-0.5 rounded border border-indigo-300 dark:border-indigo-700 bg-white dark:bg-slate-800"
+    >
+      <button
+        type="button"
+        role="radio"
+        aria-checked={scope === 'my'}
+        onClick={() => onChange('my')}
+        className={`${base} ${
+          scope === 'my'
+            ? 'bg-indigo-600 text-white'
+            : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-200'
+        }`}
+      >
+        My jobs
+      </button>
+      <button
+        type="button"
+        role="radio"
+        aria-checked={scope === 'all'}
+        onClick={() => onChange('all')}
+        className={`${base} ${
+          scope === 'all'
+            ? 'bg-indigo-600 text-white'
+            : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-200'
+        }`}
+      >
+        All jobs
+      </button>
     </div>
   );
 }

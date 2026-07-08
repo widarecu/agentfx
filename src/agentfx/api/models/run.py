@@ -6,6 +6,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Integer,
     String,
 )
 from sqlalchemy import (
@@ -19,17 +20,34 @@ from ..core.database import Base
 
 
 class RunStatus(str, Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    PAUSED = "paused"
-    COMPLETED = "completed"
-    ERROR = "error"
+    # NOTE: values MUST match the Postgres `runstatus` enum labels,
+    # which the initial migration created UPPERCASE by name. Don't
+    # rename these to lowercase without a migration to add both
+    # forms — see 2026_07_06_1500_add_paper_trading_columns_to_runs.py
+    # for the pattern we used for the v0.6.0 additions.
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
+    COMPLETED = "COMPLETED"
+    ERROR = "ERROR"
+    # v0.6.0 paper-trading states (US-021 / US-023). Approval and halt
+    # transitions live on the same `status` column so the existing
+    # portal list can render every paper row alongside legacy runs
+    # without a schema split.
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"
+    APPROVED = "APPROVED"
+    HALTED_MANUAL = "HALTED_MANUAL"
 
 
 class RunEnvironment(str, Enum):
     DEV = "dev"
     PAPER = "paper"
     LIVE = "live"
+
+
+# The `oanda_environment` column reuses the enum defined for
+# user_oanda_credentials so the vocabulary is consistent across the
+# app. See src/agentfx/api/models/user_credentials.py::OandaEnvironment.
 
 
 class Run(Base):
@@ -46,13 +64,15 @@ class Run(Base):
     id = Column(
         String, primary_key=True, index=True
     )  # Format: run_<timestamp>_<strategy>_<pair>_<env>_<id>
-    strategy_id = Column(String, index=True, nullable=False)
+    # Nullable since v0.6.0: paper runs are backed by a StrategyGenome,
+    # not a Strategy row. Legacy dev/live runs still populate this.
+    strategy_id = Column(String, index=True, nullable=True)
     pair = Column(String, index=True, nullable=False)  # Trading pair, e.g., "AUDUSD"
     environment = Column(SQLEnum(RunEnvironment), index=True, nullable=False)
     status = Column(SQLEnum(RunStatus), default=RunStatus.PENDING, index=True)
 
     # Configuration
-    parameters = Column(JSON, nullable=False)  # Strategy parameters
+    parameters = Column(JSON, nullable=False)  # Strategy parameters / DSL spec
     initial_balance = Column(Float, default=10000.0)
 
     # Metrics
@@ -67,6 +87,63 @@ class Run(Base):
     completed_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    # ─────────────────────────────────────────────────────────────
+    # v0.6.0 paper trading extension (US-021 / US-023).
+    # ─────────────────────────────────────────────────────────────
+    # Which validated genome this paper run trades. Null for legacy
+    # dev/live runs backed by a Strategy row.
+    strategy_genome_id = Column(
+        String(120),
+        ForeignKey("strategy_genomes.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # Owner. Duplicates the legacy inferred ownership (strategy.created_by
+    # cascade) but is required for the RBAC filter in US-018 that scopes
+    # `list_runs` at the query layer.
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # Which OANDA account this run trades in (picked from the user's
+    # detected accounts in the deploy modal). Format matches OANDA:
+    # "101-004-12345678-001".
+    oanda_account_id = Column(String(64), nullable=True, index=True)
+    # PRACTICE for v0.6.0; LIVE gated by ADMIN + v1.0.0.
+    oanda_environment = Column(
+        SQLEnum(
+            "practice",
+            "live",
+            name="oandaenvironment",
+            create_type=False,
+        ),
+        nullable=True,
+    )
+    # Balance snapshotted from OANDA on the first tick. Denominator for
+    # every P&L % on the run detail page (Wilson's UX answer #4 — user
+    # never types an initial balance; it's read from the sub-account).
+    snapshot_balance = Column(Float, nullable=True)
+    # Human-readable stop reason. Vocabulary: `USER_KILL`,
+    # `DAILY_LOSS_LIMIT`, `BROKER_CIRCUIT`, `process_crashed`,
+    # `crashed_pre_init`, `COMPLETED`.
+    stop_reason = Column(String(40), nullable=True)
+    # Set by `POST /paper-runs/:id/kill`; the runner polls this on
+    # every loop tick and halts when it flips from NULL to non-NULL.
+    kill_requested_at = Column(DateTime(timezone=True), nullable=True)
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    approved_by_user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # {"max_position_size_units": 10000, "daily_loss_pct": 2.0,
+    #  "kill_switch_dd_pct": 5.0}
+    risk_config = Column(JSON, nullable=True)
+    # PID of the runner subprocess. Set by `schedule_paper_run`.
+    process_pid = Column(Integer, nullable=True)
 
     # Relationships
     strategy = relationship("Strategy", back_populates="runs")
