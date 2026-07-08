@@ -15,6 +15,7 @@ import ChartGallery from './pages/ChartGallery'
 import Settings from './pages/Settings'
 import PaperRuns from './pages/PaperRuns'
 import ApprovalQueue from './pages/ApprovalQueue'
+import PaperRunDetail from './pages/PaperRunDetail'
 import { ProtectedRoute } from './components/ProtectedRoute'
 import { RequireRole } from './components/RequireRole'
 
@@ -71,6 +72,14 @@ export const router = createBrowserRouter([
         element: (
           <RequireRole allowed={['trader', 'admin']}>
             <ApprovalQueue />
+          </RequireRole>
+        ),
+      },
+      {
+        path: 'paper/:runId',
+        element: (
+          <RequireRole allowed={['trader', 'admin']}>
+            <PaperRunDetail />
           </RequireRole>
         ),
       },

@@ -8,11 +8,12 @@
  */
 
 import React, { useCallback, useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { CheckCircle2, Loader2 } from 'lucide-react';
 
 import { useToast } from '../contexts/ToastContext';
 import { ApprovalQueueCard } from '../components/ApprovalQueueCard';
+import { DeployPaperModal } from '../components/DeployPaperModal';
 import { RejectGenomeModal } from '../components/RejectGenomeModal';
 import { listApprovalQueue, rejectGenome } from '../services/paperApi';
 import type { ApprovalQueueItem } from '../types/paper';
@@ -24,7 +25,11 @@ export default function ApprovalQueue() {
   const [rejectTarget, setRejectTarget] = useState<ApprovalQueueItem | null>(
     null,
   );
+  const [deployTarget, setDeployTarget] = useState<ApprovalQueueItem | null>(
+    null,
+  );
   const { showToast } = useToast();
+  const navigate = useNavigate();
 
   const fetchQueue = useCallback(async () => {
     try {
@@ -43,13 +48,14 @@ export default function ApprovalQueue() {
   }, [fetchQueue]);
 
   function handleApprove(item: ApprovalQueueItem) {
-    // PR-J owns the deploy modal (OANDA account picker + risk knobs).
-    // For PR-I we surface an explanatory toast so users see the
-    // button exists but understand the flow is incomplete.
-    showToast(
-      `Deploy configuration modal ships in the next update. Genome ${item.strategy_genome_id} stays on the queue.`,
-      'info',
-    );
+    // PR-J: open the deploy modal (OANDA account picker + risk knobs).
+    setDeployTarget(item);
+  }
+
+  function handleDeployed(runId: string) {
+    setDeployTarget(null);
+    showToast('Paper run deployed — watching from the detail page.', 'success');
+    navigate(`/paper/${runId}`);
   }
 
   function handleRejectClick(item: ApprovalQueueItem) {
@@ -120,6 +126,14 @@ export default function ApprovalQueue() {
           item={rejectTarget}
           onCancel={() => setRejectTarget(null)}
           onSubmit={handleRejectSubmit}
+        />
+      )}
+
+      {deployTarget && (
+        <DeployPaperModal
+          item={deployTarget}
+          onCancel={() => setDeployTarget(null)}
+          onDeployed={handleDeployed}
         />
       )}
     </div>

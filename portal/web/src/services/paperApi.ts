@@ -82,6 +82,37 @@ export async function getPaperRun(runId: string): Promise<PaperRunPublic> {
   return handleResponse(res);
 }
 
+export interface ApprovePaperRunRequest {
+  strategy_genome_id: string;
+  instrument: string;
+  granularity: string;
+  oanda_account_id: string;
+  name?: string;
+  risk_config: {
+    max_position_size_units: number;
+    daily_loss_pct: number;
+    kill_switch_dd_pct: number;
+  };
+}
+
+export interface ApprovePaperRunResponse {
+  run_id: string;
+  status: string;
+  approval_status: string;
+  status_url: string;
+}
+
+export async function approvePaperRun(
+  body: ApprovePaperRunRequest,
+): Promise<ApprovePaperRunResponse> {
+  const res = await fetch(`${API_BASE_URL}/paper-runs/approve`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify(body),
+  });
+  return handleResponse(res);
+}
+
 export async function listApprovalQueue(): Promise<ApprovalQueueList> {
   const res = await fetch(`${API_BASE_URL}/paper-runs/approval-queue`, {
     headers: authHeaders(),
