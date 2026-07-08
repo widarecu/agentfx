@@ -260,16 +260,16 @@ export function DeployPaperModal({
             </div>
           </div>
 
-          <div className="p-6 border-t border-slate-200 dark:border-slate-700 flex items-center justify-between">
-            <div className="text-xs text-slate-500 dark:text-slate-400">
+          <div className="p-6 border-t border-slate-200 dark:border-slate-700 flex flex-wrap items-center justify-between gap-3">
+            <div className="text-xs text-slate-500 dark:text-slate-400 min-w-0 flex-1 basis-full sm:basis-auto">
               The paper runner picks this up within one loop cycle.
             </div>
-            <div className="flex gap-2">
+            <div className="flex gap-2 shrink-0 ml-auto">
               <button
                 type="button"
                 onClick={onCancel}
                 disabled={submitting}
-                className="px-4 py-2 border border-slate-200 dark:border-slate-700 rounded text-sm hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-50"
+                className="px-4 py-2 border border-slate-200 dark:border-slate-700 rounded text-sm hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-50 whitespace-nowrap"
               >
                 Cancel
               </button>
@@ -278,7 +278,7 @@ export function DeployPaperModal({
                 disabled={
                   submitting || !selectedAccountId || accounts?.length === 0
                 }
-                className="inline-flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-semibold shadow disabled:opacity-50 disabled:cursor-not-allowed"
+                className="inline-flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-semibold shadow disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
               >
                 {submitting && <Loader2 className="w-4 h-4 animate-spin" />}
                 Approve &amp; deploy →
@@ -318,12 +318,12 @@ function NumericField({
           min={0}
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          className={`flex-1 px-3 py-2 border border-slate-300 dark:border-slate-600 dark:bg-slate-900 font-mono text-sm ${
+          className={`flex-1 min-w-0 px-3 py-2 border border-slate-300 dark:border-slate-600 dark:bg-slate-900 font-mono text-sm ${
             suffix ? 'rounded-l' : 'rounded'
           }`}
         />
         {suffix && (
-          <span className="px-3 py-2 border border-slate-300 dark:border-slate-600 border-l-0 rounded-r bg-slate-50 dark:bg-slate-700 text-slate-500 text-sm">
+          <span className="shrink-0 px-3 py-2 border border-slate-300 dark:border-slate-600 border-l-0 rounded-r bg-slate-50 dark:bg-slate-700 text-slate-500 text-sm whitespace-nowrap">
             {suffix}
           </span>
         )}
