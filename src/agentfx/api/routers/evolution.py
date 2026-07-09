@@ -551,6 +551,87 @@ def list_run_decisions(
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# ADMIN validator override (US-027)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@router.post(
+    "/strategy-genomes/{genome_id}/override-validator",
+    response_model=schemas.StrategyGenomePublic,
+)
+def override_validator_verdict_endpoint(
+    genome_id: str,
+    body: schemas.ValidatorOverrideRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> schemas.StrategyGenomePublic:
+    """Flip `strategy_genomes.validator_passed` with an audit-log entry.
+
+    Retires the raw-SQL demo-unblock workaround Wilson used during the
+    v0.6.0 smoke-test. ADMIN only; TRADER / VIEWER get 403. Reason is
+    required (min 20 chars) to force a self-documenting audit trail —
+    the `USER_VALIDATOR_OVERRIDE` DecisionLog row records previous /
+    new / reason / actor for anyone reading history later.
+    """
+    _ensure_admin(current_user)
+    try:
+        genome = evolution_service.override_validator_verdict(
+            db,
+            genome_id=genome_id,
+            new_value=body.new_value,
+            reason=body.reason,
+            actor_user=current_user,
+        )
+    except evolution_service.GenomeNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Strategy genome {genome_id} not found",
+        )
+
+    # Return the same shape as get_genome_detail so the frontend can
+    # replace its cached genome row directly. We reload with lineage so
+    # the response includes validation_folds — matches the detail-page
+    # query cache key.
+    detail = evolution_service.get_genome_with_lineage(
+        db,
+        run_id=(
+            db.query(models.Generation.run_id)
+            .filter(models.Generation.id == genome.generation_id)
+            .scalar()
+        ),
+        genome_id=genome.id,
+    )
+    if detail is None:
+        # Should not happen — we just wrote to this row. If it does, the
+        # override succeeded but the response can't include lineage.
+        # Fall through with a minimal projection.
+        return schemas.StrategyGenomePublic.model_validate(
+            {
+                "id": genome.id,
+                "generation_id": genome.generation_id,
+                "generation_index": 0,
+                "dsl_json": genome.dsl_json,
+                "parent_ids": list(genome.parent_ids or []),
+                "origin": (
+                    genome.origin.value
+                    if hasattr(genome.origin, "value")
+                    else str(genome.origin)
+                ),
+                "fitness": genome.fitness,
+                "metrics_json": genome.metrics_json,
+                "validator_passed": genome.validator_passed,
+                "validation_failures": list(genome.validation_failures or []),
+                "llm_reasoning": genome.llm_reasoning,
+                "llm_call_id": genome.llm_call_id,
+                "created_at": genome.created_at,
+                "children": [],
+                "validation_folds": [],
+            }
+        )
+    return schemas.StrategyGenomePublic.model_validate(detail)
+
+
 # Used internally by the worker to derive a default data window when the
 # request body doesn't specify one. Exposed as a helper so tests can
 # mock the clock easily.

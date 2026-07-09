@@ -157,9 +157,43 @@ class ApprovalQueueItem(BaseSchema):
     created_at: datetime | None = None
 
 
+class ClosestGenome(BaseSchema):
+    """Summary of the highest-median-OOS-Sharpe non-passing genome.
+
+    Populated on the approval-queue meta when at least one genome was
+    validated but none passed Gate B. Gives the user one concrete signal
+    about how close the evolution came instead of a blank "queue empty"
+    state (US-027).
+    """
+
+    genome_id: str
+    oos_sharpe: float | None = None
+    oos_max_drawdown: float | None = None
+    oos_n_trades: int | None = None
+    failure_summary: str  # "Sharpe 0.82 < 1.0 · Trades 292 < 300"
+
+
+class ApprovalQueueMeta(BaseSchema):
+    """Diagnostic counts rendered in the empty-state banner.
+
+    Distinguishes the four scenarios that all look identical when the
+    queue happens to be empty: no evolutions yet, evolutions ran but 0
+    validated, validated-none-pass, user has already deployed every
+    passing genome. See US-027.
+    """
+
+    evolution_run_count: int
+    total_genomes: int
+    validated_count: int
+    passed_count: int
+    touched_count: int
+    closest_to_passing: ClosestGenome | None = None
+
+
 class ApprovalQueueList(BaseSchema):
     items: list[ApprovalQueueItem]
     total: int
+    meta: ApprovalQueueMeta
 
 
 class KillPaperRunResponse(BaseSchema):
@@ -173,6 +207,8 @@ class KillPaperRunResponse(BaseSchema):
 __all__ = [
     "ApprovalQueueItem",
     "ApprovalQueueList",
+    "ApprovalQueueMeta",
+    "ClosestGenome",
     "DeployPaperRequest",
     "KillPaperRunResponse",
     "PaperRunApproval",

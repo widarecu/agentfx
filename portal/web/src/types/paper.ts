@@ -97,9 +97,33 @@ export interface ApprovalQueueItem {
   created_at: string | null;
 }
 
+export interface ClosestGenome {
+  genome_id: string;
+  oos_sharpe: number | null;
+  oos_max_drawdown: number | null;
+  oos_n_trades: number | null;
+  /** Short human-readable summary like "Sharpe 0.82 < 1.0 · Trades 292 < 300" — server-formatted. */
+  failure_summary: string;
+}
+
+/** Diagnostic counts driving the four empty-state banners on
+ *  `/paper/approvals` (US-027). Distinguishes "no evolutions yet" vs
+ *  "evolutions ran but nothing passed" vs "user already deployed
+ *  everything that passed" — three very different situations that all
+ *  look identical when the queue happens to be empty. */
+export interface ApprovalQueueMeta {
+  evolution_run_count: number;
+  total_genomes: number;
+  validated_count: number;
+  passed_count: number;
+  touched_count: number;
+  closest_to_passing: ClosestGenome | null;
+}
+
 export interface ApprovalQueueList {
   items: ApprovalQueueItem[];
   total: number;
+  meta: ApprovalQueueMeta;
 }
 
 export interface KillPaperRunResponse {

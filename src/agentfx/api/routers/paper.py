@@ -175,9 +175,9 @@ def list_approval_queue(
     current_user: models.User = Depends(user_service.get_current_active_user),
 ) -> schemas.ApprovalQueueList:
     _ensure_trader(current_user)
-    genomes = paper_service.list_approval_queue_for_user(db, current_user.id)
+    result = paper_service.list_approval_queue_for_user(db, current_user.id)
     items: list[schemas.ApprovalQueueItem] = []
-    for g in genomes:
+    for g in result.items:
         # Pull evolution run + instrument info via the parent
         # generation → run chain. Kept explicit because the schemas
         # module doesn't own model relationships.
@@ -197,7 +197,11 @@ def list_approval_queue(
                 created_at=g.created_at,
             )
         )
-    return schemas.ApprovalQueueList(items=items, total=len(items))
+    return schemas.ApprovalQueueList(
+        items=items,
+        total=len(items),
+        meta=result.meta,
+    )
 
 
 @router.post(

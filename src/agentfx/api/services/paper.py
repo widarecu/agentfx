@@ -14,14 +14,32 @@ from __future__ import annotations
 
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from collections.abc import Iterable
 
-from sqlalchemy import and_
+from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..schemas.paper import DeployPaperRequest
+from ..schemas.paper import (
+    ApprovalQueueMeta,
+    ClosestGenome,
+    DeployPaperRequest,
+)
+
+
+@dataclass
+class ApprovalQueueResult:
+    """What `list_approval_queue_for_user` now returns.
+
+    Split into the deployable list (`items`) and the diagnostic counts
+    (`meta`) so the router can pass both through to the response schema
+    without recomputing anything.
+    """
+
+    items: list[models.StrategyGenome]
+    meta: ApprovalQueueMeta
 
 
 def _new_paper_run_id(instrument: str, granularity: str) -> str:
@@ -41,8 +59,8 @@ def _new_paper_run_id(instrument: str, granularity: str) -> str:
 def list_approval_queue_for_user(
     db: Session,
     user_id: int,
-) -> list[models.StrategyGenome]:
-    """Return validated genomes not yet approved or rejected by this user.
+) -> ApprovalQueueResult:
+    """Return deployable genomes + diagnostic meta counts for the user.
 
     A genome is on the queue when:
     - `validator_passed = True` on the genome row, AND
@@ -54,9 +72,18 @@ def list_approval_queue_for_user(
 
     The last predicate implements "one paper deployment per genome per
     user" — approving twice would duplicate broker orders.
+
+    US-027: the meta counts drive the empty-state diagnostic banner. A
+    generic "queue empty" hides four very different situations (no
+    evolutions yet / evolutions ran but 0 validated / validated-none-
+    pass / all-passing-touched); the counts let the frontend render an
+    accurate explanation. Wilson's 2026-07-08 smoke-test mis-diagnosed
+    the empty queue as a write-back bug because there was no diagnostic
+    on the page.
     """
-    # 1. Grab every genome that passed Gate B whose run is the user's.
-    passing = (
+    # 1. Genomes with a written verdict (any value) under this user's
+    #    evolution runs — the pool the meta counts sum over.
+    verdicts = (
         db.query(models.StrategyGenome)
         .join(
             models.Generation,
@@ -64,15 +91,15 @@ def list_approval_queue_for_user(
         )
         .join(models.EvolutionRun, models.Generation.run_id == models.EvolutionRun.id)
         .filter(
-            models.StrategyGenome.validator_passed.is_(True),
             models.EvolutionRun.created_by == user_id,
+            models.StrategyGenome.validator_passed.isnot(None),
         )
         .all()
     )
+    passing = [g for g in verdicts if g.validator_passed is True]
+    failed = [g for g in verdicts if g.validator_passed is False]
 
-    # 2. Filter out ones the user has already acted on. We fetch the
-    #    set of "already-touched" genome ids in one query rather than
-    #    per-row.
+    # 2. Filter out passing genomes the user has already acted on.
     touched = {
         r.strategy_genome_id
         for r in db.query(models.Run.strategy_genome_id)
@@ -82,8 +109,112 @@ def list_approval_queue_for_user(
         )
         .all()
     }
+    deployable = [g for g in passing if g.id not in touched]
 
-    return [g for g in passing if g.id not in touched]
+    # 3. Meta rollups. Kept as separate queries so the row-fetch above
+    #    only pulls verdicted genomes — count queries stay cheap even
+    #    when the user has 10k+ genomes.
+    evolution_run_count = (
+        db.query(func.count(models.EvolutionRun.id))
+        .filter(models.EvolutionRun.created_by == user_id)
+        .scalar()
+        or 0
+    )
+    total_genomes = (
+        db.query(func.count(models.StrategyGenome.id))
+        .join(
+            models.Generation,
+            models.StrategyGenome.generation_id == models.Generation.id,
+        )
+        .join(models.EvolutionRun, models.Generation.run_id == models.EvolutionRun.id)
+        .filter(models.EvolutionRun.created_by == user_id)
+        .scalar()
+        or 0
+    )
+
+    meta = ApprovalQueueMeta(
+        evolution_run_count=int(evolution_run_count),
+        total_genomes=int(total_genomes),
+        validated_count=len(verdicts),
+        passed_count=len(passing),
+        touched_count=sum(1 for g in passing if g.id in touched),
+        closest_to_passing=(
+            _closest_to_passing(db, failed) if failed and not deployable else None
+        ),
+    )
+    return ApprovalQueueResult(items=deployable, meta=meta)
+
+
+def _closest_to_passing(
+    db: Session,
+    failed_genomes: list[models.StrategyGenome],
+) -> ClosestGenome | None:
+    """Pick the failed genome with the highest median OOS Sharpe.
+
+    Tiebreaker is fewest failing gates. Returns None when there are no
+    OOS folds to compare against (would happen only on legacy data).
+    """
+    if not failed_genomes:
+        return None
+
+    ids = [g.id for g in failed_genomes]
+    oos_rows = (
+        db.query(models.ValidationFold)
+        .filter(
+            models.ValidationFold.genome_id.in_(ids),
+            models.ValidationFold.is_oos.is_(True),
+        )
+        .all()
+    )
+    if not oos_rows:
+        return None
+
+    # Group by genome, compute median Sharpe / drawdown / n_trades per
+    # genome across its OOS folds.
+    by_genome: dict[str, list[models.ValidationFold]] = {}
+    for row in oos_rows:
+        by_genome.setdefault(row.genome_id, []).append(row)
+
+    def _median(values: list[float]) -> float:
+        s = sorted(values)
+        mid = len(s) // 2
+        return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
+
+    genome_lookup = {g.id: g for g in failed_genomes}
+    best_id: str | None = None
+    best_sharpe: float = float("-inf")
+    best_fewest_fails: int = 1_000
+    for gid, folds in by_genome.items():
+        sharpes = [f.sharpe for f in folds if f.sharpe is not None]
+        if not sharpes:
+            continue
+        med_sharpe = _median(sharpes)
+        fails = len(genome_lookup[gid].validation_failures or [])
+        if med_sharpe > best_sharpe or (
+            med_sharpe == best_sharpe and fails < best_fewest_fails
+        ):
+            best_sharpe = med_sharpe
+            best_fewest_fails = fails
+            best_id = gid
+
+    if best_id is None:
+        return None
+
+    folds = by_genome[best_id]
+    genome = genome_lookup[best_id]
+    med_mdd = _median([f.max_drawdown for f in folds if f.max_drawdown is not None])
+    total_trades = sum((f.n_trades or 0) for f in folds)
+    failure_summary = (
+        " · ".join(str(f) for f in (genome.validation_failures or [])[:3])
+        or "Failed Gate B"
+    )
+    return ClosestGenome(
+        genome_id=best_id,
+        oos_sharpe=best_sharpe,
+        oos_max_drawdown=med_mdd,
+        oos_n_trades=total_trades,
+        failure_summary=failure_summary,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────

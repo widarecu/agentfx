@@ -9,17 +9,18 @@
 
 import React, { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { CheckCircle2, Loader2 } from 'lucide-react';
+import { AlertCircle, CheckCircle2, Loader2, PackageOpen, PlayCircle } from 'lucide-react';
 
 import { useToast } from '../contexts/ToastContext';
 import { ApprovalQueueCard } from '../components/ApprovalQueueCard';
 import { DeployPaperModal } from '../components/DeployPaperModal';
 import { RejectGenomeModal } from '../components/RejectGenomeModal';
 import { listApprovalQueue, rejectGenome } from '../services/paperApi';
-import type { ApprovalQueueItem } from '../types/paper';
+import type { ApprovalQueueItem, ApprovalQueueMeta } from '../types/paper';
 
 export default function ApprovalQueue() {
   const [items, setItems] = useState<ApprovalQueueItem[]>([]);
+  const [meta, setMeta] = useState<ApprovalQueueMeta | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [rejectTarget, setRejectTarget] = useState<ApprovalQueueItem | null>(
@@ -36,6 +37,7 @@ export default function ApprovalQueue() {
       setError(null);
       const response = await listApprovalQueue();
       setItems(response.items);
+      setMeta(response.meta);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -107,7 +109,7 @@ export default function ApprovalQueue() {
           <Loader2 className="w-8 h-8 text-emerald-500 animate-spin" />
         </div>
       ) : items.length === 0 ? (
-        <EmptyState />
+        <EmptyState meta={meta} />
       ) : (
         <div className="space-y-4">
           {items.map((item) => (
@@ -140,26 +142,182 @@ export default function ApprovalQueue() {
   );
 }
 
-function EmptyState() {
-  return (
-    <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-12">
-      <div className="max-w-md mx-auto text-center">
-        <div className="w-16 h-16 bg-emerald-100 dark:bg-emerald-900/30 rounded-full mx-auto flex items-center justify-center text-3xl text-emerald-600">
-          <CheckCircle2 className="w-8 h-8" />
-        </div>
-        <div className="text-lg font-semibold mt-4">Your queue is empty</div>
+/**
+ * Empty-state diagnostic banner (US-027).
+ *
+ * The generic "queue empty" state was actively misleading during the
+ * 2026-07-08 UAT smoke-test: Wilson diagnosed a broken validator
+ * write-back when the reality (confirmed by a direct DB audit) was
+ * that no evolution had ever produced a Gate-B-passing genome on real
+ * OANDA data. The four scenarios below are visually distinct so the
+ * user can tell "no evolutions" from "evolutions ran but nothing
+ * generalised" from "you already deployed everything that passed" —
+ * three completely different next-steps.
+ */
+export type EmptyBannerScenario =
+  | 'no_evolutions'
+  | 'none_validated'
+  | 'none_passed'
+  | 'all_deployed';
+
+/**
+ * Pure banner-scenario picker — exported so Vitest can lock the
+ * switch table without a jsdom render pass. The React component below
+ * is a straight visual translation of this classification.
+ */
+export function _pickEmptyBannerScenario(
+  meta: ApprovalQueueMeta | null,
+): EmptyBannerScenario {
+  if (!meta || meta.evolution_run_count === 0) return 'no_evolutions';
+  if (meta.validated_count === 0) return 'none_validated';
+  if (meta.passed_count === 0) return 'none_passed';
+  return 'all_deployed';
+}
+
+function EmptyState({ meta }: { meta: ApprovalQueueMeta | null }) {
+  const scenario = _pickEmptyBannerScenario(meta);
+  if (scenario === 'no_evolutions') {
+    return (
+      <BannerFrame icon={<PlayCircle className="w-8 h-8" />} tone="emerald">
+        <div className="text-lg font-semibold mt-4">No evolution runs yet</div>
         <div className="text-sm text-slate-500 dark:text-slate-400 mt-1">
-          Nothing waiting for approval. Genomes land here after passing
-          Gate B (Sharpe ≥ 1.0, MDD ≤ 10%, hit ≥ 48%, ≥ 300 trades) and
-          being explicitly sent to your queue.
+          Genomes land on this queue after an evolution run produces at
+          least one strategy that clears Gate B on the held-out OOS folds.
         </div>
         <Link
           to="/evolution"
           className="mt-6 inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm px-4 py-2 rounded"
         >
-          Browse validated genomes in Evolution →
+          Start an evolution →
         </Link>
+      </BannerFrame>
+    );
+  }
+
+  if (scenario === 'none_validated') {
+    return (
+      <BannerFrame icon={<AlertCircle className="w-8 h-8" />} tone="amber">
+        <div className="text-lg font-semibold mt-4">
+          {meta!.evolution_run_count} evolution run
+          {meta!.evolution_run_count === 1 ? '' : 's'} · {meta!.total_genomes}{' '}
+          genome{meta!.total_genomes === 1 ? '' : 's'} · 0 validated
+        </div>
+        <div className="text-sm text-slate-500 dark:text-slate-400 mt-1">
+          Runs completed but the validator never wrote a verdict — this
+          usually means a run crashed mid-loop before reaching validation,
+          or the top-K genome pool ended up empty. Check the evolution
+          runs page for details.
+        </div>
+        <Link
+          to="/evolution"
+          className="mt-6 inline-flex items-center gap-2 bg-slate-600 hover:bg-slate-700 text-white font-semibold text-sm px-4 py-2 rounded"
+        >
+          View evolution runs →
+        </Link>
+      </BannerFrame>
+    );
+  }
+
+  if (scenario === 'none_passed') {
+    return (
+      <BannerFrame icon={<AlertCircle className="w-8 h-8" />} tone="amber">
+        <div className="text-lg font-semibold mt-4">
+          {meta!.evolution_run_count} evolution run
+          {meta!.evolution_run_count === 1 ? '' : 's'} ·{' '}
+          {meta!.validated_count} genome
+          {meta!.validated_count === 1 ? '' : 's'} validated on OOS folds ·
+          0 passed Gate B
+        </div>
+        <div className="text-sm text-slate-500 dark:text-slate-400 mt-1">
+          The evolutions produced strategies but none generalised to the
+          held-out out-of-sample window. This isn't a bug in the pipeline —
+          it's the training-vs-OOS gap the paper platform exists to
+          expose. Consider running a fresh evolution or adjusting Gate B.
+        </div>
+        {meta!.closest_to_passing && (
+          <ClosestGenomeCard closest={meta!.closest_to_passing} />
+        )}
+      </BannerFrame>
+    );
+  }
+
+  // scenario === 'all_deployed' — passing genomes exist but the user
+  // has deployed all of them.
+  return (
+    <BannerFrame icon={<CheckCircle2 className="w-8 h-8" />} tone="emerald">
+      <div className="text-lg font-semibold mt-4">
+        {meta!.passed_count} validated genome
+        {meta!.passed_count === 1 ? ' has' : 's have'} been deployed
+      </div>
+      <div className="text-sm text-slate-500 dark:text-slate-400 mt-1">
+        Every genome that passed Gate B is already running (or was
+        previously run) on paper. Nothing new to approve until the next
+        evolution produces a fresh candidate.
+      </div>
+      <Link
+        to="/paper"
+        className="mt-6 inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm px-4 py-2 rounded"
+      >
+        View paper runs →
+      </Link>
+    </BannerFrame>
+  );
+}
+
+function BannerFrame({
+  icon,
+  tone,
+  children,
+}: {
+  icon: React.ReactNode;
+  tone: 'emerald' | 'amber';
+  children: React.ReactNode;
+}) {
+  const iconBg =
+    tone === 'emerald'
+      ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600'
+      : 'bg-amber-100 dark:bg-amber-900/30 text-amber-600';
+  return (
+    <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-12">
+      <div className="max-w-xl mx-auto text-center">
+        <div
+          className={`w-16 h-16 rounded-full mx-auto flex items-center justify-center text-3xl ${iconBg}`}
+        >
+          {icon}
+        </div>
+        {children}
       </div>
     </div>
+  );
+}
+
+function ClosestGenomeCard({
+  closest,
+}: {
+  closest: NonNullable<ApprovalQueueMeta['closest_to_passing']>;
+}) {
+  return (
+    <Link
+      to={`/genomes/${closest.genome_id}`}
+      className="mt-6 block bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 rounded p-4 text-left hover:border-emerald-400 transition-colors"
+    >
+      <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
+        <PackageOpen className="w-4 h-4" /> Closest to passing
+      </div>
+      <div className="font-mono text-sm mt-1 truncate">{closest.genome_id}</div>
+      <div className="text-sm text-slate-600 dark:text-slate-300 mt-2">
+        {closest.failure_summary}
+      </div>
+      {closest.oos_sharpe !== null && (
+        <div className="text-xs text-slate-500 dark:text-slate-400 mt-2">
+          Median OOS Sharpe {closest.oos_sharpe.toFixed(2)}
+          {closest.oos_n_trades !== null &&
+            ` · ${closest.oos_n_trades} OOS trades`}
+        </div>
+      )}
+      <div className="text-xs text-emerald-600 dark:text-emerald-400 mt-3">
+        View genome detail →
+      </div>
+    </Link>
   );
 }

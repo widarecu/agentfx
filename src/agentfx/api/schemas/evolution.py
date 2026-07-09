@@ -368,6 +368,19 @@ class DecisionLogList(BaseModel):
     page_size: int
 
 
+class ValidatorOverrideRequest(BaseSchema):
+    """ADMIN-only override of a genome's `validator_passed` verdict.
+
+    Ships a mandatory `reason` (min 20 chars) so the DecisionLog audit
+    trail explains WHY the override happened. Retires the raw-SQL
+    demo-unblock workaround Wilson used during the v0.6.0 smoke-test.
+    See US-027.
+    """
+
+    new_value: bool
+    reason: str = Field(min_length=20, max_length=500)
+
+
 __all__ = [
     "DecisionLogList",
     "DecisionLogPublic",
@@ -384,4 +397,5 @@ __all__ = [
     "StrategyGenomeSummary",
     "StrategyGenomeSummaryList",
     "ValidationFoldPublic",
+    "ValidatorOverrideRequest",
 ]

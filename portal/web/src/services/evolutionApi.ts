@@ -154,6 +154,31 @@ export async function getGenome(
   return handleResponse(res);
 }
 
+/**
+ * ADMIN-only override of `strategy_genomes.validator_passed` (US-027).
+ *
+ * Retires the raw-SQL demo-unblock workaround Wilson used during the
+ * v0.6.0 smoke-test. Backend enforces the ADMIN role and writes a
+ * `USER_VALIDATOR_OVERRIDE` DecisionLog row with previous/new/reason
+ * for the audit trail. `reason` must be at least 20 chars — the
+ * modal enforces this before submission but the backend re-validates
+ * (any non-ADMIN caller gets 403; short reasons return 422).
+ */
+export async function overrideValidatorVerdict(
+  genomeId: string,
+  body: { new_value: boolean; reason: string },
+): Promise<StrategyGenome> {
+  const res = await fetch(
+    `${API_BASE_URL}/strategy-genomes/${genomeId}/override-validator`,
+    {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(body),
+    },
+  );
+  return handleResponse(res);
+}
+
 export async function getGenomeBacktest(
   runId: string,
   genomeId: string,

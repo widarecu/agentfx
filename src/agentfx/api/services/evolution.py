@@ -800,6 +800,77 @@ def list_run_genome_summaries(
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# ADMIN validator override (US-027)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class GenomeNotFoundError(LookupError):
+    """Raised when `override_validator_verdict` can't find the genome."""
+
+
+def override_validator_verdict(
+    db: Session,
+    *,
+    genome_id: str,
+    new_value: bool,
+    reason: str,
+    actor_user: models.User,
+) -> models.StrategyGenome:
+    """ADMIN-only override of `strategy_genomes.validator_passed`.
+
+    Retires the raw-SQL demo-unblock workaround Wilson used during the
+    v0.6.0 smoke-test by writing a `USER_VALIDATOR_OVERRIDE` DecisionLog
+    row alongside the flag flip. Router enforces the ADMIN check; this
+    helper just does the work.
+
+    The DecisionLog row's `run_id` points at the genome's parent
+    evolution run so the per-run timeline surfaces the override.
+    `outputs_json` records the previous value + new value + reason for
+    audit-trail readers.
+    """
+    genome = (
+        db.query(models.StrategyGenome)
+        .filter(models.StrategyGenome.id == genome_id)
+        .first()
+    )
+    if genome is None:
+        raise GenomeNotFoundError(genome_id)
+
+    previous_value = genome.validator_passed
+    genome.validator_passed = new_value
+
+    generation = (
+        db.query(models.Generation)
+        .filter(models.Generation.id == genome.generation_id)
+        .first()
+    )
+    run_id = generation.run_id if generation is not None else None
+
+    log = models.DecisionLog(
+        id=uuid.uuid4().hex,
+        run_id=run_id,
+        generation_id=genome.generation_id,
+        agent_type="USER",
+        action="USER_VALIDATOR_OVERRIDE",
+        outputs_json={
+            "genome_id": genome_id,
+            "previous_value": previous_value,
+            "new_value": new_value,
+            "reason": reason,
+        },
+        reasoning_text=(
+            f"ADMIN {actor_user.email} overrode validator verdict for "
+            f"{genome_id}: {previous_value} → {new_value}. Reason: {reason}"
+        ),
+        user_id=actor_user.id,
+    )
+    db.add(log)
+    db.commit()
+    db.refresh(genome)
+    return genome
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # SQLAlchemy-backed EvolutionStatePersister (orchestrator dependency)
 # ─────────────────────────────────────────────────────────────────────────
 

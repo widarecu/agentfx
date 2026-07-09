@@ -16,6 +16,7 @@ from .evolution import (
     StrategyGenomeSummary,
     StrategyGenomeSummaryList,
     ValidationFoldPublic,
+    ValidatorOverrideRequest,
 )
 from .market_data import (
     CandleBase,
@@ -92,6 +93,8 @@ from .user import (
 from .paper import (
     ApprovalQueueItem,
     ApprovalQueueList,
+    ApprovalQueueMeta,
+    ClosestGenome,
     DeployPaperRequest,
     KillPaperRunResponse,
     PaperRunApproval,
@@ -212,5 +215,8 @@ __all__ = [
     "PaperRunList",
     "ApprovalQueueItem",
     "ApprovalQueueList",
+    "ApprovalQueueMeta",
+    "ClosestGenome",
     "KillPaperRunResponse",
+    "ValidatorOverrideRequest",
 ]

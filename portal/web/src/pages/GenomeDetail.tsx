@@ -29,6 +29,7 @@ import {
   Loader2,
   AlertTriangle,
   Send,
+  Shield,
 } from 'lucide-react';
 
 import DslTree from '../components/DslTree';
@@ -36,6 +37,9 @@ import FitnessBreakdown from '../components/FitnessBreakdown';
 import GenomeLineageStrip from '../components/GenomeLineageStrip';
 import LineageExplainer from '../components/LineageExplainer';
 import WalkForwardFoldTable from '../components/WalkForwardFoldTable';
+import { ValidatorOverrideModal } from '../components/ValidatorOverrideModal';
+import { useAuth } from '../contexts/AuthContext';
+import { useToast } from '../contexts/ToastContext';
 import { getEvolutionRun, getGenome } from '../services/evolutionApi';
 import {
   archetypeTooltip,
@@ -70,6 +74,8 @@ const ARCHETYPE_LABELS: Record<string, string> = {
 export default function GenomeDetail() {
   const { runId, genomeId } = useParams<{ runId: string; genomeId: string }>();
   const navigate = useNavigate();
+  const { user: currentUser } = useAuth();
+  const { showToast } = useToast();
 
   const [genome, setGenome] = useState<StrategyGenome | null>(null);
   const [run, setRun] = useState<EvolutionRun | null>(null);
@@ -77,6 +83,7 @@ export default function GenomeDetail() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [parentError, setParentError] = useState<string | null>(null);
+  const [overrideOpen, setOverrideOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -294,6 +301,20 @@ export default function GenomeDetail() {
               <ChevronRight className="w-4 h-4" />
             </Link>
           )}
+          {/* v0.6.1 (US-027): ADMIN-only validator override — retires the
+              raw-SQL demo-unblock workaround Wilson used during the v0.6.0
+              smoke-test. Writes an auditable DecisionLog entry. */}
+          {currentUser?.role === 'ADMIN' && (
+            <button
+              type="button"
+              onClick={() => setOverrideOpen(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-amber-400 text-amber-700 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-900/20 text-sm font-medium"
+              title="ADMIN: flip validator_passed on this genome with an audit-log entry"
+            >
+              <Shield className="w-4 h-4" />
+              Override validator verdict
+            </button>
+          )}
           <span className="text-xs text-slate-500 dark:text-slate-400">
             Backtest re-runs on demand to show every trade + signal. Approval
             queue is where you deploy this genome to paper trading.
@@ -396,6 +417,29 @@ export default function GenomeDetail() {
       <Section title="Strategy DSL (full spec)">
         <DslTree spec={genome.dsl_json} />
       </Section>
+
+      {overrideOpen && (
+        <ValidatorOverrideModal
+          genome={{
+            id: genome.id,
+            validator_passed: genome.validator_passed,
+          }}
+          onCancel={() => setOverrideOpen(false)}
+          onOverridden={(updated) => {
+            setOverrideOpen(false);
+            setGenome({
+              ...genome,
+              validator_passed: updated.validator_passed,
+              validation_failures: updated.validation_failures,
+            });
+            showToast(
+              `Validator verdict updated to ${updated.validator_passed}.`,
+              'success',
+            );
+          }}
+          onError={(msg) => showToast(msg, 'error')}
+        />
+      )}
     </div>
   );
 }
