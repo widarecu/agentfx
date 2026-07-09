@@ -343,6 +343,35 @@ The v0.6.0 backend + portal shipped clean, but the smoke-test on Wilson's real U
 - [ ] `NEEDS BACKEND` Backtest OOS overlay data on `LivePnLChart` — right now the backtest curve is a placeholder; needs a source that returns the walk-forward OOS equity time series
 - [ ] `UX POLISH` **LLM-suggested deployment name** on the DeployPaperModal — today the field pre-fills with `{instrument} {granularity} — {YYYY-MM-DD}` which is fine for one deployment but useless when the user has 10+ paper runs. Use the existing Anthropic integration (same one the evolution runner uses for genome hypotheses) to summarise the genome's DSL into a short, memorable identifier — e.g. `EUR_USD trend-MACD 20/50` or `USD_JPY RSI-oversold 14`. New backend endpoint `POST /paper-runs/generate-name` body `{strategy_genome_id}` → `{suggested_name}`. Frontend calls it when the deploy modal opens and shows the suggestion in the name field with an "AI" chip; user can still overwrite. Cheap LLM call — Haiku is fine given the DSL is small.
 
+### v0.6.1 — Critical gap (2026-07-09): the paper runner doesn't actually trade
+
+The v0.6.0 paper runner shipped as a **monitoring skeleton** — Wilson's 24-hour UAT run halted with 0 trades, $10,366.23 balance unchanged, because the runner loop never fetches candles, never compiles the DSL, and never calls `place_market_order`. Confirmed by `grep -n "generate_signals\|place_market_order\|StrategySpec" src/agentfx/services/paper_runner.py` → no matches. The comment I left in the file ("full DSL → signal evaluation … lands in PR-G with the integration test; for now the loop is scaffolded") was accurate for the initial ship but shouldn't have survived the UAT deployment untriaged.
+
+This is the highest-priority v0.6.1 work — every other v0.6.1 item (trades endpoint, decisions endpoint, equity persistence, chart markers) presupposes that the runner is actually executing the strategy.
+
+**Scope of the fix (`feat/paper-runner-live-execution`):**
+
+- [ ] `CORE` **Wire live DSL execution into `_execute_loop`.** Every tick (cadence tuned to granularity — M1 = 60s, H1 = 3600s, etc., not the current 5s health-poll):
+  1. Fetch the latest N candles from the shared `candles` table (via `agentfx.api.services.market_data`) — enough for the DSL's longest lookback plus a few bars of history for stability. Skip execution if the newest candle is older than the granularity's expected freshness (weekend / OANDA maintenance).
+  2. Compile the genome's DSL via `compile_dsl_spec(run.parameters['dsl_json'])` → `Strategy` — the same helper the backtest engine uses, so training-vs-live parity is preserved.
+  3. Generate the signal series via `strategy.generate_signals(df)`. Take the last row's signal as the decision.
+  4. Fetch the current OANDA position via `client.get_position(instrument)`.
+  5. Call `decide_action(signal_direction, signal_units, current_net_units)` (already exists + tested in PR-F).
+  6. If `action == 'place'`: `client.place_market_order(instrument, signed_units, stop_loss_pips, take_profit_pips)` — SL/TP pulled from the risk_config or DSL. Persist to `orders` + `trades` tables tagged with `run.id`. Write a `USER_DEPLOY_PAPER` decision log entry for audit.
+  7. If `action == 'close'`: `client.close_all_positions(instrument)`, persist the exit to `trades`.
+  8. If `action == 'hold'`: no-op.
+- [ ] `CORE` **Split the loop cadence.** Balance / kill / gate polling stays at 5s (fast feedback for kill switch). Signal + candle polling runs at the granularity's cadence (aligned to the top of the minute / hour to reduce race with candle ingestion). Two independent timers inside `_execute_loop` — or split into two subprocesses if the code stays cleaner.
+- [ ] `CORE` **Persist trades on placement + close.** The `Trade` model exists (PR-F migration didn't add columns, just related to it) — populate `entry_timestamp`, `exit_timestamp`, `entry_price`, `exit_price`, `quantity`, `side`, `pnl`, `pnl_pct` per trade. Reuse the mapping the backtest engine already writes.
+- [ ] `CORE` **`GET /paper-runs/{id}/trades` endpoint** — with the trades finally being persisted, the endpoint that maps them to `TradeSignal[]` for the frontend chart becomes trivial. The chart is already wired to accept them (`StrategyChart signals={chartSignals}`), so entry / exit markers appear the moment the endpoint returns non-empty.
+- [ ] `TESTING` **End-to-end integration test.** Fake OANDA server (patched `OandaClient.get_position` / `place_market_order` / `get_pricing`), pre-seeded candles table, drive `_execute_loop` for 20+ ticks, assert: candles fetched → signals generated → orders placed → trades persisted → `runs.pnl` updated. Kill switch closes positions cleanly.
+- [ ] `UX` **Runner status banner on `/paper/:id`.** While the runner is between signal evaluations, the sticky header should surface "next signal in Xs" so the user knows the runner is alive and idle vs stuck. Cheap poll from the run row's `updated_at`.
+
+Blocked-on / adjacent decisions:
+- Candle staleness policy: should the runner halt on stale candles (ingestion has stalled) or just skip signal evaluation? Recommend skip + log, since ingestion outages shouldn't halt the paper run.
+- OANDA v20 streaming (previously deferred to v0.6.2) becomes more attractive here — polling every 60s for M1 means we might miss 30s-scale entries. Not blocking, but worth revisiting.
+
+**Impact of this gap being un-triaged in v0.6.0:** wasted 24h of Wilson's UAT time on a run that couldn't trade. Halted 2026-07-09 via a direct DB `UPDATE runs SET status='HALTED_MANUAL'` with `stop_reason='USER_KILL_v0.6.0_gap'`. The runner subprocess (pid 26 inside `agentfx-backend-uat`) will notice the flag on next tick and exit.
+
 ---
 
 ## v1.0.0 - Live Trading + Portfolio
