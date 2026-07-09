@@ -275,6 +275,46 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 
 ---
 
+## v0.6.1 - Paper Trading Live Execution & Observability
+
+**Theme:** Turn the v0.6.0 paper platform from a UX skeleton into a working strategy evaluator — the runner actually trades, and the run-detail page surfaces what it did.
+
+**Why this shape.** The 24-hour UAT smoke-test on 2026-07-08 flushed out a critical gap: `paper_runner._execute_loop` shipped as a monitoring skeleton — it polls balance + risk gates but never fetches candles, compiles the DSL, or places orders. Wilson's real paper run sat RUNNING for 24 hours with zero trades before being halted with `stop_reason='USER_KILL_v0.6.0_gap'`. Every other observability gap surfaced by the smoke-test (empty Trades table, missing decision log, curve resets on reload, placeholder backtest overlay) presupposes the runner is executing. v0.6.1 is therefore not "polish + one bug fix" but a coherent live-execution sprint that unblocks everything downstream. Plus a parallel fix for the validator write-back bug that keeps every VALIDATED genome out of the approval queue.
+
+**User Stories:** [US-024](requirements/US-024-paper-runner-live-execution.md), [US-025](requirements/US-025-paper-run-read-endpoints.md), [US-026](requirements/US-026-persisted-equity-and-backtest-overlay.md), [US-027](requirements/US-027-validator-writeback-fix.md), [US-028](requirements/US-028-deploy-modal-sl-tp-fields.md)
+
+**Key Capabilities:**
+- **Live DSL execution in the paper runner** — every granularity tick the runner fetches candles from the shared `candles` table, calls `compile_dsl_spec(genome.dsl_json)`, evaluates `strategy.generate_signals(df)`, diffs against the current OANDA position via `decide_action`, and places / closes orders. Emits `USER_SIGNAL_EVALUATED`, `USER_ORDER_PLACED`, `USER_POSITION_CLOSED` decision-log entries. Two internal timers: 5s health poll (kill flag, balance, risk gates) and granularity-aligned signal poll (M1 = every 60s aligned to `:00`, H1 = every `HH:00`).
+- **Trades / decisions / equity read endpoints** — three RBAC-scoped `GET /paper-runs/{id}/*` endpoints so the run-detail page can show what the runner is doing. `origin` field on trades reserved for v0.7.0 backtest-vs-live overlay.
+- **Persisted equity snapshots + backtest OOS overlay** — new `paper_equity_snapshots` table populated on every signal tick so `LivePnLChart` survives page reloads with the full history, and `GET /paper-runs/{id}/backtest-overlay` returns the walk-forward OOS equity time series aligned to the paper run's clock so the overlay curve is real data, not the current placeholder.
+- **Validator write-back fix** — `agentfx.agents.validator` persists its Gate-B verdict back onto the `strategy_genomes.validator_passed` column. Regression test locks the fix in. Approval queue then populates without any manual `UPDATE`.
+- **DeployPaperModal SL/TP fields** — two optional numeric fields (`stop_loss_pips`, `take_profit_pips`) under an "Advanced risk controls" collapsible; wired into `run.risk_config` and passed to `client.place_market_order` when set. Absent = strategy exits on signal reversal only (same as backtest).
+
+**User-approved decisions** (locked before Phase 1):
+- Candle staleness policy: **skip signal evaluation + log warning**, keep polling. Kill switch + daily-loss halt remain the hard stops.
+- Loop cadence: **one subprocess, two internal timers.** Not two subprocesses.
+- OANDA v20 pricing stream: **defer to v0.6.2.** 60s polling is fine for MVP.
+- Order timing: **candle close only.** No intra-bar entries.
+- Position flip: **two-step (close then place).** Explicit in the decision log.
+- SL/TP sourcing: **`run.risk_config`, not the DSL.** DSL extension deferred.
+
+**Deferred to v0.6.2+ (NOT in v0.6.1):**
+- LLM-suggested deployment name on DeployPaperModal
+- Email / Slack notifications
+- OANDA v20 streaming pricing (replaces polling)
+- Live-vs-validation drift dashboard as a separate UI surface
+
+**Exit Criteria:**
+- [ ] A validated genome from a fresh evolution run appears in `/paper/approvals` without any manual DB writes (US-027 closed).
+- [ ] `paper_runner._execute_loop` fetches candles → compiles DSL → generates signals → places orders → persists trades on real OANDA Practice, verified by a fake-OANDA integration test.
+- [ ] `/paper/:id` Trades table populates from `GET /paper-runs/{id}/trades` with entry / exit timestamps, side, quantity, pnl, origin, signal reason.
+- [ ] `/paper/:id` Decision log streams from `GET /paper-runs/{id}/decisions` with 5s polling — every gate refusal / order / kill visible.
+- [ ] LivePnLChart survives a browser reload; equity samples persisted to `paper_equity_snapshots`.
+- [ ] LivePnLChart's backtest overlay curve is real walk-forward OOS equity fetched from `GET /paper-runs/{id}/backtest-overlay`.
+- [ ] 48-hour UAT paper deployment before tag: 5+ trades executed, no unexplained halts, live-vs-backtest drift within ±30% of backtest expected pnl.
+
+---
+
 ## v1.0.0 - Regime-Aware Portfolio + Live Trading
 
 **Theme:** Self-sustaining strategy factory in production — the end-state described in the North Star section.
