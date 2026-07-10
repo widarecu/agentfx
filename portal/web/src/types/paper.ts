@@ -133,6 +133,87 @@ export interface KillPaperRunResponse {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// US-025 read endpoints — /paper-runs/:id/{trades,decisions,equity}
+// ─────────────────────────────────────────────────────────────────────
+
+export interface PaperTradePublic {
+  id: string;
+  entry_timestamp: string;
+  exit_timestamp: string | null;
+  side: 'buy' | 'sell' | string;
+  quantity: number;
+  entry_price: number;
+  exit_price: number | null;
+  pnl: number | null;
+  pnl_pct: number | null;
+  /** Reserved for v0.7.0 backtest-vs-live overlay; always 'live' in v0.6.1. */
+  origin: string | null;
+  /** DSL entry-condition summary, e.g. "sma > sma" or "macd_line crosses_above macd_signal". */
+  signal_reason: string | null;
+}
+
+export interface PaperTradeList {
+  items: PaperTradePublic[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface PaperDecisionPublic {
+  id: string;
+  timestamp: string;
+  action: string;
+  agent_type: string;
+  actor_user_id: number | null;
+  reason: string | null;
+  metadata_json: Record<string, unknown> | null;
+}
+
+export interface PaperDecisionList {
+  items: PaperDecisionPublic[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface EquitySnapshotPublic {
+  timestamp: string;
+  balance: number;
+  unrealized_pnl: number;
+}
+
+/** Response for `GET /paper-runs/:id/equity` — `LivePnLChart` seeds
+ *  from `items` and anchors its zero-line at `snapshot_balance` /
+ *  `run_started_at` without a second request. */
+export interface EquityList {
+  items: EquitySnapshotPublic[];
+  run_started_at: string | null;
+  snapshot_balance: number | null;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// US-026 backtest OOS overlay
+// ─────────────────────────────────────────────────────────────────────
+
+export interface BacktestOverlayPoint {
+  /** Seconds since the OOS window's first bar — renders directly
+   *  against LivePnLChart's hours-since-run-start axis. */
+  timestamp_relative_seconds: number;
+  balance: number;
+}
+
+export type BacktestOverlayReason =
+  | 'no_associated_evolution_run'
+  | 'no_oos_equity_persisted'
+  | 'genome_predates_v0_4_0';
+
+export interface BacktestOverlayResponse {
+  items: BacktestOverlayPoint[];
+  source: 'walk_forward_oos' | 'unavailable';
+  reason: BacktestOverlayReason | null;
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Gate B evaluation — UI-only helper used by ApprovalQueueCard to
 // colour each metric independently. Thresholds mirror the backend
 // (see `planning/MVP_CONSTRAINTS.md` + `src/agentfx/core/gates.py`).

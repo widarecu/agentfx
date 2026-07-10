@@ -16,7 +16,10 @@ import React, { useEffect, useState } from 'react';
 import { Loader2, X } from 'lucide-react';
 
 import { listMyAccounts } from '../services/credentialsApi';
-import { approvePaperRun } from '../services/paperApi';
+import {
+  approvePaperRun,
+  type ApprovePaperRunRequest,
+} from '../services/paperApi';
 import type { UserOandaAccountPublic } from '../types/credentials';
 import type { ApprovalQueueItem } from '../types/paper';
 
@@ -46,6 +49,14 @@ export function DeployPaperModal({
   const [maxPositionSize, setMaxPositionSize] = useState<string>('10000');
   const [dailyLossPct, setDailyLossPct] = useState<string>('2.0');
   const [killDdPct, setKillDdPct] = useState<string>('5.0');
+  // v0.6.1 (US-028): optional per-trade SL/TP passed through to
+  // `client.place_market_order`. Empty string = don't send the field
+  // (broker-side SL/TP not registered; strategy exits on signal
+  // reversal). Under an "Advanced" collapsible so the common deploy
+  // stays uncluttered.
+  const [stopLossPips, setStopLossPips] = useState<string>('');
+  const [takeProfitPips, setTakeProfitPips] = useState<string>('');
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
@@ -68,17 +79,21 @@ export function DeployPaperModal({
     e.preventDefault();
     if (!selectedAccountId) return;
 
-    const payload = {
+    const riskConfig = _buildRiskConfig({
+      maxPositionSize,
+      dailyLossPct,
+      killDdPct,
+      stopLossPips,
+      takeProfitPips,
+    });
+
+    const payload: ApprovePaperRunRequest = {
       strategy_genome_id: item.strategy_genome_id,
       instrument: item.instrument,
       granularity: item.granularity,
       oanda_account_id: selectedAccountId,
       name: name.trim() || undefined,
-      risk_config: {
-        max_position_size_units: Math.max(1, Number(maxPositionSize) || 10000),
-        daily_loss_pct: Math.max(0.01, Number(dailyLossPct) || 2),
-        kill_switch_dd_pct: Math.max(0.01, Number(killDdPct) || 5),
-      },
+      risk_config: riskConfig as ApprovePaperRunRequest['risk_config'],
     };
 
     setSubmitting(true);
@@ -244,6 +259,49 @@ export function DeployPaperModal({
               />
             </div>
 
+            {/* v0.6.1 (US-028): optional broker-side SL/TP. Under a
+                collapsible so the common deploy stays uncluttered —
+                leaving both blank means the strategy exits on signal
+                reversal (same as backtest); daily-loss + kill-switch
+                remain the safety net either way. */}
+            <div>
+              <button
+                type="button"
+                onClick={() => setAdvancedOpen((v) => !v)}
+                aria-expanded={advancedOpen}
+                className="text-xs uppercase tracking-wide text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-slate-100 inline-flex items-center gap-1"
+              >
+                <span
+                  className={`inline-block transition-transform ${
+                    advancedOpen ? 'rotate-90' : ''
+                  }`}
+                >
+                  ▸
+                </span>
+                Advanced risk controls
+              </button>
+              {advancedOpen && (
+                <div className="mt-3 grid grid-cols-2 gap-4">
+                  <NumericField
+                    label="Stop loss (pips)"
+                    hint="Broker-side SL; leave blank for none"
+                    value={stopLossPips}
+                    onChange={setStopLossPips}
+                    step="1"
+                    placeholder="e.g. 20"
+                  />
+                  <NumericField
+                    label="Take profit (pips)"
+                    hint="Broker-side TP; leave blank for none"
+                    value={takeProfitPips}
+                    onChange={setTakeProfitPips}
+                    step="1"
+                    placeholder="e.g. 40"
+                  />
+                </div>
+              )}
+            </div>
+
             {submitError && (
               <div
                 role="alert"
@@ -298,6 +356,7 @@ function NumericField({
   value,
   onChange,
   step = '1',
+  placeholder,
 }: {
   label: string;
   hint?: string;
@@ -305,6 +364,7 @@ function NumericField({
   value: string;
   onChange: (next: string) => void;
   step?: string;
+  placeholder?: string;
 }) {
   return (
     <div>
@@ -318,6 +378,7 @@ function NumericField({
           min={0}
           value={value}
           onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
           className={`flex-1 min-w-0 px-3 py-2 border border-slate-300 dark:border-slate-600 dark:bg-slate-900 font-mono text-sm ${
             suffix ? 'rounded-l' : 'rounded'
           }`}
@@ -333,4 +394,38 @@ function NumericField({
       )}
     </div>
   );
+}
+
+/**
+ * Pure helper that builds the `risk_config` payload from the raw
+ * text inputs. Exported for Vitest so the SL/TP inclusion logic and
+ * default-clamping behaviour lock without a jsdom render pass. See
+ * US-028 for the spec: empty SL/TP fields must NOT ship as null/0 —
+ * they must be absent from the payload entirely so the backend
+ * treats them as "no broker-side SL/TP registered".
+ */
+export function _buildRiskConfig(inputs: {
+  maxPositionSize: string;
+  dailyLossPct: string;
+  killDdPct: string;
+  stopLossPips: string;
+  takeProfitPips: string;
+}): Record<string, number> {
+  const cfg: Record<string, number> = {
+    max_position_size_units: Math.max(
+      1,
+      Number(inputs.maxPositionSize) || 10000,
+    ),
+    daily_loss_pct: Math.max(0.01, Number(inputs.dailyLossPct) || 2),
+    kill_switch_dd_pct: Math.max(0.01, Number(inputs.killDdPct) || 5),
+  };
+  const sl = Number(inputs.stopLossPips);
+  if (inputs.stopLossPips.trim() !== '' && Number.isFinite(sl) && sl > 0) {
+    cfg.stop_loss_pips = sl;
+  }
+  const tp = Number(inputs.takeProfitPips);
+  if (inputs.takeProfitPips.trim() !== '' && Number.isFinite(tp) && tp > 0) {
+    cfg.take_profit_pips = tp;
+  }
+  return cfg;
 }

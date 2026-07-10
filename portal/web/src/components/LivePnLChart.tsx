@@ -1,16 +1,17 @@
 /**
- * Live equity chart with dual x-axis (US-022 / PR-J).
+ * Live equity chart with dual x-axis (US-022 / US-026).
  *
  * Wilson's answer #2 (locked in the v2 UX): dual x-axis — bottom
- * shows relative hours since run start, top shows actual UTC
- * timestamps. Live equity is drawn in emerald; backtest OOS overlay
- * ships as a placeholder curve for PR-J (real backtest points wire
- * up in a v0.6.1 follow-up when the trades endpoint lands).
+ * shows relative hours since run start, top shows actual local
+ * timestamps. Live equity drawn in emerald; backtest OOS overlay
+ * (dashed grey) sourced from `GET /paper-runs/:id/backtest-overlay`
+ * — the walk-forward OOS equity series of the source genome,
+ * anchored at `runStartMs` so the two curves share an x-axis.
  *
- * The component is a pure function of its props — the parent
- * accumulates live samples over polling ticks and passes the series
- * in. Scaling helpers are exposed as `_scaleX`/`_scaleY` so Vitest
- * can lock the axis maths without jsdom.
+ * `liveSeries` is seeded from `GET /paper-runs/:id/equity` on mount
+ * (reload-safe) and appended-to by the 5s poll loop. Scaling helpers
+ * are exposed as `_scaleX`/`_scaleY` so Vitest can lock the axis
+ * maths without jsdom.
  */
 
 import React from 'react';

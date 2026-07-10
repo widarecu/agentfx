@@ -29,9 +29,15 @@ import {
   LivePnLChart,
   type EquityPoint,
 } from '../components/LivePnLChart';
+import { PaperRunTradesTable } from '../components/PaperRunTradesTable';
+import { PaperRunDecisionLog } from '../components/PaperRunDecisionLog';
 import StrategyChart from '../components/StrategyChart';
 import {
+  getBacktestOverlayForRun,
+  getDecisionsForRun,
+  getEquityForRun,
   getPaperRun,
+  getTradesForRun,
   killPaperRun,
   resumePaperRun,
 } from '../services/paperApi';
@@ -39,8 +45,11 @@ import { getGenome } from '../services/evolutionApi';
 import {
   isTerminal,
   STATUS_PILL_CLASSES,
+  type BacktestOverlayResponse,
+  type PaperDecisionPublic,
   type PaperRunPublic,
   type PaperRunStatus,
+  type PaperTradePublic,
 } from '../types/paper';
 import type { CandleData, TradeSignal } from '../types/optimization';
 import type { StrategyGenome } from '../types/evolution';
@@ -62,6 +71,16 @@ export default function PaperRunDetail() {
   const [loading, setLoading] = useState(true);
   const equityRef = useRef<EquityPoint[]>([]);
   const [equity, setEquity] = useState<EquityPoint[]>([]);
+  const equitySeeded = useRef(false);
+
+  // v0.6.1 (US-025 + US-026): Trades / decisions / backtest overlay
+  // now come from real endpoints. State + polling live below; the
+  // PaperRunTradesTable + PaperRunDecisionLog components render off
+  // these arrays.
+  const [trades, setTrades] = useState<PaperTradePublic[]>([]);
+  const [decisions, setDecisions] = useState<PaperDecisionPublic[]>([]);
+  const [backtestOverlay, setBacktestOverlay] =
+    useState<BacktestOverlayResponse | null>(null);
 
   const load = useCallback(async () => {
     if (!runId) return;
@@ -194,10 +213,125 @@ export default function PaperRunDetail() {
     [genome, candles],
   );
 
-  // TradeSignal list is empty until the /paper-runs/:id/trades
-  // endpoint ships (tracked in v0.6.1). StrategyChart accepts an
-  // empty array — the chart just renders candles + indicators with
-  // no entry/exit markers.
+  // ─────────────────────────────────────────────────────────────
+  // US-025 read-endpoint wiring (v0.6.1).
+  //
+  // - Equity: seeded ONCE on mount from `/equity` so a reload
+  //   preserves history; subsequent polls append `current_balance`
+  //   from the run row (same behaviour as v0.6.0, just no longer
+  //   losing the historical window).
+  // - Trades: fetched on mount + every 5s while running.
+  // - Decisions: fetched with a `since` cursor so we only pull new
+  //   entries after the initial page load.
+  // - Backtest overlay: one-shot on mount; the OOS series doesn't
+  //   change over a run's lifetime.
+  // ─────────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!runId || equitySeeded.current) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const eq = await getEquityForRun(runId);
+        if (cancelled) return;
+        const seeded: EquityPoint[] = eq.items.map((s) => ({
+          timestampMs: new Date(s.timestamp).getTime(),
+          balance: s.balance,
+        }));
+        equityRef.current = seeded;
+        setEquity(seeded);
+        equitySeeded.current = true;
+      } catch {
+        // Non-fatal — chart still accumulates from the poll loop.
+        equitySeeded.current = true;
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [runId]);
+
+  useEffect(() => {
+    if (!runId) return;
+    let cancelled = false;
+    const loadTrades = async () => {
+      try {
+        const resp = await getTradesForRun(runId, { limit: 100 });
+        if (!cancelled) setTrades(resp.items);
+      } catch {
+        /* non-fatal */
+      }
+    };
+    void loadTrades();
+    if (run && isTerminal(run.status)) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    const interval = setInterval(loadTrades, POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [runId, run?.status]);
+
+  useEffect(() => {
+    if (!runId) return;
+    let cancelled = false;
+    let cursor: string | undefined;
+    const loadDecisions = async () => {
+      try {
+        const resp = await getDecisionsForRun(runId, { since: cursor });
+        if (cancelled) return;
+        if (resp.items.length > 0) {
+          // Server returns newest-first; oldest is the last row so
+          // that becomes our next-cursor floor.
+          cursor = resp.items[0].timestamp;
+          setDecisions((prev) => {
+            const newIds = new Set(resp.items.map((d) => d.id));
+            const kept = prev.filter((d) => !newIds.has(d.id));
+            return [...resp.items, ...kept].slice(0, 500);
+          });
+        }
+      } catch {
+        /* non-fatal */
+      }
+    };
+    void loadDecisions();
+    if (run && isTerminal(run.status)) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    const interval = setInterval(loadDecisions, POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [runId, run?.status]);
+
+  useEffect(() => {
+    if (!runId) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const resp = await getBacktestOverlayForRun(runId);
+        if (!cancelled) setBacktestOverlay(resp);
+      } catch {
+        /* non-fatal */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [runId]);
+
+  // v0.6.1: StrategyChart entry/exit markers require the full
+  // `TradeSignal` shape (indicator values at signal time, structured
+  // exit reason) that paper Trade rows don't carry. The Trades table
+  // below is the source of truth for now; overlaying paper markers
+  // on the price chart is a v0.6.2 follow-up once the runner
+  // persists per-tick indicator values.
   const chartSignals: TradeSignal[] = useMemo(() => [], []);
 
   if (loading && !run) {
@@ -293,8 +427,9 @@ export default function PaperRunDetail() {
               Live vs backtest equity
             </div>
             <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Dual x-axis: relative hours (bottom) + local time (top). Live
-              samples accumulate every 5s while this tab is open.
+              Dual x-axis: relative hours (bottom) + local time (top).
+              Curve seeded from persisted signal-tick snapshots, then
+              5s polling appends new samples.
             </div>
           </div>
           <div className="flex gap-4 text-xs">
@@ -312,8 +447,23 @@ export default function PaperRunDetail() {
             runStartMs={runStartMs}
             snapshotBalance={snapshot || current || 10_000}
             liveSeries={equity}
+            backtestSeries={(backtestOverlay?.items ?? []).map((p) => ({
+              timestampMs: runStartMs + p.timestamp_relative_seconds * 1000,
+              balance: p.balance,
+            }))}
           />
         </div>
+        {backtestOverlay?.source === 'unavailable' && (
+          <div className="text-xs text-slate-500 dark:text-slate-400 italic mt-2">
+            Backtest OOS overlay unavailable
+            {backtestOverlay.reason === 'no_associated_evolution_run' &&
+              ' — this run isn\'t linked to an evolution.'}
+            {backtestOverlay.reason === 'no_oos_equity_persisted' &&
+              ' — no OOS folds were persisted for the source genome.'}
+            {backtestOverlay.reason === 'genome_predates_v0_4_0' &&
+              ' — the source genome predates the v0.4.0 OOS-series persistence work.'}
+          </div>
+        )}
       </div>
 
       {/* Candles + indicators — same StrategyChart the backtest page
@@ -379,23 +529,15 @@ export default function PaperRunDetail() {
       </div>
 
       <div className="mt-6 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
-        <div className="text-sm font-semibold mb-2">Trades</div>
-        <div className="text-xs text-slate-500 dark:text-slate-400 italic">
-          Trades table (with Origin + Signal reason columns) wires up in
-          v0.6.1 alongside the /paper-runs/{`{id}`}/trades endpoint. For
-          now the run's live P&amp;L above is the source of truth and
-          the Price + indicators chart shows the strategy's DSL logic.
+        <div className="text-sm font-semibold mb-2">
+          Trades{trades.length > 0 && ` (${trades.length})`}
         </div>
+        <PaperRunTradesTable trades={trades} />
       </div>
 
       <div className="mt-6 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
         <div className="text-sm font-semibold mb-2">Decision log</div>
-        <div className="text-xs text-slate-500 dark:text-slate-400 italic">
-          Decision log stream lands in v0.6.1. Every gate refusal, order
-          placement, and kill request is already persisted server-side via
-          the `decision_logs` table; surfacing it here needs a small
-          /paper-runs/{`{id}`}/decisions endpoint.
-        </div>
+        <PaperRunDecisionLog decisions={decisions} />
       </div>
     </div>
   );

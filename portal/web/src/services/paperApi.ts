@@ -10,10 +10,14 @@
 import { API_BASE_URL } from './config';
 import type {
   ApprovalQueueList,
+  BacktestOverlayResponse,
+  EquityList,
   KillPaperRunResponse,
+  PaperDecisionList,
   PaperRunList,
   PaperRunPublic,
   PaperRunStatus,
+  PaperTradeList,
 } from '../types/paper';
 import type { Scope } from '../utils/rbac';
 
@@ -92,6 +96,12 @@ export interface ApprovePaperRunRequest {
     max_position_size_units: number;
     daily_loss_pct: number;
     kill_switch_dd_pct: number;
+    /** v0.6.1 (US-028): optional broker-side SL. When set, passed
+     *  through to `client.place_market_order` on the runner's next
+     *  signal tick. Absent → no broker-side SL registered. */
+    stop_loss_pips?: number;
+    /** v0.6.1 (US-028): same as above, for TP. */
+    take_profit_pips?: number;
   };
 }
 
@@ -167,5 +177,97 @@ export async function deletePaperRun(
     method: 'DELETE',
     headers: authHeaders(),
   });
+  return handleResponse(res);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// US-025 + US-026 read endpoints (PR-D backend / PR-F frontend).
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Trade rows for the /paper/:id Trades table. Open trades sort ahead
+ * of closed. `origin='live'` for every v0.6.1 row; `signal_reason` is
+ * the DSL entry condition summary (e.g. "sma > sma") rendered in the
+ * "Reason" column.
+ */
+export async function getTradesForRun(
+  runId: string,
+  { limit = 100, offset = 0 }: { limit?: number; offset?: number } = {},
+): Promise<PaperTradeList> {
+  const params = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+  });
+  const res = await fetch(
+    `${API_BASE_URL}/paper-runs/${runId}/trades?${params}`,
+    { headers: authHeaders() },
+  );
+  return handleResponse(res);
+}
+
+/**
+ * DecisionLog rows for the /paper/:id Decision log stream. Filtered
+ * server-side to paper-specific actions (order placed / position
+ * closed / signal skipped / kill / resume / etc.). `since` supports
+ * incremental polling — pass the newest `timestamp` you've already
+ * displayed and the server returns only newer rows.
+ */
+export async function getDecisionsForRun(
+  runId: string,
+  {
+    limit = 100,
+    offset = 0,
+    since,
+  }: { limit?: number; offset?: number; since?: string } = {},
+): Promise<PaperDecisionList> {
+  const params = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+  });
+  if (since) params.set('since', since);
+  const res = await fetch(
+    `${API_BASE_URL}/paper-runs/${runId}/decisions?${params}`,
+    { headers: authHeaders() },
+  );
+  return handleResponse(res);
+}
+
+/**
+ * Persisted equity snapshots for `LivePnLChart` — one per signal tick
+ * (not per health tick). Response includes `run_started_at` +
+ * `snapshot_balance` so the chart can anchor without a second request.
+ */
+export async function getEquityForRun(
+  runId: string,
+  {
+    fromTs,
+    toTs,
+    limit = 5000,
+  }: { fromTs?: string; toTs?: string; limit?: number } = {},
+): Promise<EquityList> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (fromTs) params.set('from_ts', fromTs);
+  if (toTs) params.set('to_ts', toTs);
+  const res = await fetch(
+    `${API_BASE_URL}/paper-runs/${runId}/equity?${params}`,
+    { headers: authHeaders() },
+  );
+  return handleResponse(res);
+}
+
+/**
+ * Walk-forward OOS equity series from the paper run's underlying
+ * evolution. `timestamp_relative_seconds` = seconds since OOS start,
+ * so the frontend renders it directly against LivePnLChart's
+ * hours-since-run-start axis. Returns `{source: 'unavailable', ...}`
+ * when the chain breaks (pre-v0.4.0 genome, no genome linked, etc.).
+ */
+export async function getBacktestOverlayForRun(
+  runId: string,
+): Promise<BacktestOverlayResponse> {
+  const res = await fetch(
+    `${API_BASE_URL}/paper-runs/${runId}/backtest-overlay`,
+    { headers: authHeaders() },
+  );
   return handleResponse(res);
 }
