@@ -174,6 +174,15 @@ class Trade(Base):
     pnl = Column(Float, nullable=True)  # Realized PnL
     pnl_pct = Column(Float, nullable=True)  # Realized PnL as percentage
 
+    # v0.6.1 (US-024): where did this trade come from? Always 'live' for
+    # paper-runner-executed trades; reserved for the v0.7.0 backtest-vs-
+    # live overlay work when the same table will hold both.
+    origin = Column(String, nullable=True)
+    # v0.6.1 (US-024): the indicator condition that triggered the entry,
+    # e.g. "SMA_20 > SMA_50" or "MACD ↑". Rendered in the /paper/:id
+    # Trades table's "Reason" column per Wilson's UX answer #1.
+    signal_reason = Column(String, nullable=True)
+
     # Relationships
     run = relationship("Run", back_populates="trades")
     orders = relationship("Order", back_populates="trade", cascade="all, delete-orphan")

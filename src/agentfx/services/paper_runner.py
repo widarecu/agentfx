@@ -1,4 +1,4 @@
-"""Paper runner decision loop (US-021).
+"""Paper runner decision loop (US-021 + US-024).
 
 Runs inside the subprocess spawned by
 `agentfx.api.workers.paper_runner.schedule_paper_run`. The parent-side
@@ -6,39 +6,74 @@ plumbing (spawn / watchdog / kill-signal escape hatch) is intentionally
 separate so this module can be exercised by unit tests without
 touching multiprocessing.
 
-Loop shape:
-1. Load the run row + user credentials → build an OandaClient scoped
-   to the user's chosen sub-account.
-2. Snapshot the account balance on the first tick and persist it as
-   `runs.snapshot_balance` (per Wilson's UX answer #4 the user never
-   types this — it comes from OANDA).
-3. Enter the decision loop. Each tick:
-   - Poll `kill_requested_at`; if set, close positions and exit
-     `HALTED_MANUAL`.
-   - Fetch current OANDA position + balance.
-   - Fetch fresh candles + compile a signal from the genome's DSL.
-   - Evaluate risk gates (US-023). Kill-switch / daily-loss trip a
-     terminal halt; position-size cap skips this tick.
-   - Diff signal vs position → place / close / hold.
-   - Write updated `current_balance` + `pnl` to the row.
-4. Exit gracefully on `stop_conditions` (COMPLETED) or on an
-   `OandaCircuitOpen` from the adapter (`stop_reason=BROKER_CIRCUIT`).
+Loop shape (v0.6.1):
+    Two interleaved cadences in one subprocess.
 
-The full DSL → signal evaluation for live candles lands in PR-G with
-the integration test; for now the loop is scaffolded so tests can
-exercise the individual pieces (`decide_action`, gate integration,
-kill polling) with mocked candles and mocked OandaClient.
+    1. **Health tick** — every 5 seconds. Reloads the run row, checks
+       the kill flag, fetches balance from OANDA, evaluates risk
+       gates. This preserves the sub-5s kill-switch guarantee from
+       v0.6.0.
+
+    2. **Signal tick** — aligned to the strategy's granularity
+       (M1 = every 60s at `:00`, H1 = every `HH:00`, etc.). Fetches
+       fresh candles from the shared `candles` table, compiles the
+       genome's DSL via `compile_spec()` (same helper the backtest
+       engine uses — training-vs-live parity), evaluates
+       `strategy.generate_signals(df)`, diffs against the current
+       OANDA position, and places / closes orders. Every action
+       writes a `USER_ORDER_PLACED` / `USER_POSITION_CLOSED` /
+       `USER_SIGNAL_EVALUATED` / `USER_SIGNAL_SKIPPED_STALE`
+       DecisionLog row for the audit trail.
+
+The v0.6.0 ship of this module was a monitoring skeleton — it polled
+balance + risk gates but never fetched candles, compiled the DSL, or
+called `place_market_order`. Wilson's 24-hour UAT run on 2026-07-08
+halted with zero trades because of that gap. US-024 closes it.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
+
+if TYPE_CHECKING:  # pragma: no cover
+    import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────
+
+
+# Fixed lookback window for live signal evaluation. Covers every DSL
+# indicator commonly used (SMA_200 needs 200; MACD_26 needs ~35; etc.)
+# with a comfortable safety margin so early-bar NaNs from indicators
+# never propagate into the last-row signal we act on. Chosen as a
+# constant rather than walking the spec so a strategy that stretches
+# its lookback doesn't silently under-fetch — if we ever ship indicators
+# with lookbacks past this ceiling, bump the constant + write a
+# regression test.
+DEFAULT_LOOKBACK_BARS = 500
+
+# Granularity → seconds. Mirrors OANDA's naming; keep in sync with the
+# frontend's `granularityToSeconds` in `portal/web/src/utils/candles.ts`.
+_GRANULARITY_SECONDS: dict[str, int] = {
+    "M1": 60,
+    "M5": 300,
+    "M10": 600,
+    "M15": 900,
+    "M30": 1800,
+    "H1": 3600,
+    "H4": 14400,
+    "D": 86400,
+}
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -69,7 +104,7 @@ class PositionSource(Protocol):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Pure decision logic — tested in isolation
+# Pure helpers — tested in isolation
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -119,6 +154,42 @@ def decide_action(
     )
 
 
+def granularity_to_seconds(granularity: str) -> int:
+    """OANDA-standard granularity → seconds.
+
+    Falls back to 60s (M1) on unknown values so a misconfigured run
+    still yields a legible signal cadence. Matches the frontend
+    helper in `candles.ts` — keep in sync.
+    """
+    return _GRANULARITY_SECONDS.get(granularity, 60)
+
+
+def align_to_granularity(now_ts: float, granularity_seconds: int) -> float:
+    """Round `now_ts` UP to the next granularity boundary.
+
+    Signal ticks fire at the top of the granularity (M1 → `:00`, H1 →
+    `HH:00`) so evaluation always sees a freshly-closed bar. Rounding
+    in UTC epoch-seconds keeps this DST-safe. If `now_ts` is exactly
+    on a boundary we return the NEXT boundary — otherwise the tick
+    would fire twice in the same instant.
+    """
+    if granularity_seconds <= 0:
+        return now_ts
+    remainder = now_ts % granularity_seconds
+    return now_ts + (granularity_seconds - remainder)
+
+
+def pip_size_for_pair(pair: str) -> float:
+    """0.01 for JPY crosses, 0.0001 for majors.
+
+    Mirrors the helper in `services/backtest.py`. Extracted here so
+    the runner doesn't drag a full backtest import chain just for pip
+    location.
+    """
+    p = pair.upper()
+    return 0.01 if p.endswith("JPY") or "_JPY" in p else 0.0001
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Loop entry
 # ─────────────────────────────────────────────────────────────────────
@@ -135,7 +206,9 @@ def run_paper_run(
     run to ERROR with `stop_reason=process_crashed`.
 
     Kept thin — the real logic is in `_execute_loop`, which takes
-    injectables (OandaClient, sleep) so tests can exercise it.
+    injectables (OandaClient, strategy, candle_fetch_fn, sleep) so
+    tests can exercise it without pulling real DSL / DB / OANDA
+    infrastructure.
     """
     # Lazy imports so this module can be imported without pulling
     # SQLAlchemy or the OANDA HTTP client (unit tests hit
@@ -144,6 +217,7 @@ def run_paper_run(
     from agentfx.api.core.database import SessionLocal
     from agentfx.api.core.secrets import decrypt_secret
     from agentfx.api.models import Run, RunStatus, UserOandaCredentials
+    from agentfx.core.dsl import StrategySpec, compile_spec
 
     db = SessionLocal()
     try:
@@ -182,13 +256,91 @@ def run_paper_run(
             account_id=run.oanda_account_id,
         )
 
+        # Compile the strategy from the deployed genome's DSL. The
+        # `dsl_json` is copied onto `run.parameters` at approve time so
+        # a subsequent genome edit doesn't retroactively change what
+        # the runner executes.
+        params = run.parameters or {}
+        dsl_json = params.get("dsl_json")
+        granularity = params.get("granularity") or "M1"
+        instrument = params.get("instrument") or run.pair
+        strategy = None
+        if dsl_json is not None:
+            try:
+                spec = StrategySpec.model_validate(dsl_json)
+                strategy = compile_spec(spec, pip_size=pip_size_for_pair(instrument))
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "paper runner: DSL compile failed for %s; running monitoring-only",
+                    run_id,
+                )
+                strategy = None
+
         run.status = RunStatus.RUNNING
         run.started_at = datetime.now(UTC)
         db.commit()
 
-        _execute_loop(db=db, run=run, client=client)
+        _execute_loop(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=_default_candle_fetch(db),
+            instrument=instrument,
+            granularity_seconds=granularity_to_seconds(granularity),
+        )
     finally:
         db.close()
+
+
+def _default_candle_fetch(
+    db,
+) -> Callable[
+    [str, str, int], pd.DataFrame
+]:  # pragma: no cover — thin adapter, exercised by integration test
+    """Return a `(instrument, granularity, bars) -> DataFrame` closure
+    that pulls the last N candles from the shared `candles` table.
+
+    Extracted as a factory so `_execute_loop` doesn't take a DB
+    dependency directly and unit tests inject their own arrays.
+    """
+    from agentfx.api.services.market_data import market_data_service
+
+    def _fetch(instrument: str, granularity: str, bars: int):
+        import pandas as pd
+
+        candles, _total = market_data_service.get_candles(
+            db=db,
+            exchange="oanda",
+            instrument=instrument,
+            timeframe=granularity,
+            limit=bars,
+        )
+        # market_data_service.get_candles returns newest-first when no
+        # time range is specified — reverse to chronological order for
+        # `generate_signals`.
+        candles = list(reversed(candles))
+        if not candles:
+            return pd.DataFrame(
+                columns=["open", "high", "low", "close", "volume"]
+            ).astype(float)
+        return pd.DataFrame(
+            {
+                "open": [c.open for c in candles],
+                "high": [c.high for c in candles],
+                "low": [c.low for c in candles],
+                "close": [c.close for c in candles],
+                "volume": [c.volume or 0.0 for c in candles],
+            },
+            index=pd.DatetimeIndex([c.timestamp for c in candles], tz="UTC"),
+        )
+
+    return _fetch
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Loop body
+# ─────────────────────────────────────────────────────────────────────
 
 
 def _execute_loop(
@@ -197,18 +349,44 @@ def _execute_loop(
     run,
     client,
     sleep_fn=time.sleep,
+    now_fn: Callable[[], float] | None = None,
     max_iterations: int | None = None,
+    strategy=None,
+    candle_fetch_fn: Callable[[str, str, int], pd.DataFrame] | None = None,
+    instrument: str | None = None,
+    granularity_seconds: int = 60,
 ) -> None:
     """Body of the paper-runner main loop.
 
     Extracted from `run_paper_run` so tests can drive it with a mocked
-    `client` and a bounded `max_iterations`. Production callers pass
-    `max_iterations=None` (unbounded) and rely on `kill_requested_at`
-    or a terminal risk-gate refusal to exit.
+    `client`, a mocked candle fetch, and a bounded `max_iterations`.
+    Production callers pass `max_iterations=None` (unbounded) and rely
+    on `kill_requested_at` or a terminal risk-gate refusal to exit.
+
+    When `strategy is None` OR `candle_fetch_fn is None`, the signal
+    tick is skipped entirely — the loop degrades to the v0.6.0
+    monitoring-only shape. Every unit test that only exercises the
+    kill / gate / balance paths runs in this mode.
     """
     from agentfx.adapters.oanda import OandaCircuitOpen
     from agentfx.api.models import RunStatus
     from agentfx.services.paper_policy import RiskState, evaluate_all
+
+    if now_fn is None:  # pragma: no cover — trivial
+
+        def _wall_clock() -> float:
+            return datetime.now(UTC).timestamp()
+
+        now_fn = _wall_clock
+
+    signal_enabled = (
+        strategy is not None and candle_fetch_fn is not None and instrument is not None
+    )
+    next_signal_at = (
+        align_to_granularity(now_fn(), granularity_seconds)
+        if signal_enabled
+        else float("inf")
+    )
 
     _snapshot_balance_if_needed(db=db, run=run, client=client)
 
@@ -223,6 +401,7 @@ def _execute_loop(
             return
         iteration += 1
 
+        # ─── Health tick ─────────────────────────────────────────────
         # Reload the row so we see kill flags set by the router in
         # another process.
         db.refresh(run)
@@ -272,16 +451,401 @@ def _execute_loop(
             _flatten_and_halt(db, run, client, reason=gate.reason)
             return
 
-        # Cadence — polling matches the granularity roughly. Kept as
-        # an injectable `sleep_fn` so tests skip the wait entirely.
-        # Real cadence lands in PR-G; here we default to 5s to match
-        # the run-detail page's polling.
-        sleep_fn(5.0)
+        # ─── Signal tick (only when past the boundary) ───────────────
+        now = now_fn()
+        if signal_enabled and now >= next_signal_at:
+            try:
+                _signal_tick(
+                    db=db,
+                    run=run,
+                    client=client,
+                    strategy=strategy,
+                    candle_fetch_fn=candle_fetch_fn,
+                    instrument=instrument,
+                    granularity_seconds=granularity_seconds,
+                    now_utc=datetime.fromtimestamp(now, tz=UTC),
+                )
+            except Exception:  # noqa: BLE001
+                # Signal work is best-effort — a compilation failure /
+                # arithmetic overflow / OANDA network blip mustn't take
+                # the whole runner down. Log and continue; the health
+                # tick keeps the kill switch responsive.
+                logger.exception(
+                    "paper runner: signal tick failed on %s; skipping this bar",
+                    run.id,
+                )
+            next_signal_at = align_to_granularity(
+                now + granularity_seconds, granularity_seconds
+            )
+
+        # Cadence — health tick every 5s, or sooner if the next signal
+        # tick is closer. Injectable `sleep_fn` so tests skip the wait
+        # entirely.
+        if signal_enabled:
+            sleep_seconds = min(5.0, max(0.1, next_signal_at - now_fn()))
+        else:
+            sleep_seconds = 5.0
+        sleep_fn(sleep_seconds)
 
         if max_iterations is None and run.status != RunStatus.RUNNING:
             # Something outside the loop terminated the run — respect
             # it and exit.
             return
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Signal tick (US-024)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _signal_tick(
+    *,
+    db,
+    run,
+    client,
+    strategy,
+    candle_fetch_fn: Callable[[str, str, int], pd.DataFrame],
+    instrument: str,
+    granularity_seconds: int,
+    now_utc: datetime,
+) -> None:
+    """One granularity-boundary tick: fetch → compile → decide → act.
+
+    Extracted so unit tests can drive one tick in isolation with
+    mocked candles + mocked OandaClient. Errors bubble to
+    `_execute_loop` which logs and continues.
+    """
+    from agentfx.api.models import RunStatus
+
+    if run.status != RunStatus.RUNNING:
+        return
+
+    granularity = _seconds_to_granularity(granularity_seconds)
+    df = candle_fetch_fn(instrument, granularity, DEFAULT_LOOKBACK_BARS)
+
+    # Stale-candle guard. Ingestion outages (weekend, OANDA maintenance,
+    # ingester falling behind) leave the shared `candles` table N bars
+    # behind wall-clock. We skip signal evaluation + log rather than
+    # halt — the runner resumes on next tick when fresh data lands.
+    if df.empty:
+        _write_decision(
+            db,
+            run,
+            action="USER_SIGNAL_SKIPPED_STALE",
+            reason=f"no candles returned for {instrument} {granularity}",
+            outputs={
+                "paper_run_id": run.id,
+                "reason_detail": "empty_candles",
+            },
+        )
+        return
+    latest_ts = df.index[-1]
+    if hasattr(latest_ts, "to_pydatetime"):
+        latest_dt = latest_ts.to_pydatetime()
+    else:  # pragma: no cover — defensive
+        latest_dt = latest_ts
+    if latest_dt.tzinfo is None:
+        latest_dt = latest_dt.replace(tzinfo=UTC)
+    if (now_utc - latest_dt).total_seconds() > 2 * granularity_seconds:
+        _write_decision(
+            db,
+            run,
+            action="USER_SIGNAL_SKIPPED_STALE",
+            reason=(
+                f"latest candle {latest_dt.isoformat()} is older than "
+                f"2x {granularity} bars — skipping signal"
+            ),
+            outputs={
+                "paper_run_id": run.id,
+                "latest_candle_at": latest_dt.isoformat(),
+                "now": now_utc.isoformat(),
+            },
+        )
+        return
+
+    signals = strategy.generate_signals(df)
+    if len(signals) == 0:
+        return
+    last_signal = int(signals.iloc[-1])
+    signal_direction: Direction = (
+        "long" if last_signal > 0 else "short" if last_signal < 0 else "flat"
+    )
+
+    position = client.get_position(instrument)
+    long_units = int(position.get("long_units", 0) or 0)
+    short_units = int(position.get("short_units", 0) or 0)
+    # OANDA returns short_units as a negative integer; treat the sum as
+    # signed net exposure so `decide_action`'s arithmetic works
+    # consistently regardless of sign convention.
+    net_units = long_units + short_units
+
+    risk_cfg = run.risk_config or {}
+    max_units = int(risk_cfg.get("max_position_size_units", 10_000))
+    action = decide_action(
+        signal_direction=signal_direction,
+        signal_units=max_units if signal_direction != "flat" else 0,
+        current_net_units=net_units,
+    )
+
+    if action.action == "hold":
+        # Deliberately no decision log here — a busy strategy would
+        # produce one row per health-tick × signal-tick, blowing up
+        # the audit table. `USER_ORDER_PLACED` / `USER_POSITION_CLOSED`
+        # are the load-bearing entries.
+        return
+
+    if action.action == "close":
+        _close_position_and_persist(
+            db=db,
+            run=run,
+            client=client,
+            instrument=instrument,
+            now_utc=now_utc,
+            reason="flat_signal",
+        )
+        return
+
+    # action.action == "place"
+    # Two-step position flip: if we have an open position in the
+    # opposite direction, close first + return. Next signal tick opens
+    # the new side. Explicit in the audit trail; matches how the
+    # backtest engine records flips.
+    if net_units != 0 and (
+        (net_units > 0 and signal_direction == "short")
+        or (net_units < 0 and signal_direction == "long")
+    ):
+        _close_position_and_persist(
+            db=db,
+            run=run,
+            client=client,
+            instrument=instrument,
+            now_utc=now_utc,
+            reason="direction_change",
+        )
+        return
+
+    signed_units = max_units if signal_direction == "long" else -max_units
+    sl_pips = risk_cfg.get("stop_loss_pips")
+    tp_pips = risk_cfg.get("take_profit_pips")
+
+    result = client.place_market_order(
+        instrument,
+        signed_units,
+        stop_loss_pips=sl_pips,
+        take_profit_pips=tp_pips,
+    )
+    fill_price = float(result.get("fill_price") or 0.0)
+    filled_units = int(result.get("units") or signed_units)
+    trade_id = result.get("trade_id")
+    signal_reason = _signal_reason(strategy, signal_direction)
+
+    _persist_trade_entry(
+        db=db,
+        run=run,
+        instrument=instrument,
+        entry_price=fill_price,
+        quantity=abs(filled_units),
+        side="long" if filled_units > 0 else "short",
+        entry_timestamp=now_utc,
+        signal_reason=signal_reason,
+    )
+    _write_decision(
+        db,
+        run,
+        action="USER_ORDER_PLACED",
+        reason=(
+            f"{signal_direction.upper()} {abs(filled_units)} {instrument} "
+            f"@ {fill_price:.5f} ({signal_reason})"
+        ),
+        outputs={
+            "paper_run_id": run.id,
+            "instrument": instrument,
+            "signed_units": filled_units,
+            "fill_price": fill_price,
+            "broker_trade_id": trade_id,
+            "signal_reason": signal_reason,
+        },
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Trade + decision persistence helpers
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _persist_trade_entry(
+    *,
+    db,
+    run,
+    instrument: str,
+    entry_price: float,
+    quantity: float,
+    side: str,
+    entry_timestamp: datetime,
+    signal_reason: str,
+) -> None:
+    """Insert a new Trade row for a placed order.
+
+    Side convention on the Trade table is 'buy' / 'sell' (legacy). Map
+    'long' → 'buy', 'short' → 'sell'. Both `origin='live'` and
+    `signal_reason` were added in the b3e5c7a1d842 migration.
+    """
+    from agentfx.api.models import Trade
+
+    ts = int(entry_timestamp.timestamp() * 1000)
+    trade = Trade(
+        id=f"tr_{ts}_{run.id}_{uuid.uuid4().hex[:8]}",
+        run_id=run.id,
+        entry_timestamp=entry_timestamp,
+        entry_price=entry_price,
+        quantity=quantity,
+        side="buy" if side == "long" else "sell",
+        origin="live",
+        signal_reason=signal_reason,
+    )
+    db.add(trade)
+    db.commit()
+
+
+def _close_position_and_persist(
+    *,
+    db,
+    run,
+    client,
+    instrument: str,
+    now_utc: datetime,
+    reason: str,
+) -> None:
+    """Flatten the OANDA position, update matching open Trade rows,
+    and write a `USER_POSITION_CLOSED` decision log.
+
+    Best-effort on the Trade update — if the trade row was written by
+    a prior runner instance and lost, we still commit the OANDA close
+    and log the decision so the audit trail is preserved.
+    """
+    from agentfx.api.models import Trade
+
+    result = client.close_all_positions(instrument)
+    long_pnl = float(result.get("long_realized_pnl", 0.0) or 0.0)
+    short_pnl = float(result.get("short_realized_pnl", 0.0) or 0.0)
+    total_pnl = long_pnl + short_pnl
+
+    # Update every open Trade row for this run — a normal single-side
+    # position will have exactly one; the multi-fill / partial-close
+    # cases would have more.
+    open_trades = (
+        db.query(Trade)
+        .filter(Trade.run_id == run.id, Trade.exit_timestamp.is_(None))
+        .all()
+    )
+    if open_trades:
+        # Split the realized pnl proportionally to quantity. Rough
+        # apportionment is fine — OANDA's per-trade close would give
+        # us exact per-trade pnl but we're closing everything at once
+        # here so the proportional split is the honest read of the
+        # combined result.
+        total_qty = sum(t.quantity for t in open_trades) or 1.0
+        for t in open_trades:
+            share = float(t.quantity) / total_qty
+            t.pnl = total_pnl * share
+            t.pnl_pct = (
+                (t.pnl / (t.entry_price * t.quantity)) * 100 if t.entry_price else 0.0
+            )
+            t.exit_timestamp = now_utc
+            # Exit price: derive from the pnl share + entry price. Not
+            # exact for JPY vs major pip differences but close enough
+            # for the UI. If this drifts noticeably we'll read the
+            # actual fill price from the OANDA response in v0.6.2.
+            t.exit_price = t.entry_price + (t.pnl / t.quantity if t.quantity else 0.0)
+        db.commit()
+
+    _write_decision(
+        db,
+        run,
+        action="USER_POSITION_CLOSED",
+        reason=(
+            f"Closed {instrument} — long_pnl={long_pnl:.2f} "
+            f"short_pnl={short_pnl:.2f} ({reason})"
+        ),
+        outputs={
+            "paper_run_id": run.id,
+            "instrument": instrument,
+            "long_realized_pnl": long_pnl,
+            "short_realized_pnl": short_pnl,
+            "close_reason": reason,
+            "closed_trade_count": len(open_trades),
+        },
+    )
+
+
+def _write_decision(
+    db,
+    run,
+    *,
+    action: str,
+    reason: str,
+    outputs: dict,
+) -> None:
+    """Append a DecisionLog row scoped to this paper run.
+
+    The `decision_logs.run_id` column FKs to `evolution_runs.id`, not
+    paper runs — since v0.6.0 it's nullable to accommodate user
+    actions that aren't attached to an evolution. We stash the paper
+    run id inside `outputs_json` so `GET /paper-runs/{id}/decisions`
+    (US-025) can filter cleanly. A future migration may promote it to
+    its own column with an index.
+    """
+    from agentfx.api.models import DecisionLog
+
+    log = DecisionLog(
+        id=uuid.uuid4().hex,
+        run_id=None,
+        agent_type="PAPER_RUNNER",
+        action=action,
+        outputs_json=outputs,
+        reasoning_text=reason,
+        user_id=run.user_id,
+    )
+    db.add(log)
+    db.commit()
+
+
+def _signal_reason(strategy, direction: Direction) -> str:
+    """Derive a short human-legible reason string for the trade row.
+
+    In v0.6.1 we surface the strategy's DSL condition summary via
+    `spec.entry.long` / `spec.entry.short` — same shape the backtest
+    engine records. If the strategy doesn't expose that shape (e.g.
+    a legacy MA/RSI strategy from the classic path) we fall back to a
+    generic direction tag.
+    """
+    try:
+        spec = getattr(strategy, "spec", None)
+        if spec is None:
+            return f"{direction} signal"
+        cond = spec.entry.long if direction == "long" else spec.entry.short
+        if cond is None:
+            return f"{direction} signal"
+        lhs_ind = getattr(cond.lhs, "ind", None) or "expr"
+        cmp = cond.cmp
+        rhs_ind = getattr(cond.rhs, "ind", None) or "expr"
+        return f"{lhs_ind} {cmp} {rhs_ind}"
+    except Exception:  # noqa: BLE001
+        return f"{direction} signal"
+
+
+def _seconds_to_granularity(seconds: int) -> str:
+    """Inverse of `granularity_to_seconds` — needed by the candle
+    fetcher which takes granularity string, not seconds.
+
+    Falls back to 'M1' on unknown values (matches the forward map's
+    fallback behaviour so a misconfigured run still gets bars, just
+    at the wrong cadence — the stale-candle guard then triggers).
+    """
+    for name, value in _GRANULARITY_SECONDS.items():
+        if value == seconds:
+            return name
+    return "M1"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -345,7 +909,11 @@ def _mark_terminal(db, run, status, reason: str) -> None:
 
 
 __all__ = [
+    "DEFAULT_LOOKBACK_BARS",
     "TickAction",
+    "align_to_granularity",
     "decide_action",
+    "granularity_to_seconds",
+    "pip_size_for_pair",
     "run_paper_run",
 ]
