@@ -229,3 +229,37 @@ class Order(Base):
 
     def __repr__(self):
         return f"<Order {self.id} - {self.side} {self.quantity} {self.order_type}>"
+
+
+class PaperEquitySnapshot(Base):
+    """One equity sample from the paper runner's signal tick (US-026).
+
+    Written every granularity boundary — NOT every health tick — so the
+    row count stays proportional to trading cadence, not runner-loop
+    cadence. Backs `GET /paper-runs/{id}/equity` so `LivePnLChart`
+    survives a browser reload with its full historical curve.
+
+    Only the paper runner writes here (agent_type='PAPER_RUNNER').
+    Reads are RBAC-scoped by walking `run_id → Run.user_id` in the
+    service layer.
+    """
+
+    __tablename__ = "paper_equity_snapshots"
+
+    id = Column(String(36), primary_key=True)  # uuid hex
+    run_id = Column(
+        String(120),
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    timestamp = Column(DateTime(timezone=True), nullable=False)
+    balance = Column(Float, nullable=False)
+    unrealized_pnl = Column(Float, nullable=False, default=0.0)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    def __repr__(self):
+        return (
+            f"<PaperEquitySnapshot {self.id} run={self.run_id} balance={self.balance}>"
+        )

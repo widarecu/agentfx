@@ -556,6 +556,242 @@ def _link_to_evolution_run_id(genome: models.StrategyGenome) -> str | None:
     return None
 
 
+# ─────────────────────────────────────────────────────────────────────
+# US-025 — read endpoints (trades / decisions / equity)
+# ─────────────────────────────────────────────────────────────────────
+
+
+# DecisionLog action types the runner + user actions emit for a paper
+# run. Any row outside this set (agent-authored evolution decisions,
+# unrelated user actions) is filtered out so the /paper/:id log stream
+# stays focused on the run's own timeline.
+_PAPER_DECISION_ACTIONS: tuple[str, ...] = (
+    "USER_ORDER_PLACED",
+    "USER_POSITION_CLOSED",
+    "USER_SIGNAL_SKIPPED_STALE",
+    "USER_DEPLOY_PAPER",
+    "USER_APPROVE_GENOME",
+    "USER_REJECT_GENOME",
+    "USER_KILL_PAPER",
+    "USER_RESUME_PAPER",
+    "USER_VALIDATOR_OVERRIDE",
+)
+
+
+def list_trades_for_run(
+    db: Session,
+    run_id: str,
+    *,
+    limit: int = 100,
+    offset: int = 0,
+) -> tuple[list[models.Trade], int]:
+    """Trades belonging to `run_id`, newest-first.
+
+    Ordering: `COALESCE(exit_timestamp, entry_timestamp) DESC` so open
+    trades (no exit) sort ahead of the closed history.
+    """
+    from sqlalchemy import desc, func as sa_func
+
+    q = db.query(models.Trade).filter(models.Trade.run_id == run_id)
+    total = q.count()
+    items = (
+        q.order_by(
+            desc(
+                sa_func.coalesce(
+                    models.Trade.exit_timestamp, models.Trade.entry_timestamp
+                )
+            )
+        )
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return items, total
+
+
+def list_decisions_for_run(
+    db: Session,
+    run_id: str,
+    *,
+    limit: int = 100,
+    offset: int = 0,
+    since: datetime | None = None,
+) -> tuple[list[models.DecisionLog], int]:
+    """Paper-runner-relevant DecisionLog rows for `run_id`.
+
+    The runner writes rows with `run_id=None` (evolution-runs FK doesn't
+    fit paper runs) and stashes `paper_run_id` inside `outputs_json`.
+    Router-side user actions (kill / resume / deploy / reject) write
+    rows with `run_id` pointing at the associated *evolution* run —
+    which isn't what we want here — but ALSO include `paper_run_id`
+    in `outputs_json`. So we filter by JSON-key membership across both
+    row shapes, then narrow to the paper-specific action set.
+
+    Ordered newest-first. `since` filters to rows strictly after the
+    timestamp so the frontend can incrementally poll for new entries.
+    """
+    from sqlalchemy import cast, desc, String as SAString
+
+    # Postgres has JSONB `->` / `->>` operators — the column is JSON
+    # (not JSONB) so we cast to text and compare. Slower than a native
+    # JSONB index but volume here is small (order of hundreds per run).
+    paper_id_matches = (
+        cast(models.DecisionLog.outputs_json["paper_run_id"], SAString) == f'"{run_id}"'
+    )
+
+    q = db.query(models.DecisionLog).filter(
+        paper_id_matches,
+        models.DecisionLog.action.in_(_PAPER_DECISION_ACTIONS),
+    )
+    if since is not None:
+        q = q.filter(models.DecisionLog.created_at > since)
+    total = q.count()
+    items = (
+        q.order_by(desc(models.DecisionLog.created_at))
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return items, total
+
+
+def list_equity_for_run(
+    db: Session,
+    run_id: str,
+    *,
+    from_ts: datetime | None = None,
+    to_ts: datetime | None = None,
+    limit: int = 5000,
+) -> list[models.PaperEquitySnapshot]:
+    """Persisted equity snapshots for `run_id`, chart-friendly (oldest
+    first). `from_ts` / `to_ts` narrow to a visible window on the chart.
+    """
+    q = db.query(models.PaperEquitySnapshot).filter(
+        models.PaperEquitySnapshot.run_id == run_id
+    )
+    if from_ts is not None:
+        q = q.filter(models.PaperEquitySnapshot.timestamp >= from_ts)
+    if to_ts is not None:
+        q = q.filter(models.PaperEquitySnapshot.timestamp <= to_ts)
+    return q.order_by(models.PaperEquitySnapshot.timestamp).limit(limit).all()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# US-026 — backtest OOS overlay for LivePnLChart
+# ─────────────────────────────────────────────────────────────────────
+
+
+def get_backtest_overlay(
+    db: Session,
+    run: models.Run,
+) -> dict:
+    """Resolve the paper run's underlying evolution → OOS equity series.
+
+    Returns a dict shaped like the `BacktestOverlayResponse` schema
+    (`items` list + `source` + `reason`). Falls through to
+    `unavailable` when the genome has no parent evolution or the OOS
+    equity series was never persisted (older evolutions predate the
+    v0.4.0 fold-consistency work that started storing it).
+
+    The overlay curve x-axis is `timestamp_relative_seconds` — seconds
+    from the OOS window's first bar — so the frontend can render it
+    against `LivePnLChart`'s hours-since-run-start axis directly
+    without knowing anything about the backtest's calendar.
+    """
+    if run.strategy_genome_id is None:
+        return {
+            "items": [],
+            "source": "unavailable",
+            "reason": "no_associated_evolution_run",
+        }
+
+    genome = (
+        db.query(models.StrategyGenome)
+        .filter(models.StrategyGenome.id == run.strategy_genome_id)
+        .first()
+    )
+    if genome is None:
+        return {
+            "items": [],
+            "source": "unavailable",
+            "reason": "no_associated_evolution_run",
+        }
+
+    generation = (
+        db.query(models.Generation)
+        .filter(models.Generation.id == genome.generation_id)
+        .first()
+    )
+    if generation is None:
+        return {
+            "items": [],
+            "source": "unavailable",
+            "reason": "no_associated_evolution_run",
+        }
+
+    # Pick the champion OOS fold — walk-forward OOS metrics are per-fold
+    # rows, not a single curve. v0.4.0's persistence stored the fold's
+    # equity series as a JSON list; older rows have None.
+    oos_folds = (
+        db.query(models.ValidationFold)
+        .filter(
+            models.ValidationFold.genome_id == genome.id,
+            models.ValidationFold.is_oos.is_(True),
+        )
+        .order_by(models.ValidationFold.fold_index)
+        .all()
+    )
+    if not oos_folds:
+        return {
+            "items": [],
+            "source": "unavailable",
+            "reason": "no_oos_equity_persisted",
+        }
+
+    # Look for a fold that has a persisted equity series. The column
+    # isn't on the current model; v0.4.0 ADDED a `oos_equity_series`
+    # JSON blob but that column may not exist yet on this schema. We
+    # try both attribute names and gracefully return unavailable when
+    # neither is present.
+    series_attr = None
+    for candidate in ("oos_equity_series", "equity_series"):
+        if any(getattr(f, candidate, None) for f in oos_folds):
+            series_attr = candidate
+            break
+    if series_attr is None:
+        return {
+            "items": [],
+            "source": "unavailable",
+            "reason": "genome_predates_v0_4_0",
+        }
+
+    # Concatenate the persisted per-fold series into one relative-time
+    # curve so LivePnLChart renders a single continuous overlay.
+    items: list[dict] = []
+    offset_seconds = 0.0
+    for fold in oos_folds:
+        raw = getattr(fold, series_attr, None) or []
+        for entry in raw:
+            ts_seconds = float(entry.get("t", 0.0))
+            balance = float(entry.get("balance", 0.0))
+            items.append(
+                {
+                    "timestamp_relative_seconds": offset_seconds + ts_seconds,
+                    "balance": balance,
+                }
+            )
+        # Advance the offset by the fold's duration so the next fold
+        # continues along the same x-axis rather than restarting at 0.
+        if raw:
+            offset_seconds += float(raw[-1].get("t", 0.0))
+
+    return {
+        "items": items,
+        "source": "walk_forward_oos",
+        "reason": None,
+    }
+
+
 def find_orphaned_running_paper_runs(db: Session) -> Iterable[models.Run]:
     """Lifespan startup: paper runs left as RUNNING when the app
     crashed. The caller resets them to APPROVED so the scheduler picks

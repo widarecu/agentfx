@@ -592,6 +592,9 @@ def _signal_tick(
         # produce one row per health-tick × signal-tick, blowing up
         # the audit table. `USER_ORDER_PLACED` / `USER_POSITION_CLOSED`
         # are the load-bearing entries.
+        # Still snapshot equity so the reload-safe LivePnLChart curve
+        # doesn't skip bars just because the strategy held.
+        _persist_equity_snapshot(db=db, run=run, position=position, now_utc=now_utc)
         return
 
     if action.action == "close":
@@ -666,6 +669,7 @@ def _signal_tick(
             "signal_reason": signal_reason,
         },
     )
+    _persist_equity_snapshot(db=db, run=run, position=position, now_utc=now_utc)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -776,6 +780,40 @@ def _close_position_and_persist(
             "closed_trade_count": len(open_trades),
         },
     )
+    # Position is now flat — snapshot equity without unrealized_pnl.
+    _persist_equity_snapshot(db=db, run=run, position=None, now_utc=now_utc)
+
+
+def _persist_equity_snapshot(
+    *,
+    db,
+    run,
+    position: dict | None,
+    now_utc: datetime,
+) -> None:
+    """Append a paper_equity_snapshot row for the reload-safe chart (US-026).
+
+    Written on every signal tick — hold / place / close — but NEVER on
+    the health tick, so the row count scales with trading cadence
+    rather than loop cadence. `unrealized_pnl` is pulled from the
+    OANDA position when the runner was holding a live side; passing
+    `position=None` (post-close) records 0.
+    """
+    from agentfx.api.models import PaperEquitySnapshot
+
+    unrealized = 0.0
+    if position is not None:
+        unrealized = float(position.get("unrealized_pnl", 0.0) or 0.0)
+
+    snapshot = PaperEquitySnapshot(
+        id=uuid.uuid4().hex,
+        run_id=run.id,
+        timestamp=now_utc,
+        balance=float(run.current_balance or run.snapshot_balance or 0.0),
+        unrealized_pnl=unrealized,
+    )
+    db.add(snapshot)
+    db.commit()
 
 
 def _write_decision(

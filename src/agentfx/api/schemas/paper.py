@@ -204,17 +204,134 @@ class KillPaperRunResponse(BaseSchema):
     )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# US-025 — trades / decisions / equity read endpoints
+# ─────────────────────────────────────────────────────────────────────
+
+
+class PaperTradePublic(BaseSchema):
+    """One row of the /paper/:id Trades table.
+
+    Populated by the runner's signal tick (US-024). `origin='live'` for
+    every v0.6.1 row; the column is reserved for v0.7.0's backtest-vs-
+    live overlay work when the same table will hold both. `signal_reason`
+    is the DSL entry condition summary (e.g. "sma > sma") the trader
+    reads to understand WHY the runner entered.
+    """
+
+    id: str
+    entry_timestamp: datetime
+    exit_timestamp: datetime | None = None
+    side: str  # "buy" | "sell"
+    quantity: float
+    entry_price: float
+    exit_price: float | None = None
+    pnl: float | None = None
+    pnl_pct: float | None = None
+    origin: str | None = None
+    signal_reason: str | None = None
+
+
+class PaperTradeList(BaseSchema):
+    items: list[PaperTradePublic]
+    total: int
+    limit: int
+    offset: int
+
+
+class PaperDecisionPublic(BaseSchema):
+    """One paper-run audit-log row.
+
+    Filtered from the shared `decision_logs` table to just the actions
+    the paper runner writes (USER_ORDER_PLACED / USER_POSITION_CLOSED /
+    USER_SIGNAL_SKIPPED_STALE / USER_KILL_PAPER / USER_DEPLOY_PAPER /
+    USER_APPROVE_GENOME / USER_REJECT_GENOME / USER_RESUME_PAPER /
+    USER_VALIDATOR_OVERRIDE). Owner-scoping happens at the router.
+    """
+
+    id: str
+    timestamp: datetime
+    action: str
+    agent_type: str
+    actor_user_id: int | None = None
+    reason: str | None = None
+    metadata_json: dict | None = None
+
+
+class PaperDecisionList(BaseSchema):
+    items: list[PaperDecisionPublic]
+    total: int
+    limit: int
+    offset: int
+
+
+class EquitySnapshotPublic(BaseSchema):
+    timestamp: datetime
+    balance: float
+    unrealized_pnl: float
+
+
+class EquityList(BaseSchema):
+    """`GET /paper-runs/{id}/equity` response.
+
+    `run_started_at` + `snapshot_balance` are returned alongside so
+    `LivePnLChart` can anchor its curve without a second request.
+    """
+
+    items: list[EquitySnapshotPublic]
+    run_started_at: datetime | None = None
+    snapshot_balance: float | None = None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# US-026 — backtest OOS overlay for LivePnLChart
+# ─────────────────────────────────────────────────────────────────────
+
+
+class BacktestOverlayPoint(BaseSchema):
+    """One point on the backtest OOS overlay curve.
+
+    `timestamp_relative_seconds` is normalized to seconds-since-run-
+    start so the frontend can render it against LivePnLChart's
+    relative x-axis directly.
+    """
+
+    timestamp_relative_seconds: float
+    balance: float
+
+
+BacktestOverlayReason = Literal[
+    "no_associated_evolution_run",
+    "no_oos_equity_persisted",
+    "genome_predates_v0_4_0",
+]
+
+
+class BacktestOverlayResponse(BaseSchema):
+    items: list[BacktestOverlayPoint]
+    source: Literal["walk_forward_oos", "unavailable"]
+    reason: BacktestOverlayReason | None = None
+
+
 __all__ = [
     "ApprovalQueueItem",
     "ApprovalQueueList",
     "ApprovalQueueMeta",
+    "BacktestOverlayPoint",
+    "BacktestOverlayResponse",
     "ClosestGenome",
     "DeployPaperRequest",
+    "EquityList",
+    "EquitySnapshotPublic",
     "KillPaperRunResponse",
+    "PaperDecisionList",
+    "PaperDecisionPublic",
     "PaperRunApproval",
     "PaperRunList",
     "PaperRunListItem",
     "PaperRunPublic",
+    "PaperTradeList",
+    "PaperTradePublic",
     "RejectGenomeRequest",
     "RiskConfig",
 ]

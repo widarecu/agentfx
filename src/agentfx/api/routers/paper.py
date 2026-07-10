@@ -16,6 +16,8 @@ so a stray endpoint can't accidentally leak another user's rows.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -256,6 +258,158 @@ def reject_paper_run(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
         ) from e
     return {"success": True, "message": "Genome rejected"}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# US-025 — trades / decisions / equity read endpoints
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _load_owned_paper_run(
+    db: Session, run_id: str, current_user: models.User
+) -> models.Run:
+    """Fetch a paper run and enforce owner-or-ADMIN access.
+
+    404 if the run doesn't exist; 403 if it exists but the caller isn't
+    the owner and isn't ADMIN. Extracted so the four read endpoints
+    below share one enforcement point.
+    """
+    run = paper_service.get_paper_run(db, run_id)
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Paper run not found"
+        )
+    _require_paper_run_owner(run, current_user)
+    return run
+
+
+def _decision_to_public(row: models.DecisionLog) -> schemas.PaperDecisionPublic:
+    outputs = row.outputs_json or {}
+    return schemas.PaperDecisionPublic(
+        id=row.id,
+        timestamp=row.created_at,
+        action=row.action,
+        agent_type=row.agent_type,
+        actor_user_id=row.user_id,
+        reason=row.reasoning_text,
+        metadata_json=outputs,
+    )
+
+
+@router.get(
+    "/paper-runs/{run_id}/trades",
+    response_model=schemas.PaperTradeList,
+)
+def list_paper_run_trades(
+    run_id: str,
+    limit: int = 100,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> schemas.PaperTradeList:
+    run = _load_owned_paper_run(db, run_id, current_user)
+    items, total = paper_service.list_trades_for_run(
+        db, run.id, limit=limit, offset=offset
+    )
+    return schemas.PaperTradeList(
+        items=[
+            schemas.PaperTradePublic(
+                id=t.id,
+                entry_timestamp=t.entry_timestamp,
+                exit_timestamp=t.exit_timestamp,
+                side=t.side,
+                quantity=t.quantity,
+                entry_price=t.entry_price,
+                exit_price=t.exit_price,
+                pnl=t.pnl,
+                pnl_pct=t.pnl_pct,
+                origin=t.origin,
+                signal_reason=t.signal_reason,
+            )
+            for t in items
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get(
+    "/paper-runs/{run_id}/decisions",
+    response_model=schemas.PaperDecisionList,
+)
+def list_paper_run_decisions(
+    run_id: str,
+    limit: int = 100,
+    offset: int = 0,
+    since: datetime | None = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> schemas.PaperDecisionList:
+    run = _load_owned_paper_run(db, run_id, current_user)
+    items, total = paper_service.list_decisions_for_run(
+        db, run.id, limit=limit, offset=offset, since=since
+    )
+    return schemas.PaperDecisionList(
+        items=[_decision_to_public(d) for d in items],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get(
+    "/paper-runs/{run_id}/equity",
+    response_model=schemas.EquityList,
+)
+def list_paper_run_equity(
+    run_id: str,
+    from_ts: datetime | None = None,
+    to_ts: datetime | None = None,
+    limit: int = 5000,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> schemas.EquityList:
+    run = _load_owned_paper_run(db, run_id, current_user)
+    items = paper_service.list_equity_for_run(
+        db, run.id, from_ts=from_ts, to_ts=to_ts, limit=limit
+    )
+    return schemas.EquityList(
+        items=[
+            schemas.EquitySnapshotPublic(
+                timestamp=s.timestamp,
+                balance=float(s.balance),
+                unrealized_pnl=float(s.unrealized_pnl or 0.0),
+            )
+            for s in items
+        ],
+        run_started_at=run.started_at,
+        snapshot_balance=run.snapshot_balance,
+    )
+
+
+@router.get(
+    "/paper-runs/{run_id}/backtest-overlay",
+    response_model=schemas.BacktestOverlayResponse,
+)
+def get_paper_run_backtest_overlay(
+    run_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> schemas.BacktestOverlayResponse:
+    run = _load_owned_paper_run(db, run_id, current_user)
+    result = paper_service.get_backtest_overlay(db, run)
+    return schemas.BacktestOverlayResponse(
+        items=[
+            schemas.BacktestOverlayPoint(
+                timestamp_relative_seconds=p["timestamp_relative_seconds"],
+                balance=p["balance"],
+            )
+            for p in result["items"]
+        ],
+        source=result["source"],
+        reason=result["reason"],
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────

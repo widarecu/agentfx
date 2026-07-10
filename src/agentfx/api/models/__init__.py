@@ -20,7 +20,14 @@ from .optimization import (
     OptimizationTrial,
     StrategyType,
 )
-from .run import Order, Run, RunEnvironment, RunStatus, Trade
+from .run import (
+    Order,
+    PaperEquitySnapshot,
+    Run,
+    RunEnvironment,
+    RunStatus,
+    Trade,
+)
 from .strategy import Strategy
 from .user import User, UserRole
 from .user_credentials import (
@@ -37,6 +44,7 @@ __all__ = [
     "Run",
     "Trade",
     "Order",
+    "PaperEquitySnapshot",
     "RunStatus",
     "RunEnvironment",
     "Strategy",
