@@ -311,7 +311,7 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 - [ ] `/paper/:id` Decision log streams from `GET /paper-runs/{id}/decisions` with 5s polling — every gate refusal / order / kill visible.
 - [ ] LivePnLChart survives a browser reload; equity samples persisted to `paper_equity_snapshots`.
 - [ ] LivePnLChart's backtest overlay curve is real walk-forward OOS equity fetched from `GET /paper-runs/{id}/backtest-overlay`.
-- [ ] 48-hour UAT paper deployment before tag: 5+ trades executed, no unexplained halts, live-vs-backtest drift within ±30% of backtest expected pnl.
+- [ ] 48-hour UAT paper deployment before tag: 5+ trades executed, no unexplained halts, live-vs-backtest drift within ±30% of backtest expected pnl. Step-by-step verification checklist: [v0.6.1-uat-verification.md](runbooks/v0.6.1-uat-verification.md).
 
 ---
 

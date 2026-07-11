@@ -338,6 +338,8 @@ The current evolve → evaluate → repeat loop is optimization without learning
 
 **Plan document:** [V0.6.1_IMPLEMENTATION_PLAN.md](V0.6.1_IMPLEMENTATION_PLAN.md) — phase-by-phase PR sequencing + user-approved decisions.
 
+**UAT verification runbook (exit gate before tagging):** [runbooks/v0.6.1-uat-verification.md](runbooks/v0.6.1-uat-verification.md) — step-by-step checklist Wilson executes on the UAT stack + 48-hour observation window.
+
 **Genesis:** The 24-hour UAT smoke-test on 2026-07-08 flushed out that `paper_runner._execute_loop` shipped as a monitoring skeleton — polls balance + risk gates but never fetches candles, compiles the DSL, or places orders. Wilson's real paper run halted on 2026-07-09 with `stop_reason='USER_KILL_v0.6.0_gap'` after 24h with zero trades. Every other observability gap the smoke-test surfaced (empty Trades table, missing decision log, curve resets on reload, placeholder backtest overlay) presupposes the runner is executing, so v0.6.1 is a single coherent live-execution sprint plus the validator write-back bug that keeps VALIDATED genomes out of the approval queue.
 
 ### User stories
