@@ -304,7 +304,7 @@ export default function GenomeDetail() {
           {/* v0.6.1 (US-027): ADMIN-only validator override — retires the
               raw-SQL demo-unblock workaround Wilson used during the v0.6.0
               smoke-test. Writes an auditable DecisionLog entry. */}
-          {currentUser?.role === 'ADMIN' && (
+          {currentUser?.role === 'admin' && (
             <button
               type="button"
               onClick={() => setOverrideOpen(true)}
