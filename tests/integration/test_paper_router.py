@@ -351,7 +351,7 @@ class TestReject:
             .filter_by(user_id=paper_users["alice"]["user"].id)
             .all()
         )
-        assert any(l.action == "user_reject_genome" for l in logs)
+        assert any(l.action == "USER_REJECT_GENOME" for l in logs)
 
     def test_rejected_genome_leaves_the_queue(
         self,
@@ -631,7 +631,7 @@ class TestResume:
             .filter_by(user_id=paper_users["alice"]["user"].id)
             .all()
         )
-        assert any(l.action == "user_resume_paper" for l in logs)
+        assert any(l.action == "USER_RESUME_PAPER" for l in logs)
 
     def test_resume_running_run_returns_409(
         self, test_client_with_db, db_session, paper_users

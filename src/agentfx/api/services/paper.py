@@ -286,21 +286,31 @@ def approve_and_deploy(
     )
     db.add(run)
 
-    # Audit trail (US-018) — a real user did this.
+    # Audit trail (US-018) — a real user did this. `paper_run_id`
+    # lives in `outputs_json` so `GET /paper-runs/{id}/decisions`
+    # (US-025) surfaces this row — the endpoint filters on the
+    # outputs_json key. `action` uses the enum's uppercase NAME to
+    # match the runner-emitted decisions' casing (v0.6.0 originally
+    # used `.value` here, but that ships lowercase strings and made
+    # every router-side user action invisible to the endpoint).
     db.add(
         models.DecisionLog(
             id=uuid.uuid4().hex,
             run_id=_link_to_evolution_run_id(genome),
             agent_type=models.AgentType.USER.value,
-            action=models.UserAction.USER_APPROVE_GENOME.value,
+            action=models.UserAction.USER_APPROVE_GENOME.name,
             user_id=current_user.id,
-            inputs_json={
+            reasoning_text=(
+                f"{current_user.email} approved genome {genome.id} for paper "
+                f"trading on {body.instrument} {body.granularity}."
+            ),
+            outputs_json={
+                "paper_run_id": run.id,
                 "strategy_genome_id": genome.id,
                 "instrument": body.instrument,
                 "granularity": body.granularity,
                 "oanda_account_id": body.oanda_account_id,
                 "risk_config": body.risk_config.model_dump(),
-                "paper_run_id": run.id,
             },
         )
     )
@@ -335,9 +345,13 @@ def reject_genome(
             id=uuid.uuid4().hex,
             run_id=_link_to_evolution_run_id(genome),
             agent_type=models.AgentType.USER.value,
-            action=models.UserAction.USER_REJECT_GENOME.value,
+            action=models.UserAction.USER_REJECT_GENOME.name,
             user_id=current_user.id,
-            inputs_json={
+            reasoning_text=(
+                f"{current_user.email} rejected genome {genome.id} from the "
+                f"approval queue. Reason: {reason}"
+            ),
+            outputs_json={
                 "strategy_genome_id": genome.id,
                 "reason": reason,
             },
@@ -410,9 +424,13 @@ def request_kill(
             id=uuid.uuid4().hex,
             run_id=None,  # paper-run kills aren't tied to an evolution run
             agent_type=models.AgentType.USER.value,
-            action=models.UserAction.USER_KILL_PAPER.value,
+            action=models.UserAction.USER_KILL_PAPER.name,
             user_id=current_user.id,
-            inputs_json={"paper_run_id": run.id},
+            reasoning_text=(
+                f"{current_user.email} requested kill on paper run {run.id}. "
+                "The runner halts on next loop tick (<5s SLA)."
+            ),
+            outputs_json={"paper_run_id": run.id},
         )
     )
     db.commit()
@@ -458,9 +476,14 @@ def resume_paper_run(
             id=uuid.uuid4().hex,
             run_id=None,
             agent_type=models.AgentType.USER.value,
-            action=models.UserAction.USER_RESUME_PAPER.value,
+            action=models.UserAction.USER_RESUME_PAPER.name,
             user_id=current_user.id,
-            inputs_json={"paper_run_id": run.id},
+            reasoning_text=(
+                f"{current_user.email} resumed halted paper run {run.id}. "
+                "Snapshot balance preserved so P&L % stays anchored to the "
+                "original run start."
+            ),
+            outputs_json={"paper_run_id": run.id},
         )
     )
     db.commit()
