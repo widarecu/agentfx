@@ -208,8 +208,19 @@ def _closest_to_passing(
         " · ".join(str(f) for f in (genome.validation_failures or [])[:3])
         or "Failed Gate B"
     )
+    # `evolution_run_id` lets the frontend build a valid /evolution/:runId/
+    # genomes/:genomeId link — the only route pattern GenomeDetail
+    # matches. Without this the "View genome detail →" link on the
+    # closest-to-passing card 404s (v0.6.1 UAT bug caught 2026-07-12).
+    generation = (
+        db.query(models.Generation)
+        .filter(models.Generation.id == genome.generation_id)
+        .first()
+    )
+    evolution_run_id = generation.run_id if generation is not None else None
     return ClosestGenome(
         genome_id=best_id,
+        evolution_run_id=evolution_run_id,
         oos_sharpe=best_sharpe,
         oos_max_drawdown=med_mdd,
         oos_n_trades=total_trades,

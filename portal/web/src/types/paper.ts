@@ -99,6 +99,10 @@ export interface ApprovalQueueItem {
 
 export interface ClosestGenome {
   genome_id: string;
+  /** Populated when the backend can walk genome → generation → run.
+   *  Null on legacy or orphaned genomes. Used to build the
+   *  `/evolution/:runId/genomes/:genomeId` link on the card. */
+  evolution_run_id: string | null;
   oos_sharpe: number | null;
   oos_max_drawdown: number | null;
   oos_n_trades: number | null;

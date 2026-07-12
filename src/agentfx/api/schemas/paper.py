@@ -167,6 +167,7 @@ class ClosestGenome(BaseSchema):
     """
 
     genome_id: str
+    evolution_run_id: str | None = None
     oos_sharpe: float | None = None
     oos_max_drawdown: float | None = None
     oos_n_trades: int | None = None

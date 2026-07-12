@@ -296,11 +296,12 @@ function ClosestGenomeCard({
 }: {
   closest: NonNullable<ApprovalQueueMeta['closest_to_passing']>;
 }) {
-  return (
-    <Link
-      to={`/genomes/${closest.genome_id}`}
-      className="mt-6 block bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 rounded p-4 text-left hover:border-emerald-400 transition-colors"
-    >
+  // GenomeDetail only mounts on `/evolution/:runId/genomes/:genomeId`.
+  // Fall back to a non-navigating div when the backend couldn't
+  // resolve the evolution_run_id (legacy or orphaned genomes) so we
+  // don't ship a link that 404s.
+  const cardBody = (
+    <>
       <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
         <PackageOpen className="w-4 h-4" /> Closest to passing
       </div>
@@ -315,9 +316,26 @@ function ClosestGenomeCard({
             ` · ${closest.oos_n_trades} OOS trades`}
         </div>
       )}
-      <div className="text-xs text-emerald-600 dark:text-emerald-400 mt-3">
-        View genome detail →
+      {closest.evolution_run_id && (
+        <div className="text-xs text-emerald-600 dark:text-emerald-400 mt-3">
+          View genome detail →
+        </div>
+      )}
+    </>
+  );
+  if (!closest.evolution_run_id) {
+    return (
+      <div className="mt-6 block bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 rounded p-4 text-left">
+        {cardBody}
       </div>
+    );
+  }
+  return (
+    <Link
+      to={`/evolution/${closest.evolution_run_id}/genomes/${closest.genome_id}`}
+      className="mt-6 block bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 rounded p-4 text-left hover:border-emerald-400 transition-colors"
+    >
+      {cardBody}
     </Link>
   );
 }

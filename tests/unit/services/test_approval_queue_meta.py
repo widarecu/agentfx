@@ -226,6 +226,10 @@ def test_meta_validated_but_none_passed_selects_closest(db):
     assert closest.oos_sharpe == pytest.approx(0.82)
     assert closest.oos_n_trades == 292  # 140 + 152
     assert "Sharpe" in closest.failure_summary
+    # v0.6.1 UAT bugfix: `evolution_run_id` must be populated so the
+    # frontend can build a valid `/evolution/:runId/genomes/:genomeId`
+    # link on the closest-to-passing card.
+    assert closest.evolution_run_id == "evorun_b"
 
 
 def test_meta_all_passing_deployed_returns_empty_but_marks_touched(db):
