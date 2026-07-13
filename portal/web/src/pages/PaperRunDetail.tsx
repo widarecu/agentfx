@@ -55,6 +55,7 @@ import type { CandleData, TradeSignal } from '../types/optimization';
 import type { StrategyGenome } from '../types/evolution';
 import { fetchRecentCandles } from '../utils/candles';
 import { buildIndicatorsFromDsl } from '../utils/dslIndicators';
+import { formatUTC } from '../utils/time';
 
 const POLL_INTERVAL_MS = 5_000;
 const CANDLES_POLL_INTERVAL_MS = 60_000; // fresh candles every minute
@@ -729,7 +730,7 @@ function CrashDetailPanel({
           )}
           {crashDetail?.crashed_at && (
             <div className="text-xs text-rose-800 dark:text-rose-300 mt-0.5">
-              crashed at {new Date(crashDetail.crashed_at).toLocaleString()}
+              crashed at {formatUTC(crashDetail.crashed_at)}
             </div>
           )}
         </div>
@@ -860,30 +861,22 @@ function RunLifecyclePanel({ run }: { run: PaperRunPublic }) {
       <dl className="space-y-2 text-sm">
         <Row label="Approved">
           <span className="font-mono text-xs">
-            {run.approved_at
-              ? new Date(run.approved_at).toLocaleString()
-              : '—'}
+            {run.approved_at ? formatUTC(run.approved_at) : '—'}
           </span>
         </Row>
         <Row label="Started">
           <span className="font-mono text-xs">
-            {run.started_at
-              ? new Date(run.started_at).toLocaleString()
-              : '—'}
+            {run.started_at ? formatUTC(run.started_at) : '—'}
           </span>
         </Row>
         <Row label="Kill requested">
           <span className="font-mono text-xs">
-            {run.kill_requested_at
-              ? new Date(run.kill_requested_at).toLocaleString()
-              : '—'}
+            {run.kill_requested_at ? formatUTC(run.kill_requested_at) : '—'}
           </span>
         </Row>
         <Row label="Completed">
           <span className="font-mono text-xs">
-            {run.completed_at
-              ? new Date(run.completed_at).toLocaleString()
-              : '—'}
+            {run.completed_at ? formatUTC(run.completed_at) : '—'}
           </span>
         </Row>
         {run.stop_reason && (

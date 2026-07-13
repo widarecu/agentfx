@@ -30,6 +30,7 @@ import {
   classifyIndicator,
   offScaleId,
 } from '../utils/indicatorScales';
+import { formatUTC } from '../utils/time';
 
 interface StrategyChartProps {
   candles: CandleData[];
@@ -231,7 +232,7 @@ export default function StrategyChart({
           offScalesTooltip.push({ label, value: formatted });
         }
         setTooltip({
-          time: new Date((param.time as number) * 1000).toLocaleString('en-US', { timeZone: 'UTC', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+          time: formatUTC((param.time as number) * 1000),
           o: d.open.toFixed(5), h: d.high.toFixed(5), l: d.low.toFixed(5), c: d.close.toFixed(5),
           osc,
           offScales: offScalesTooltip.length > 0 ? offScalesTooltip : undefined,

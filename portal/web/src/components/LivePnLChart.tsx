@@ -92,13 +92,12 @@ export function LivePnLChart({
     x: PADDING_LEFT + PLOT_WIDTH * frac,
   }));
 
-  // Top axis ticks — same positions, but as actual browser-local
-  // timestamps. Wilson's feedback: the previous UTC axis was a
-  // mismatch against the local-time Lifecycle panel below, which
-  // made the two feel out of sync. Consistency > timezone purity.
+  // Top axis ticks — same positions, but as actual wall-clock
+  // timestamps in UTC (matches the candle chart axis, decision log,
+  // and Lifecycle panel — see utils/time.ts).
   const utcTicks = relativeTicks.map((t) => ({
     ...t,
-    label: formatLocalHHMM(runStartMs + spanMs * t.frac),
+    label: formatUtcHHMM(runStartMs + spanMs * t.frac),
   }));
 
   const currentLive = liveSeries[liveSeries.length - 1];
@@ -291,9 +290,9 @@ function pointsToPath(
   return segments.join(' ');
 }
 
-function formatLocalHHMM(ms: number): string {
+function formatUtcHHMM(ms: number): string {
   const d = new Date(ms);
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mm = String(d.getMinutes()).padStart(2, '0');
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  const mm = String(d.getUTCMinutes()).padStart(2, '0');
   return `${hh}:${mm}`;
 }

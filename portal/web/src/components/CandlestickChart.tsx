@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { createChart, IChartApi, ISeriesApi, CandlestickData, UTCTimestamp } from 'lightweight-charts';
 import { Candle } from '../services/marketData';
 import { AlertCircle, TrendingUp, Loader2 } from 'lucide-react';
+import { formatUTC } from '../utils/time';
 
 interface CandlestickChartProps {
   candles: Candle[];
@@ -327,7 +328,7 @@ export default function CandlestickChart({
             }}
           >
             <div className="font-medium text-slate-300 mb-1">
-              {new Date(tooltipData.candle.timestamp).toLocaleString()}
+              {formatUTC(tooltipData.candle.timestamp)}
             </div>
             <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
               <span className="text-slate-400">Open</span>

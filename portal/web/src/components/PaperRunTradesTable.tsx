@@ -9,6 +9,7 @@
 
 import React from 'react';
 import type { PaperTradePublic } from '../types/paper';
+import { formatUTC } from '../utils/time';
 
 interface PaperRunTradesTableProps {
   trades: PaperTradePublic[];
@@ -60,11 +61,11 @@ export function PaperRunTradesTable({ trades }: PaperRunTradesTableProps) {
                 }`}
               >
                 <td className="py-1.5 pr-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-300">
-                  {new Date(t.entry_timestamp).toLocaleString()}
+                  {formatUTC(t.entry_timestamp)}
                 </td>
                 <td className="py-1.5 pr-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-300">
                   {t.exit_timestamp
-                    ? new Date(t.exit_timestamp).toLocaleString()
+                    ? formatUTC(t.exit_timestamp)
                     : <span className="text-amber-600 font-medium">open</span>}
                 </td>
                 <td className="py-1.5 pr-3">
