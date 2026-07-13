@@ -21,7 +21,7 @@ function meta(partial: Partial<ApprovalQueueMeta> = {}): ApprovalQueueMeta {
     validated_count: 0,
     passed_count: 0,
     touched_count: 0,
-    closest_to_passing: null,
+    top_close_to_passing: [],
     ...partial,
   };
 }

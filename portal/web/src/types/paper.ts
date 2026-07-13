@@ -101,11 +101,16 @@ export interface ClosestGenome {
   genome_id: string;
   /** Populated when the backend can walk genome → generation → run.
    *  Null on legacy or orphaned genomes. Used to build the
-   *  `/evolution/:runId/genomes/:genomeId` link on the card. */
+   *  `/evolution/:runId/genomes/:genomeId` link on each table row. */
   evolution_run_id: string | null;
   oos_sharpe: number | null;
   oos_max_drawdown: number | null;
+  oos_hit_rate: number | null;
   oos_n_trades: number | null;
+  /** 0..4 — how many Gate B thresholds already cleared. */
+  gates_cleared: number;
+  /** Sum of normalized deficits across the 4 gates. Smaller = closer. */
+  distance_score: number;
   /** Short human-readable summary like "Sharpe 0.82 < 1.0 · Trades 292 < 300" — server-formatted. */
   failure_summary: string;
 }
@@ -114,14 +119,18 @@ export interface ClosestGenome {
  *  `/paper/approvals` (US-027). Distinguishes "no evolutions yet" vs
  *  "evolutions ran but nothing passed" vs "user already deployed
  *  everything that passed" — three very different situations that all
- *  look identical when the queue happens to be empty. */
+ *  look identical when the queue happens to be empty.
+ *
+ *  `top_close_to_passing` holds up to 5 near-miss genomes ordered by
+ *  distance-to-passing. Rendered as a comparison table so the user can
+ *  eyeball which one to override rather than trusting a single pick. */
 export interface ApprovalQueueMeta {
   evolution_run_count: number;
   total_genomes: number;
   validated_count: number;
   passed_count: number;
   touched_count: number;
-  closest_to_passing: ClosestGenome | null;
+  top_close_to_passing: ClosestGenome[];
 }
 
 export interface ApprovalQueueList {
@@ -209,7 +218,7 @@ export interface BacktestOverlayPoint {
 export type BacktestOverlayReason =
   | 'no_associated_evolution_run'
   | 'no_oos_equity_persisted'
-  | 'genome_predates_v0_4_0';
+  | 'oos_equity_series_not_persisted';
 
 export interface BacktestOverlayResponse {
   items: BacktestOverlayPoint[];

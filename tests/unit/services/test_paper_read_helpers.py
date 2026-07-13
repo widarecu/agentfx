@@ -379,10 +379,13 @@ class TestGetBacktestOverlay:
         assert result["source"] == "unavailable"
         assert result["reason"] == "no_oos_equity_persisted"
 
-    def test_legacy_predates_v_0_4_0_reason(self, db):
+    def test_oos_equity_series_not_persisted_reason(self, db):
         """OOS folds exist but neither `oos_equity_series` nor
-        `equity_series` attribute is populated on any fold → the
-        genome predates v0.4.0's per-fold equity persistence."""
+        `equity_series` attribute is populated on any fold. The
+        overlay endpoint returns `oos_equity_series_not_persisted`
+        as the honest reason label (v0.6.1 UAT fix — the previous
+        `genome_predates_v0_4_0` label was misleading because the
+        column was planned for v0.4.0 but never actually shipped)."""
         user = _make_user(db)
         evo = models.EvolutionRun(
             id="evorun_y",
@@ -427,4 +430,4 @@ class TestGetBacktestOverlay:
         result = paper_service.get_backtest_overlay(db, run)
 
         assert result["source"] == "unavailable"
-        assert result["reason"] == "genome_predates_v0_4_0"
+        assert result["reason"] == "oos_equity_series_not_persisted"

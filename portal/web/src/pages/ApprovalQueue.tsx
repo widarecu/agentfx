@@ -219,6 +219,7 @@ function EmptyState({ meta }: { meta: ApprovalQueueMeta | null }) {
   }
 
   if (scenario === 'none_passed') {
+    const rows = meta!.top_close_to_passing ?? [];
     return (
       <BannerFrame icon={<AlertCircle className="w-8 h-8" />} tone="amber">
         <div className="text-lg font-semibold mt-4">
@@ -234,9 +235,7 @@ function EmptyState({ meta }: { meta: ApprovalQueueMeta | null }) {
           it's the training-vs-OOS gap the paper platform exists to
           expose. Consider running a fresh evolution or adjusting Gate B.
         </div>
-        {meta!.closest_to_passing && (
-          <ClosestGenomeCard closest={meta!.closest_to_passing} />
-        )}
+        {rows.length > 0 && <CloseToPassingTable rows={rows} />}
       </BannerFrame>
     );
   }
@@ -291,51 +290,123 @@ function BannerFrame({
   );
 }
 
-function ClosestGenomeCard({
-  closest,
+/**
+ * Comparison table of up to 5 near-miss genomes ordered by
+ * distance-to-passing (US-027). Wilson called out on 2026-07-13
+ * that a single "closest" recommendation was:
+ *   (a) picked by a noisy heuristic (fluky-high-Sharpe folds beat
+ *       solid multi-fold performance), and
+ *   (b) hides better candidates from an ADMIN override decision.
+ * A table sorted by an aggregate distance score lets him eyeball
+ * per-gate metrics and pick with context rather than trusting one
+ * heuristic-driven pick.
+ */
+function CloseToPassingTable({
+  rows,
 }: {
-  closest: NonNullable<ApprovalQueueMeta['closest_to_passing']>;
+  rows: NonNullable<ApprovalQueueMeta['top_close_to_passing']>;
 }) {
-  // GenomeDetail only mounts on `/evolution/:runId/genomes/:genomeId`.
-  // Fall back to a non-navigating div when the backend couldn't
-  // resolve the evolution_run_id (legacy or orphaned genomes) so we
-  // don't ship a link that 404s.
-  const cardBody = (
-    <>
-      <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
-        <PackageOpen className="w-4 h-4" /> Closest to passing
-      </div>
-      <div className="font-mono text-sm mt-1 truncate">{closest.genome_id}</div>
-      <div className="text-sm text-slate-600 dark:text-slate-300 mt-2">
-        {closest.failure_summary}
-      </div>
-      {closest.oos_sharpe !== null && (
-        <div className="text-xs text-slate-500 dark:text-slate-400 mt-2">
-          Median OOS Sharpe {closest.oos_sharpe.toFixed(2)}
-          {closest.oos_n_trades !== null &&
-            ` · ${closest.oos_n_trades} OOS trades`}
-        </div>
-      )}
-      {closest.evolution_run_id && (
-        <div className="text-xs text-emerald-600 dark:text-emerald-400 mt-3">
-          View genome detail →
-        </div>
-      )}
-    </>
-  );
-  if (!closest.evolution_run_id) {
-    return (
-      <div className="mt-6 block bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 rounded p-4 text-left">
-        {cardBody}
-      </div>
-    );
-  }
   return (
-    <Link
-      to={`/evolution/${closest.evolution_run_id}/genomes/${closest.genome_id}`}
-      className="mt-6 block bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 rounded p-4 text-left hover:border-emerald-400 transition-colors"
-    >
-      {cardBody}
-    </Link>
+    <div className="mt-6 text-left">
+      <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-2">
+        <PackageOpen className="w-4 h-4" /> Top {rows.length} closest to
+        passing — ordered by aggregate distance from Gate B thresholds
+      </div>
+      <div className="overflow-x-auto bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 rounded">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-xs uppercase text-slate-500 dark:text-slate-400 text-left border-b border-slate-200 dark:border-slate-700">
+              <th className="px-3 py-2">Genome</th>
+              <th className="px-3 py-2 text-right">Sharpe</th>
+              <th className="px-3 py-2 text-right">MDD</th>
+              <th className="px-3 py-2 text-right">Hit</th>
+              <th className="px-3 py-2 text-right">Trades</th>
+              <th className="px-3 py-2 text-center">Gates ✓</th>
+              <th className="px-3 py-2 text-right">Distance</th>
+              <th className="px-3 py-2"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r, i) => (
+              <tr
+                key={r.genome_id}
+                className={
+                  i === 0
+                    ? 'bg-amber-50/40 dark:bg-amber-900/10 border-b border-slate-200 dark:border-slate-700'
+                    : 'border-b border-slate-100 dark:border-slate-800'
+                }
+              >
+                <td className="px-3 py-1.5 font-mono text-xs truncate max-w-[14ch]">
+                  <span title={r.genome_id}>
+                    {r.genome_id.split('_').slice(-3).join('_')}
+                  </span>
+                </td>
+                <td
+                  className={`px-3 py-1.5 text-right font-mono text-xs ${
+                    (r.oos_sharpe ?? 0) >= 1 ? 'text-emerald-600' : ''
+                  }`}
+                >
+                  {r.oos_sharpe !== null ? r.oos_sharpe.toFixed(2) : '—'}
+                </td>
+                <td
+                  className={`px-3 py-1.5 text-right font-mono text-xs ${
+                    Math.abs(r.oos_max_drawdown ?? 1) <= 0.1
+                      ? 'text-emerald-600'
+                      : ''
+                  }`}
+                >
+                  {r.oos_max_drawdown !== null
+                    ? `${(r.oos_max_drawdown * 100).toFixed(1)}%`
+                    : '—'}
+                </td>
+                <td
+                  className={`px-3 py-1.5 text-right font-mono text-xs ${
+                    (r.oos_hit_rate ?? 0) >= 0.48 ? 'text-emerald-600' : ''
+                  }`}
+                >
+                  {r.oos_hit_rate !== null
+                    ? `${(r.oos_hit_rate * 100).toFixed(1)}%`
+                    : '—'}
+                </td>
+                <td
+                  className={`px-3 py-1.5 text-right font-mono text-xs ${
+                    (r.oos_n_trades ?? 0) >= 300 ? 'text-emerald-600' : ''
+                  }`}
+                >
+                  {r.oos_n_trades !== null
+                    ? r.oos_n_trades.toLocaleString()
+                    : '—'}
+                </td>
+                <td className="px-3 py-1.5 text-center font-mono text-xs">
+                  {r.gates_cleared}/4
+                </td>
+                <td className="px-3 py-1.5 text-right font-mono text-xs text-slate-600 dark:text-slate-400">
+                  {r.distance_score.toFixed(2)}
+                </td>
+                <td className="px-3 py-1.5 text-right">
+                  {r.evolution_run_id ? (
+                    <Link
+                      to={`/evolution/${r.evolution_run_id}/genomes/${r.genome_id}`}
+                      className="text-xs text-emerald-600 dark:text-emerald-400 hover:underline whitespace-nowrap"
+                    >
+                      View →
+                    </Link>
+                  ) : (
+                    <span className="text-xs text-slate-400">—</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="text-xs text-slate-500 dark:text-slate-400 mt-2 italic">
+        Ranked by aggregate distance from Gate B thresholds (Sharpe ≥ 1.0,
+        |MDD| ≤ 10%, Hit ≥ 48%, Trades ≥ 300). Highlighted row = smallest
+        distance. Green cells = gate already cleared. Use the ADMIN
+        override on the genome detail page to promote any row to
+        approvable.
+      </div>
+    </div>
   );
 }

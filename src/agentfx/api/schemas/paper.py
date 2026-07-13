@@ -158,19 +158,35 @@ class ApprovalQueueItem(BaseSchema):
 
 
 class ClosestGenome(BaseSchema):
-    """Summary of the highest-median-OOS-Sharpe non-passing genome.
+    """One row of the "closest to passing" comparison table (US-027).
 
     Populated on the approval-queue meta when at least one genome was
-    validated but none passed Gate B. Gives the user one concrete signal
-    about how close the evolution came instead of a blank "queue empty"
-    state (US-027).
+    validated but none passed Gate B. The frontend renders a scrollable
+    5-row table with these metrics so the user can eyeball which
+    near-miss looks most promising rather than trusting a single
+    heuristic pick.
+
+    `distance_score` is the sum of normalized deficits across the four
+    Gate B thresholds (Sharpe ≥ 1.0, |MDD| ≤ 10%, Hit ≥ 48%, Trades
+    ≥ 300). Smaller = closer to passing overall. Table is ordered
+    ascending by this field.
     """
 
     genome_id: str
     evolution_run_id: str | None = None
+    # OOS aggregates: median across folds for sharpe / hit_rate,
+    # worst-case (most-negative) for max_drawdown, sum for n_trades.
+    # `n_trades` is Gate-B-relevant only in the summed form since the
+    # threshold is a total across OOS.
     oos_sharpe: float | None = None
     oos_max_drawdown: float | None = None
+    oos_hit_rate: float | None = None
     oos_n_trades: int | None = None
+    # Number of Gate B thresholds this genome already clears (0..4).
+    gates_cleared: int
+    # Sum of normalized (deficit / threshold) across failing gates.
+    # 0.0 = passes all 4. Higher = further from passing.
+    distance_score: float
     failure_summary: str  # "Sharpe 0.82 < 1.0 · Trades 292 < 300"
 
 
@@ -188,7 +204,12 @@ class ApprovalQueueMeta(BaseSchema):
     validated_count: int
     passed_count: int
     touched_count: int
-    closest_to_passing: ClosestGenome | None = None
+    # Top up to 5 non-passing genomes ordered by distance_score
+    # ascending (closest-to-passing first). Empty when 0 genomes
+    # validated or when passing-untouched genomes exist. Frontend
+    # renders as a comparison table so Wilson can pick rather than
+    # rubber-stamp a single heuristic-driven recommendation.
+    top_close_to_passing: list[ClosestGenome] = []
 
 
 class ApprovalQueueList(BaseSchema):
@@ -304,7 +325,7 @@ class BacktestOverlayPoint(BaseSchema):
 BacktestOverlayReason = Literal[
     "no_associated_evolution_run",
     "no_oos_equity_persisted",
-    "genome_predates_v0_4_0",
+    "oos_equity_series_not_persisted",
 ]
 
 

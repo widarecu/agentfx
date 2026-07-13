@@ -138,24 +138,51 @@ def list_approval_queue_for_user(
         validated_count=len(verdicts),
         passed_count=len(passing),
         touched_count=sum(1 for g in passing if g.id in touched),
-        closest_to_passing=(
-            _closest_to_passing(db, failed) if failed and not deployable else None
+        top_close_to_passing=(
+            _top_close_to_passing(db, failed, limit=5)
+            if failed and not deployable
+            else []
         ),
     )
     return ApprovalQueueResult(items=deployable, meta=meta)
 
 
-def _closest_to_passing(
+# ─────────────────────────────────────────────────────────────────────
+# US-027: closest-to-passing ranking
+#
+# Gate B thresholds — kept in sync with `agentfx.core.gates` (which is
+# the authoritative source in the backend) and the frontend Vitest
+# constants in `portal/web/src/types/paper.ts::GATE_B_THRESHOLDS`. If
+# these ever drift the empty-state banner will silently mis-rank
+# genomes; changing thresholds should be a coordinated 3-place edit.
+# ─────────────────────────────────────────────────────────────────────
+_GATE_B_SHARPE_MIN = 1.0
+_GATE_B_MAX_DRAWDOWN_MAX = 0.10  # absolute value; storage is negative
+_GATE_B_HIT_RATE_MIN = 0.48
+_GATE_B_TRADES_MIN = 300
+
+
+def _top_close_to_passing(
     db: Session,
     failed_genomes: list[models.StrategyGenome],
-) -> ClosestGenome | None:
-    """Pick the failed genome with the highest median OOS Sharpe.
+    *,
+    limit: int = 5,
+) -> list[ClosestGenome]:
+    """Return up to `limit` failed genomes ordered by distance to passing.
 
-    Tiebreaker is fewest failing gates. Returns None when there are no
-    OOS folds to compare against (would happen only on legacy data).
+    Ranking: sum of normalized deficits across the four Gate B gates
+    (Sharpe / |MDD| / Hit rate / Trades). Smaller total deficit = closer
+    to passing. Ties broken by `gates_cleared` desc, then by ID for a
+    deterministic order.
+
+    Rationale (v0.6.1 UAT feedback, 2026-07-13): the previous "max
+    median OOS Sharpe" heuristic could rank a genome with 1 fluky
+    high-Sharpe fold above a genome with 5 solid folds averaging lower.
+    Normalized-distance is noise-resistant because low trade counts
+    incur their own deficit rather than being ignored.
     """
     if not failed_genomes:
-        return None
+        return []
 
     ids = [g.id for g in failed_genomes]
     oos_rows = (
@@ -167,10 +194,8 @@ def _closest_to_passing(
         .all()
     )
     if not oos_rows:
-        return None
+        return []
 
-    # Group by genome, compute median Sharpe / drawdown / n_trades per
-    # genome across its OOS folds.
     by_genome: dict[str, list[models.ValidationFold]] = {}
     for row in oos_rows:
         by_genome.setdefault(row.genome_id, []).append(row)
@@ -180,52 +205,75 @@ def _closest_to_passing(
         mid = len(s) // 2
         return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
 
+    # Batch-load the generation → run_id mapping so a 5-row rank
+    # doesn't fire 5 separate SELECTs.
+    gen_ids = {g.generation_id for g in failed_genomes if g.generation_id}
+    gen_to_run: dict[str, str] = {}
+    if gen_ids:
+        gen_to_run = {
+            gid: rid
+            for gid, rid in db.query(models.Generation.id, models.Generation.run_id)
+            .filter(models.Generation.id.in_(gen_ids))
+            .all()
+        }
+
     genome_lookup = {g.id: g for g in failed_genomes}
-    best_id: str | None = None
-    best_sharpe: float = float("-inf")
-    best_fewest_fails: int = 1_000
+    scored: list[ClosestGenome] = []
     for gid, folds in by_genome.items():
         sharpes = [f.sharpe for f in folds if f.sharpe is not None]
+        mdds = [f.max_drawdown for f in folds if f.max_drawdown is not None]
+        hits = [f.hit_rate for f in folds if f.hit_rate is not None]
         if not sharpes:
             continue
         med_sharpe = _median(sharpes)
-        fails = len(genome_lookup[gid].validation_failures or [])
-        if med_sharpe > best_sharpe or (
-            med_sharpe == best_sharpe and fails < best_fewest_fails
-        ):
-            best_sharpe = med_sharpe
-            best_fewest_fails = fails
-            best_id = gid
+        # Storage: max_drawdown is stored as a NEGATIVE fraction
+        # (e.g. -0.05 = 5% drawdown). "Worst case" for ranking is the
+        # smallest (most negative) — that's the one Gate B compares
+        # against its 10% ceiling on abs value.
+        worst_mdd = min(mdds) if mdds else 0.0
+        med_hit = _median(hits) if hits else 0.0
+        total_trades = sum((f.n_trades or 0) for f in folds)
 
-    if best_id is None:
-        return None
+        # Per-gate deficits, normalized by the threshold so gates are
+        # commensurable. Zero when the gate is already cleared.
+        d_sharpe = max(0.0, (_GATE_B_SHARPE_MIN - med_sharpe) / _GATE_B_SHARPE_MIN)
+        d_mdd = max(
+            0.0,
+            (abs(worst_mdd) - _GATE_B_MAX_DRAWDOWN_MAX) / _GATE_B_MAX_DRAWDOWN_MAX,
+        )
+        d_hit = max(0.0, (_GATE_B_HIT_RATE_MIN - med_hit) / _GATE_B_HIT_RATE_MIN)
+        d_trades = max(0.0, (_GATE_B_TRADES_MIN - total_trades) / _GATE_B_TRADES_MIN)
+        distance = d_sharpe + d_mdd + d_hit + d_trades
+        gates_cleared = (
+            (0 if d_sharpe > 0 else 1)
+            + (0 if d_mdd > 0 else 1)
+            + (0 if d_hit > 0 else 1)
+            + (0 if d_trades > 0 else 1)
+        )
 
-    folds = by_genome[best_id]
-    genome = genome_lookup[best_id]
-    med_mdd = _median([f.max_drawdown for f in folds if f.max_drawdown is not None])
-    total_trades = sum((f.n_trades or 0) for f in folds)
-    failure_summary = (
-        " · ".join(str(f) for f in (genome.validation_failures or [])[:3])
-        or "Failed Gate B"
-    )
-    # `evolution_run_id` lets the frontend build a valid /evolution/:runId/
-    # genomes/:genomeId link — the only route pattern GenomeDetail
-    # matches. Without this the "View genome detail →" link on the
-    # closest-to-passing card 404s (v0.6.1 UAT bug caught 2026-07-12).
-    generation = (
-        db.query(models.Generation)
-        .filter(models.Generation.id == genome.generation_id)
-        .first()
-    )
-    evolution_run_id = generation.run_id if generation is not None else None
-    return ClosestGenome(
-        genome_id=best_id,
-        evolution_run_id=evolution_run_id,
-        oos_sharpe=best_sharpe,
-        oos_max_drawdown=med_mdd,
-        oos_n_trades=total_trades,
-        failure_summary=failure_summary,
-    )
+        genome = genome_lookup[gid]
+        failure_summary = (
+            " · ".join(str(f) for f in (genome.validation_failures or [])[:3])
+            or "Failed Gate B"
+        )
+        scored.append(
+            ClosestGenome(
+                genome_id=gid,
+                evolution_run_id=gen_to_run.get(genome.generation_id or ""),
+                oos_sharpe=med_sharpe,
+                oos_max_drawdown=worst_mdd,
+                oos_hit_rate=med_hit,
+                oos_n_trades=total_trades,
+                gates_cleared=gates_cleared,
+                distance_score=distance,
+                failure_summary=failure_summary,
+            )
+        )
+
+    # Ascending by distance, tie-break by more-gates-cleared desc,
+    # tie-break by genome_id for determinism.
+    scored.sort(key=lambda c: (c.distance_score, -c.gates_cleared, c.genome_id))
+    return scored[:limit]
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -782,11 +830,14 @@ def get_backtest_overlay(
             "reason": "no_oos_equity_persisted",
         }
 
-    # Look for a fold that has a persisted equity series. The column
-    # isn't on the current model; v0.4.0 ADDED a `oos_equity_series`
-    # JSON blob but that column may not exist yet on this schema. We
-    # try both attribute names and gracefully return unavailable when
-    # neither is present.
+    # Look for a fold that has a persisted equity series. The v0.4.0
+    # plan document proposed an `oos_equity_series` JSON blob on
+    # ValidationFold to store the walk-forward OOS equity curve for
+    # each fold, but that column was never actually landed — no
+    # migration adds it. Every genome (fresh or historical) hits this
+    # branch. The reason label reflects the ACTUAL situation ("column
+    # not in schema") rather than the misleading v0.4.0-predates
+    # framing Wilson's UAT walkthrough (2026-07-13) surfaced.
     series_attr = None
     for candidate in ("oos_equity_series", "equity_series"):
         if any(getattr(f, candidate, None) for f in oos_folds):
@@ -796,7 +847,7 @@ def get_backtest_overlay(
         return {
             "items": [],
             "source": "unavailable",
-            "reason": "genome_predates_v0_4_0",
+            "reason": "oos_equity_series_not_persisted",
         }
 
     # Concatenate the persisted per-fold series into one relative-time

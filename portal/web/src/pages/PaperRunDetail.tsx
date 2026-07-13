@@ -460,8 +460,8 @@ export default function PaperRunDetail() {
               ' — this run isn\'t linked to an evolution.'}
             {backtestOverlay.reason === 'no_oos_equity_persisted' &&
               ' — no OOS folds were persisted for the source genome.'}
-            {backtestOverlay.reason === 'genome_predates_v0_4_0' &&
-              ' — the source genome predates the v0.4.0 OOS-series persistence work.'}
+            {backtestOverlay.reason === 'oos_equity_series_not_persisted' &&
+              " — the OOS equity-series column isn't populated on the ValidationFold rows for this genome. That per-fold curve was planned for v0.4.0 but never landed; the overlay will remain unavailable until the schema + evolution runner both persist it."}
           </div>
         )}
       </div>

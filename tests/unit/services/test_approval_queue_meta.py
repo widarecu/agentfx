@@ -167,7 +167,7 @@ def test_meta_zero_evolutions(db):
     assert result.meta.validated_count == 0
     assert result.meta.passed_count == 0
     assert result.meta.touched_count == 0
-    assert result.meta.closest_to_passing is None
+    assert result.meta.top_close_to_passing == []
 
 
 def test_meta_evolutions_but_none_validated(db):
@@ -186,14 +186,24 @@ def test_meta_evolutions_but_none_validated(db):
     assert result.meta.total_genomes == 2
     assert result.meta.validated_count == 0
     assert result.meta.passed_count == 0
-    assert result.meta.closest_to_passing is None  # nothing to compare
+    assert result.meta.top_close_to_passing == []  # nothing to compare
 
 
-def test_meta_validated_but_none_passed_selects_closest(db):
+def test_meta_validated_but_none_passed_ranks_by_distance(db):
     """Wilson's UAT reality — validator ran and correctly wrote `false`
-    for every genome. Closest-to-passing = highest median OOS Sharpe."""
+    for every genome. The top-N list is ordered by aggregate distance
+    to passing (smaller = closer), NOT by max median OOS Sharpe.
+
+    Regression against the pre-v0.6.1-UAT ranking that Wilson called
+    out as noisy: a genome with one fluky-high-Sharpe fold could
+    beat a genome with more, stabler OOS folds because the old
+    heuristic ignored trade counts. Distance-to-passing weights
+    every gate deficit equally, so low trade counts drag the score.
+    """
     user = _make_user(db)
     evo = _make_run(db, user.id, "evorun_b")
+
+    # "Poor" — Sharpe 0.2 avg, low trades. Fails everything.
     poor = _make_genome(
         db,
         evo.id,
@@ -201,9 +211,11 @@ def test_meta_validated_but_none_passed_selects_closest(db):
         validator_passed=False,
         validation_failures=["Sharpe 0.2 < 1.0"],
     )
-    _make_oos_fold(db, poor.id, fold_index=0, sharpe=0.2)
-    _make_oos_fold(db, poor.id, fold_index=1, sharpe=0.1)
+    _make_oos_fold(db, poor.id, fold_index=0, sharpe=0.2, n_trades=100)
+    _make_oos_fold(db, poor.id, fold_index=1, sharpe=0.1, n_trades=100)
 
+    # "Close" — Sharpe 0.82, 292 trades. Fails Sharpe + Trades but by
+    # small margins → smallest distance score.
     close = _make_genome(
         db,
         evo.id,
@@ -214,22 +226,51 @@ def test_meta_validated_but_none_passed_selects_closest(db):
     _make_oos_fold(db, close.id, fold_index=0, sharpe=0.9, n_trades=140)
     _make_oos_fold(db, close.id, fold_index=1, sharpe=0.74, n_trades=152)
 
+    # "Fluky" — one super-high-Sharpe fold on 7 trades. Under the old
+    # heuristic this would win because max median Sharpe. Under
+    # distance-to-passing, the tiny trade count pushes it well below
+    # `close`.
+    fluky = _make_genome(
+        db,
+        evo.id,
+        3,
+        validator_passed=False,
+        validation_failures=["Trades 7 < 300"],
+    )
+    _make_oos_fold(db, fluky.id, fold_index=0, sharpe=3.0, n_trades=7)
+
     result = paper_service.list_approval_queue_for_user(db, user.id)
 
     assert result.items == []
-    assert result.meta.validated_count == 2
+    assert result.meta.validated_count == 3
     assert result.meta.passed_count == 0
-    assert result.meta.closest_to_passing is not None
-    closest = result.meta.closest_to_passing
-    assert closest.genome_id == close.id
-    # Median of [0.9, 0.74] = 0.82
-    assert closest.oos_sharpe == pytest.approx(0.82)
-    assert closest.oos_n_trades == 292  # 140 + 152
-    assert "Sharpe" in closest.failure_summary
-    # v0.6.1 UAT bugfix: `evolution_run_id` must be populated so the
-    # frontend can build a valid `/evolution/:runId/genomes/:genomeId`
-    # link on the closest-to-passing card.
-    assert closest.evolution_run_id == "evorun_b"
+    rows = result.meta.top_close_to_passing
+    assert len(rows) == 3
+    # `close` should rank #1 despite `fluky` having higher median Sharpe.
+    assert rows[0].genome_id == close.id
+    # `close` metrics: median Sharpe 0.82, 292 total trades.
+    assert rows[0].oos_sharpe == pytest.approx(0.82)
+    assert rows[0].oos_n_trades == 292
+    assert rows[0].evolution_run_id == "evorun_b"
+    # Distance score is deterministic: (1 - 0.82)/1 + (300 - 292)/300
+    #                               = 0.18 + 0.02666... = 0.20666...
+    assert rows[0].distance_score == pytest.approx(0.20666, abs=0.001)
+    assert rows[0].gates_cleared == 2  # Passes MDD (0%) + Hit (0.5)
+
+    # `fluky` ranks MIDDLE despite its 3.0 median Sharpe — the
+    # 7-trade sample kills its distance score to 0.977. Under the
+    # OLD "max median Sharpe" heuristic fluky would have won.
+    assert rows[1].genome_id == fluky.id
+    assert rows[1].gates_cleared == 3  # Only trades fails
+    # `poor` ranks LAST — worst on both Sharpe (0.15 vs 1.0) and trades
+    # (200 vs 300). Distance score ≈ 0.85 + 0.333 = 1.183.
+    assert rows[-1].genome_id == poor.id
+    # Distance strictly increases across the list — deterministic
+    # ranking guarantee.
+    assert rows[0].distance_score <= rows[1].distance_score <= rows[-1].distance_score
+
+    # Table stays capped at 5 (only 3 genomes here, but bound is <=5).
+    assert len(rows) <= 5
 
 
 def test_meta_all_passing_deployed_returns_empty_but_marks_touched(db):
@@ -260,8 +301,8 @@ def test_meta_all_passing_deployed_returns_empty_but_marks_touched(db):
     assert result.items == []
     assert result.meta.passed_count == 1
     assert result.meta.touched_count == 1
-    # closest_to_passing suppressed when passing genomes exist
-    assert result.meta.closest_to_passing is None
+    # top_close_to_passing suppressed when passing genomes exist
+    assert result.meta.top_close_to_passing == []
 
 
 def test_meta_mixed_passing_untouched_and_touched(db):
@@ -293,7 +334,7 @@ def test_meta_mixed_passing_untouched_and_touched(db):
     assert result.items[0].id == untouched.id
     assert result.meta.passed_count == 2
     assert result.meta.touched_count == 1
-    assert result.meta.closest_to_passing is None
+    assert result.meta.top_close_to_passing == []
 
 
 def test_meta_ignores_other_users_evolutions(db):
