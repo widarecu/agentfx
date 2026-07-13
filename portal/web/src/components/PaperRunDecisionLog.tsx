@@ -9,6 +9,7 @@
 
 import React from 'react';
 import type { PaperDecisionPublic } from '../types/paper';
+import { formatUTC } from '../utils/time';
 
 interface PaperRunDecisionLogProps {
   decisions: PaperDecisionPublic[];
@@ -20,6 +21,8 @@ const ACTION_STYLES: Record<string, string> = {
   USER_POSITION_CLOSED:
     'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300',
   USER_SIGNAL_SKIPPED_STALE:
+    'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
+  USER_ENTRY_MISSED:
     'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
   USER_KILL_PAPER:
     'bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300',
@@ -65,7 +68,7 @@ export function PaperRunDecisionLog({ decisions }: PaperRunDecisionLogProps) {
                 {d.reason ?? d.action}
               </div>
               <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                {new Date(d.timestamp).toLocaleString()}
+                {formatUTC(d.timestamp)}
               </div>
             </div>
           </li>

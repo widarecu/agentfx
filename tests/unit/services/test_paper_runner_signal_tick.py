@@ -304,6 +304,42 @@ class TestSignalTick:
         assert not any(type(r).__name__ == "Trade" for r in added)
         assert not any(type(r).__name__ == "DecisionLog" for r in added)
 
+    def test_held_state_from_flat_position_logs_entry_missed(self):
+        # Backtest state is +1 at bar N AND at bar N-1 — no fresh cross
+        # at the latest bar. OANDA position is flat (cold deploy or
+        # manual close mid-hold). Runner must NOT chase the entry late;
+        # it logs USER_ENTRY_MISSED and waits for the next fresh cross.
+        # Wilson's UAT observation 2026-07-13 was that the runner opened
+        # a short immediately at deploy time even though no fresh MACD
+        # cross was visible at the latest bar.
+        strategy = _make_strategy(signals=[1, 1, 1])
+        candles_df = _mk_candles_df(3, datetime(2026, 7, 10, 12, 0, tzinfo=UTC))
+        fetch = MagicMock(return_value=candles_df)
+
+        client = MagicMock()
+        client.get_position.return_value = {"long_units": 0, "short_units": 0}
+        db = MagicMock()
+        run = _make_run()
+
+        _signal_tick(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=datetime(2026, 7, 10, 12, 0, tzinfo=UTC),
+        )
+
+        client.place_market_order.assert_not_called()
+        client.close_all_positions.assert_not_called()
+        added = [c.args[0] for c in db.add.call_args_list]
+        decisions = [r for r in added if type(r).__name__ == "DecisionLog"]
+        assert any(d.action == "USER_ENTRY_MISSED" for d in decisions)
+        # No Trade rows — we did NOT enter.
+        assert not any(type(r).__name__ == "Trade" for r in added)
+
     def test_stale_candles_skip_signal_and_log(self):
         # Latest candle is 3 minutes old vs a 60s granularity → skip.
         strategy = _make_strategy(signals=[0, 0, 1])

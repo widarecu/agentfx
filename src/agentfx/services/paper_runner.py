@@ -564,9 +564,10 @@ def _signal_tick(
         return
 
     signals = strategy.generate_signals(df)
-    if len(signals) == 0:
+    if len(signals) < 2:
         return
     last_signal = int(signals.iloc[-1])
+    prev_signal = int(signals.iloc[-2])
     signal_direction: Direction = (
         "long" if last_signal > 0 else "short" if last_signal < 0 else "flat"
     )
@@ -578,6 +579,35 @@ def _signal_tick(
     # signed net exposure so `decide_action`'s arithmetic works
     # consistently regardless of sign convention.
     net_units = long_units + short_units
+
+    # Missed-entry guard. `generate_signals` returns a HELD-STATE series:
+    # +1 on every bar while long, -1 while short, 0 while flat. So a
+    # non-zero value at the latest bar can mean either "fresh cross this
+    # bar" (prev == 0) or "in a held position since a cross that fired
+    # some earlier bar" (prev == last). If we cold-deployed mid-hold
+    # (or the operator manually closed the OANDA position while backtest
+    # state persisted), the runner would otherwise chase a stale entry
+    # hours late — Wilson's UAT observation 2026-07-13. Policy: skip and
+    # wait for the next fresh cross.
+    is_fresh_entry_or_flip = prev_signal != last_signal
+    if last_signal != 0 and net_units == 0 and not is_fresh_entry_or_flip:
+        _write_decision(
+            db,
+            run,
+            action="USER_ENTRY_MISSED",
+            reason=(
+                f"backtest state is {signal_direction} but no cross at latest "
+                f"bar — entry was before we started watching. Waiting for next "
+                f"cross."
+            ),
+            outputs={
+                "paper_run_id": run.id,
+                "last_signal": last_signal,
+                "prev_signal": prev_signal,
+            },
+        )
+        _persist_equity_snapshot(db=db, run=run, position=position, now_utc=now_utc)
+        return
 
     risk_cfg = run.risk_config or {}
     max_units = int(risk_cfg.get("max_position_size_units", 10_000))
