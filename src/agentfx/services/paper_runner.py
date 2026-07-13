@@ -621,19 +621,38 @@ def _signal_tick(
     # wait for the next fresh cross.
     is_fresh_entry_or_flip = prev_signal != last_signal
     if last_signal != 0 and net_units == 0 and not is_fresh_entry_or_flip:
+        # Walk backward through `signals` to find the bar where the
+        # current held-state began (last transition from a different
+        # value). Surface it in the log so the operator can locate that
+        # cross on the chart instead of guessing.
+        signals_arr = signals.to_numpy()
+        entry_bar_idx = len(signals_arr) - 1
+        for i in range(len(signals_arr) - 2, -1, -1):
+            if int(signals_arr[i]) != last_signal:
+                entry_bar_idx = i + 1
+                break
+        else:
+            entry_bar_idx = 0
+        entry_bar_ts = df.index[entry_bar_idx]
+        latest_bar_ts = df.index[-1]
         _write_decision(
             db,
             run,
             action="USER_ENTRY_MISSED",
             reason=(
-                f"backtest state is {signal_direction} but no cross at latest "
-                f"bar — entry was before we started watching. Waiting for next "
-                f"cross."
+                f"backtest state is {signal_direction} at bar "
+                f"{latest_bar_ts.isoformat()} but the entry cross fired at "
+                f"{entry_bar_ts.isoformat()} — the runner didn't catch that "
+                f"bar live (deployed after it, or a prior stale/skip window "
+                f"straddled it). Not chasing a late entry; waiting for the "
+                f"next fresh cross."
             ),
             outputs={
                 "paper_run_id": run.id,
                 "last_signal": last_signal,
                 "prev_signal": prev_signal,
+                "latest_bar_at": latest_bar_ts.isoformat(),
+                "entry_bar_at": entry_bar_ts.isoformat(),
             },
         )
         _persist_equity_snapshot(db=db, run=run, position=position, now_utc=now_utc)
