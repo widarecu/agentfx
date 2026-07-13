@@ -341,7 +341,8 @@ class TestSignalTick:
         assert not any(type(r).__name__ == "Trade" for r in added)
 
     def test_stale_candles_skip_signal_and_log(self):
-        # Latest candle is 3 minutes old vs a 60s granularity → skip.
+        # Latest bar 3 minutes old (180s) vs the new threshold
+        # granularity + INGEST_LAG_TOLERANCE = 60 + 90 = 150s → skip.
         strategy = _make_strategy(signals=[0, 0, 1])
         now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
         stale_df = _mk_candles_df(3, now - timedelta(minutes=3))
@@ -369,6 +370,41 @@ class TestSignalTick:
         added = [c.args[0] for c in db.add.call_args_list]
         decisions = [r for r in added if type(r).__name__ == "DecisionLog"]
         assert any(d.action == "USER_SIGNAL_SKIPPED_STALE" for d in decisions)
+
+    def test_normal_ingest_lag_does_not_trip_stale_guard(self):
+        # OANDA-typical ingest lag: latest closed bar's open is 100s
+        # before now (60s bar length + ~40s median ingest lag). Under the
+        # old 2*g = 120s threshold this passed by a narrow margin and
+        # trip-flapped as lag varied; under the new g + 90s = 150s
+        # threshold it's comfortably within tolerance. Wilson's UAT
+        # observation 2026-07-13: 30-60% of ticks were tripping stale
+        # under normal operation.
+        strategy = _make_strategy(signals=[0, 0, 0])
+        now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+        # _mk_candles_df places `latest_ts` on df.index[-1].
+        fresh_df = _mk_candles_df(3, now - timedelta(seconds=100))
+        fetch = MagicMock(return_value=fresh_df)
+
+        client = MagicMock()
+        client.get_position.return_value = {"long_units": 0, "short_units": 0}
+        db = MagicMock()
+        run = _make_run()
+
+        _signal_tick(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=now,
+        )
+
+        # Stale guard MUST NOT fire — 100s < 150s threshold.
+        added = [c.args[0] for c in db.add.call_args_list]
+        decisions = [r for r in added if type(r).__name__ == "DecisionLog"]
+        assert not any(d.action == "USER_SIGNAL_SKIPPED_STALE" for d in decisions)
 
     def test_empty_candles_skip(self):
         # Ingestion gap: fetch returns 0 rows.

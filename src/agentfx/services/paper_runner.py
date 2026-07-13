@@ -62,6 +62,18 @@ logger = logging.getLogger(__name__)
 # regression test.
 DEFAULT_LOOKBACK_BARS = 500
 
+# Wall-clock tolerance for ingester lag on top of the granularity. A bar
+# labeled T (OANDA convention: bar-open time) closes at wall-clock T+g;
+# our ingester writes it at T+g + lag, where observed lag on UAT ranges
+# from ~10s to ~80s depending on OANDA API latency and our poll cadence.
+# So `now - latest_closed_bar_open` at steady state is `g + lag` and can
+# legitimately hit ~150s for M1 without any data problem. The old
+# `2*g` threshold trips flapping under normal operation; use `g + tol`
+# where `tol` is calibrated once for the ingester as a whole, uniform
+# across granularities (the lag is set by the ingester's poll cadence,
+# not by bar length).
+INGEST_LAG_TOLERANCE_SECONDS = 90
+
 # Granularity → seconds. Mirrors OANDA's naming; keep in sync with the
 # frontend's `granularityToSeconds` in `portal/web/src/utils/candles.ts`.
 _GRANULARITY_SECONDS: dict[str, int] = {
@@ -309,17 +321,24 @@ def _default_candle_fetch(
     def _fetch(instrument: str, granularity: str, bars: int):
         import pandas as pd
 
+        # Fetch one extra so if the newest row is still-in-flight
+        # (`complete = False`) we drop it and still return `bars` closed
+        # bars. Signals MUST run on closed OHLC only — an in-flight bar's
+        # close moves tick-by-tick, so evaluating on it produces
+        # non-deterministic entries that don't match backtest (backtest
+        # only sees closed bars).
         candles, _total = market_data_service.get_candles(
             db=db,
             exchange="oanda",
             instrument=instrument,
             timeframe=granularity,
-            limit=bars,
+            limit=bars + 1,
         )
         # market_data_service.get_candles returns newest-first when no
         # time range is specified — reverse to chronological order for
         # `generate_signals`.
         candles = list(reversed(candles))
+        candles = [c for c in candles if c.complete]
         if not candles:
             return pd.DataFrame(
                 columns=["open", "high", "low", "close", "volume"]
@@ -546,19 +565,30 @@ def _signal_tick(
         latest_dt = latest_ts
     if latest_dt.tzinfo is None:
         latest_dt = latest_dt.replace(tzinfo=UTC)
-    if (now_utc - latest_dt).total_seconds() > 2 * granularity_seconds:
+    # OANDA labels bars by open-time; the latest CLOSED bar's open
+    # timestamp is `now - granularity` at best (ingestion catches up
+    # instantly) and `now - granularity - ingest_lag` at worst. Trip
+    # only when the gap exceeds `granularity + ingest_lag_tolerance`
+    # — that isolates real ingester outages from the normal 30-80s
+    # OANDA/ingester lag. Uniform tolerance across granularities
+    # since the lag is set by the ingester's poll cadence, not by bar
+    # length. See UAT observation 2026-07-13 (Wilson).
+    stale_threshold_seconds = granularity_seconds + INGEST_LAG_TOLERANCE_SECONDS
+    if (now_utc - latest_dt).total_seconds() > stale_threshold_seconds:
         _write_decision(
             db,
             run,
             action="USER_SIGNAL_SKIPPED_STALE",
             reason=(
                 f"latest candle {latest_dt.isoformat()} is older than "
-                f"2x {granularity} bars — skipping signal"
+                f"{granularity} + {INGEST_LAG_TOLERANCE_SECONDS}s "
+                f"(={stale_threshold_seconds}s) — ingestion may be behind"
             ),
             outputs={
                 "paper_run_id": run.id,
                 "latest_candle_at": latest_dt.isoformat(),
                 "now": now_utc.isoformat(),
+                "threshold_seconds": stale_threshold_seconds,
             },
         )
         return
