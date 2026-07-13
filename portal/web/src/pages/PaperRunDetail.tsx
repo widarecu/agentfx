@@ -21,6 +21,7 @@ import {
   ExternalLink,
   Loader2,
   Play,
+  Trash2,
 } from 'lucide-react';
 
 import { useToast } from '../contexts/ToastContext';
@@ -33,6 +34,7 @@ import { PaperRunTradesTable } from '../components/PaperRunTradesTable';
 import { PaperRunDecisionLog } from '../components/PaperRunDecisionLog';
 import StrategyChart from '../components/StrategyChart';
 import {
+  deletePaperRun,
   getBacktestOverlayForRun,
   getDecisionsForRun,
   getEquityForRun,
@@ -138,6 +140,26 @@ export default function PaperRunDetail() {
         'success',
       );
       void load();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : String(err), 'error');
+    }
+  }
+
+  async function handleDelete() {
+    if (!runId) return;
+    if (
+      !confirm(
+        `Delete paper run ${runId}?\n\nThis removes the run row, all its ` +
+          `trades, equity snapshots, and decision-log entries. The genome ` +
+          `re-appears on the approval queue so you can redeploy it. Cannot ` +
+          `be undone.`,
+      )
+    )
+      return;
+    try {
+      await deletePaperRun(runId);
+      showToast('Paper run deleted.', 'success');
+      navigate('/paper');
     } catch (err) {
       showToast(err instanceof Error ? err.message : String(err), 'error');
     }
@@ -390,6 +412,7 @@ export default function PaperRunDetail() {
         onResume={handleResume}
         pnlPct={pnlPct}
         onKill={handleKill}
+        onDelete={handleDelete}
       />
 
       {run.status === 'ERROR' && (
@@ -558,12 +581,14 @@ function StickyHeader({
   pnlPct,
   onKill,
   onResume,
+  onDelete,
 }: {
   run: PaperRunPublic;
   pnl: number;
   pnlPct: number;
   onKill: () => Promise<void>;
   onResume: () => Promise<void>;
+  onDelete: () => Promise<void>;
 }) {
   const disabledReason = useMemo(() => {
     if (run.kill_requested_at) return 'Kill already requested';
@@ -638,13 +663,45 @@ function StickyHeader({
             {pnlPct.toFixed(2)}%
           </div>
         </div>
-        {canResume ? (
-          <ResumeButton onResume={onResume} />
-        ) : (
-          <KillSwitchButton onKill={onKill} disabledReason={disabledReason} />
-        )}
+        <div className="flex items-center gap-2 flex-wrap">
+          {canResume ? (
+            <ResumeButton onResume={onResume} />
+          ) : (
+            <KillSwitchButton onKill={onKill} disabledReason={disabledReason} />
+          )}
+          {isTerminal(run.status) && <DeleteButton onDelete={onDelete} />}
+        </div>
       </div>
     </div>
+  );
+}
+
+function DeleteButton({ onDelete }: { onDelete: () => Promise<void> }) {
+  const [submitting, setSubmitting] = useState(false);
+  async function handleClick() {
+    if (submitting) return;
+    setSubmitting(true);
+    try {
+      await onDelete();
+    } finally {
+      setSubmitting(false);
+    }
+  }
+  return (
+    <button
+      type="button"
+      onClick={handleClick}
+      disabled={submitting}
+      className="inline-flex items-center gap-2 px-4 py-3 bg-white dark:bg-slate-800 border border-rose-300 dark:border-rose-800 text-rose-700 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-900/30 rounded-lg font-semibold disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
+      title="Delete this run — removes the row, trades, decisions. Returns the genome to the approval queue."
+    >
+      {submitting ? (
+        <Loader2 className="w-4 h-4 animate-spin" />
+      ) : (
+        <Trash2 className="w-4 h-4" />
+      )}
+      Delete
+    </button>
   );
 }
 

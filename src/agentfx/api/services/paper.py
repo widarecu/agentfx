@@ -584,11 +584,24 @@ def resume_paper_run(
 
 
 def delete_paper_run(db: Session, run: models.Run) -> None:
-    """Delete a paper run row.
+    """Delete a paper run row + its orphaned decision logs.
 
     Router-level guard refuses on non-terminal states so this
     function trusts its input.
+
+    Trades, orders, and paper_equity_snapshots cascade via the ORM /
+    FK cascade on `runs.id`. Decision logs don't — the runner writes
+    them with `run_id=None` and stashes the paper run id inside
+    `outputs_json.paper_run_id` (see `paper_runner._write_decision`).
+    Sweep those explicitly so redeploying doesn't leave a growing
+    tail of unreferenced audit rows per delete cycle.
     """
+    db.query(models.DecisionLog).filter(
+        # Postgres JSON ->> operator extracts the value as text; works
+        # for both JSON and JSONB columns. `outputs_json.astext` isn't
+        # available on the generic JSON type used by the column.
+        models.DecisionLog.outputs_json.op("->>")("paper_run_id") == run.id
+    ).delete(synchronize_session=False)
     db.delete(run)
     db.commit()
 
