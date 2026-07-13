@@ -497,38 +497,66 @@ def request_kill(
     return run
 
 
+_RESUMABLE_STATUSES = {
+    models.RunStatus.HALTED_MANUAL,
+    models.RunStatus.ERROR,
+}
+
+
 def resume_paper_run(
     db: Session,
     run: models.Run,
     *,
     current_user: models.User,
 ) -> models.Run:
-    """Reverse a HALTED_MANUAL run so the runner picks it up again.
+    """Reverse a halted or crashed run so the runner picks it up again.
 
-    Clears `kill_requested_at`, `stop_reason`, and `completed_at`;
-    transitions status to APPROVED so `schedule_paper_run` treats it
-    the same way as a fresh approval. `snapshot_balance` is
-    preserved intentionally — the P&L % denominator stays anchored
-    to the original run start so the metric is coherent across the
-    halt boundary. If the user wanted a fresh snapshot they'd
-    redeploy from the queue, not resume.
+    Clears `kill_requested_at`, `stop_reason`, `completed_at`, and any
+    prior `crash_detail`; transitions status to APPROVED so
+    `schedule_paper_run` treats it the same way as a fresh approval.
+    `snapshot_balance` is preserved intentionally — the P&L %
+    denominator stays anchored to the original run start so the metric
+    is coherent across the halt boundary. If the user wanted a fresh
+    snapshot they'd redeploy from the queue, not resume.
 
-    Refuses (raises ValueError) if the run isn't in HALTED_MANUAL —
-    the router translates that into 409. Resuming an ERRORed run is
-    a separate feature (v0.6.1): those halts encode real problems
-    (broker circuit, decrypt failure) that resume alone can't fix.
+    Accepts both HALTED_MANUAL (user pressed kill) and ERROR (crash /
+    hibernation / broker circuit). Wilson's UAT feedback 2026-07-13
+    surfaced that laptop hibernation ERRORs are often transient and
+    should be resumable without re-approving from scratch. If the
+    underlying cause is non-recoverable (credentials revoked, DSL
+    invalid), the next run will crash the same way and the user can
+    read the fresh `crash_detail` to make a call.
+
+    Refuses (raises ValueError) if the run isn't in a resumable
+    status — the router translates that into 409.
     """
-    if run.status != models.RunStatus.HALTED_MANUAL:
+    if run.status not in _RESUMABLE_STATUSES:
         raise ValueError(
             f"Run is {run.status.value if hasattr(run.status, 'value') else run.status}; "
-            "only HALTED_MANUAL runs can be resumed"
+            "only HALTED_MANUAL or ERROR runs can be resumed"
         )
 
+    was_error = run.status == models.RunStatus.ERROR
     run.status = models.RunStatus.APPROVED
     run.kill_requested_at = None
     run.stop_reason = None
     run.completed_at = None
     run.process_pid = None
+    # Clear the crash_detail on the params dict but keep the rest so
+    # the runner still has dsl_json / instrument / granularity on the
+    # next launch. Push the old detail into a `crash_history` list so
+    # a repeated-crash pattern is visible.
+    if was_error and run.parameters:
+        from sqlalchemy.orm.attributes import flag_modified
+
+        params = dict(run.parameters)
+        prior_detail = params.pop("crash_detail", None)
+        if prior_detail is not None:
+            history = list(params.get("crash_history") or [])
+            history.append(prior_detail)
+            params["crash_history"] = history[-5:]  # keep last 5
+        run.parameters = params
+        flag_modified(run, "parameters")
 
     db.add(
         models.DecisionLog(
@@ -538,11 +566,16 @@ def resume_paper_run(
             action=models.UserAction.USER_RESUME_PAPER.name,
             user_id=current_user.id,
             reasoning_text=(
-                f"{current_user.email} resumed halted paper run {run.id}. "
+                f"{current_user.email} resumed "
+                f"{'crashed' if was_error else 'halted'} paper run {run.id}. "
                 "Snapshot balance preserved so P&L % stays anchored to the "
                 "original run start."
+                + (" Prior crash_detail moved to crash_history." if was_error else "")
             ),
-            outputs_json={"paper_run_id": run.id},
+            outputs_json={
+                "paper_run_id": run.id,
+                "resumed_from": ("ERROR" if was_error else "HALTED_MANUAL"),
+            },
         )
     )
     db.commit()

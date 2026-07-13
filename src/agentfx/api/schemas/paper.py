@@ -122,6 +122,12 @@ class PaperRunPublic(BaseSchema):
     started_at: datetime | None = None
     completed_at: datetime | None = None
     user_id: int | None = None
+    # v0.6.1 (Wilson's UAT feedback 2026-07-13): when the runner
+    # subprocess crashes, the child persists a structured traceback
+    # into `run.parameters.crash_detail` before re-raising. Surfaced
+    # here so the /paper/:id page can render a diagnostic panel
+    # instead of just showing "process_crashed (exit_code=1)".
+    crash_detail: dict | None = None
 
 
 class PaperRunListItem(BaseSchema):

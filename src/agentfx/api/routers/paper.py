@@ -101,6 +101,13 @@ def _to_public(
         pnl=run.pnl,
         risk_config=run.risk_config,
         stop_reason=run.stop_reason,
+        # `crash_detail` is stashed onto `run.parameters` by the
+        # subprocess's exception handler (see workers/paper_runner.py
+        # `_persist_crash_detail`). Extract it out so the frontend can
+        # render a diagnostic panel without knowing about the whole
+        # parameters blob (which also contains dsl_json + other run
+        # config not meant for the response).
+        crash_detail=(run.parameters or {}).get("crash_detail"),
         kill_requested_at=run.kill_requested_at,
         approved_at=run.approved_at,
         approved_by_user_id=run.approved_by_user_id,

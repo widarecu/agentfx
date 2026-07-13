@@ -391,6 +391,14 @@ export default function PaperRunDetail() {
         onKill={handleKill}
       />
 
+      {run.status === 'ERROR' && (
+        <CrashDetailPanel
+          stopReason={run.stop_reason}
+          crashDetail={run.crash_detail}
+          canResume
+        />
+      )}
+
       <div className="mt-6 grid grid-cols-2 md:grid-cols-6 gap-3">
         <MetricCard
           label="Live P&L $"
@@ -562,11 +570,15 @@ function StickyHeader({
     return null;
   }, [run.kill_requested_at, run.status]);
 
-  // Only HALTED_MANUAL is resumable. ERROR runs stay terminal because
-  // their failure encodes a real problem the runner can't fix by
-  // itself (broker circuit, credentials revoked). COMPLETED runs
-  // wouldn't be reached here — the user would redeploy.
-  const canResume = run.status === 'HALTED_MANUAL';
+  // HALTED_MANUAL always resumable (user pressed kill; recovery is
+  // trivially safe). ERROR resumable too since v0.6.1 UAT feedback —
+  // Wilson noted laptop hibernation crashes are typically transient
+  // and forcing a re-approve is unnecessary friction. Non-recoverable
+  // causes (credential decrypt, invalid DSL) will simply crash the
+  // next launch the same way, at which point the fresh `crash_detail`
+  // guides the next decision. COMPLETED runs aren't resumable — the
+  // user would redeploy.
+  const canResume = run.status === 'HALTED_MANUAL' || run.status === 'ERROR';
 
   const pnlColor =
     pnl >= 0
@@ -676,6 +688,91 @@ function StatusPill({ status }: { status: PaperRunStatus }) {
       )}
       {status}
     </span>
+  );
+}
+
+/**
+ * Diagnostic panel shown when status = ERROR. Wilson's UAT feedback
+ * (2026-07-13): the runner crashed with a generic
+ * "process_crashed (exit_code=1)" and no way to see WHY without SSH
+ * into the container. Now the child subprocess persists a structured
+ * traceback to `run.parameters.crash_detail` before re-raising, and
+ * the router surfaces it out here for the UI.
+ *
+ * `canResume` mirrors the sticky header's Resume button — the panel
+ * echoes the affordance so the user doesn't have to scroll up to
+ * find it after reading the trace.
+ */
+function CrashDetailPanel({
+  stopReason,
+  crashDetail,
+  canResume,
+}: {
+  stopReason: string | null;
+  crashDetail: PaperRunPublic['crash_detail'];
+  canResume: boolean;
+}) {
+  return (
+    <div className="mt-6 bg-rose-50 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-800 rounded-lg p-5">
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-5 h-5 text-rose-600 dark:text-rose-400 shrink-0" />
+            <div className="text-sm font-semibold text-rose-900 dark:text-rose-100">
+              Runner crashed
+            </div>
+          </div>
+          {stopReason && (
+            <div className="text-xs text-rose-800 dark:text-rose-300 mt-1 font-mono">
+              stop_reason: {stopReason}
+            </div>
+          )}
+          {crashDetail?.crashed_at && (
+            <div className="text-xs text-rose-800 dark:text-rose-300 mt-0.5">
+              crashed at {new Date(crashDetail.crashed_at).toLocaleString()}
+            </div>
+          )}
+        </div>
+        {canResume && (
+          <div className="text-xs text-rose-800 dark:text-rose-300 shrink-0">
+            Use the <span className="font-semibold">Resume</span> button
+            above once you've read the trace. Non-recoverable causes will
+            crash again with a fresh detail.
+          </div>
+        )}
+      </div>
+
+      {crashDetail?.exception_type && crashDetail?.message && (
+        <div className="mt-3 text-sm text-rose-900 dark:text-rose-100 font-mono">
+          <span className="font-semibold">{crashDetail.exception_type}:</span>{' '}
+          {crashDetail.message}
+        </div>
+      )}
+
+      {crashDetail?.traceback && (
+        <details className="mt-3">
+          <summary className="text-xs text-rose-800 dark:text-rose-300 cursor-pointer hover:underline">
+            Show traceback ({crashDetail.traceback.split('\n').length} lines)
+          </summary>
+          <pre className="mt-2 text-xs bg-white dark:bg-slate-900 border border-rose-200 dark:border-rose-800 rounded p-3 overflow-x-auto font-mono text-slate-800 dark:text-slate-200 max-h-96">
+            {crashDetail.traceback}
+          </pre>
+        </details>
+      )}
+
+      {!crashDetail && (
+        <div className="mt-3 text-xs text-rose-800 dark:text-rose-300 italic">
+          No structured crash detail was captured. This usually means the
+          process died at the OS level (SIGKILL, OOM, hibernation) before
+          the exception handler could persist a traceback. Check the
+          container logs for the last messages from{' '}
+          <span className="font-mono">agentfx.services.paper_runner</span>{' '}
+          and{' '}
+          <span className="font-mono">agentfx.api.workers.paper_runner</span>{' '}
+          around the crash timestamp.
+        </div>
+      )}
+    </div>
   );
 }
 

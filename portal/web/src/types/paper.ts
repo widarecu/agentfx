@@ -84,6 +84,17 @@ export interface PaperRunPublic {
   started_at: string | null;
   completed_at: string | null;
   user_id: number | null;
+  /** v0.6.1: structured traceback the runner subprocess persists when
+   *  it crashes with a Python exception. Rendered as a diagnostic
+   *  panel on `/paper/:id` when status = ERROR. Null in every other
+   *  state, and null even in ERROR if the crash happened at the OS
+   *  level (SIGKILL / OOM) before the exception handler could fire. */
+  crash_detail: {
+    exception_type?: string;
+    message?: string;
+    traceback?: string;
+    crashed_at?: string;
+  } | null;
 }
 
 export interface ApprovalQueueItem {

@@ -633,6 +633,78 @@ class TestResume:
         )
         assert any(l.action == "USER_RESUME_PAPER" for l in logs)
 
+    def test_resume_from_error_moves_crash_detail_to_history(
+        self, test_client_with_db, db_session, paper_users
+    ):
+        """v0.6.1 UAT feedback (2026-07-13): allow resume from ERROR
+        (typically laptop hibernation / OANDA blip). On resume, the
+        existing `crash_detail` gets pushed into `crash_history` so a
+        repeated-crash pattern is diagnosable. Snapshot balance
+        preserved so P&L % stays anchored."""
+        from datetime import UTC, datetime
+        from unittest.mock import patch
+        from src.agentfx.api.models import (
+            Run,
+            RunEnvironment,
+            RunStatus,
+        )
+
+        run = Run(
+            id=_mk_id("run"),
+            strategy_id=None,
+            pair="EUR_USD",
+            environment=RunEnvironment.PAPER,
+            status=RunStatus.ERROR,
+            parameters={
+                "granularity": "M1",
+                "dsl_json": {"stub": True},
+                "crash_detail": {
+                    "exception_type": "ConnectionError",
+                    "message": "OANDA get_account_balance timed out",
+                    "traceback": "Traceback (most recent call last):\n  ...",
+                    "crashed_at": "2026-07-13T04:53:57Z",
+                },
+            },
+            initial_balance=0,
+            current_balance=10_000,
+            pnl=0,
+            user_id=paper_users["alice"]["user"].id,
+            oanda_account_id="101-011-99999-001",
+            snapshot_balance=10_000,
+            stop_reason="process_crashed (exit_code=1)",
+            completed_at=datetime.now(UTC),
+        )
+        db_session.add(run)
+        db_session.commit()
+
+        headers = _auth_headers(
+            test_client_with_db,
+            paper_users["alice"]["email"],
+            paper_users["alice"]["password"],
+        )
+        with patch("agentfx.api.workers.paper_runner.schedule_paper_run"):
+            resp = test_client_with_db.post(
+                f"/api/v1/paper-runs/{run.id}/resume", headers=headers
+            )
+        assert resp.status_code == 200, resp.json()
+        body = resp.json()
+        assert body["status"] == "APPROVED"
+        assert body["stop_reason"] is None
+        assert body["completed_at"] is None
+        # `crash_detail` on the API surface cleared out.
+        assert body["crash_detail"] is None
+        # Snapshot preserved so P&L % stays anchored across the halt.
+        assert body["snapshot_balance"] == 10_000
+
+        db_session.expire_all()
+        refreshed = db_session.query(Run).filter_by(id=run.id).one()
+        params = refreshed.parameters or {}
+        # Old detail moved into history for repeated-crash diagnostics.
+        assert "crash_detail" not in params
+        history = params.get("crash_history") or []
+        assert len(history) == 1
+        assert history[0]["exception_type"] == "ConnectionError"
+
     def test_resume_running_run_returns_409(
         self, test_client_with_db, db_session, paper_users
     ):

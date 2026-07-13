@@ -247,9 +247,60 @@ def _subprocess_entry(run_id: str) -> None:
         from agentfx.services.paper_runner import run_paper_run
 
         run_paper_run(run_id)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.exception("paper-runner subprocess crashed for run %s", run_id)
+        # Persist the traceback to `run.parameters.crash_detail` so the
+        # operator can diagnose without spelunking container logs.
+        # Best-effort — if the DB write fails (e.g. corrupted session),
+        # the watchdog still catches the non-zero exit and marks ERROR
+        # with the generic `process_crashed` reason.
+        _persist_crash_detail(run_id, exc)
         # Non-zero exit tells the parent watchdog to flip the run to
         # ERROR. Bare `raise` re-uses the current traceback for the
         # crash log; the process exit code will be 1.
         raise
+
+
+def _persist_crash_detail(run_id: str, exc: Exception) -> None:
+    """Store a structured traceback into `runs.parameters.crash_detail`.
+
+    The runner subprocess calls this from inside its own exception
+    handler, so the write happens BEFORE the watchdog thread flips
+    the run to ERROR. On resume the frontend clears the detail (or
+    stashes it into `crash_history` if the user wants a log of past
+    crashes — for now we just overwrite).
+
+    Wilson's UAT scenario (2026-07-13): laptop hibernation → runner
+    subprocess dies with exit_code=1 → previous UI just showed
+    "process_crashed (exit_code=1)" with no traceback. This surfaces
+    the actual Python exception + line.
+    """
+    try:
+        import traceback
+
+        from agentfx.api.core.database import SessionLocal
+        from agentfx.api.services import paper as paper_service
+        from sqlalchemy.orm.attributes import flag_modified
+
+        detail = {
+            "exception_type": type(exc).__name__,
+            "message": str(exc)[:2000],  # cap to avoid huge JSON blobs
+            "traceback": traceback.format_exc()[-8000:],  # tail only
+            "crashed_at": datetime.now(UTC).isoformat(),
+        }
+        db = SessionLocal()
+        try:
+            run = paper_service.get_paper_run(db, run_id)
+            if run is None:
+                return
+            params = dict(run.parameters or {})
+            params["crash_detail"] = detail
+            run.parameters = params
+            # SQLAlchemy doesn't track in-place JSON mutations —
+            # explicitly flag so the change hits the UPDATE.
+            flag_modified(run, "parameters")
+            db.commit()
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001
+        logger.exception("failed to persist crash_detail for paper run %s", run_id)

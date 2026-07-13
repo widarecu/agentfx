@@ -213,7 +213,12 @@ class TestSignalTick:
         assert trade.quantity == 10_000
         assert trade.entry_price == 1.1005
         assert trade.origin == "live"
-        assert trade.signal_reason == "sma > sma"
+        # v0.6.1 UAT enrichment (2026-07-13): signal_reason now includes
+        # indicator args + trigger-bar timestamp so Wilson can verify
+        # what the runner saw on the chart. Mock is duck-typed so
+        # value evaluation is skipped, but labels + timestamp render.
+        assert trade.signal_reason.startswith("sma[20] > sma[50]")
+        assert " @ " in trade.signal_reason
         # A USER_ORDER_PLACED decision log too.
         decisions = [r for r in added if type(r).__name__ == "DecisionLog"]
         assert any(d.action == "USER_ORDER_PLACED" for d in decisions)

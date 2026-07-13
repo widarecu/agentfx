@@ -640,7 +640,12 @@ def _signal_tick(
     fill_price = float(result.get("fill_price") or 0.0)
     filled_units = int(result.get("units") or signed_units)
     trade_id = result.get("trade_id")
-    signal_reason = _signal_reason(strategy, signal_direction)
+    # Pass the candles DataFrame so `_signal_reason` can compute
+    # actual indicator values at the trigger bar. Wilson's UAT
+    # feedback (2026-07-13): "the indicator on the graph didn't seem
+    # as the signal actually fired" — enriched form makes it
+    # verifiable at a glance.
+    signal_reason = _signal_reason(strategy, signal_direction, df)
 
     _persist_trade_entry(
         db=db,
@@ -848,15 +853,72 @@ def _write_decision(
     db.commit()
 
 
-def _signal_reason(strategy, direction: Direction) -> str:
-    """Derive a short human-legible reason string for the trade row.
+def _signal_reason(strategy, direction: Direction, df=None) -> str:
+    """Derive a debuggable reason string for the trade row.
 
-    In v0.6.1 we surface the strategy's DSL condition summary via
-    `spec.entry.long` / `spec.entry.short` — same shape the backtest
-    engine records. If the strategy doesn't expose that shape (e.g.
-    a legacy MA/RSI strategy from the classic path) we fall back to a
-    generic direction tag.
+    Wilson's UAT feedback (2026-07-13): "SHORT trade opened immediately
+    but looking at the indicator in the graph, it didn't seem as the
+    signal actually fired". Root problem: the previous version returned
+    just "sma < sma" without values, so the operator couldn't verify
+    what the runner saw vs what the chart shows.
+
+    Now includes:
+    - Indicator name + args ("sma[5]", not just "sma")
+    - Actual computed value at the trigger bar
+    - Comparison operator
+    - RHS values (indicator OR literal)
+    - Bar timestamp (so the chart can be scrolled to the exact bar)
+
+    Example output:
+        "sma[5]=1.08452 < sma[20]=1.08517 @ 2026-07-13T05:30:00+00:00"
+
+    Falls back to the previous "sma < sma" form (or generic "SIDE
+    signal") when the DSL uses AND/OR compound conditions the walker
+    can't summarize in one line, or when indicator eval fails. Failure
+    never breaks the trade write.
     """
+    from agentfx.core.dsl.indicators import evaluate_indicator
+    from agentfx.core.dsl.grammar import IndicatorCall
+
+    def _side_label_value(side, cache: dict) -> tuple[str, str | None]:
+        """(display label, numeric string) for one side of a Comparison.
+
+        Numeric string is None when the value can't be resolved (e.g.
+        indicator eval raised); the caller renders just the label.
+
+        Handles both real `IndicatorCall` instances (production) and
+        duck-typed objects with `.ind` / `.args` attrs (test mocks).
+        """
+        ind = getattr(side, "ind", None)
+        if ind is not None:
+            args = list(getattr(side, "args", []) or [])
+            args_str = "[" + ",".join(_fmt_num(a) for a in args) + "]" if args else ""
+            label = f"{ind}{args_str}"
+            if df is None or not isinstance(side, IndicatorCall):
+                # Duck-typed mock or no candles — return label without
+                # attempting eval. `evaluate_indicator` requires a real
+                # IndicatorCall + real DataFrame.
+                return label, None
+            key = (ind, tuple(args))
+            if key not in cache:
+                try:
+                    cache[key] = evaluate_indicator(df, ind, args)
+                except Exception:  # noqa: BLE001
+                    cache[key] = None
+            series = cache[key]
+            if series is None or len(series) == 0:
+                return label, None
+            val = series.iloc[-1]
+            if val is None or (isinstance(val, float) and (val != val)):
+                return label, None
+            return label, _fmt_num(float(val))
+        # Numeric literal on this side.
+        try:
+            val = float(side)
+            return _fmt_num(val), _fmt_num(val)
+        except (TypeError, ValueError):
+            return "expr", None
+
     try:
         spec = getattr(strategy, "spec", None)
         if spec is None:
@@ -864,12 +926,36 @@ def _signal_reason(strategy, direction: Direction) -> str:
         cond = spec.entry.long if direction == "long" else spec.entry.short
         if cond is None:
             return f"{direction} signal"
-        lhs_ind = getattr(cond.lhs, "ind", None) or "expr"
+        # Compound (AND/OR) or nested — bail to the previous simple form.
+        if not (hasattr(cond, "lhs") and hasattr(cond, "rhs") and hasattr(cond, "cmp")):
+            return f"{direction} compound signal"
+
+        cache: dict = {}
+        lhs_label, lhs_val = _side_label_value(cond.lhs, cache)
+        rhs_label, rhs_val = _side_label_value(cond.rhs, cache)
         cmp = cond.cmp
-        rhs_ind = getattr(cond.rhs, "ind", None) or "expr"
-        return f"{lhs_ind} {cmp} {rhs_ind}"
+        lhs_render = f"{lhs_label}={lhs_val}" if lhs_val is not None else lhs_label
+        rhs_render = f"{rhs_label}={rhs_val}" if rhs_val is not None else rhs_label
+        core = f"{lhs_render} {cmp} {rhs_render}"
+
+        if df is not None and len(df) > 0:
+            ts = df.index[-1]
+            if hasattr(ts, "isoformat"):
+                core += f" @ {ts.isoformat()}"
+        return core
     except Exception:  # noqa: BLE001
         return f"{direction} signal"
+
+
+def _fmt_num(x) -> str:
+    """Compact number formatting: 5 decimals for prices, integer otherwise."""
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    if f == int(f) and abs(f) < 1e6:
+        return str(int(f))
+    return f"{f:.5f}"
 
 
 def _seconds_to_granularity(seconds: int) -> str:
