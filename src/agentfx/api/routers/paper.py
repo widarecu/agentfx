@@ -349,6 +349,7 @@ def list_paper_run_trades(
                 pnl_pct=t.pnl_pct,
                 origin=t.origin,
                 signal_reason=t.signal_reason,
+                exit_reason=t.exit_reason,
             )
             for t in items
         ],

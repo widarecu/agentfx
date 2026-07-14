@@ -276,6 +276,11 @@ class PaperTradePublic(BaseSchema):
     pnl_pct: float | None = None
     origin: str | None = None
     signal_reason: str | None = None
+    # Structured exit classification (v0.6.1 UAT 2026-07-14): one of
+    # 'stop' / 'target' / 'max_hold' / 'opposite_flip' / 'user_kill' /
+    # 'broker_other'. Null while the trade is still open or for legacy
+    # rows written before the migration.
+    exit_reason: str | None = None
 
 
 class PaperTradeList(BaseSchema):

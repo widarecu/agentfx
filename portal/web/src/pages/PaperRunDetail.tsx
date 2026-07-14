@@ -368,6 +368,19 @@ export default function PaperRunDetail() {
         indicatorValues: {},
       });
       if (t.exit_timestamp !== null && t.exit_price !== null) {
+        // Map paper's exit_reason → StrategyChart's exitReason. The
+        // chart's TradeSignal type accepts stop / target / max_hold /
+        // opposite_flip (backtest's original taxonomy). Paper adds
+        // user_kill / broker_other which the chart doesn't know about
+        // — coerce those to null so the marker still renders (just
+        // without a specific reason label).
+        const chartReason =
+          t.exit_reason === 'stop' ||
+          t.exit_reason === 'target' ||
+          t.exit_reason === 'max_hold' ||
+          t.exit_reason === 'opposite_flip'
+            ? t.exit_reason
+            : null;
         out.push({
           timestamp: t.exit_timestamp,
           signal: 0,
@@ -375,6 +388,7 @@ export default function PaperRunDetail() {
           price: t.exit_price,
           pnl: t.pnl ?? undefined,
           indicatorValues: {},
+          exitReason: chartReason,
         });
       }
     }

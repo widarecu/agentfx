@@ -182,6 +182,12 @@ class Trade(Base):
     # e.g. "SMA_20 > SMA_50" or "MACD ↑". Rendered in the /paper/:id
     # Trades table's "Reason" column per Wilson's UX answer #1.
     signal_reason = Column(String, nullable=True)
+    # v0.6.1 UAT (2026-07-14): structured exit classification for the
+    # chart's exit-marker tooltip. One of 'stop' / 'target' / 'max_hold'
+    # / 'opposite_flip' / 'user_kill' / 'broker_other'. Set by the
+    # runner when it closes a trade (either directly, or when it
+    # detects OANDA's SL/TP fired between ticks).
+    exit_reason = Column(String(length=20), nullable=True)
 
     # Relationships
     run = relationship("Run", back_populates="trades")

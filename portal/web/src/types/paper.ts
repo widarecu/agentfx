@@ -184,6 +184,10 @@ export interface PaperTradePublic {
   origin: string | null;
   /** DSL entry-condition summary, e.g. "sma > sma" or "macd_line crosses_above macd_signal". */
   signal_reason: string | null;
+  /** Structured exit classification (v0.6.1). One of stop / target /
+   *  max_hold / opposite_flip / user_kill / broker_other. Null while
+   *  open or on legacy pre-migration rows. */
+  exit_reason: string | null;
 }
 
 export interface PaperTradeList {

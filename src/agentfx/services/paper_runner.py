@@ -631,6 +631,25 @@ def _signal_tick(
     # consistently regardless of sign convention.
     net_units = long_units + short_units
 
+    # Broker-side SL/TP reconciliation. OANDA's SL/TP orders (placed
+    # at entry time) fire on any tick, not at bar close. If they filled
+    # between our previous tick and this one, OANDA position went from
+    # open to 0 without the runner initiating close, and our open Trade
+    # row is stranded with exit_timestamp=None forever. Detect and
+    # reconcile: use the latest bar's close as an approximation of the
+    # fill price (broker doesn't tell us the exact fill without a
+    # transaction-history call — v0.7.0 follow-up), classify as
+    # 'stop' / 'target' / 'broker_other' by comparing to the strategy's
+    # SL/TP pip distances.
+    if net_units == 0:
+        _reconcile_broker_side_close(
+            db=db,
+            run=run,
+            strategy=strategy,
+            latest_close=float(df["close"].iloc[-1]),
+            now_utc=now_utc,
+        )
+
     # Time-based exit check. Backtest applies `max_hold_bars` inside
     # `_apply_exits`; OANDA has no equivalent, so the runner must
     # enforce it. If we have an open trade whose age exceeds
@@ -669,6 +688,7 @@ def _signal_tick(
                         f"(held for {int(held_seconds)}s vs limit "
                         f"{max_hold_bars * granularity_seconds}s)"
                     ),
+                    exit_reason="max_hold",
                 )
                 return
 
@@ -719,6 +739,7 @@ def _signal_tick(
             instrument=instrument,
             now_utc=now_utc,
             reason="direction_change",
+            exit_reason="opposite_flip",
         )
         return
 
@@ -822,6 +843,107 @@ def _persist_trade_entry(
     db.commit()
 
 
+def _reconcile_broker_side_close(
+    *,
+    db,
+    run,
+    strategy,
+    latest_close: float,
+    now_utc: datetime,
+) -> None:
+    """Detect and reconcile a broker-side SL/TP fill.
+
+    Called when the OANDA position is flat AND we might have an open
+    Trade row (the runner didn't initiate the close, but the broker's
+    SL/TP order fired between ticks). Updates the Trade row with an
+    approximate exit price + pnl + a classified `exit_reason`, and
+    writes a USER_POSITION_CLOSED decision log so the timeline shows
+    the exit.
+
+    Classification: compare `latest_close` (proxy for fill price) to
+    the strategy's stop/target pip distances from entry. Whichever is
+    closer wins; if neither is within one pip, fall back to
+    'broker_other' (rare — usually manual close on the OANDA side).
+    """
+    from agentfx.api.models import Trade
+
+    open_trade = (
+        db.query(Trade)
+        .filter(Trade.run_id == run.id, Trade.exit_timestamp.is_(None))
+        .order_by(Trade.entry_timestamp.asc())
+        .first()
+    )
+    if open_trade is None:
+        return  # nothing to reconcile
+
+    exit_rules = getattr(strategy, "spec", None)
+    if exit_rules is None or exit_rules.exit is None:
+        return
+    stop_pips = int(exit_rules.exit.stop_pips)
+    target_pips = int(exit_rules.exit.target_pips)
+    pip_size = float(getattr(strategy, "pip_size", 0.0001) or 0.0001)
+
+    entry_price = float(open_trade.entry_price)
+    is_long = open_trade.side == "buy"
+    stop_price = (
+        entry_price - stop_pips * pip_size
+        if is_long
+        else entry_price + stop_pips * pip_size
+    )
+    target_price = (
+        entry_price + target_pips * pip_size
+        if is_long
+        else entry_price - target_pips * pip_size
+    )
+    # Whichever expected level `latest_close` is closer to wins. If
+    # both are farther than 1 pip, fallback (broker-side manual close,
+    # unusual fill, etc.).
+    dist_stop = abs(latest_close - stop_price)
+    dist_target = abs(latest_close - target_price)
+    one_pip = pip_size
+    if dist_stop < dist_target and dist_stop <= 2 * one_pip:
+        classified = "stop"
+    elif dist_target <= dist_stop and dist_target <= 2 * one_pip:
+        classified = "target"
+    else:
+        classified = "broker_other"
+
+    # Approximate pnl in account currency: (exit - entry) * qty for
+    # long; (entry - exit) * qty for short. Same shape as the
+    # backtest engine's per-trade calc — good enough for the chart
+    # marker + trades table. Broker's exact pnl would need a
+    # transaction-history query.
+    signed_move = latest_close - entry_price if is_long else entry_price - latest_close
+    open_trade.exit_timestamp = now_utc
+    open_trade.exit_price = latest_close
+    open_trade.pnl = signed_move * float(open_trade.quantity)
+    open_trade.pnl_pct = (
+        (open_trade.pnl / (entry_price * float(open_trade.quantity))) * 100
+        if entry_price
+        else 0.0
+    )
+    open_trade.exit_reason = classified
+    db.commit()
+
+    _write_decision(
+        db,
+        run,
+        action="USER_POSITION_CLOSED",
+        reason=(
+            f"broker-side {classified} fill detected — trade {open_trade.id} "
+            f"closed at ~{latest_close:.5f} (entry {entry_price:.5f}), "
+            f"pnl ~{open_trade.pnl:.2f}"
+        ),
+        outputs={
+            "paper_run_id": run.id,
+            "trade_id": open_trade.id,
+            "exit_reason": classified,
+            "exit_price": latest_close,
+            "pnl": open_trade.pnl,
+        },
+    )
+
+
 def _close_position_and_persist(
     *,
     db,
@@ -830,9 +952,15 @@ def _close_position_and_persist(
     instrument: str,
     now_utc: datetime,
     reason: str,
+    exit_reason: str | None = None,
 ) -> None:
     """Flatten the OANDA position, update matching open Trade rows,
     and write a `USER_POSITION_CLOSED` decision log.
+
+    `exit_reason` is the structured taxonomy value written to
+    `trades.exit_reason` (see the migration for the enum). Distinct
+    from the human-readable `reason` string that goes into the
+    decision log.
 
     Best-effort on the Trade update — if the trade row was written by
     a prior runner instance and lost, we still commit the OANDA close
@@ -872,6 +1000,8 @@ def _close_position_and_persist(
             # for the UI. If this drifts noticeably we'll read the
             # actual fill price from the OANDA response in v0.6.2.
             t.exit_price = t.entry_price + (t.pnl / t.quantity if t.quantity else 0.0)
+            if exit_reason is not None:
+                t.exit_reason = exit_reason
         db.commit()
 
     _write_decision(
@@ -1114,7 +1244,11 @@ def _snapshot_balance_if_needed(*, db, run, client) -> None:
 def _flatten_and_halt(db, run, client, *, reason: str) -> None:
     """Close all OANDA positions on the run's instrument and mark the
     run terminal. Best-effort on the OANDA close — the run row is
-    always transitioned even if the broker call raises."""
+    always transitioned even if the broker call raises. Also flags
+    any open Trade row with a classified `exit_reason` so the chart
+    marker shows the halt cause instead of a stranded open trade."""
+    from agentfx.api.models import RunStatus, Trade
+
     try:
         client.close_all_positions(run.pair)
     except Exception:  # noqa: BLE001
@@ -1123,7 +1257,31 @@ def _flatten_and_halt(db, run, client, *, reason: str) -> None:
             run.id,
         )
 
-    from agentfx.api.models import RunStatus
+    # Close any stranded open Trade rows so the chart doesn't show a
+    # trade running past the halt. Map halt `reason` → structured
+    # exit_reason for the chart marker.
+    exit_reason_map = {
+        "USER_KILL": "user_kill",
+        "BROKER_CIRCUIT": "broker_other",
+    }
+    now = datetime.now(UTC)
+    open_trades = (
+        db.query(Trade)
+        .filter(Trade.run_id == run.id, Trade.exit_timestamp.is_(None))
+        .all()
+    )
+    for t in open_trades:
+        t.exit_timestamp = now
+        # Exit price/pnl are best-effort — the broker's exact fill
+        # isn't queried here. Chart marker still renders with the
+        # entry-price fallback so the halt is visible.
+        if t.exit_price is None:
+            t.exit_price = t.entry_price
+        if t.pnl is None:
+            t.pnl = 0.0
+        t.exit_reason = exit_reason_map.get(reason, "broker_other")
+    if open_trades:
+        db.commit()
 
     terminal_status = (
         RunStatus.HALTED_MANUAL if reason == "USER_KILL" else RunStatus.ERROR
