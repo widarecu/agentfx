@@ -412,11 +412,13 @@ class TestSignalTick:
         assert not any(type(r).__name__ == "DecisionLog" for r in added)
 
     def test_stale_candles_skip_signal_and_log(self):
-        # Latest bar 3 minutes old (180s) vs the new threshold
-        # granularity + INGEST_LAG_TOLERANCE = 60 + 90 = 150s → skip.
+        # Latest bar 5 minutes old (300s) — beyond the current threshold
+        # granularity + INGEST_LAG_TOLERANCE = 60 + 150 = 210s. This is
+        # the "ingester actually stopped" case we want the guard to
+        # catch; normal 3-minute lag is now under the threshold.
         strategy = _make_strategy(signals=[0, 0, 1])
         now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
-        stale_df = _mk_candles_df(3, now - timedelta(minutes=3))
+        stale_df = _mk_candles_df(3, now - timedelta(minutes=5))
         fetch = MagicMock(return_value=stale_df)
 
         client = MagicMock()
@@ -443,17 +445,18 @@ class TestSignalTick:
         assert any(d.action == "USER_SIGNAL_SKIPPED_STALE" for d in decisions)
 
     def test_normal_ingest_lag_does_not_trip_stale_guard(self):
-        # OANDA-typical ingest lag: latest closed bar's open is 100s
-        # before now (60s bar length + ~40s median ingest lag). Under the
-        # old 2*g = 120s threshold this passed by a narrow margin and
-        # trip-flapped as lag varied; under the new g + 90s = 150s
-        # threshold it's comfortably within tolerance. Wilson's UAT
-        # observation 2026-07-13: 30-60% of ticks were tripping stale
-        # under normal operation.
+        # Real UAT pattern (Wilson 2026-07-14): the ingester UPDATEs
+        # bar T to `complete=true` only on the poll AFTER bar close.
+        # With an ~80s poll cadence, the newest `complete=true` bar at
+        # wall-clock T is typically `T - 2*g` and can be `T - 3*g` in
+        # the tail. This test locks in that a 180s-old bar (worst-case
+        # tail of normal operation) does NOT trip the current g + 150s
+        # = 210s threshold. The old 2*g = 120s threshold trip-flapped
+        # on this pattern; g + 90s = 150s tripped on the tail.
         strategy = _make_strategy(signals=[0, 0, 0])
         now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
         # _mk_candles_df places `latest_ts` on df.index[-1].
-        fresh_df = _mk_candles_df(3, now - timedelta(seconds=100))
+        fresh_df = _mk_candles_df(3, now - timedelta(seconds=180))
         fetch = MagicMock(return_value=fresh_df)
 
         client = MagicMock()

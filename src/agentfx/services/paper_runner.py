@@ -62,17 +62,28 @@ logger = logging.getLogger(__name__)
 # regression test.
 DEFAULT_LOOKBACK_BARS = 500
 
-# Wall-clock tolerance for ingester lag on top of the granularity. A bar
-# labeled T (OANDA convention: bar-open time) closes at wall-clock T+g;
-# our ingester writes it at T+g + lag, where observed lag on UAT ranges
-# from ~10s to ~80s depending on OANDA API latency and our poll cadence.
-# So `now - latest_closed_bar_open` at steady state is `g + lag` and can
-# legitimately hit ~150s for M1 without any data problem. The old
-# `2*g` threshold trips flapping under normal operation; use `g + tol`
-# where `tol` is calibrated once for the ingester as a whole, uniform
-# across granularities (the lag is set by the ingester's poll cadence,
-# not by bar length).
-INGEST_LAG_TOLERANCE_SECONDS = 90
+# Wall-clock tolerance for ingester lag on top of the granularity.
+#
+# Two-layer lag reality (Wilson UAT observation 2026-07-14, verified
+# by candles.updated_at vs candles.timestamp):
+#
+#   1. The bar labeled T (OANDA open-time convention) closes at
+#      wall-clock T+g. Our ingester polls OANDA every ~80s and writes
+#      the row as complete=false during the bar, then UPDATES it to
+#      complete=true only on the poll AFTER the bar closes.
+#   2. Observed `updated_at - timestamp` for M1 bars: 89-130s
+#      (median ~110s). Meaning: a bar isn't `complete=true` in our
+#      DB until ~2 bar-lengths after it opened.
+#
+# So at wall-clock T, the newest `complete=true` bar is typically
+# `T - 2*g` and can be `T - 3*g` in the window between "bar T-g
+# closed" and "next poll marks it complete." Under healthy ops the
+# gap from wall-clock to newest complete bar therefore oscillates
+# between `g` and `~2g + poll_cadence`.
+#
+# Threshold must cover the tail (~180s for M1) without hiding real
+# outages. 150s tolerance → M1 threshold 210s = 3.5 bar lengths.
+INGEST_LAG_TOLERANCE_SECONDS = 150
 
 # Granularity → seconds. Mirrors OANDA's naming; keep in sync with the
 # frontend's `granularityToSeconds` in `portal/web/src/utils/candles.ts`.
