@@ -104,6 +104,21 @@ async def lifespan(app: FastAPI):
         # manually re-queued via the API.
         logger.exception("evolution-run recovery failed; continuing startup")
 
+    # Recover orphaned paper runs. Same shape as evolution recovery:
+    # flip RUNNING → APPROVED when the child subprocess is gone, then
+    # re-schedule anything APPROVED. Without this, backend restarts
+    # leave paper runs in a zombie RUNNING state with no subprocess or
+    # watchdog — kill requests never get serviced and the UI hides
+    # Delete because status isn't terminal. Wilson UAT 2026-07-14.
+    from .workers.paper_runner import recover_orphaned_paper_runs
+
+    try:
+        recovered_paper = recover_orphaned_paper_runs()
+        if recovered_paper > 0:
+            logger.info(f"Scheduled {recovered_paper} paper runs for recovery")
+    except Exception:  # noqa: BLE001
+        logger.exception("paper-run recovery failed; continuing startup")
+
     yield  # App runs here
 
     # Shutdown
