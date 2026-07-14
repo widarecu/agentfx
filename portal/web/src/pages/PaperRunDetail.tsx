@@ -349,13 +349,37 @@ export default function PaperRunDetail() {
     };
   }, [runId]);
 
-  // v0.6.1: StrategyChart entry/exit markers require the full
-  // `TradeSignal` shape (indicator values at signal time, structured
-  // exit reason) that paper Trade rows don't carry. The Trades table
-  // below is the source of truth for now; overlaying paper markers
-  // on the price chart is a v0.6.2 follow-up once the runner
-  // persists per-tick indicator values.
-  const chartSignals: TradeSignal[] = useMemo(() => [], []);
+  // Map each Trade row → one entry marker (+ one exit marker if closed).
+  // `indicatorValues` is left empty because the runner doesn't snapshot
+  // per-bar indicator values into Trade rows (would need extra DB writes
+  // — a v0.7.0 follow-up if the chart tooltip needs the numeric readout).
+  // `exitReason` is null because paper exits come from broker-side SL/TP
+  // fills (or the runner's max_hold force-close) and aren't classified
+  // into the backtest's stop/target/max_hold/opposite_flip taxonomy.
+  const chartSignals: TradeSignal[] = useMemo(() => {
+    const out: TradeSignal[] = [];
+    for (const t of trades) {
+      const isLong = t.side === 'buy';
+      out.push({
+        timestamp: t.entry_timestamp,
+        signal: isLong ? 1 : -1,
+        signalType: isLong ? 'entry_long' : 'entry_short',
+        price: t.entry_price,
+        indicatorValues: {},
+      });
+      if (t.exit_timestamp !== null && t.exit_price !== null) {
+        out.push({
+          timestamp: t.exit_timestamp,
+          signal: 0,
+          signalType: isLong ? 'exit_long' : 'exit_short',
+          price: t.exit_price,
+          pnl: t.pnl ?? undefined,
+          indicatorValues: {},
+        });
+      }
+    }
+    return out;
+  }, [trades]);
 
   if (loading && !run) {
     return (
