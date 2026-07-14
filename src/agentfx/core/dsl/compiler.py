@@ -349,6 +349,48 @@ class CompiledDSLStrategy(Strategy):
         }
         return pd.Series(final, index=df.index, dtype=int)
 
+    def raw_entry_signals(self, df: pd.DataFrame) -> pd.Series:
+        """Per-bar entry EVENTS with no state projection.
+
+        Returns +1 at bars where the long entry condition fires (e.g.
+        `crosses_above`), -1 at bars where the short entry fires, 0
+        elsewhere. Unlike `generate_signals`, this method does NOT
+        walk the exit machine — it does not project a hypothetical
+        held position across bars. Callers get raw cross events only.
+
+        Purpose: the paper runner asks "did an entry cross fire at the
+        latest closed bar?" and acts on that event. It must not inherit
+        a projected held state from before the runner was watching (the
+        alternative model, `generate_signals`, walks in-position state
+        from bar 0 of the window forward — for cold-deployed paper runs
+        this makes the runner think it's mid-hold on a hypothetical
+        trade that never actually opened, causing it to skip real fresh
+        crosses that come later while `opposite_signal: false` or an
+        active min_hold blocks the state from re-transitioning).
+
+        The 1-bar shift (`raw_pos.shift(1)`) is preserved so the caller
+        gets the same no-lookahead guarantee as backtest — the entry
+        signal at bar T is based on the condition that closed AT bar T,
+        available for action at bar T+1 (or, in the paper runner, at
+        the signal-tick that fires shortly after bar T closes).
+        """
+        cache: dict[tuple, pd.Series] = {}
+        if self.spec.entry.long is not None:
+            long_sig = _eval_condition(self.spec.entry.long, df, cache).fillna(False)
+        else:
+            long_sig = pd.Series(False, index=df.index)
+        if self.spec.entry.short is not None:
+            short_sig = _eval_condition(self.spec.entry.short, df, cache).fillna(False)
+        else:
+            short_sig = pd.Series(False, index=df.index)
+        raw = (
+            (long_sig.astype(int) - short_sig.astype(int))
+            .shift(1)
+            .fillna(0)
+            .astype(int)
+        )
+        return raw
+
 
 def compile_spec(spec: StrategySpec, pip_size: float = 0.0001) -> Strategy:
     """Validate and compile a `StrategySpec` into a runnable `Strategy`.

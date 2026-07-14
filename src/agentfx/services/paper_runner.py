@@ -593,13 +593,23 @@ def _signal_tick(
         )
         return
 
-    signals = strategy.generate_signals(df)
-    if len(signals) < 2:
+    # Raw entry events at bar-close: +1 = long cross fired at latest
+    # bar, -1 = short cross fired, 0 = no event. This replaces
+    # `generate_signals` (which projected `_apply_exits` state across
+    # the full lookback window). Wilson's UAT 2026-07-13 finding: the
+    # projected-state model treated a hypothetical pre-deploy trade as
+    # "we're currently long" and refused every subsequent cross while
+    # `opposite_signal: false` prevented state re-transitions, so paper
+    # deployments would idle for hours. Under the event model the runner
+    # only reacts to entry crosses that fire post-deploy, and exits are
+    # handled by (a) OANDA-side SL/TP orders placed at entry time and
+    # (b) the max_hold check below.
+    raw_entries = strategy.raw_entry_signals(df)
+    if len(raw_entries) < 1:
         return
-    last_signal = int(signals.iloc[-1])
-    prev_signal = int(signals.iloc[-2])
+    raw_entry = int(raw_entries.iloc[-1])
     signal_direction: Direction = (
-        "long" if last_signal > 0 else "short" if last_signal < 0 else "flat"
+        "long" if raw_entry > 0 else "short" if raw_entry < 0 else "flat"
     )
 
     position = client.get_position(instrument)
@@ -610,92 +620,87 @@ def _signal_tick(
     # consistently regardless of sign convention.
     net_units = long_units + short_units
 
-    # Missed-entry guard. `generate_signals` returns a HELD-STATE series:
-    # +1 on every bar while long, -1 while short, 0 while flat. So a
-    # non-zero value at the latest bar can mean either "fresh cross this
-    # bar" (prev == 0) or "in a held position since a cross that fired
-    # some earlier bar" (prev == last). If we cold-deployed mid-hold
-    # (or the operator manually closed the OANDA position while backtest
-    # state persisted), the runner would otherwise chase a stale entry
-    # hours late — Wilson's UAT observation 2026-07-13. Policy: skip and
-    # wait for the next fresh cross.
-    is_fresh_entry_or_flip = prev_signal != last_signal
-    if last_signal != 0 and net_units == 0 and not is_fresh_entry_or_flip:
-        # Walk backward through `signals` to find the bar where the
-        # current held-state began (last transition from a different
-        # value). Surface it in the log so the operator can locate that
-        # cross on the chart instead of guessing.
-        signals_arr = signals.to_numpy()
-        entry_bar_idx = len(signals_arr) - 1
-        for i in range(len(signals_arr) - 2, -1, -1):
-            if int(signals_arr[i]) != last_signal:
-                entry_bar_idx = i + 1
-                break
-        else:
-            entry_bar_idx = 0
-        entry_bar_ts = df.index[entry_bar_idx]
-        latest_bar_ts = df.index[-1]
-        _write_decision(
-            db,
-            run,
-            action="USER_ENTRY_MISSED",
-            reason=(
-                f"backtest state is {signal_direction} at bar "
-                f"{latest_bar_ts.isoformat()} but the entry cross fired at "
-                f"{entry_bar_ts.isoformat()} — the runner didn't catch that "
-                f"bar live (deployed after it, or a prior stale/skip window "
-                f"straddled it). Not chasing a late entry; waiting for the "
-                f"next fresh cross."
-            ),
-            outputs={
-                "paper_run_id": run.id,
-                "last_signal": last_signal,
-                "prev_signal": prev_signal,
-                "latest_bar_at": latest_bar_ts.isoformat(),
-                "entry_bar_at": entry_bar_ts.isoformat(),
-            },
+    # Time-based exit check. Backtest applies `max_hold_bars` inside
+    # `_apply_exits`; OANDA has no equivalent, so the runner must
+    # enforce it. If we have an open trade whose age exceeds
+    # `max_hold_bars * granularity`, force-close now. Runs BEFORE the
+    # entry check so a max_hold expiry + fresh cross same-tick closes
+    # first (next tick opens the new side, matching backtest's
+    # "same-bar exit + re-entry" semantics for opposite-direction
+    # crosses).
+    exit_rules = getattr(strategy, "spec", None)
+    max_hold_bars: int | None = None
+    if exit_rules is not None and exit_rules.exit is not None:
+        max_hold_bars = int(exit_rules.exit.max_hold_bars)
+    if max_hold_bars is not None and net_units != 0:
+        from agentfx.api.models import Trade
+
+        open_trade = (
+            db.query(Trade)
+            .filter(Trade.run_id == run.id, Trade.exit_timestamp.is_(None))
+            .order_by(Trade.entry_timestamp.asc())
+            .first()
         )
+        if open_trade is not None:
+            entry_ts = open_trade.entry_timestamp
+            if entry_ts.tzinfo is None:
+                entry_ts = entry_ts.replace(tzinfo=UTC)
+            held_seconds = (now_utc - entry_ts).total_seconds()
+            if held_seconds >= max_hold_bars * granularity_seconds:
+                _close_position_and_persist(
+                    db=db,
+                    run=run,
+                    client=client,
+                    instrument=instrument,
+                    now_utc=now_utc,
+                    reason=(
+                        f"max_hold_bars={max_hold_bars} exceeded "
+                        f"(held for {int(held_seconds)}s vs limit "
+                        f"{max_hold_bars * granularity_seconds}s)"
+                    ),
+                )
+                return
+
+    # No entry event at the latest bar → nothing to do. Silent no-op
+    # (health polls would spam a decision log otherwise); snapshot
+    # equity so LivePnLChart survives reload with a continuous curve.
+    if raw_entry == 0:
         _persist_equity_snapshot(db=db, run=run, position=position, now_utc=now_utc)
         return
 
+    # Fresh entry event. Decide against current OANDA position.
     risk_cfg = run.risk_config or {}
     max_units = int(risk_cfg.get("max_position_size_units", 10_000))
-    action = decide_action(
-        signal_direction=signal_direction,
-        signal_units=max_units if signal_direction != "flat" else 0,
-        current_net_units=net_units,
+
+    same_direction = (net_units > 0 and signal_direction == "long") or (
+        net_units < 0 and signal_direction == "short"
+    )
+    opposite_direction = (net_units > 0 and signal_direction == "short") or (
+        net_units < 0 and signal_direction == "long"
     )
 
-    if action.action == "hold":
-        # Deliberately no decision log here — a busy strategy would
-        # produce one row per health-tick × signal-tick, blowing up
-        # the audit table. `USER_ORDER_PLACED` / `USER_POSITION_CLOSED`
-        # are the load-bearing entries.
-        # Still snapshot equity so the reload-safe LivePnLChart curve
-        # doesn't skip bars just because the strategy held.
+    if same_direction:
+        # We're already in the direction the entry event just fired.
+        # This can happen if a previous same-side cross entered us and
+        # OANDA-side SL/TP hasn't fired yet at this bar. Backtest would
+        # simply hold, no re-entry, so we do too. Silent to keep the
+        # audit log focused on real state changes.
         _persist_equity_snapshot(db=db, run=run, position=position, now_utc=now_utc)
         return
 
-    if action.action == "close":
-        _close_position_and_persist(
-            db=db,
-            run=run,
-            client=client,
-            instrument=instrument,
-            now_utc=now_utc,
-            reason="flat_signal",
-        )
-        return
-
-    # action.action == "place"
-    # Two-step position flip: if we have an open position in the
-    # opposite direction, close first + return. Next signal tick opens
-    # the new side. Explicit in the audit trail; matches how the
-    # backtest engine records flips.
-    if net_units != 0 and (
-        (net_units > 0 and signal_direction == "short")
-        or (net_units < 0 and signal_direction == "long")
-    ):
+    if opposite_direction:
+        # Cross fires in the direction opposite our open position.
+        # Backtest respects `spec.exit.opposite_signal`: when True, exit
+        # + flip (same bar); when False, ignore the cross and keep
+        # holding. Mirror that here.
+        opp_flag = True
+        if exit_rules is not None and exit_rules.exit is not None:
+            opp_flag = bool(exit_rules.exit.opposite_signal)
+        if not opp_flag:
+            _persist_equity_snapshot(db=db, run=run, position=position, now_utc=now_utc)
+            return
+        # opposite_signal=True → close first + return; next tick opens
+        # the new side. Explicit two-step matches backtest's audit trail.
         _close_position_and_persist(
             db=db,
             run=run,
@@ -706,9 +711,20 @@ def _signal_tick(
         )
         return
 
+    # net_units == 0 AND raw_entry != 0 → fresh entry from flat.
     signed_units = max_units if signal_direction == "long" else -max_units
+    # Broker-side SL/TP: the strategy's DSL exit block is the source
+    # of truth. The deploy modal pre-populates from these and the user
+    # can override in `risk_config`. Runner falls back to the DSL
+    # values if the modal didn't override (or a legacy run row is
+    # missing them) — see US-028.
     sl_pips = risk_cfg.get("stop_loss_pips")
     tp_pips = risk_cfg.get("take_profit_pips")
+    if exit_rules is not None and exit_rules.exit is not None:
+        if sl_pips is None:
+            sl_pips = int(exit_rules.exit.stop_pips)
+        if tp_pips is None:
+            tp_pips = int(exit_rules.exit.target_pips)
 
     result = client.place_market_order(
         instrument,

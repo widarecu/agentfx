@@ -192,6 +192,22 @@ def list_approval_queue(
         # module doesn't own model relationships.
         gen = getattr(g, "generation", None)
         evorun = gen.run if gen is not None else None
+        # DSL exit block → surface pre-populated SL/TP for the modal
+        # (v0.6.1 UAT feedback). Skip on any parse anomaly rather than
+        # error the whole queue.
+        dsl_exit: schemas.DslExitPublic | None = None
+        exit_block = (g.dsl_json or {}).get("exit") if g.dsl_json else None
+        if isinstance(exit_block, dict):
+            try:
+                dsl_exit = schemas.DslExitPublic(
+                    stop_pips=int(exit_block["stop_pips"]),
+                    target_pips=int(exit_block["target_pips"]),
+                    max_hold_bars=int(exit_block["max_hold_bars"]),
+                    min_hold_bars=int(exit_block.get("min_hold_bars", 0)),
+                    opposite_signal=bool(exit_block.get("opposite_signal", True)),
+                )
+            except (KeyError, TypeError, ValueError):
+                dsl_exit = None
         items.append(
             schemas.ApprovalQueueItem(
                 strategy_genome_id=g.id,
@@ -204,6 +220,7 @@ def list_approval_queue(
                 fitness=g.fitness,
                 metrics_summary=g.metrics_json,
                 created_at=g.created_at,
+                dsl_exit=dsl_exit,
             )
         )
     return schemas.ApprovalQueueList(

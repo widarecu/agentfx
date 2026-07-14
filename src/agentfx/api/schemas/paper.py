@@ -151,6 +151,23 @@ class PaperRunList(BaseSchema):
     page_size: int
 
 
+class DslExitPublic(BaseSchema):
+    """DSL exit-block projection for the approval queue.
+
+    Frontend uses these to pre-populate the deploy modal's SL/TP
+    fields — v0.6.1 UX fix: SL/TP are always visible and always
+    populated from the strategy DSL by default (user can override).
+    Prevents Wilson-2026-07-13 case where an empty broker-side SL
+    field silently shipped orders without stop-loss protection.
+    """
+
+    stop_pips: int
+    target_pips: int
+    max_hold_bars: int
+    min_hold_bars: int
+    opposite_signal: bool
+
+
 class ApprovalQueueItem(BaseSchema):
     """One row in `GET /paper-runs/approval-queue`."""
 
@@ -161,6 +178,7 @@ class ApprovalQueueItem(BaseSchema):
     fitness: float | None = None
     metrics_summary: dict | None = None
     created_at: datetime | None = None
+    dsl_exit: DslExitPublic | None = None
 
 
 class ClosestGenome(BaseSchema):

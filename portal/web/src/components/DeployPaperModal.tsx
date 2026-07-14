@@ -49,14 +49,19 @@ export function DeployPaperModal({
   const [maxPositionSize, setMaxPositionSize] = useState<string>('10000');
   const [dailyLossPct, setDailyLossPct] = useState<string>('2.0');
   const [killDdPct, setKillDdPct] = useState<string>('5.0');
-  // v0.6.1 (US-028): optional per-trade SL/TP passed through to
-  // `client.place_market_order`. Empty string = don't send the field
-  // (broker-side SL/TP not registered; strategy exits on signal
-  // reversal). Under an "Advanced" collapsible so the common deploy
-  // stays uncluttered.
-  const [stopLossPips, setStopLossPips] = useState<string>('');
-  const [takeProfitPips, setTakeProfitPips] = useState<string>('');
-  const [advancedOpen, setAdvancedOpen] = useState(false);
+  // Broker-side SL/TP. Pre-populated from the strategy's DSL exit
+  // block so paper trades always ship with the strategy's designed
+  // stop/target. User can override; the fields are always visible
+  // and required so nothing ever leaves without protection.
+  // (v0.6.1 UAT feedback 2026-07-13 — previously these were empty
+  // strings under an "Advanced" collapsible, so orders shipped
+  // without SL/TP unless the user explicitly filled them in.)
+  const [stopLossPips, setStopLossPips] = useState<string>(
+    item.dsl_exit ? String(item.dsl_exit.stop_pips) : '',
+  );
+  const [takeProfitPips, setTakeProfitPips] = useState<string>(
+    item.dsl_exit ? String(item.dsl_exit.target_pips) : '',
+  );
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
@@ -78,6 +83,13 @@ export function DeployPaperModal({
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!selectedAccountId) return;
+
+    // Both SL and TP must be present. v0.6.1 UAT rule: no orders
+    // leave without broker-side stop/target protection.
+    if (!stopLossPips.trim() || !takeProfitPips.trim()) {
+      setSubmitError('Stop loss and take profit are required.');
+      return;
+    }
 
     const riskConfig = _buildRiskConfig({
       maxPositionSize,
@@ -259,47 +271,36 @@ export function DeployPaperModal({
               />
             </div>
 
-            {/* v0.6.1 (US-028): optional broker-side SL/TP. Under a
-                collapsible so the common deploy stays uncluttered —
-                leaving both blank means the strategy exits on signal
-                reversal (same as backtest); daily-loss + kill-switch
-                remain the safety net either way. */}
-            <div>
-              <button
-                type="button"
-                onClick={() => setAdvancedOpen((v) => !v)}
-                aria-expanded={advancedOpen}
-                className="text-xs uppercase tracking-wide text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-slate-100 inline-flex items-center gap-1"
-              >
-                <span
-                  className={`inline-block transition-transform ${
-                    advancedOpen ? 'rotate-90' : ''
-                  }`}
-                >
-                  ▸
-                </span>
-                Advanced risk controls
-              </button>
-              {advancedOpen && (
-                <div className="mt-3 grid grid-cols-2 gap-4">
-                  <NumericField
-                    label="Stop loss (pips)"
-                    hint="Broker-side SL; leave blank for none"
-                    value={stopLossPips}
-                    onChange={setStopLossPips}
-                    step="1"
-                    placeholder="e.g. 20"
-                  />
-                  <NumericField
-                    label="Take profit (pips)"
-                    hint="Broker-side TP; leave blank for none"
-                    value={takeProfitPips}
-                    onChange={setTakeProfitPips}
-                    step="1"
-                    placeholder="e.g. 40"
-                  />
-                </div>
-              )}
+            {/* v0.6.1 UAT fix (2026-07-13): SL/TP are always visible
+                and pre-populated from the strategy's DSL exit block.
+                Nothing ships to OANDA without stop-loss + take-profit
+                protection. User can override the pre-filled values.
+                Both are required. */}
+            <div className="grid grid-cols-2 gap-4">
+              <NumericField
+                label="Stop loss (pips)"
+                hint={
+                  item.dsl_exit
+                    ? `From strategy DSL (${item.dsl_exit.stop_pips}); override if you want`
+                    : 'DSL exit not readable — enter manually'
+                }
+                value={stopLossPips}
+                onChange={setStopLossPips}
+                step="1"
+                placeholder="e.g. 20"
+              />
+              <NumericField
+                label="Take profit (pips)"
+                hint={
+                  item.dsl_exit
+                    ? `From strategy DSL (${item.dsl_exit.target_pips}); override if you want`
+                    : 'DSL exit not readable — enter manually'
+                }
+                value={takeProfitPips}
+                onChange={setTakeProfitPips}
+                step="1"
+                placeholder="e.g. 40"
+              />
             </div>
 
             {submitError && (

@@ -97,6 +97,14 @@ export interface PaperRunPublic {
   } | null;
 }
 
+export interface DslExitPublic {
+  stop_pips: number;
+  target_pips: number;
+  max_hold_bars: number;
+  min_hold_bars: number;
+  opposite_signal: boolean;
+}
+
 export interface ApprovalQueueItem {
   strategy_genome_id: string;
   run_id: string;
@@ -106,6 +114,8 @@ export interface ApprovalQueueItem {
   /** Full metrics blob from the genome — Gate B eval reads this. */
   metrics_summary: Record<string, unknown> | null;
   created_at: string | null;
+  /** DSL exit block — used by DeployPaperModal to pre-populate SL/TP. */
+  dsl_exit: DslExitPublic | null;
 }
 
 export interface ClosestGenome {

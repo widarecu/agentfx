@@ -132,10 +132,25 @@ def _make_run(user_id: int = 42) -> SimpleNamespace:
     )
 
 
-def _make_strategy(signals: list[int], entry_long_ind: str = "sma") -> SimpleNamespace:
-    """A stand-in for `CompiledDSLStrategy`. `generate_signals` returns
-    the pre-baked signal series. `spec.entry.long.lhs.ind` shape
-    matches what `_signal_reason` walks."""
+def _make_strategy(
+    signals: list[int],
+    entry_long_ind: str = "sma",
+    *,
+    stop_pips: int = 20,
+    target_pips: int = 50,
+    max_hold_bars: int = 600,
+    opposite_signal: bool = True,
+) -> SimpleNamespace:
+    """A stand-in for `CompiledDSLStrategy`.
+
+    - `generate_signals` and `raw_entry_signals` both return the
+      pre-baked series (the runner uses `raw_entry_signals` after the
+      v0.6.1 refactor; the older method is kept for compatibility with
+      tests that pre-date the rewrite and for backtest callers).
+    - `spec.entry.long.lhs.ind` shape matches `_signal_reason`.
+    - `spec.exit` mirrors the DSL exit block so the runner can consult
+      max_hold_bars, opposite_signal, and DSL-native SL/TP fallbacks.
+    """
     series = pd.Series(signals, dtype=int)
 
     def _generate(_df):
@@ -145,8 +160,27 @@ def _make_strategy(signals: list[int], entry_long_ind: str = "sma") -> SimpleNam
     rhs = SimpleNamespace(ind="sma", args=[50])
     long_cond = SimpleNamespace(lhs=lhs, cmp=">", rhs=rhs)
     entry = SimpleNamespace(long=long_cond, short=None)
-    spec = SimpleNamespace(entry=entry)
-    return SimpleNamespace(generate_signals=_generate, spec=spec)
+    exit_rules = SimpleNamespace(
+        stop_pips=stop_pips,
+        target_pips=target_pips,
+        max_hold_bars=max_hold_bars,
+        opposite_signal=opposite_signal,
+    )
+    spec = SimpleNamespace(entry=entry, exit=exit_rules)
+    return SimpleNamespace(
+        generate_signals=_generate,
+        raw_entry_signals=_generate,
+        spec=spec,
+    )
+
+
+def _set_open_trade(db: MagicMock, trade: object | None) -> None:
+    """Wire the DB mock so `db.query(Trade).filter(...).order_by(...).first()`
+    returns `trade` (or None to signal no open trade). The runner's
+    max_hold check runs this chain on every tick when there's an OANDA
+    position, so tests with a non-flat position must set it explicitly.
+    """
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = trade
 
 
 def _mk_candles_df(bars: int, latest_ts: datetime) -> pd.DataFrame:
@@ -198,11 +232,14 @@ class TestSignalTick:
             now_utc=datetime(2026, 7, 10, 12, 0, tzinfo=UTC),
         )
 
+        # v0.6.1 raw-entry refactor: DSL's exit block seeds SL/TP when
+        # `risk_config` doesn't override, so tests use the mock's
+        # default stop_pips=20, target_pips=50.
         client.place_market_order.assert_called_once_with(
             "EUR_USD",
             10_000,
-            stop_loss_pips=None,
-            take_profit_pips=None,
+            stop_loss_pips=20,
+            take_profit_pips=50,
         )
         # A Trade row got added.
         added = [c.args[0] for c in db.add.call_args_list]
@@ -223,102 +260,20 @@ class TestSignalTick:
         decisions = [r for r in added if type(r).__name__ == "DecisionLog"]
         assert any(d.action == "USER_ORDER_PLACED" for d in decisions)
 
-    def test_flat_signal_on_open_position_closes_and_updates_trade(self):
-        # Signal series ends with 0 → close current long position.
-        strategy = _make_strategy(signals=[1, 1, 0])
-        candles_df = _mk_candles_df(3, datetime(2026, 7, 10, 12, 0, tzinfo=UTC))
-        fetch = MagicMock(return_value=candles_df)
-
-        client = MagicMock()
-        client.get_position.return_value = {"long_units": 10_000, "short_units": 0}
-        client.close_all_positions.return_value = {
-            "long_realized_pnl": 12.30,
-            "short_realized_pnl": 0.0,
-            "long_units_closed": 10_000,
-            "short_units_closed": 0,
-        }
-
-        # Simulate one open Trade row for this run so the update path
-        # fires. db.query returns a chain terminating in an .all() that
-        # returns the open trade.
-        open_trade = SimpleNamespace(
-            id="tr_existing",
-            run_id="run_test_signal",
-            entry_price=1.1000,
-            quantity=10_000,
-            exit_timestamp=None,
-            pnl=None,
-            pnl_pct=None,
-            exit_price=None,
-        )
-        db = MagicMock()
-        db.query.return_value.filter.return_value.all.return_value = [open_trade]
-
-        run = _make_run()
-        _signal_tick(
-            db=db,
-            run=run,
-            client=client,
-            strategy=strategy,
-            candle_fetch_fn=fetch,
-            instrument="EUR_USD",
-            granularity_seconds=60,
-            now_utc=datetime(2026, 7, 10, 12, 0, tzinfo=UTC),
-        )
-
-        client.close_all_positions.assert_called_once_with("EUR_USD")
-        # Open trade row got updated with exit_timestamp + pnl.
-        assert open_trade.pnl == pytest.approx(12.30)
-        assert open_trade.exit_timestamp == datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
-        # USER_POSITION_CLOSED decision log written.
-        added = [c.args[0] for c in db.add.call_args_list]
-        decisions = [r for r in added if type(r).__name__ == "DecisionLog"]
-        assert any(d.action == "USER_POSITION_CLOSED" for d in decisions)
-
-    def test_hold_signal_matches_position_is_noop(self):
-        # Signal +1 with existing +10_000 long position → hold.
-        strategy = _make_strategy(signals=[1, 1, 1])
-        candles_df = _mk_candles_df(3, datetime(2026, 7, 10, 12, 0, tzinfo=UTC))
-        fetch = MagicMock(return_value=candles_df)
-
-        client = MagicMock()
-        client.get_position.return_value = {"long_units": 10_000, "short_units": 0}
-        db = MagicMock()
-        run = _make_run()
-
-        _signal_tick(
-            db=db,
-            run=run,
-            client=client,
-            strategy=strategy,
-            candle_fetch_fn=fetch,
-            instrument="EUR_USD",
-            granularity_seconds=60,
-            now_utc=datetime(2026, 7, 10, 12, 0, tzinfo=UTC),
-        )
-
-        client.place_market_order.assert_not_called()
-        client.close_all_positions.assert_not_called()
-        # No Trade rows added, no decision log spam.
-        added = [c.args[0] for c in db.add.call_args_list]
-        assert not any(type(r).__name__ == "Trade" for r in added)
-        assert not any(type(r).__name__ == "DecisionLog" for r in added)
-
-    def test_held_state_from_flat_position_logs_entry_missed(self):
-        # Backtest state is +1 at bar N AND at bar N-1 — no fresh cross
-        # at the latest bar. OANDA position is flat (cold deploy or
-        # manual close mid-hold). Runner must NOT chase the entry late;
-        # it logs USER_ENTRY_MISSED and waits for the next fresh cross.
-        # Wilson's UAT observation 2026-07-13 was that the runner opened
-        # a short immediately at deploy time even though no fresh MACD
-        # cross was visible at the latest bar.
-        strategy = _make_strategy(signals=[1, 1, 1])
+    def test_no_entry_event_from_flat_is_silent_noop(self):
+        # Under the v0.6.1 raw-entry-signal model, `raw_entries.iloc[-1] == 0`
+        # means "no fresh cross at the latest bar." With OANDA flat and
+        # no entry event, the runner does nothing (silent, no decision
+        # log). This replaces the old USER_ENTRY_MISSED path — the raw-
+        # entry model has no projected held state to "miss."
+        strategy = _make_strategy(signals=[0, 0, 0])
         candles_df = _mk_candles_df(3, datetime(2026, 7, 10, 12, 0, tzinfo=UTC))
         fetch = MagicMock(return_value=candles_df)
 
         client = MagicMock()
         client.get_position.return_value = {"long_units": 0, "short_units": 0}
         db = MagicMock()
+        _set_open_trade(db, None)
         run = _make_run()
 
         _signal_tick(
@@ -335,10 +290,126 @@ class TestSignalTick:
         client.place_market_order.assert_not_called()
         client.close_all_positions.assert_not_called()
         added = [c.args[0] for c in db.add.call_args_list]
-        decisions = [r for r in added if type(r).__name__ == "DecisionLog"]
-        assert any(d.action == "USER_ENTRY_MISSED" for d in decisions)
-        # No Trade rows — we did NOT enter.
         assert not any(type(r).__name__ == "Trade" for r in added)
+        assert not any(type(r).__name__ == "DecisionLog" for r in added)
+
+    def test_hold_signal_matches_position_is_noop(self):
+        # Fresh long-entry event AND we're already long on OANDA → hold
+        # silently (same-direction). Would happen if a prior cross opened
+        # us and another same-direction cross fires before an exit.
+        strategy = _make_strategy(signals=[0, 0, 1])
+        candles_df = _mk_candles_df(3, datetime(2026, 7, 10, 12, 0, tzinfo=UTC))
+        fetch = MagicMock(return_value=candles_df)
+
+        client = MagicMock()
+        client.get_position.return_value = {"long_units": 10_000, "short_units": 0}
+        db = MagicMock()
+        # No open Trade row → max_hold check is a no-op.
+        _set_open_trade(db, None)
+        run = _make_run()
+
+        _signal_tick(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=datetime(2026, 7, 10, 12, 0, tzinfo=UTC),
+        )
+
+        client.place_market_order.assert_not_called()
+        client.close_all_positions.assert_not_called()
+        added = [c.args[0] for c in db.add.call_args_list]
+        assert not any(type(r).__name__ == "Trade" for r in added)
+        assert not any(type(r).__name__ == "DecisionLog" for r in added)
+
+    def test_max_hold_forces_close_of_open_trade(self):
+        # OANDA has no concept of a bar-count-based exit — the runner
+        # enforces `spec.exit.max_hold_bars` itself. When the open trade
+        # has been held longer than max_hold * granularity, force-close.
+        now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+        # max_hold_bars=5, granularity=60s → 300s limit. Entry was 400s
+        # ago → over the limit.
+        entry_ts = now - timedelta(seconds=400)
+        strategy = _make_strategy(signals=[0, 0, 0], max_hold_bars=5)
+        candles_df = _mk_candles_df(3, now)
+        fetch = MagicMock(return_value=candles_df)
+
+        client = MagicMock()
+        client.get_position.return_value = {"long_units": 10_000, "short_units": 0}
+        client.close_all_positions.return_value = {
+            "long_realized_pnl": 3.30,
+            "short_realized_pnl": 0.0,
+        }
+        open_trade = SimpleNamespace(
+            id="tr_open",
+            run_id="run_test",
+            entry_price=1.10,
+            quantity=10_000,
+            entry_timestamp=entry_ts,
+            exit_timestamp=None,
+            pnl=None,
+            pnl_pct=None,
+            exit_price=None,
+        )
+        db = MagicMock()
+        _set_open_trade(db, open_trade)
+        # Second query (inside _close_position_and_persist) fetches all
+        # open trades to update — reuse the same row via .all().
+        db.query.return_value.filter.return_value.all.return_value = [open_trade]
+        run = _make_run()
+
+        _signal_tick(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=now,
+        )
+
+        client.close_all_positions.assert_called_once_with("EUR_USD")
+        added = [c.args[0] for c in db.add.call_args_list]
+        decisions = [r for r in added if type(r).__name__ == "DecisionLog"]
+        closed = [d for d in decisions if d.action == "USER_POSITION_CLOSED"]
+        assert closed
+        assert "max_hold_bars=5" in closed[0].reasoning_text
+
+    def test_opposite_signal_false_holds_through_opposite_cross(self):
+        # DSL with `opposite_signal: false` (Wilson's genome 019_028
+        # config) — an opposite cross while holding is ignored, position
+        # keeps riding until stop/target/max_hold fires. Verifies the
+        # runner mirrors backtest's opposite_signal behavior.
+        strategy = _make_strategy(signals=[0, 0, -1], opposite_signal=False)
+        candles_df = _mk_candles_df(3, datetime(2026, 7, 10, 12, 0, tzinfo=UTC))
+        fetch = MagicMock(return_value=candles_df)
+
+        client = MagicMock()
+        client.get_position.return_value = {"long_units": 10_000, "short_units": 0}
+        db = MagicMock()
+        _set_open_trade(db, None)
+        run = _make_run()
+
+        _signal_tick(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=datetime(2026, 7, 10, 12, 0, tzinfo=UTC),
+        )
+
+        # Opposite cross ignored — no order, no close.
+        client.place_market_order.assert_not_called()
+        client.close_all_positions.assert_not_called()
+        added = [c.args[0] for c in db.add.call_args_list]
+        assert not any(type(r).__name__ == "DecisionLog" for r in added)
 
     def test_stale_candles_skip_signal_and_log(self):
         # Latest bar 3 minutes old (180s) vs the new threshold
@@ -435,9 +506,10 @@ class TestSignalTick:
         assert any(d.action == "USER_SIGNAL_SKIPPED_STALE" for d in decisions)
 
     def test_two_step_flip_closes_first(self):
-        # Existing long +10k, signal says short → close first, don't
+        # Existing long +10k, fresh short cross fires with
+        # `opposite_signal=True` (mock default) → close first, don't
         # place yet. Next tick will open the short.
-        strategy = _make_strategy(signals=[1, 1, -1])
+        strategy = _make_strategy(signals=[0, 0, -1])
         candles_df = _mk_candles_df(3, datetime(2026, 7, 10, 12, 0, tzinfo=UTC))
         fetch = MagicMock(return_value=candles_df)
 
@@ -448,6 +520,9 @@ class TestSignalTick:
             "short_realized_pnl": 0.0,
         }
         db = MagicMock()
+        # No expired-max-hold trade, so the max_hold check is a no-op
+        # and the flip path fires.
+        _set_open_trade(db, None)
         db.query.return_value.filter.return_value.all.return_value = []
 
         run = _make_run()
