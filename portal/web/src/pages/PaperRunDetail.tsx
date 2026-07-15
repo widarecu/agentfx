@@ -602,7 +602,12 @@ export default function PaperRunDetail() {
         <div className="text-sm font-semibold mb-2">
           Trades{trades.length > 0 && ` (${trades.length})`}
         </div>
-        <PaperRunTradesTable trades={trades} />
+        <PaperRunTradesTable
+          trades={trades}
+          latestClose={
+            candles.length > 0 ? candles[candles.length - 1].close : null
+          }
+        />
       </div>
 
       <div className="mt-6 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">

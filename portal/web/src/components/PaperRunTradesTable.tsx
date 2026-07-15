@@ -13,9 +13,18 @@ import { formatUTC } from '../utils/time';
 
 interface PaperRunTradesTableProps {
   trades: PaperTradePublic[];
+  /** Latest closed-bar price for the run's instrument. When provided,
+   *  open trades render an approximate unrealized PnL in the P&L
+   *  column with an "unrealized" badge. Approximate because it uses
+   *  the latest bar close (mid) rather than the broker's live bid/ask
+   *  spread — off by ~1 pip for majors. */
+  latestClose?: number | null;
 }
 
-export function PaperRunTradesTable({ trades }: PaperRunTradesTableProps) {
+export function PaperRunTradesTable({
+  trades,
+  latestClose,
+}: PaperRunTradesTableProps) {
   if (trades.length === 0) {
     return (
       <div className="text-xs text-slate-500 dark:text-slate-400 italic">
@@ -44,7 +53,18 @@ export function PaperRunTradesTable({ trades }: PaperRunTradesTableProps) {
         <tbody>
           {trades.map((t) => {
             const open = t.exit_timestamp === null;
-            const pnl = t.pnl;
+            // Realised PnL for closed trades; approximate unrealised
+            // for open trades (latest bar close vs entry, ignoring
+            // spread — off by ~1 pip on majors).
+            let pnl: number | null;
+            let pnlIsUnrealized = false;
+            if (open && latestClose != null) {
+              const sign = t.side === 'buy' ? 1 : -1;
+              pnl = (latestClose - t.entry_price) * t.quantity * sign;
+              pnlIsUnrealized = true;
+            } else {
+              pnl = t.pnl;
+            }
             const pnlClass =
               pnl == null
                 ? 'text-slate-500'
@@ -89,7 +109,21 @@ export function PaperRunTradesTable({ trades }: PaperRunTradesTableProps) {
                   {t.exit_price != null ? t.exit_price.toFixed(5) : '—'}
                 </td>
                 <td className={`py-1.5 pr-3 text-right font-mono text-xs ${pnlClass}`}>
-                  {pnl != null ? pnl.toFixed(2) : '—'}
+                  {pnl != null ? (
+                    <>
+                      {pnl.toFixed(2)}
+                      {pnlIsUnrealized && (
+                        <span
+                          className="ml-1 text-[10px] uppercase italic font-sans text-amber-600 dark:text-amber-400"
+                          title="Approximate — latest bar close vs entry, ignoring spread"
+                        >
+                          unrealised
+                        </span>
+                      )}
+                    </>
+                  ) : (
+                    '—'
+                  )}
                 </td>
                 <td className="py-1.5 pr-3">
                   {t.origin && (
