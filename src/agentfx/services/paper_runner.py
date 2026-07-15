@@ -889,13 +889,24 @@ def _signal_tick(
         entry_timestamp=now_utc,
         signal_reason=signal_reason,
     )
+    # Sizing trace so the operator can audit `why this many units` at
+    # a glance — surface balance × risk_pct / (stop × pip_value) plus
+    # the account currency and conversion rate used. Full breakdown
+    # goes to outputs_json for programmatic inspection.
+    sizing_note = (
+        f"{sizing.balance:.2f} {sizing.account_currency} × {sizing.risk_pct} "
+        f"/ ({sizing.stop_pips}pip × {sizing.pip_value_account:.6f}) = "
+        f"{sizing.desired_units}"
+    )
+    if sizing.capped_units < sizing.desired_units:
+        sizing_note += f" → capped at {sizing.capped_units}"
     _write_decision(
         db,
         run,
         action="USER_ORDER_PLACED",
         reason=(
             f"{signal_direction.upper()} {abs(filled_units)} {instrument} "
-            f"@ {fill_price:.5f} ({signal_reason})"
+            f"@ {fill_price:.5f} ({signal_reason}) | sizing: {sizing_note}"
         ),
         outputs={
             "paper_run_id": run.id,
@@ -904,6 +915,17 @@ def _signal_tick(
             "fill_price": fill_price,
             "broker_trade_id": trade_id,
             "signal_reason": signal_reason,
+            "sizing": {
+                "balance": sizing.balance,
+                "account_currency": sizing.account_currency,
+                "risk_pct": sizing.risk_pct,
+                "stop_pips": sizing.stop_pips,
+                "pip_value_account": sizing.pip_value_account,
+                "quote_to_account_rate": sizing.quote_to_account_rate,
+                "desired_units": sizing.desired_units,
+                "capped_units": sizing.capped_units,
+                "safety_cap": sizing.safety_cap,
+            },
         },
     )
     _persist_equity_snapshot(db=db, run=run, position=position, now_utc=now_utc)
