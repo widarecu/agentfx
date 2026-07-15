@@ -438,17 +438,34 @@ class OandaClient:
 
         OANDA's v20 API distinguishes long and short — a hedged
         instrument can have both open at once. We close both in a
-        single request. Sides with no exposure are silently skipped
-        by OANDA (they return 200 with no fill), so this is safe on a
-        flat account.
+        single request.
+
+        Reality-check (Wilson UAT 2026-07-15): the earlier docstring
+        claimed OANDA silently skips empty sides. Wrong. OANDA returns
+        HTTP 400 with `CLOSEOUT_POSITION_DOESNT_EXIST` when neither
+        side has exposure. That's not an error from our perspective —
+        we asked "make sure it's flat" and it is flat — so we swallow
+        this specific rejection and return a zero-fill result.
         """
         aid = self._resolve_account_id(account_id)
         instrument_norm = to_oanda_instrument(instrument)
-        resp = self._request(
-            "PUT",
-            f"/accounts/{aid}/positions/{instrument_norm}/close",
-            json_body={"longUnits": "ALL", "shortUnits": "ALL"},
-        )
+        try:
+            resp = self._request(
+                "PUT",
+                f"/accounts/{aid}/positions/{instrument_norm}/close",
+                json_body={"longUnits": "ALL", "shortUnits": "ALL"},
+            )
+        except OandaError as exc:
+            # Only swallow the "nothing to close" case; any other 4xx/5xx
+            # is a real problem the caller must see.
+            if "CLOSEOUT_POSITION_DOESNT_EXIST" in str(exc):
+                return {
+                    "long_realized_pnl": 0.0,
+                    "short_realized_pnl": 0.0,
+                    "long_units_closed": 0,
+                    "short_units_closed": 0,
+                }
+            raise
         long_fill = resp.get("longOrderFillTransaction") or {}
         short_fill = resp.get("shortOrderFillTransaction") or {}
         return {

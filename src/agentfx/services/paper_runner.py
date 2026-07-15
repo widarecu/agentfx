@@ -575,6 +575,48 @@ def _signal_tick(
                 entry_ts_early = entry_ts_early.replace(tzinfo=UTC)
             held_seconds_early = (now_utc - entry_ts_early).total_seconds()
             if held_seconds_early >= max_hold_bars_early * granularity_seconds:
+                # Before calling close, check whether OANDA still has a
+                # position. If the broker's SL/TP fired between ticks
+                # while we weren't watching (Wilson UAT 2026-07-15:
+                # stale-guard blocked reconciliation overnight, then
+                # max_hold expired), calling close_all_positions would
+                # spam OANDA with CLOSEOUT_POSITION_DOESNT_EXIST rejects
+                # every tick. Instead, mark the trade as broker-closed
+                # (we can't distinguish stop vs target without recent
+                # candle data — reconciler handles that separately).
+                pos_early = client.get_position(instrument)
+                net_early = int(pos_early.get("long_units", 0) or 0) + int(
+                    pos_early.get("short_units", 0) or 0
+                )
+                if net_early == 0:
+                    open_trade_early.exit_timestamp = now_utc
+                    if open_trade_early.exit_price is None:
+                        open_trade_early.exit_price = float(
+                            open_trade_early.entry_price
+                        )
+                    if open_trade_early.pnl is None:
+                        open_trade_early.pnl = 0.0
+                    open_trade_early.exit_reason = "broker_other"
+                    db.commit()
+                    _write_decision(
+                        db,
+                        run,
+                        action="USER_POSITION_CLOSED",
+                        reason=(
+                            f"max_hold check found OANDA position already 0 — "
+                            f"broker closed trade {open_trade_early.id} while "
+                            f"runner was blocked (stale/restart). Marked as "
+                            f"broker_other; actual fill detail lost to time."
+                        ),
+                        outputs={
+                            "paper_run_id": run.id,
+                            "trade_id": open_trade_early.id,
+                            "exit_reason": "broker_other",
+                            "held_seconds": int(held_seconds_early),
+                        },
+                    )
+                    return
+                # Position still exists → normal max_hold force-close.
                 _close_position_and_persist(
                     db=db,
                     run=run,
