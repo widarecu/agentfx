@@ -223,12 +223,18 @@ class TestPaperRunnerFullCycle:
         strategy = compile_spec(spec, pip_size=pip_size_for_pair("EUR_USD"))
 
         client = MagicMock()
-        client.get_account_balance.return_value = {"balance": 10_000.0}
+        client.get_account_balance.return_value = {
+            "balance": 10_000.0,
+            "currency": "USD",
+        }
         client.get_position.return_value = {"long_units": 0, "short_units": 0}
+        # v0.6.1 dynamic sizing: $10k × 0.005 / (100pip × 0.0001) = 5000
+        # units. Mock echoes exactly what the runner sent so the Trade
+        # row's quantity reflects the runner's actual computation.
         client.place_market_order.return_value = {
             "trade_id": "broker_trade_1",
             "fill_price": 1.0900,
-            "units": 10_000,
+            "units": 5_000,
         }
 
         # Anchor the clock 30 seconds after the newest seeded bar so:
@@ -258,7 +264,8 @@ class TestPaperRunnerFullCycle:
         assert len(trades) == 1
         trade = trades[0]
         assert trade.side == "buy"
-        assert trade.quantity == 10_000
+        # v0.6.1 dynamic sizing: risk_pct × balance / (stop × pip_value).
+        assert trade.quantity == 5_000
         assert trade.entry_price == pytest.approx(1.0900)
         assert trade.origin == "live"
         assert trade.signal_reason is not None
@@ -489,7 +496,8 @@ class TestPaperRunnerFullCycle:
         assert len(opened_trades) >= 1
         first_trade = opened_trades[0]
         assert first_trade.entry_price == pytest.approx(FILL_PRICE)
-        assert first_trade.quantity == 10_000
+        # v0.6.1 dynamic sizing: $10k × 0.005 / (100 × 0.0001) = 5000.
+        assert first_trade.quantity == 5_000
         assert first_trade.origin == "live"
 
         # At least one trade got closed via the signal-flip path.
