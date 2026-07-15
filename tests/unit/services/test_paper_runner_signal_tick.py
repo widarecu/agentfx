@@ -177,10 +177,20 @@ def _make_strategy(
 def _set_open_trade(db: MagicMock, trade: object | None) -> None:
     """Wire the DB mock so `db.query(Trade).filter(...).order_by(...).first()`
     returns `trade` (or None to signal no open trade). The runner's
-    max_hold check runs this chain on every tick when there's an OANDA
-    position, so tests with a non-flat position must set it explicitly.
+    max_hold + broker-reconcile paths run this chain on every tick,
+    so tests must set it explicitly. Called automatically by
+    `_make_db()` — use directly only to override the None default.
     """
     db.query.return_value.filter.return_value.order_by.return_value.first.return_value = trade
+
+
+def _make_db() -> MagicMock:
+    """MagicMock() + default `_set_open_trade(None)` so the runner's
+    time-based-exit query doesn't fetch a Mock instead of a Trade row.
+    """
+    db = MagicMock()
+    _set_open_trade(db, None)
+    return db
 
 
 def _mk_candles_df(bars: int, latest_ts: datetime) -> pd.DataFrame:
@@ -218,7 +228,7 @@ class TestSignalTick:
             "fill_price": 1.1005,
             "units": 10_000,
         }
-        db = MagicMock()
+        db = _make_db()
         run = _make_run()
 
         _signal_tick(
@@ -272,7 +282,7 @@ class TestSignalTick:
 
         client = MagicMock()
         client.get_position.return_value = {"long_units": 0, "short_units": 0}
-        db = MagicMock()
+        db = _make_db()
         _set_open_trade(db, None)
         run = _make_run()
 
@@ -303,7 +313,7 @@ class TestSignalTick:
 
         client = MagicMock()
         client.get_position.return_value = {"long_units": 10_000, "short_units": 0}
-        db = MagicMock()
+        db = _make_db()
         # No open Trade row → max_hold check is a no-op.
         _set_open_trade(db, None)
         run = _make_run()
@@ -354,7 +364,7 @@ class TestSignalTick:
             pnl_pct=None,
             exit_price=None,
         )
-        db = MagicMock()
+        db = _make_db()
         _set_open_trade(db, open_trade)
         # Second query (inside _close_position_and_persist) fetches all
         # open trades to update — reuse the same row via .all().
@@ -390,7 +400,7 @@ class TestSignalTick:
 
         client = MagicMock()
         client.get_position.return_value = {"long_units": 10_000, "short_units": 0}
-        db = MagicMock()
+        db = _make_db()
         _set_open_trade(db, None)
         run = _make_run()
 
@@ -422,7 +432,7 @@ class TestSignalTick:
         fetch = MagicMock(return_value=stale_df)
 
         client = MagicMock()
-        db = MagicMock()
+        db = _make_db()
         run = _make_run()
 
         _signal_tick(
@@ -461,7 +471,7 @@ class TestSignalTick:
 
         client = MagicMock()
         client.get_position.return_value = {"long_units": 0, "short_units": 0}
-        db = MagicMock()
+        db = _make_db()
         run = _make_run()
 
         _signal_tick(
@@ -489,7 +499,7 @@ class TestSignalTick:
         fetch = MagicMock(return_value=empty_df)
 
         client = MagicMock()
-        db = MagicMock()
+        db = _make_db()
         run = _make_run()
 
         _signal_tick(
@@ -522,7 +532,7 @@ class TestSignalTick:
             "long_realized_pnl": 5.0,
             "short_realized_pnl": 0.0,
         }
-        db = MagicMock()
+        db = _make_db()
         # No expired-max-hold trade, so the max_hold check is a no-op
         # and the flip path fires.
         _set_open_trade(db, None)
@@ -555,7 +565,7 @@ class TestSignalTick:
             "fill_price": 1.1010,
             "units": 5000,
         }
-        db = MagicMock()
+        db = _make_db()
         run = _make_run()
         run.risk_config = {
             "max_position_size_units": 5000,
@@ -621,7 +631,7 @@ class TestExecuteLoopSignalIntegration:
             "fill_price": 1.10,
             "units": 10_000,
         }
-        db = MagicMock()
+        db = _make_db()
         strategy = _make_strategy(signals=[0, 0, 1])
 
         # Feed a clock that starts BEFORE a boundary and advances past

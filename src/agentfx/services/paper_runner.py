@@ -545,12 +545,51 @@ def _signal_tick(
     mocked candles + mocked OandaClient. Errors bubble to
     `_execute_loop` which logs and continues.
     """
-    from agentfx.api.models import RunStatus
+    from agentfx.api.models import RunStatus, Trade
 
     if run.status != RunStatus.RUNNING:
         return
 
     granularity = _seconds_to_granularity(granularity_seconds)
+
+    # Wall-clock max_hold check FIRST — doesn't need candles, so it
+    # fires regardless of stale-guard state. Bug caught 2026-07-15
+    # (Wilson): trade 2 was overdue for max_hold force-close but the
+    # stale-guard tripped 12× overnight and blocked the check because
+    # it lived after `candle_fetch_fn`. Time-based exits shouldn't
+    # depend on fresh candle ingestion.
+    exit_rules_early = getattr(strategy, "spec", None)
+    max_hold_bars_early: int | None = None
+    if exit_rules_early is not None and exit_rules_early.exit is not None:
+        max_hold_bars_early = int(exit_rules_early.exit.max_hold_bars)
+    if max_hold_bars_early is not None:
+        open_trade_early = (
+            db.query(Trade)
+            .filter(Trade.run_id == run.id, Trade.exit_timestamp.is_(None))
+            .order_by(Trade.entry_timestamp.asc())
+            .first()
+        )
+        if open_trade_early is not None:
+            entry_ts_early = open_trade_early.entry_timestamp
+            if entry_ts_early.tzinfo is None:
+                entry_ts_early = entry_ts_early.replace(tzinfo=UTC)
+            held_seconds_early = (now_utc - entry_ts_early).total_seconds()
+            if held_seconds_early >= max_hold_bars_early * granularity_seconds:
+                _close_position_and_persist(
+                    db=db,
+                    run=run,
+                    client=client,
+                    instrument=instrument,
+                    now_utc=now_utc,
+                    reason=(
+                        f"max_hold_bars={max_hold_bars_early} exceeded "
+                        f"(held for {int(held_seconds_early)}s vs limit "
+                        f"{max_hold_bars_early * granularity_seconds}s)"
+                    ),
+                    exit_reason="max_hold",
+                )
+                return
+
     df = candle_fetch_fn(instrument, granularity, DEFAULT_LOOKBACK_BARS)
 
     # Stale-candle guard. Ingestion outages (weekend, OANDA maintenance,
@@ -647,50 +686,18 @@ def _signal_tick(
             run=run,
             strategy=strategy,
             latest_close=float(df["close"].iloc[-1]),
+            latest_high=float(df["high"].iloc[-1]),
+            latest_low=float(df["low"].iloc[-1]),
             now_utc=now_utc,
         )
 
-    # Time-based exit check. Backtest applies `max_hold_bars` inside
-    # `_apply_exits`; OANDA has no equivalent, so the runner must
-    # enforce it. If we have an open trade whose age exceeds
-    # `max_hold_bars * granularity`, force-close now. Runs BEFORE the
-    # entry check so a max_hold expiry + fresh cross same-tick closes
-    # first (next tick opens the new side, matching backtest's
-    # "same-bar exit + re-entry" semantics for opposite-direction
-    # crosses).
-    exit_rules = getattr(strategy, "spec", None)
-    max_hold_bars: int | None = None
-    if exit_rules is not None and exit_rules.exit is not None:
-        max_hold_bars = int(exit_rules.exit.max_hold_bars)
-    if max_hold_bars is not None and net_units != 0:
-        from agentfx.api.models import Trade
+    # (max_hold check now happens at the top of _signal_tick before
+    # the stale-guard, so it fires on wall-clock regardless of ingest
+    # state — see the early hoist above.)
 
-        open_trade = (
-            db.query(Trade)
-            .filter(Trade.run_id == run.id, Trade.exit_timestamp.is_(None))
-            .order_by(Trade.entry_timestamp.asc())
-            .first()
-        )
-        if open_trade is not None:
-            entry_ts = open_trade.entry_timestamp
-            if entry_ts.tzinfo is None:
-                entry_ts = entry_ts.replace(tzinfo=UTC)
-            held_seconds = (now_utc - entry_ts).total_seconds()
-            if held_seconds >= max_hold_bars * granularity_seconds:
-                _close_position_and_persist(
-                    db=db,
-                    run=run,
-                    client=client,
-                    instrument=instrument,
-                    now_utc=now_utc,
-                    reason=(
-                        f"max_hold_bars={max_hold_bars} exceeded "
-                        f"(held for {int(held_seconds)}s vs limit "
-                        f"{max_hold_bars * granularity_seconds}s)"
-                    ),
-                    exit_reason="max_hold",
-                )
-                return
+    # `exit_rules` is needed further down for opposite_signal + DSL
+    # SL/TP fallback; re-bind here so the naming stays local.
+    exit_rules = exit_rules_early
 
     # No entry event at the latest bar → nothing to do. Silent no-op
     # (health polls would spam a decision log otherwise); snapshot
@@ -849,6 +856,8 @@ def _reconcile_broker_side_close(
     run,
     strategy,
     latest_close: float,
+    latest_high: float,
+    latest_low: float,
     now_utc: datetime,
 ) -> None:
     """Detect and reconcile a broker-side SL/TP fill.
@@ -860,10 +869,13 @@ def _reconcile_broker_side_close(
     writes a USER_POSITION_CLOSED decision log so the timeline shows
     the exit.
 
-    Classification: compare `latest_close` (proxy for fill price) to
-    the strategy's stop/target pip distances from entry. Whichever is
-    closer wins; if neither is within one pip, fall back to
-    'broker_other' (rare — usually manual close on the OANDA side).
+    Classification uses the latest bar's HIGH-LOW range: if the range
+    contains the expected stop or target level, that level was
+    touched intraday and OANDA's SL/TP would have fired. Much more
+    robust than the earlier "close-price-with-2-pip-tolerance"
+    approach — Wilson UAT 2026-07-15 hit a stop where the bar close
+    was 21 pips below the stop level (fired mid-bar, price bounced),
+    causing 'broker_other' misclassification.
     """
     from agentfx.api.models import Trade
 
@@ -895,27 +907,50 @@ def _reconcile_broker_side_close(
         if is_long
         else entry_price - target_pips * pip_size
     )
-    # Whichever expected level `latest_close` is closer to wins. If
-    # both are farther than 1 pip, fallback (broker-side manual close,
-    # unusual fill, etc.).
-    dist_stop = abs(latest_close - stop_price)
-    dist_target = abs(latest_close - target_price)
-    one_pip = pip_size
-    if dist_stop < dist_target and dist_stop <= 2 * one_pip:
+
+    # A level was "touched" in the latest bar if it falls inside the
+    # bar's high-low range. That's the condition OANDA's SL/TP order
+    # actually watches — it fires on any tick that crosses the level,
+    # not on bar close.
+    if is_long:
+        stop_hit = latest_low <= stop_price  # long SL is below entry
+        target_hit = latest_high >= target_price  # long TP is above entry
+    else:
+        stop_hit = latest_high >= stop_price  # short SL is above entry
+        target_hit = latest_low <= target_price  # short TP is below entry
+
+    if stop_hit and not target_hit:
         classified = "stop"
-    elif dist_target <= dist_stop and dist_target <= 2 * one_pip:
+        exit_price_est = stop_price
+    elif target_hit and not stop_hit:
         classified = "target"
+        exit_price_est = target_price
+    elif stop_hit and target_hit:
+        # Both levels in the same bar (rare, high-vol). Tie-break by
+        # whichever level is closer to the bar close — assumes the
+        # fill happened before the price kept moving.
+        dist_stop = abs(latest_close - stop_price)
+        dist_target = abs(latest_close - target_price)
+        if dist_stop < dist_target:
+            classified = "stop"
+            exit_price_est = stop_price
+        else:
+            classified = "target"
+            exit_price_est = target_price
     else:
         classified = "broker_other"
+        exit_price_est = latest_close
 
     # Approximate pnl in account currency: (exit - entry) * qty for
     # long; (entry - exit) * qty for short. Same shape as the
     # backtest engine's per-trade calc — good enough for the chart
     # marker + trades table. Broker's exact pnl would need a
     # transaction-history query.
-    signed_move = latest_close - entry_price if is_long else entry_price - latest_close
+    signed_move = (
+        exit_price_est - entry_price if is_long else entry_price - exit_price_est
+    )
     open_trade.exit_timestamp = now_utc
-    open_trade.exit_price = latest_close
+    open_trade.exit_price = exit_price_est
     open_trade.pnl = signed_move * float(open_trade.quantity)
     open_trade.pnl_pct = (
         (open_trade.pnl / (entry_price * float(open_trade.quantity))) * 100
@@ -931,14 +966,14 @@ def _reconcile_broker_side_close(
         action="USER_POSITION_CLOSED",
         reason=(
             f"broker-side {classified} fill detected — trade {open_trade.id} "
-            f"closed at ~{latest_close:.5f} (entry {entry_price:.5f}), "
+            f"closed at ~{exit_price_est:.5f} (entry {entry_price:.5f}), "
             f"pnl ~{open_trade.pnl:.2f}"
         ),
         outputs={
             "paper_run_id": run.id,
             "trade_id": open_trade.id,
             "exit_reason": classified,
-            "exit_price": latest_close,
+            "exit_price": exit_price_est,
             "pnl": open_trade.pnl,
         },
     )
