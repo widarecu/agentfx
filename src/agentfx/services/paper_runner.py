@@ -504,9 +504,20 @@ def _execute_loop(
                     "paper runner: signal tick failed on %s; skipping this bar",
                     run.id,
                 )
-            next_signal_at = align_to_granularity(
-                now + granularity_seconds, granularity_seconds
-            )
+            # Advance to the NEXT boundary strictly after `now`.
+            # `align_to_granularity` handles both cases: if `now` is
+            # exactly on a boundary it returns `now + granularity` (so
+            # we don't re-fire the current tick); otherwise it rounds
+            # up to the next boundary.
+            #
+            # BUG FIXED 2026-07-15 (Wilson UAT): previously we did
+            # `align(now + granularity, granularity)` — that overshoots
+            # by one bar. If tick fires at 12:47:00.230, `now + 60` is
+            # 12:48:00.230 which rounds up to 12:49:00 — skipping the
+            # 12:48 boundary. Result: every M1 tick was on 2-minute
+            # cadence, missing half the signals. Wilson lost the 13:03
+            # MACD cross_up because the 13:06 catch-up tick was skipped.
+            next_signal_at = align_to_granularity(now, granularity_seconds)
 
         # Cadence — health tick every 5s, or sooner if the next signal
         # tick is closer. Injectable `sleep_fn` so tests skip the wait

@@ -686,3 +686,92 @@ class TestExecuteLoopSignalIntegration:
 
         # Only one broker order placement across the two iterations.
         assert client.place_market_order.call_count == 1
+
+    def test_signal_tick_advances_to_next_boundary_not_two_ahead(self):
+        """Regression for the 2-minute-cadence bug (Wilson UAT 2026-07-15).
+
+        The scheduler previously computed `next_signal_at =
+        align_to_granularity(now + granularity_seconds, granularity_seconds)`
+        which, when a tick fired a few ms past the boundary (typical:
+        ~230ms of processing latency), overshot by a full bar. Every
+        M1 tick would then fire every OTHER minute, skipping half the
+        signals. This test locks in that the scheduler advances by
+        exactly one granularity even when the tick's actual firing
+        time is slightly past the previous boundary.
+        """
+        from agentfx.api.models import RunStatus
+
+        run = SimpleNamespace(
+            id="run_test",
+            pair="EUR_USD",
+            user_id=1,
+            snapshot_balance=10_000.0,
+            current_balance=10_000.0,
+            pnl=0.0,
+            kill_requested_at=None,
+            risk_config={
+                "daily_loss_pct": 2.0,
+                "kill_switch_dd_pct": 5.0,
+            },
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+        )
+        client = MagicMock()
+        client.get_account_balance.return_value = {
+            "balance": 10_000.0,
+            "currency": "USD",
+        }
+        client.get_position.return_value = {"long_units": 0, "short_units": 0}
+        client.place_market_order.return_value = {
+            "trade_id": "t",
+            "fill_price": 1.10,
+            "units": 5_000,
+        }
+        db = _make_db()
+        strategy = _make_strategy(signals=[0, 0, 0])
+        candles_df = _mk_candles_df(3, datetime.now(UTC))
+        fetch = MagicMock(return_value=candles_df)
+
+        # Clock: initial align at t=100 → next_signal_at=120. First iter
+        # sees now=120.230 (past boundary, tick fires with 230ms of
+        # jitter). Next iter is at 180 (should be inside the next
+        # boundary at 180). Under the old bug, next_signal_at would
+        # advance to 240 instead of 180, and the second iter would
+        # NOT fire the tick at 180.
+        clock = iter(
+            [
+                100.0,  # initial align_to_granularity call
+                120.230,  # iter 1 "now" (past 120 boundary with jitter)
+                120.230,  # iter 1 sleep calc
+                180.0,  # iter 2 "now" (exactly on 180 boundary — should fire)
+                180.0,  # iter 2 sleep calc
+            ]
+        )
+
+        def now_fn() -> float:
+            return next(clock)
+
+        _execute_loop(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_fn=now_fn,
+            sleep_fn=MagicMock(),
+            max_iterations=2,
+        )
+
+        # Signal tick evaluates on BOTH iterations (nothing placed
+        # because signals=[0,0,0] but the tick fires). We verify this
+        # via equity-snapshot writes: my code snapshots equity on
+        # every silent no-op tick.
+        added = [c.args[0] for c in db.add.call_args_list]
+        snapshots = [r for r in added if type(r).__name__ == "PaperEquitySnapshot"]
+        assert len(snapshots) == 2, (
+            f"expected 2 signal ticks (120 + 180), got {len(snapshots)} — "
+            "the 2-minute-cadence bug is back"
+        )
