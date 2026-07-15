@@ -19,12 +19,28 @@ interface PaperRunTradesTableProps {
    *  the latest bar close (mid) rather than the broker's live bid/ask
    *  spread — off by ~1 pip for majors. */
   latestClose?: number | null;
+  /** Instrument symbol (e.g. "EUR_USD" or "USD_JPY") — used to pick
+   *  pip size for the pip-move display (0.01 for JPY-quoted pairs,
+   *  0.0001 otherwise). Falls back to 0.0001 (majors) when absent. */
+  instrument?: string | null;
+}
+
+/** Pip size in the instrument's quote currency. Mirrors
+ *  `pip_size_for_pair` on the runner side; kept small + duplicated so
+ *  the table has no cross-module dep. */
+function pipSizeFor(instrument: string | null | undefined): number {
+  if (!instrument) return 0.0001;
+  const parts = instrument.toUpperCase().replace('/', '_').split('_');
+  if (parts.length !== 2) return 0.0001;
+  return parts[1] === 'JPY' ? 0.01 : 0.0001;
 }
 
 export function PaperRunTradesTable({
   trades,
   latestClose,
+  instrument,
 }: PaperRunTradesTableProps) {
+  const pipSize = pipSizeFor(instrument);
   if (trades.length === 0) {
     return (
       <div className="text-xs text-slate-500 dark:text-slate-400 italic">
@@ -53,17 +69,25 @@ export function PaperRunTradesTable({
         <tbody>
           {trades.map((t) => {
             const open = t.exit_timestamp === null;
+            const sign = t.side === 'buy' ? 1 : -1;
             // Realised PnL for closed trades; approximate unrealised
             // for open trades (latest bar close vs entry, ignoring
             // spread — off by ~1 pip on majors).
             let pnl: number | null;
             let pnlIsUnrealized = false;
+            // Pip move: (exit - entry) × side, in pip units. For open
+            // trades derived from latestClose the same way pnl$ is.
+            // Nulls out cleanly when we don't have a closing price.
+            let pipMove: number | null = null;
             if (open && latestClose != null) {
-              const sign = t.side === 'buy' ? 1 : -1;
               pnl = (latestClose - t.entry_price) * t.quantity * sign;
+              pipMove = ((latestClose - t.entry_price) * sign) / pipSize;
               pnlIsUnrealized = true;
             } else {
               pnl = t.pnl;
+              if (t.exit_price != null) {
+                pipMove = ((t.exit_price - t.entry_price) * sign) / pipSize;
+              }
             }
             const pnlClass =
               pnl == null
@@ -111,14 +135,20 @@ export function PaperRunTradesTable({
                 <td className={`py-1.5 pr-3 text-right font-mono text-xs ${pnlClass}`}>
                   {pnl != null ? (
                     <>
-                      {pnl.toFixed(2)}
+                      <div>{pnl.toFixed(2)}</div>
+                      {pipMove != null && (
+                        <div className="text-[10px] opacity-70">
+                          {pipMove >= 0 ? '+' : ''}
+                          {pipMove.toFixed(1)} pips
+                        </div>
+                      )}
                       {pnlIsUnrealized && (
-                        <span
-                          className="ml-1 text-[10px] uppercase italic font-sans text-amber-600 dark:text-amber-400"
+                        <div
+                          className="text-[10px] uppercase italic font-sans text-amber-600 dark:text-amber-400"
                           title="Approximate — latest bar close vs entry, ignoring spread"
                         >
                           unrealised
-                        </span>
+                        </div>
                       )}
                     </>
                   ) : (

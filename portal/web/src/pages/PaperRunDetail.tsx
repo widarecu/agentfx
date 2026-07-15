@@ -607,6 +607,7 @@ export default function PaperRunDetail() {
           latestClose={
             candles.length > 0 ? candles[candles.length - 1].close : null
           }
+          instrument={run.instrument}
         />
       </div>
 
