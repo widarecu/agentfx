@@ -46,7 +46,12 @@ export function DeployPaperModal({
   const [name, setName] = useState<string>(
     `${item.instrument} ${item.granularity} — ${new Date().toISOString().slice(0, 10)}`,
   );
-  const [maxPositionSize, setMaxPositionSize] = useState<string>('10000');
+  // Safety cap only (v0.6.1). Blank = no cap; the runner sizes each
+  // trade off `strategy.spec.size.risk_pct × account_balance` (same
+  // formula backtest uses). Setting a value here just clamps the
+  // result — e.g. "never fire more than 500,000 units regardless of
+  // what the strategy asks for."
+  const [maxPositionSize, setMaxPositionSize] = useState<string>('');
   const [dailyLossPct, setDailyLossPct] = useState<string>('2.0');
   const [killDdPct, setKillDdPct] = useState<string>('5.0');
   // Broker-side SL/TP. Pre-populated from the strategy's DSL exit
@@ -248,10 +253,11 @@ export function DeployPaperModal({
 
             <div className="grid grid-cols-2 gap-4">
               <NumericField
-                label="Max position size (units)"
-                hint="= 10,000 is 1 standard lot"
+                label="Max position size (safety cap, units)"
+                hint="Blank = no cap. Runner sizes off strategy risk_pct × balance."
                 value={maxPositionSize}
                 onChange={setMaxPositionSize}
+                placeholder="e.g. 500000"
               />
               <NumericField
                 label="Daily loss threshold"
@@ -413,13 +419,17 @@ export function _buildRiskConfig(inputs: {
   takeProfitPips: string;
 }): Record<string, number> {
   const cfg: Record<string, number> = {
-    max_position_size_units: Math.max(
-      1,
-      Number(inputs.maxPositionSize) || 10000,
-    ),
     daily_loss_pct: Math.max(0.01, Number(inputs.dailyLossPct) || 2),
     kill_switch_dd_pct: Math.max(0.01, Number(inputs.killDdPct) || 5),
   };
+  // v0.6.1 (Wilson UAT 2026-07-15): max_position_size_units is a
+  // SAFETY CAP now, not the exact size. Blank input → omit the key
+  // entirely so runner treats as unbounded; the strategy's
+  // risk_pct × balance sizing kicks in.
+  const cap = Number(inputs.maxPositionSize);
+  if (inputs.maxPositionSize.trim() !== '' && Number.isFinite(cap) && cap > 0) {
+    cfg.max_position_size_units = cap;
+  }
   const sl = Number(inputs.stopLossPips);
   if (inputs.stopLossPips.trim() !== '' && Number.isFinite(sl) && sl > 0) {
     cfg.stop_loss_pips = sl;

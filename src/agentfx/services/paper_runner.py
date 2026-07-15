@@ -749,8 +749,9 @@ def _signal_tick(
         return
 
     # Fresh entry event. Decide against current OANDA position.
+    # (Sizing happens further down in the flat-position branch — it
+    # depends on OANDA balance + strategy risk_pct, not just a cap.)
     risk_cfg = run.risk_config or {}
-    max_units = int(risk_cfg.get("max_position_size_units", 10_000))
 
     same_direction = (net_units > 0 and signal_direction == "long") or (
         net_units < 0 and signal_direction == "short"
@@ -793,7 +794,6 @@ def _signal_tick(
         return
 
     # net_units == 0 AND raw_entry != 0 → fresh entry from flat.
-    signed_units = max_units if signal_direction == "long" else -max_units
     # Broker-side SL/TP: the strategy's DSL exit block is the source
     # of truth. The deploy modal pre-populates from these and the user
     # can override in `risk_config`. Runner falls back to the DSL
@@ -806,6 +806,62 @@ def _signal_tick(
             sl_pips = int(exit_rules.exit.stop_pips)
         if tp_pips is None:
             tp_pips = int(exit_rules.exit.target_pips)
+
+    # Dynamic position sizing (v0.6.1 UAT 2026-07-15 — Wilson):
+    # backtest already sizes each trade off risk_pct × balance
+    # (backtest.py::_dsl_position_size) with the running balance
+    # compounding across the run. Paper was using a static
+    # `max_position_size_units` (default 10k), completely ignoring
+    # risk_pct and account balance — a 100k account was 23× under-
+    # sized. Match backtest by computing units from risk_pct + current
+    # balance + stop distance + account-currency-aware pip value.
+    # `max_position_size_units` becomes a safety cap only.
+    from agentfx.services.paper_sizing import compute_position_units
+
+    account_summary = client.get_account_balance()
+    account_currency = str(account_summary.get("currency") or "USD")
+    balance_account = float(
+        account_summary.get("balance") or run.current_balance or 0.0
+    )
+    risk_pct_dsl = 0.005  # DSL grammar default (0.5%); backtest uses it too
+    if exit_rules is not None and getattr(exit_rules, "size", None) is not None:
+        risk_pct_dsl = float(exit_rules.size.risk_pct)
+    # `max_position_size_units` semantic change (v0.6.1): now a
+    # safety cap that never exceeds the DSL-driven size. Legacy runs
+    # written before this shipped default to 10k which under-caps
+    # any reasonably-sized account — treat 10k as "no cap set" so
+    # legacy runs get the correct dynamic size on their next order.
+    raw_cap = risk_cfg.get("max_position_size_units")
+    safety_cap = int(raw_cap) if raw_cap and int(raw_cap) > 10_000 else None
+    sizing = compute_position_units(
+        instrument=instrument,
+        balance=balance_account,
+        account_currency=account_currency,
+        risk_pct=risk_pct_dsl,
+        stop_pips=float(sl_pips or 0),
+        safety_cap_units=safety_cap,
+        client=client,
+    )
+    if sizing.capped_units <= 0:
+        _write_decision(
+            db,
+            run,
+            action="USER_SIGNAL_SKIPPED_STALE",
+            reason=(
+                f"sizing produced 0 units — {sizing.notes} "
+                f"(balance={sizing.balance:.2f} {sizing.account_currency}, "
+                f"risk_pct={sizing.risk_pct}, stop_pips={sizing.stop_pips}, "
+                f"pip_value={sizing.pip_value_account:.6f})"
+            ),
+            outputs={
+                "paper_run_id": run.id,
+                "sizing": sizing.__dict__,
+            },
+        )
+        return
+    signed_units = (
+        sizing.capped_units if signal_direction == "long" else -sizing.capped_units
+    )
 
     result = client.place_market_order(
         instrument,

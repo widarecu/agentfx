@@ -140,6 +140,7 @@ def _make_strategy(
     target_pips: int = 50,
     max_hold_bars: int = 600,
     opposite_signal: bool = True,
+    risk_pct: float = 0.005,
 ) -> SimpleNamespace:
     """A stand-in for `CompiledDSLStrategy`.
 
@@ -166,7 +167,8 @@ def _make_strategy(
         max_hold_bars=max_hold_bars,
         opposite_signal=opposite_signal,
     )
-    spec = SimpleNamespace(entry=entry, exit=exit_rules)
+    size_rules = SimpleNamespace(risk_pct=risk_pct)
+    spec = SimpleNamespace(entry=entry, exit=exit_rules, size=size_rules)
     return SimpleNamespace(
         generate_signals=_generate,
         raw_entry_signals=_generate,
@@ -223,10 +225,17 @@ class TestSignalTick:
 
         client = MagicMock()
         client.get_position.return_value = {"long_units": 0, "short_units": 0}
+        client.get_account_balance.return_value = {
+            "balance": 10_000.0,
+            "currency": "USD",
+        }
+        # v0.6.1 dynamic sizing (Wilson UAT 2026-07-15): balance $10k,
+        # risk_pct 0.005, stop 20 pips, EUR/USD pip $0.0001 →
+        # desired_units = 10000 * 0.005 / (20 * 0.0001) = 25000
         client.place_market_order.return_value = {
             "trade_id": "trade_broker_123",
             "fill_price": 1.1005,
-            "units": 10_000,
+            "units": 25_000,
         }
         db = _make_db()
         run = _make_run()
@@ -247,7 +256,7 @@ class TestSignalTick:
         # default stop_pips=20, target_pips=50.
         client.place_market_order.assert_called_once_with(
             "EUR_USD",
-            10_000,
+            25_000,
             stop_loss_pips=20,
             take_profit_pips=50,
         )
@@ -257,7 +266,7 @@ class TestSignalTick:
         assert len(trade_rows) == 1
         trade = trade_rows[0]
         assert trade.side == "buy"
-        assert trade.quantity == 10_000
+        assert trade.quantity == 25_000
         assert trade.entry_price == 1.1005
         assert trade.origin == "live"
         # v0.6.1 UAT enrichment (2026-07-13): signal_reason now includes
@@ -554,21 +563,29 @@ class TestSignalTick:
         client.place_market_order.assert_not_called()
 
     def test_stop_loss_and_take_profit_passed_through(self):
+        # SL/TP from risk_config override → passed through to the
+        # broker call. Sizing under the v0.6.1 dynamic model:
+        # balance $10k × 0.005 risk / (20 pip stop × $0.0001 pip) =
+        # 25,000 units. `max_position_size_units` unset (blank) so
+        # no safety cap kicks in.
         strategy = _make_strategy(signals=[0, 0, 1])
         candles_df = _mk_candles_df(3, datetime(2026, 7, 10, 12, 0, tzinfo=UTC))
         fetch = MagicMock(return_value=candles_df)
 
         client = MagicMock()
         client.get_position.return_value = {"long_units": 0, "short_units": 0}
+        client.get_account_balance.return_value = {
+            "balance": 10_000.0,
+            "currency": "USD",
+        }
         client.place_market_order.return_value = {
             "trade_id": "trade_sl_tp",
             "fill_price": 1.1010,
-            "units": 5000,
+            "units": 25_000,
         }
         db = _make_db()
         run = _make_run()
         run.risk_config = {
-            "max_position_size_units": 5000,
             "daily_loss_pct": 2.0,
             "kill_switch_dd_pct": 5.0,
             "stop_loss_pips": 20.0,
@@ -588,7 +605,7 @@ class TestSignalTick:
 
         client.place_market_order.assert_called_once_with(
             "EUR_USD",
-            5000,
+            25_000,
             stop_loss_pips=20.0,
             take_profit_pips=40.0,
         )
