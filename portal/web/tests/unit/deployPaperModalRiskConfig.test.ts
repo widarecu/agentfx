@@ -1,12 +1,13 @@
 /**
  * Vitest for `_buildRiskConfig` in DeployPaperModal (US-028).
  *
- * The critical invariant: empty SL/TP inputs must be OMITTED from
- * the payload — not sent as null/0/etc. — so the backend treats them
- * as "no broker-side SL/TP registered" and the strategy exits on
- * signal reversal (same as backtest). If we shipped `stop_loss_pips:
- * 0` the runner would try to place a zero-pip SL and the OANDA API
- * would reject the order.
+ * Critical invariants:
+ * - Empty SL/TP inputs must be OMITTED (not sent as null/0), so the
+ *   runner falls back to the strategy DSL's exit block.
+ * - v0.6.1 (Wilson UAT 2026-07-15): `max_position_size_units` is a
+ *   SAFETY CAP, not the primary sizing input. Empty/zero input
+ *   OMITS the field so the runner treats it as unbounded; the DSL's
+ *   risk_pct × balance formula owns actual sizing.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -73,21 +74,35 @@ describe('_buildRiskConfig', () => {
     expect(cfg).not.toHaveProperty('stop_loss_pips');
   });
 
-  it('clamps max_position_size_units to at least 1 on truthy sub-1 input', () => {
-    // Number('0.5') is truthy so the `|| 10000` fallback doesn't fire —
-    // Math.max(1, 0.5) then clamps to 1. Guards against a UX gotcha
-    // where a decimal fat-finger would silently reject the order.
+  it('emits max_position_size_units when a positive number is set', () => {
+    // Any positive input is forwarded verbatim as a safety cap.
+    const cfg = _buildRiskConfig({ ...baseline, maxPositionSize: '250000' });
+    expect(cfg.max_position_size_units).toBe(250000);
+  });
+
+  it('emits sub-1 positive input verbatim (backend clamps if needed)', () => {
+    // A decimal fat-finger like '0.5' still passes the >0 test. Backend
+    // policy layer decides whether to reject/clamp — the modal doesn't
+    // silently rewrite user intent.
     const cfg = _buildRiskConfig({ ...baseline, maxPositionSize: '0.5' });
-    expect(cfg.max_position_size_units).toBe(1);
+    expect(cfg.max_position_size_units).toBe(0.5);
   });
 
-  it('falls back to 10000 for a zero input (Number("0") is falsy)', () => {
+  it('omits max_position_size_units when input is zero', () => {
+    // 0 is not > 0 → cap intentionally not set → runner runs unbounded.
     const cfg = _buildRiskConfig({ ...baseline, maxPositionSize: '0' });
-    expect(cfg.max_position_size_units).toBe(10000);
+    expect(cfg).not.toHaveProperty('max_position_size_units');
   });
 
-  it('falls back to 10000 for empty maxPositionSize', () => {
+  it('omits max_position_size_units when input is blank', () => {
+    // Blank = "no safety cap set" — runner sizes purely from DSL
+    // risk_pct × balance. This is the new default post-v0.6.1.
     const cfg = _buildRiskConfig({ ...baseline, maxPositionSize: '' });
-    expect(cfg.max_position_size_units).toBe(10000);
+    expect(cfg).not.toHaveProperty('max_position_size_units');
+  });
+
+  it('omits max_position_size_units when input is non-numeric', () => {
+    const cfg = _buildRiskConfig({ ...baseline, maxPositionSize: 'foo' });
+    expect(cfg).not.toHaveProperty('max_position_size_units');
   });
 });
