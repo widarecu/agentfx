@@ -551,6 +551,12 @@ class OandaClient:
         return {
             "order_id": create.get("id"),
             "trade_id": trade_opened.get("tradeID"),
+            # v0.6.1 T1: the fill transaction ID lets the reconciler
+            # cross-reference the ORDER_FILL event that opened this
+            # trade back to our Trade row (via
+            # `trades.broker_open_transaction_id`). Distinct from
+            # `order_id` (the MARKET_ORDER creation transaction).
+            "fill_transaction_id": fill.get("id"),
             "fill_price": float(fill["price"]) if "price" in fill else None,
             "units": (
                 int(trade_opened["units"]) if "units" in trade_opened else int(units)
@@ -783,6 +789,61 @@ class OandaClient:
                 }
             )
         return result
+
+    # ─────────────────────────────────────────────────────────────
+    # v0.6.1 T1 — transaction-log reconciliation (Wilson UAT 2026-07-16)
+    # ─────────────────────────────────────────────────────────────
+
+    def get_last_transaction_id(
+        self,
+        *,
+        account_id: str | None = None,
+    ) -> str | None:
+        """Return the current `lastTransactionID` for the account.
+
+        Called once at subprocess startup to seed the reconciliation
+        high-water mark. Anything before this ID is history the runner
+        never observed and shouldn't try to interpret retroactively.
+        """
+        aid = self._resolve_account_id(account_id)
+        resp = self._request("GET", f"/accounts/{aid}/summary")
+        acc = resp.get("account") or {}
+        return acc.get("lastTransactionID")
+
+    def get_transactions_since(
+        self,
+        transaction_id: str,
+        *,
+        account_id: str | None = None,
+    ) -> dict:
+        """Return all account transactions strictly newer than
+        `transaction_id`.
+
+        Shape:
+            {
+                "transactions": [ {full transaction dict}, ... ],
+                "lastTransactionID": "12345",
+            }
+
+        The reconciler walks `transactions` and looks for:
+        - ORDER_FILL with `tradeClosed`/`tradesClosed` referencing one
+          of our Trade.broker_trade_id values → the broker closed our
+          position (SL, TP, or margin call). Update Trade row with
+          the fill's `pl` (realized pnl) + `price` (exit) + our
+          exit_reason inferred from `reason` field.
+        - MARKET_ORDER_REJECT for orders we placed → audit only, the
+          runner's synchronous exception path already handles these.
+        """
+        aid = self._resolve_account_id(account_id)
+        resp = self._request(
+            "GET",
+            f"/accounts/{aid}/transactions/sinceid",
+            params={"id": str(transaction_id)},
+        )
+        return {
+            "transactions": resp.get("transactions") or [],
+            "lastTransactionID": resp.get("lastTransactionID"),
+        }
 
     def get_pricing(
         self,

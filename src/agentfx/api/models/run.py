@@ -144,6 +144,13 @@ class Run(Base):
     risk_config = Column(JSON, nullable=True)
     # PID of the runner subprocess. Set by `schedule_paper_run`.
     process_pid = Column(Integer, nullable=True)
+    # v0.6.1 T1 (Wilson UAT 2026-07-16): high-water mark for
+    # OANDA transaction-log polling. The reconciler fetches
+    # `/transactions/sinceid` from this value on every health tick
+    # and updates it to the response's `lastTransactionID` after
+    # applying any state changes. Nullable — populated on first
+    # signal-tick success (via `_snapshot_last_transaction_id`).
+    last_transaction_id = Column(String(length=40), nullable=True)
 
     # Relationships
     strategy = relationship("Strategy", back_populates="runs")
@@ -188,6 +195,15 @@ class Trade(Base):
     # runner when it closes a trade (either directly, or when it
     # detects OANDA's SL/TP fired between ticks).
     exit_reason = Column(String(length=20), nullable=True)
+    # v0.6.1 T1 (Wilson UAT 2026-07-16): OANDA-side identifiers for
+    # transaction-log reconciliation. `broker_trade_id` is the join
+    # key — the reconciler polls `/transactions/sinceid` and matches
+    # ORDER_FILL / STOP_LOSS_ORDER events back to our Trade rows via
+    # this field. `*_transaction_id` columns are the specific fill
+    # events (audit trail).
+    broker_trade_id = Column(String(length=40), nullable=True, index=True)
+    broker_open_transaction_id = Column(String(length=40), nullable=True)
+    broker_close_transaction_id = Column(String(length=40), nullable=True)
 
     # Relationships
     run = relationship("Run", back_populates="trades")

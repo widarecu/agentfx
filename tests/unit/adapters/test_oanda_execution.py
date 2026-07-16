@@ -288,9 +288,12 @@ class TestPlaceMarketOrder:
 
         result = client.place_market_order("EUR/USD", 10000)
 
+        # v0.6.1 T1: fill_transaction_id added for the reconciler to
+        # cross-reference ORDER_FILL events back to Trade rows.
         assert result == {
             "order_id": "1234",
             "trade_id": "trade-42",
+            "fill_transaction_id": "1235",
             "fill_price": 1.09342,
             "units": 10000,
         }

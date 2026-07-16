@@ -81,6 +81,7 @@ class TestSnapshotBalance:
     def test_captures_on_first_call(self):
         run = SimpleNamespace(
             snapshot_balance=None,
+            last_transaction_id=None,
             initial_balance=0.0,
             current_balance=0.0,
             pnl=0.0,
@@ -98,8 +99,11 @@ class TestSnapshotBalance:
         db.commit.assert_called()
 
     def test_idempotent_when_already_snapshotted(self):
+        # v0.6.1 T1: pre-set last_transaction_id so the legacy-resume
+        # seeding path doesn't fire; that's tested separately.
         run = SimpleNamespace(
             snapshot_balance=8_500.0,
+            last_transaction_id="1000",
             initial_balance=8_500.0,
             current_balance=8_500.0,
             pnl=0.0,
@@ -109,14 +113,42 @@ class TestSnapshotBalance:
 
         _snapshot_balance_if_needed(db=db, run=run, client=client)
 
-        # OANDA never queried; existing snapshot preserved.
+        # OANDA balance never queried (both balance and txn id already
+        # snapshotted); existing snapshot preserved.
         client.get_account_balance.assert_not_called()
+        client.get_last_transaction_id.assert_not_called()
         assert run.snapshot_balance == 8_500.0
         db.commit.assert_not_called()
+
+    def test_seeds_last_transaction_id_on_legacy_resume(self):
+        """v0.6.1 T1 (Wilson UAT 2026-07-16): a pre-T1 run has
+        snapshot_balance set but no last_transaction_id. On the first
+        health tick after a rebuild, we seed the reconciliation
+        high-water mark without re-anchoring the balance snapshot."""
+        run = SimpleNamespace(
+            snapshot_balance=8_500.0,
+            last_transaction_id=None,
+            initial_balance=8_500.0,
+            current_balance=8_500.0,
+            pnl=0.0,
+        )
+        client = MagicMock()
+        client.get_last_transaction_id.return_value = "2500"
+        db = MagicMock()
+
+        _snapshot_balance_if_needed(db=db, run=run, client=client)
+
+        # Balance NOT re-anchored; last_transaction_id NOW set.
+        client.get_account_balance.assert_not_called()
+        client.get_last_transaction_id.assert_called_once()
+        assert run.snapshot_balance == 8_500.0
+        assert run.last_transaction_id == "2500"
+        db.commit.assert_called()
 
     def test_zero_snapshot_is_treated_as_missing(self):
         run = SimpleNamespace(
             snapshot_balance=0.0,
+            last_transaction_id=None,
             initial_balance=0.0,
             current_balance=0.0,
             pnl=0.0,
@@ -146,6 +178,7 @@ class TestExecuteLoop:
             id="run_test",
             pair="EUR_USD",
             snapshot_balance=10_000.0,
+            last_transaction_id=None,
             current_balance=10_000.0,
             pnl=0.0,
             kill_requested_at=datetime.now(UTC),
@@ -184,6 +217,7 @@ class TestExecuteLoop:
             id="run_test",
             pair="EUR_USD",
             snapshot_balance=10_000.0,
+            last_transaction_id=None,
             current_balance=10_000.0,
             pnl=0.0,
             kill_requested_at=None,
@@ -224,6 +258,7 @@ class TestExecuteLoop:
             id="run_test",
             pair="EUR_USD",
             snapshot_balance=10_000.0,
+            last_transaction_id=None,
             current_balance=10_000.0,
             pnl=0.0,
             kill_requested_at=None,

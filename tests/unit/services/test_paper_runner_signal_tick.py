@@ -124,6 +124,7 @@ def _make_run(user_id: int = 42) -> SimpleNamespace:
         current_balance=10_000.0,
         pnl=0.0,
         kill_requested_at=None,
+        last_transaction_id=None,
         risk_config={
             "max_position_size_units": 10_000,
             "daily_loss_pct": 2.0,
@@ -631,6 +632,7 @@ class TestExecuteLoopSignalIntegration:
             current_balance=10_000.0,
             pnl=0.0,
             kill_requested_at=None,
+            last_transaction_id=None,
             risk_config={
                 "max_position_size_units": 10_000,
                 "daily_loss_pct": 2.0,
@@ -709,6 +711,7 @@ class TestExecuteLoopSignalIntegration:
             current_balance=10_000.0,
             pnl=0.0,
             kill_requested_at=None,
+            last_transaction_id=None,
             risk_config={
                 "daily_loss_pct": 2.0,
                 "kill_switch_dd_pct": 5.0,

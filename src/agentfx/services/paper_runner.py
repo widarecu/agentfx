@@ -511,6 +511,31 @@ def _execute_loop(
             _flatten_and_halt(db, run, client, reason=gate.reason)
             return
 
+        # ─── Broker transaction reconciliation (T1 — every 12 ticks) ─
+        # Every ~60s, poll OANDA's authoritative transaction log for
+        # any events we missed between polls (broker-side SL/TP fires,
+        # margin closeouts, etc.). Idempotent — safe on every tick,
+        # cheap enough at 60s cadence. Best-effort: any error here
+        # doesn't stop the runner; the next iteration re-tries.
+        if iteration % 12 == 0:
+            try:
+                from agentfx.services.paper_reconciler import (
+                    reconcile_broker_transactions,
+                )
+
+                result = reconcile_broker_transactions(db=db, run=run, client=client)
+                if result.trades_updated > 0:
+                    logger.info(
+                        "reconciler: run %s updated %d trade(s) from %d txn(s)",
+                        run.id,
+                        result.trades_updated,
+                        result.transactions_seen,
+                    )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "reconciler: failed on run %s (will retry next tick)", run.id
+                )
+
         # ─── Signal tick (only when past the boundary) ───────────────
         now = now_fn()
         if signal_enabled and now >= next_signal_at:
@@ -984,6 +1009,7 @@ def _signal_tick(
     fill_price = float(result.get("fill_price") or 0.0)
     filled_units = int(result.get("units") or signed_units)
     trade_id = result.get("trade_id")
+    fill_transaction_id = result.get("fill_transaction_id")
     # Pass the candles DataFrame so `_signal_reason` can compute
     # actual indicator values at the trigger bar. Wilson's UAT
     # feedback (2026-07-13): "the indicator on the graph didn't seem
@@ -1000,6 +1026,8 @@ def _signal_tick(
         side="long" if filled_units > 0 else "short",
         entry_timestamp=now_utc,
         signal_reason=signal_reason,
+        broker_trade_id=trade_id,
+        broker_open_transaction_id=fill_transaction_id,
     )
     # Sizing trace so the operator can audit `why this many units` at
     # a glance — surface balance × risk_pct / (stop × pip_value) plus
@@ -1058,12 +1086,16 @@ def _persist_trade_entry(
     side: str,
     entry_timestamp: datetime,
     signal_reason: str,
+    broker_trade_id: str | None = None,
+    broker_open_transaction_id: str | None = None,
 ) -> None:
     """Insert a new Trade row for a placed order.
 
     Side convention on the Trade table is 'buy' / 'sell' (legacy). Map
-    'long' → 'buy', 'short' → 'sell'. Both `origin='live'` and
-    `signal_reason` were added in the b3e5c7a1d842 migration.
+    'long' → 'buy', 'short' → 'sell'. `origin='live'` and
+    `signal_reason` were added in migration b3e5c7a1d842. `broker_*_id`
+    fields were added in 6d8a3c9e1f47 (v0.6.1 T1) so the reconciler
+    can match OANDA ORDER_FILL transactions to our Trade rows.
     """
     from agentfx.api.models import Trade
 
@@ -1077,6 +1109,8 @@ def _persist_trade_entry(
         side="buy" if side == "long" else "sell",
         origin="live",
         signal_reason=signal_reason,
+        broker_trade_id=broker_trade_id,
+        broker_open_transaction_id=broker_open_transaction_id,
     )
     db.add(trade)
     db.commit()
@@ -1493,6 +1527,16 @@ def _snapshot_balance_if_needed(*, db, run, client) -> None:
     denominator is more useful than a mid-run re-anchor.
     """
     if run.snapshot_balance is not None and run.snapshot_balance > 0:
+        # Even on resume, seed last_transaction_id if it's missing —
+        # the reconciler needs a starting point. Best-effort: any
+        # OANDA error here means the reconciler stays inert until the
+        # health tick sets it via a subsequent get_account_balance.
+        if run.last_transaction_id is None:
+            try:
+                run.last_transaction_id = client.get_last_transaction_id()
+                db.commit()
+            except Exception:  # noqa: BLE001
+                pass
         return
 
     balance = client.get_account_balance()
@@ -1500,6 +1544,12 @@ def _snapshot_balance_if_needed(*, db, run, client) -> None:
     run.initial_balance = balance["balance"]  # keep legacy col in sync
     run.current_balance = balance["balance"]
     run.pnl = 0.0
+    # Seed the reconciler high-water mark on first tick so subsequent
+    # `/transactions/sinceid` calls know where to start.
+    try:
+        run.last_transaction_id = client.get_last_transaction_id()
+    except Exception:  # noqa: BLE001
+        run.last_transaction_id = None
     db.commit()
 
 
