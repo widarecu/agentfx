@@ -628,19 +628,41 @@ def _signal_tick(
                     )
                     return
                 # Position still exists → normal max_hold force-close.
-                _close_position_and_persist(
-                    db=db,
-                    run=run,
-                    client=client,
-                    instrument=instrument,
-                    now_utc=now_utc,
-                    reason=(
-                        f"max_hold_bars={max_hold_bars_early} exceeded "
-                        f"(held for {int(held_seconds_early)}s vs limit "
-                        f"{max_hold_bars_early * granularity_seconds}s)"
-                    ),
-                    exit_reason="max_hold",
-                )
+                from agentfx.adapters.oanda import OandaOrderRejected
+
+                try:
+                    _close_position_and_persist(
+                        db=db,
+                        run=run,
+                        client=client,
+                        instrument=instrument,
+                        now_utc=now_utc,
+                        reason=(
+                            f"max_hold_bars={max_hold_bars_early} exceeded "
+                            f"(held for {int(held_seconds_early)}s vs limit "
+                            f"{max_hold_bars_early * granularity_seconds}s)"
+                        ),
+                        exit_reason="max_hold",
+                    )
+                except OandaOrderRejected as exc:
+                    _write_decision(
+                        db,
+                        run,
+                        action="USER_CLOSE_REJECTED",
+                        reason=(
+                            f"max_hold close rejected by OANDA: {exc.reject_reason} "
+                            f"(txn={exc.transaction_id}) — trade stays open, "
+                            "next tick will retry"
+                        ),
+                        outputs={
+                            "paper_run_id": run.id,
+                            "trade_id": open_trade_early.id,
+                            "reject_reason": exc.reject_reason,
+                            "reject_transaction_id": exc.transaction_id,
+                            "order_type": exc.order_type,
+                            "close_context": "max_hold",
+                        },
+                    )
                 return
 
     df = candle_fetch_fn(instrument, granularity, DEFAULT_LOOKBACK_BARS)
@@ -793,15 +815,36 @@ def _signal_tick(
             return
         # opposite_signal=True → close first + return; next tick opens
         # the new side. Explicit two-step matches backtest's audit trail.
-        _close_position_and_persist(
-            db=db,
-            run=run,
-            client=client,
-            instrument=instrument,
-            now_utc=now_utc,
-            reason="direction_change",
-            exit_reason="opposite_flip",
-        )
+        from agentfx.adapters.oanda import OandaOrderRejected
+
+        try:
+            _close_position_and_persist(
+                db=db,
+                run=run,
+                client=client,
+                instrument=instrument,
+                now_utc=now_utc,
+                reason="direction_change",
+                exit_reason="opposite_flip",
+            )
+        except OandaOrderRejected as exc:
+            _write_decision(
+                db,
+                run,
+                action="USER_CLOSE_REJECTED",
+                reason=(
+                    f"opposite-flip close rejected by OANDA: {exc.reject_reason} "
+                    f"(txn={exc.transaction_id}) — position stays open, "
+                    "next tick will re-evaluate"
+                ),
+                outputs={
+                    "paper_run_id": run.id,
+                    "reject_reason": exc.reject_reason,
+                    "reject_transaction_id": exc.transaction_id,
+                    "order_type": exc.order_type,
+                    "close_context": "opposite_flip",
+                },
+            )
         return
 
     # net_units == 0 AND raw_entry != 0 → fresh entry from flat.
@@ -874,12 +917,40 @@ def _signal_tick(
         sizing.capped_units if signal_direction == "long" else -sizing.capped_units
     )
 
-    result = client.place_market_order(
-        instrument,
-        signed_units,
-        stop_loss_pips=sl_pips,
-        take_profit_pips=tp_pips,
-    )
+    from agentfx.adapters.oanda import OandaOrderRejected
+
+    try:
+        result = client.place_market_order(
+            instrument,
+            signed_units,
+            stop_loss_pips=sl_pips,
+            take_profit_pips=tp_pips,
+        )
+    except OandaOrderRejected as exc:
+        # Broker refused to fill (INSUFFICIENT_MARGIN, MARKET_HALTED,
+        # POSITION_LOCKED, NO_FILL_TRANSACTION_RETURNED, etc.). Log
+        # with the specific reject reason so the operator sees why —
+        # don't persist a fake Trade row with a zero-fill.
+        _write_decision(
+            db,
+            run,
+            action="USER_ORDER_REJECTED",
+            reason=(
+                f"OANDA rejected {signal_direction.upper()} "
+                f"{abs(signed_units)} {instrument}: {exc.reject_reason} "
+                f"(txn={exc.transaction_id})"
+            ),
+            outputs={
+                "paper_run_id": run.id,
+                "instrument": instrument,
+                "signed_units": signed_units,
+                "reject_reason": exc.reject_reason,
+                "reject_transaction_id": exc.transaction_id,
+                "order_type": exc.order_type,
+            },
+        )
+        _persist_equity_snapshot(db=db, run=run, position=position, now_utc=now_utc)
+        return
     fill_price = float(result.get("fill_price") or 0.0)
     filled_units = int(result.get("units") or signed_units)
     trade_id = result.get("trade_id")

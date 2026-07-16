@@ -26,6 +26,40 @@ class OandaCircuitOpen(OandaError):
     """
 
 
+class OandaOrderRejected(OandaError):
+    """Raised when OANDA returns a REJECT transaction in the response.
+
+    OANDA v20 embeds `*OrderRejectTransaction` blocks inside otherwise-
+    successful HTTP responses (200 with reject payload, or 4xx with
+    reject payload — the behaviour differs by endpoint and
+    circumstance). Historically our adapter parsed only fill
+    transactions, so rejected orders looked like "successful with $0"
+    to the runner. Wilson UAT 2026-07-15 traced a $504 stop-loss loss
+    hidden by this misinterpretation.
+
+    Callers get a structured exception naming the OANDA reject
+    reason and transaction id so they can decide whether to log,
+    retry, or halt.
+    """
+
+    def __init__(
+        self,
+        reject_reason: str,
+        *,
+        transaction_id: str | None = None,
+        order_type: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        self.reject_reason = reject_reason
+        self.transaction_id = transaction_id
+        self.order_type = order_type
+        detail = message or (
+            f"OANDA rejected {order_type or 'order'} "
+            f"(txn={transaction_id}): {reject_reason}"
+        )
+        super().__init__(detail)
+
+
 class OandaCircuitBreaker:
     """Per-client failure gate (US-020).
 
@@ -390,9 +424,30 @@ class OandaClient:
             json_body={"order": order},
         )
 
+        # Detect embedded reject transaction (OANDA returns 200 with
+        # rejectReason in body for certain business-logic denials).
+        # See OandaOrderRejected for context.
+        reject = resp.get("orderRejectTransaction") or {}
+        if reject:
+            raise OandaOrderRejected(
+                reject.get("rejectReason", "UNKNOWN"),
+                transaction_id=reject.get("id"),
+                order_type="MARKET_ORDER",
+            )
+
         create = resp.get("orderCreateTransaction") or {}
         fill = resp.get("orderFillTransaction") or {}
         trade_opened = fill.get("tradeOpened") or {}
+        if not fill:
+            # Order was created but never filled (e.g., FOK couldn't
+            # execute at the quoted spread). Treat as reject rather
+            # than silently returning a fake fill.
+            raise OandaOrderRejected(
+                "NO_FILL_TRANSACTION_RETURNED",
+                transaction_id=create.get("id"),
+                order_type="MARKET_ORDER",
+                message="OANDA accepted the order but returned no fill transaction",
+            )
         return {
             "order_id": create.get("id"),
             "trade_id": trade_opened.get("tradeID"),
@@ -412,6 +467,9 @@ class OandaClient:
         """Close (or partially close) a trade by its OANDA trade id.
 
         Returns the realized P/L of the close as reported by OANDA.
+        Raises `OandaOrderRejected` when the response body contains
+        a reject transaction — silent-fail into "closed with $0" is
+        not acceptable (Wilson UAT 2026-07-15).
         """
         aid = self._resolve_account_id(account_id)
         body: dict = {"units": str(units) if not isinstance(units, str) else units}
@@ -420,7 +478,23 @@ class OandaClient:
             f"/accounts/{aid}/trades/{trade_id}/close",
             json_body=body,
         )
+        reject = resp.get("orderRejectTransaction") or {}
+        if reject:
+            raise OandaOrderRejected(
+                reject.get("rejectReason", "UNKNOWN"),
+                transaction_id=reject.get("id"),
+                order_type="TRADE_CLOSE",
+            )
         fill = resp.get("orderFillTransaction") or {}
+        if not fill:
+            raise OandaOrderRejected(
+                "NO_FILL_TRANSACTION_RETURNED",
+                order_type="TRADE_CLOSE",
+                message=(
+                    f"OANDA accepted close of trade {trade_id} but returned "
+                    "no fill transaction"
+                ),
+            )
         return {
             "trade_id": trade_id,
             "realized_pnl": float(fill["pl"]) if "pl" in fill else 0.0,
@@ -466,8 +540,47 @@ class OandaClient:
                     "short_units_closed": 0,
                 }
             raise
+        long_reject = resp.get("longOrderRejectTransaction") or {}
+        short_reject = resp.get("shortOrderRejectTransaction") or {}
         long_fill = resp.get("longOrderFillTransaction") or {}
         short_fill = resp.get("shortOrderFillTransaction") or {}
+        # Reject-transaction detection (Wilson UAT 2026-07-15):
+        # OANDA can 200 with reject payload when a specific side can't
+        # be closed (POSITION_LOCKED, INSUFFICIENT_MARGIN, etc.). We
+        # used to silently return 0-fill, marking trades as closed with
+        # $0 pnl. Now we raise so the caller decides.
+        #
+        # Suppression rule: a NO_SUCH_POSITION or CLOSEOUT_POSITION_
+        # DOESNT_EXIST on a side we didn't have exposure on is expected
+        # (we ask "close both" even when only one side is open). Treat
+        # as a benign zero for that side only.
+        _benign_no_position = {
+            "CLOSEOUT_POSITION_DOESNT_EXIST",
+            "NO_SUCH_POSITION",
+        }
+        rejections: list[OandaOrderRejected] = []
+        if long_reject and long_reject.get("rejectReason") not in _benign_no_position:
+            rejections.append(
+                OandaOrderRejected(
+                    long_reject.get("rejectReason", "UNKNOWN"),
+                    transaction_id=long_reject.get("id"),
+                    order_type="LONG_CLOSE",
+                )
+            )
+        if short_reject and short_reject.get("rejectReason") not in _benign_no_position:
+            rejections.append(
+                OandaOrderRejected(
+                    short_reject.get("rejectReason", "UNKNOWN"),
+                    transaction_id=short_reject.get("id"),
+                    order_type="SHORT_CLOSE",
+                )
+            )
+        if rejections:
+            # If both sides were rejected, raise the long side (arbitrary
+            # tie-break); the caller sees the specific reason and can
+            # log. Multi-side rejections are rare in practice — a
+            # single-instrument close usually only has one open side.
+            raise rejections[0]
         return {
             "long_realized_pnl": float(long_fill["pl"]) if "pl" in long_fill else 0.0,
             "short_realized_pnl": (

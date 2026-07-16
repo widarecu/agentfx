@@ -301,8 +301,17 @@ class TestPlaceMarketOrder:
         assert call.kwargs["json"]["order"]["instrument"] == "EUR_USD"
 
     def test_stop_loss_and_take_profit_forwarded(self, client, mock_session):
+        # v0.6.1: adapter raises OandaOrderRejected on empty fill so
+        # we need a non-empty fill body here to reach the assertion.
         mock_session.request.return_value = _http_ok(
-            {"orderCreateTransaction": {"id": "1"}, "orderFillTransaction": {}}
+            {
+                "orderCreateTransaction": {"id": "1"},
+                "orderFillTransaction": {
+                    "id": "2",
+                    "price": "1.10",
+                    "tradeOpened": {"tradeID": "t1", "units": "5000"},
+                },
+            }
         )
         client.place_market_order(
             "EUR_USD", 5000, stop_loss_pips=20, take_profit_pips=40
@@ -315,9 +324,51 @@ class TestPlaceMarketOrder:
         # 40 pips on EUR_USD = 0.0040
         assert order["takeProfitOnFill"]["distance"] == "0.00400"
 
+    def test_reject_transaction_raises(self, client, mock_session):
+        """v0.6.1: OANDA responds 200 with orderRejectTransaction when
+        an order is business-logic-rejected (INSUFFICIENT_MARGIN,
+        MARKET_HALTED, etc.). Adapter must surface as
+        OandaOrderRejected — silent-fail-with-fake-fill is what caused
+        Wilson's $504 hidden loss on 2026-07-15."""
+        from src.agentfx.adapters.oanda import OandaOrderRejected
+
+        mock_session.request.return_value = _http_ok(
+            {
+                "orderRejectTransaction": {
+                    "id": "1234",
+                    "rejectReason": "INSUFFICIENT_MARGIN",
+                    "type": "MARKET_ORDER_REJECT",
+                }
+            }
+        )
+        with pytest.raises(OandaOrderRejected) as excinfo:
+            client.place_market_order("EUR_USD", 10000)
+        assert excinfo.value.reject_reason == "INSUFFICIENT_MARGIN"
+        assert excinfo.value.transaction_id == "1234"
+
+    def test_no_fill_returned_raises(self, client, mock_session):
+        """Order accepted but returned no fill transaction (e.g., FOK
+        couldn't execute at the quoted spread). Adapter must not
+        return a phantom fill."""
+        from src.agentfx.adapters.oanda import OandaOrderRejected
+
+        mock_session.request.return_value = _http_ok(
+            {"orderCreateTransaction": {"id": "9"}}
+        )
+        with pytest.raises(OandaOrderRejected) as excinfo:
+            client.place_market_order("EUR_USD", 10000)
+        assert excinfo.value.reject_reason == "NO_FILL_TRANSACTION_RETURNED"
+
     def test_stop_loss_uses_pip_size_for_jpy(self, client, mock_session):
         mock_session.request.return_value = _http_ok(
-            {"orderCreateTransaction": {"id": "1"}, "orderFillTransaction": {}}
+            {
+                "orderCreateTransaction": {"id": "1"},
+                "orderFillTransaction": {
+                    "id": "2",
+                    "price": "150.00",
+                    "tradeOpened": {"tradeID": "t1", "units": "-10000"},
+                },
+            }
         )
         client.place_market_order("USD_JPY", -10000, stop_loss_pips=15)
         order = mock_session.request.call_args.kwargs["json"]["order"]
@@ -326,7 +377,14 @@ class TestPlaceMarketOrder:
 
     def test_signed_units_carried_through(self, client, mock_session):
         mock_session.request.return_value = _http_ok(
-            {"orderCreateTransaction": {"id": "1"}, "orderFillTransaction": {}}
+            {
+                "orderCreateTransaction": {"id": "1"},
+                "orderFillTransaction": {
+                    "id": "2",
+                    "price": "1.10",
+                    "tradeOpened": {"tradeID": "t1", "units": "-3000"},
+                },
+            }
         )
         client.place_market_order("EUR_USD", -3000)
         assert (
@@ -382,6 +440,47 @@ class TestCloseAllPositions:
         r = client.close_all_positions("EUR_USD")
         assert r["long_realized_pnl"] == 0.0
         assert r["short_realized_pnl"] == 0.0
+
+    def test_reject_transaction_in_200_body_raises(self, client, mock_session):
+        """v0.6.1 (Wilson UAT 2026-07-15): OANDA can return 200 with a
+        reject transaction embedded when a specific side can't be
+        closed (POSITION_LOCKED, INSUFFICIENT_MARGIN). Adapter now
+        surfaces this as OandaOrderRejected instead of silently
+        returning 0-fill and leaving the caller to write a bogus
+        'closed with $0' log."""
+        from src.agentfx.adapters.oanda import OandaOrderRejected
+
+        mock_session.request.return_value = _http_ok(
+            {
+                "shortOrderRejectTransaction": {
+                    "id": "999",
+                    "rejectReason": "POSITION_LOCKED",
+                    "type": "MARKET_ORDER_REJECT",
+                }
+            }
+        )
+        with pytest.raises(OandaOrderRejected) as excinfo:
+            client.close_all_positions("EUR_USD")
+        assert excinfo.value.reject_reason == "POSITION_LOCKED"
+        assert excinfo.value.transaction_id == "999"
+
+    def test_benign_no_position_reject_suppressed(self, client, mock_session):
+        """CLOSEOUT_POSITION_DOESNT_EXIST on a side we didn't have
+        exposure on is expected — we asked to close both sides even
+        when only one is open. Should NOT raise for that side alone."""
+        mock_session.request.return_value = _http_ok(
+            {
+                "shortOrderFillTransaction": {"pl": "-1.50", "units": "5000"},
+                "longOrderRejectTransaction": {
+                    "id": "998",
+                    "rejectReason": "CLOSEOUT_POSITION_DOESNT_EXIST",
+                    "type": "MARKET_ORDER_REJECT",
+                },
+            }
+        )
+        # No raise — the CLOSEOUT is expected for the flat long side.
+        r = client.close_all_positions("EUR_USD")
+        assert r["short_realized_pnl"] == -1.5
 
 
 # ─────────────────────────────────────────────────────────────────────

@@ -695,7 +695,9 @@ def _link_to_evolution_run_id(genome: models.StrategyGenome) -> str | None:
 # stays focused on the run's own timeline.
 _PAPER_DECISION_ACTIONS: tuple[str, ...] = (
     "USER_ORDER_PLACED",
+    "USER_ORDER_REJECTED",
     "USER_POSITION_CLOSED",
+    "USER_CLOSE_REJECTED",
     "USER_SIGNAL_SKIPPED_STALE",
     "USER_ENTRY_MISSED",
     "USER_DEPLOY_PAPER",
