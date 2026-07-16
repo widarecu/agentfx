@@ -291,3 +291,101 @@ def list_my_accounts(
         items=[_account_view(a) for a in row.accounts],
         verified_at=row.verified_at,
     )
+
+
+@router.get("/users/me/credentials/diagnose")
+def diagnose_my_credentials(
+    account_id: str,
+    instrument: str = "EUR_USD",
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> dict:
+    """Read-only investigation: reproduce the paper runner's OANDA calls.
+
+    Wilson UAT 2026-07-16: staging paper run crashed with 401 on
+    `get_account_balance` after 3.5h uptime, but re-verify with the
+    same stored token succeeded. To rule out (a) OandaClient
+    construction bugs, (b) stateful Session corruption over a
+    long-lived instance, (c) intermittent OANDA 401s — hit the same
+    three endpoints the runner uses on every tick, 3× each, and
+    return timing + status + first bytes of body. If all 9 calls
+    return 200, the runner path works right now and the earlier 401
+    was either transient at OANDA or a state issue our resilience
+    layer must handle. If any 401s, we've reproduced the bug.
+
+    Nothing persisted — pure investigation.
+    """
+    import time
+
+    from agentfx.adapters.oanda import OandaClient, OandaError
+
+    row = _load_credentials(db, current_user.id)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Set credentials before diagnosing",
+        )
+    try:
+        plaintext = decrypt_secret(row.oanda_api_key_encrypted)
+    except SecretEncryptionError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"decrypt failed: {e}",
+        ) from e
+
+    env_value = (
+        row.oanda_environment.value
+        if hasattr(row.oanda_environment, "value")
+        else str(row.oanda_environment)
+    )
+    # Construct exactly like paper_runner.run_paper_run does.
+    client = OandaClient(
+        api_key=plaintext,
+        environment=env_value,
+        account_id=account_id,
+    )
+
+    def _hit(name: str, fn) -> dict:
+        started = time.time()
+        try:
+            fn()
+            return {
+                "name": name,
+                "ok": True,
+                "elapsed_ms": int((time.time() - started) * 1000),
+            }
+        except OandaError as exc:
+            return {
+                "name": name,
+                "ok": False,
+                "elapsed_ms": int((time.time() - started) * 1000),
+                "error": str(exc)[:400],
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "name": name,
+                "ok": False,
+                "elapsed_ms": int((time.time() - started) * 1000),
+                "error": f"{type(exc).__name__}: {str(exc)[:400]}",
+            }
+
+    calls = []
+    for i in range(3):
+        calls.append(_hit(f"get_account_balance[{i}]", client.get_account_balance))
+        calls.append(
+            _hit(f"get_position[{i}]", lambda: client.get_position(instrument))
+        )
+        calls.append(_hit(f"get_pricing[{i}]", lambda: client.get_pricing(instrument)))
+
+    return {
+        "account_id": account_id,
+        "instrument": instrument,
+        "environment": env_value,
+        "session_reuse": "single OandaClient across all calls (matches runner)",
+        "calls": calls,
+        "summary": {
+            "total": len(calls),
+            "ok": sum(1 for c in calls if c["ok"]),
+            "failed": sum(1 for c in calls if not c["ok"]),
+        },
+    }
