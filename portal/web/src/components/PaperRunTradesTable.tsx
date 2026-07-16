@@ -106,20 +106,22 @@ export function PaperRunTradesTable({
             const priceOnly = t.pnl;
             const financing = t.financing;
             const commission = t.commission;
-            const hasAdjustments =
-              (financing != null && financing !== 0) ||
-              (commission != null && commission !== 0);
+            // Show the tooltip whenever we HAVE financing/commission data
+            // (non-null), even if zero. A zero-value fill is still a
+            // captured fact — hiding it made "captured and zero" (intraday
+            // close, no rollover) indistinguishable from "not captured
+            // yet" (reconciler hasn't run). Wilson UAT 2026-07-16.
+            const hasFinancingData =
+              !open && (financing != null || commission != null);
             const tooltipLines: string[] = [];
-            if (!open && hasAdjustments && priceOnly != null) {
+            if (hasFinancingData && priceOnly != null) {
               tooltipLines.push(`Price P&L:    ${priceOnly.toFixed(2)}`);
-              if (financing != null && financing !== 0) {
-                tooltipLines.push(
-                  `Financing:    ${financing >= 0 ? '+' : ''}${financing.toFixed(2)}`,
-                );
-              }
-              if (commission != null && commission !== 0) {
-                tooltipLines.push(`Commission:  -${Math.abs(commission).toFixed(2)}`);
-              }
+              const fin = financing ?? 0;
+              tooltipLines.push(
+                `Financing:    ${fin >= 0 ? '+' : ''}${fin.toFixed(2)}`,
+              );
+              const com = commission ?? 0;
+              tooltipLines.push(`Commission:  -${Math.abs(com).toFixed(2)}`);
               tooltipLines.push('─────────────────');
               tooltipLines.push(`Net:          ${(pnl ?? 0).toFixed(2)}`);
             }
