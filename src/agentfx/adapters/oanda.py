@@ -626,34 +626,58 @@ class OandaClient:
     ) -> dict:
         """Flatten both sides of an instrument position.
 
-        OANDA's v20 API distinguishes long and short — a hedged
-        instrument can have both open at once. We close both in a
-        single request.
+        Wilson UAT 2026-07-16 probe (endpoint
+        `/users/me/credentials/oanda-close-probe`) established the
+        actual OANDA behaviour: sending `{longUnits: "ALL", shortUnits:
+        "ALL"}` when only one side has exposure returns HTTP 400 with
+        `CLOSEOUT_POSITION_REJECT` on BOTH sides — not the intuitive
+        "empty side gets `CLOSEOUT_POSITION_DOESNT_EXIST`". The reject
+        cascade blocked our runner from ever closing a position: 50+
+        consecutive rejects observed on account 101-011-28889100-001.
 
-        Reality-check (Wilson UAT 2026-07-15): the earlier docstring
-        claimed OANDA silently skips empty sides. Wrong. OANDA returns
-        HTTP 400 with `CLOSEOUT_POSITION_DOESNT_EXIST` when neither
-        side has exposure. That's not an error from our perspective —
-        we asked "make sure it's flat" and it is flat — so we swallow
-        this specific rejection and return a zero-fill result.
+        Fix: read the position first and only send the sides that
+        actually have units. If neither side has exposure, short-circuit
+        with a zero-fill result (nothing to close, not an error).
         """
         aid = self._resolve_account_id(account_id)
         instrument_norm = to_oanda_instrument(instrument)
+        position = self.get_position(instrument_norm, account_id=aid)
+        body: dict[str, str] = {}
+        if position["long_units"] > 0:
+            body["longUnits"] = "ALL"
+        if position["short_units"] < 0:
+            body["shortUnits"] = "ALL"
+        if not body:
+            return {
+                "long_realized_pnl": 0.0,
+                "short_realized_pnl": 0.0,
+                "long_units_closed": 0,
+                "short_units_closed": 0,
+                "long_financing": 0.0,
+                "short_financing": 0.0,
+                "long_commission": 0.0,
+                "short_commission": 0.0,
+            }
         try:
             resp = self._request(
                 "PUT",
                 f"/accounts/{aid}/positions/{instrument_norm}/close",
-                json_body={"longUnits": "ALL", "shortUnits": "ALL"},
+                json_body=body,
             )
         except OandaError as exc:
-            # Only swallow the "nothing to close" case; any other 4xx/5xx
-            # is a real problem the caller must see.
+            # Race: position closed between our GET and PUT (SL/TP fill,
+            # manual close on another session). Not an error from the
+            # runner's perspective — the position is flat.
             if "CLOSEOUT_POSITION_DOESNT_EXIST" in str(exc):
                 return {
                     "long_realized_pnl": 0.0,
                     "short_realized_pnl": 0.0,
                     "long_units_closed": 0,
                     "short_units_closed": 0,
+                    "long_financing": 0.0,
+                    "short_financing": 0.0,
+                    "long_commission": 0.0,
+                    "short_commission": 0.0,
                 }
             raise
         long_reject = resp.get("longOrderRejectTransaction") or {}

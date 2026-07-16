@@ -430,34 +430,97 @@ class TestCloseTrade:
         assert mock_session.request.call_args.kwargs["json"] == {"units": "500"}
 
 
+def _position_response(long_units: int = 0, short_units: int = 0) -> MagicMock:
+    """GET /accounts/{aid}/positions/{inst} shape."""
+    return _http_ok(
+        {
+            "position": {
+                "long": {"units": str(long_units)} if long_units else {"units": "0"},
+                "short": {"units": str(short_units)} if short_units else {"units": "0"},
+                "unrealizedPL": "0",
+            }
+        }
+    )
+
+
+def _close_dispatch(position_resp: MagicMock, close_resp: MagicMock):
+    """side_effect for mock_session.request that returns the position
+    resp on GET and the close resp on PUT — matches the two-call shape
+    of `close_all_positions` after the 2026-07-16 preflight fix."""
+
+    def _fn(method, *_args, **_kwargs):
+        return position_resp if method == "GET" else close_resp
+
+    return _fn
+
+
 class TestCloseAllPositions:
-    def test_handles_both_sides(self, client, mock_session):
-        mock_session.request.return_value = _http_ok(
+    """Wilson UAT 2026-07-16 probe established: OANDA rejects the whole
+    request with `CLOSEOUT_POSITION_REJECT` (both sides) when you send
+    `{longUnits: ALL, shortUnits: ALL}` while only one side has units.
+    The adapter now preflights `get_position` and only includes sides
+    with actual exposure."""
+
+    def test_only_long_open_sends_only_long_units(self, client, mock_session):
+        position = _position_response(long_units=10000, short_units=0)
+        close = _http_ok(
+            {"longOrderFillTransaction": {"pl": "3.00", "units": "-10000"}}
+        )
+        mock_session.request.side_effect = _close_dispatch(position, close)
+        r = client.close_all_positions("EUR_USD")
+        assert r["long_realized_pnl"] == 3.0
+        assert r["short_realized_pnl"] == 0.0
+        # Second call is the PUT with only longUnits — the whole point
+        # of this fix. shortUnits must not be present.
+        put_call = mock_session.request.call_args_list[1]
+        assert put_call.args[0] == "PUT"
+        assert put_call.kwargs["json"] == {"longUnits": "ALL"}
+
+    def test_only_short_open_sends_only_short_units(self, client, mock_session):
+        position = _position_response(long_units=0, short_units=-5000)
+        close = _http_ok(
+            {"shortOrderFillTransaction": {"pl": "-1.50", "units": "5000"}}
+        )
+        mock_session.request.side_effect = _close_dispatch(position, close)
+        r = client.close_all_positions("EUR_USD")
+        assert r["short_realized_pnl"] == -1.5
+        assert r["long_realized_pnl"] == 0.0
+        put_call = mock_session.request.call_args_list[1]
+        assert put_call.kwargs["json"] == {"shortUnits": "ALL"}
+
+    def test_hedged_position_sends_both_sides(self, client, mock_session):
+        position = _position_response(long_units=10000, short_units=-4000)
+        close = _http_ok(
             {
-                "longOrderFillTransaction": {"pl": "3.00", "units": "-5000"},
-                "shortOrderFillTransaction": {"pl": "-1.50", "units": "2000"},
+                "longOrderFillTransaction": {"pl": "3.00", "units": "-10000"},
+                "shortOrderFillTransaction": {"pl": "-1.50", "units": "4000"},
             }
         )
+        mock_session.request.side_effect = _close_dispatch(position, close)
         r = client.close_all_positions("EUR_USD")
         assert r["long_realized_pnl"] == 3.0
         assert r["short_realized_pnl"] == -1.5
+        put_call = mock_session.request.call_args_list[1]
+        assert put_call.kwargs["json"] == {"longUnits": "ALL", "shortUnits": "ALL"}
 
-    def test_flat_position_is_no_op(self, client, mock_session):
-        mock_session.request.return_value = _http_ok({})
+    def test_flat_position_is_no_op_no_put(self, client, mock_session):
+        """Both sides zero → short-circuit, don't hit OANDA at all."""
+        mock_session.request.return_value = _position_response(0, 0)
         r = client.close_all_positions("EUR_USD")
         assert r["long_realized_pnl"] == 0.0
         assert r["short_realized_pnl"] == 0.0
+        # Only the GET happened.
+        assert mock_session.request.call_count == 1
+        assert mock_session.request.call_args.args[0] == "GET"
 
     def test_reject_transaction_in_200_body_raises(self, client, mock_session):
-        """v0.6.1 (Wilson UAT 2026-07-15): OANDA can return 200 with a
-        reject transaction embedded when a specific side can't be
-        closed (POSITION_LOCKED, INSUFFICIENT_MARGIN). Adapter now
-        surfaces this as OandaOrderRejected instead of silently
-        returning 0-fill and leaving the caller to write a bogus
-        'closed with $0' log."""
+        """OANDA can return 200 with a reject transaction embedded when
+        a specific side can't be closed (POSITION_LOCKED,
+        INSUFFICIENT_MARGIN). Adapter surfaces as OandaOrderRejected."""
         from src.agentfx.adapters.oanda import OandaOrderRejected
 
-        mock_session.request.return_value = _http_ok(
+        position = _position_response(long_units=0, short_units=-5000)
+        close = _http_ok(
             {
                 "shortOrderRejectTransaction": {
                     "id": "999",
@@ -466,28 +529,26 @@ class TestCloseAllPositions:
                 }
             }
         )
+        mock_session.request.side_effect = _close_dispatch(position, close)
         with pytest.raises(OandaOrderRejected) as excinfo:
             client.close_all_positions("EUR_USD")
         assert excinfo.value.reject_reason == "POSITION_LOCKED"
         assert excinfo.value.transaction_id == "999"
 
-    def test_benign_no_position_reject_suppressed(self, client, mock_session):
-        """CLOSEOUT_POSITION_DOESNT_EXIST on a side we didn't have
-        exposure on is expected — we asked to close both sides even
-        when only one is open. Should NOT raise for that side alone."""
-        mock_session.request.return_value = _http_ok(
-            {
-                "shortOrderFillTransaction": {"pl": "-1.50", "units": "5000"},
-                "longOrderRejectTransaction": {
-                    "id": "998",
-                    "rejectReason": "CLOSEOUT_POSITION_DOESNT_EXIST",
-                    "type": "MARKET_ORDER_REJECT",
-                },
-            }
+    def test_race_between_get_and_put_swallowed(self, client, mock_session):
+        """Position closes (SL/TP fill) between our GET and PUT →
+        OANDA returns CLOSEOUT_POSITION_DOESNT_EXIST 4xx. From the
+        runner's perspective the position is flat, which is what it
+        wanted — treat as zero-fill, don't raise."""
+        position = _position_response(long_units=10000, short_units=0)
+        error_resp = _http_error(
+            400,
+            '{"errorMessage":"The Position specified does not exist",'
+            '"errorCode":"CLOSEOUT_POSITION_DOESNT_EXIST"}',
         )
-        # No raise — the CLOSEOUT is expected for the flat long side.
+        mock_session.request.side_effect = _close_dispatch(position, error_resp)
         r = client.close_all_positions("EUR_USD")
-        assert r["short_realized_pnl"] == -1.5
+        assert r["long_realized_pnl"] == 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────
