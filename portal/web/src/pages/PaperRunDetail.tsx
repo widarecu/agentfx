@@ -844,6 +844,26 @@ function CrashDetailPanel({
         )}
       </div>
 
+      {stopReason === 'OANDA_AUTH_LOST' && (
+        <div className="mt-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded p-3">
+          <div className="text-sm font-semibold text-amber-900 dark:text-amber-200">
+            OANDA authorization was lost
+          </div>
+          <div className="text-xs text-amber-800 dark:text-amber-300 mt-1">
+            The runner tried a fresh session with the stored token and
+            still got 401. Head to{' '}
+            <Link
+              to="/settings"
+              className="underline font-medium"
+            >
+              Settings → OANDA Credentials
+            </Link>{' '}
+            and re-verify. Once verified, the Resume button will
+            re-schedule this run with the fresh credentials.
+          </div>
+        </div>
+      )}
+
       {crashDetail?.exception_type && crashDetail?.message && (
         <div className="mt-3 text-sm text-rose-900 dark:text-rose-100 font-mono">
           <span className="font-semibold">{crashDetail.exception_type}:</span>{' '}

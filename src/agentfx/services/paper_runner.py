@@ -447,12 +447,42 @@ def _execute_loop(
         # `_flatten_and_halt` (best-effort close) even though the
         # first request will bounce; the runner logs the failure and
         # the run row still transitions to ERROR.
+        #
+        # 401 handling (Wilson UAT 2026-07-15): the previous
+        # subprocess crashed on 401 after 3.5h — a diagnostic run
+        # against the same code path with the same stored token
+        # returned 200 for all calls. Most-likely cause was either
+        # transient OANDA-side 401 or a long-lived Session state
+        # issue. Recovery: try one credential refresh (in case the
+        # user re-verified the token in the UI while the run was
+        # live) with a fresh Session; if the second call still 401s,
+        # halt cleanly with a specific stop_reason so the frontend
+        # can prompt the user to re-verify.
+        from agentfx.adapters.oanda import OandaError
+
         try:
             balance = client.get_account_balance()
         except OandaCircuitOpen:
             logger.warning("paper runner: %s got OandaCircuitOpen; halting", run.id)
             _flatten_and_halt(db, run, client, reason="BROKER_CIRCUIT")
             return
+        except OandaError as exc:
+            if not _is_auth_error(exc):
+                raise
+            logger.warning(
+                "paper runner: %s got 401 on balance; attempting cred refresh",
+                run.id,
+            )
+            new_client = _recover_from_auth_loss(db, run, exc)
+            if new_client is None:
+                logger.error(
+                    "paper runner: %s auth-refresh failed; halting oanda_auth_lost",
+                    run.id,
+                )
+                _flatten_and_halt(db, run, client, reason="OANDA_AUTH_LOST")
+                return
+            client = new_client
+            balance = client.get_account_balance()
         run.current_balance = balance["balance"]
         run.pnl = balance["balance"] - (run.snapshot_balance or 0.0)
         db.commit()
@@ -1471,6 +1501,91 @@ def _snapshot_balance_if_needed(*, db, run, client) -> None:
     run.current_balance = balance["balance"]
     run.pnl = 0.0
     db.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Credential recovery (T0.2 — Wilson UAT 2026-07-15)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    """True iff `exc` is an OANDA auth-loss error (401 or 403).
+
+    We check the message string because `_request` wraps status codes
+    in `OandaError(f"{code} {text}")`; there's no structured status
+    field on the exception. Both 401 and 403 map to auth-loss for
+    our purposes — the user needs to intervene.
+    """
+    s = str(exc)
+    return s.startswith("401 ") or s.startswith("403 ")
+
+
+def _recover_from_auth_loss(db, run, original_exc: Exception):
+    """Reload creds from DB and build a fresh OandaClient.
+
+    Returns the new client if the refresh yields something that can
+    complete a `get_account_balance` call, or None if the fresh
+    client also 401s (meaning the credentials are truly bad, not
+    just stale in the subprocess).
+
+    This handles two operational scenarios:
+    - User re-verified credentials in Settings while the run was
+      running → we pick up the fresh token.
+    - The subprocess's long-lived requests.Session got into a bad
+      state → a brand new session might work with the same token.
+    """
+    from agentfx.adapters.oanda import OandaClient, OandaError
+    from agentfx.api.core.secrets import decrypt_secret
+    from agentfx.api.models import UserOandaCredentials
+
+    creds = (
+        db.query(UserOandaCredentials)
+        .filter(UserOandaCredentials.user_id == run.user_id)
+        .one_or_none()
+    )
+    if creds is None:
+        logger.error(
+            "auth-refresh: no credentials in DB for run %s user %s",
+            run.id,
+            run.user_id,
+        )
+        return None
+
+    try:
+        api_key = decrypt_secret(creds.oanda_api_key_encrypted)
+    except Exception:  # noqa: BLE001
+        logger.exception("auth-refresh: decrypt failed for run %s", run.id)
+        return None
+
+    env_value = (
+        creds.oanda_environment.value
+        if hasattr(creds.oanda_environment, "value")
+        else str(creds.oanda_environment)
+    )
+    new_client = OandaClient(
+        api_key=api_key,
+        environment=env_value,
+        account_id=run.oanda_account_id,
+    )
+    try:
+        new_client.get_account_balance()
+    except OandaError as exc:
+        if _is_auth_error(exc):
+            logger.warning(
+                "auth-refresh: fresh client still 401 for run %s (%s)",
+                run.id,
+                original_exc,
+            )
+            return None
+        # Some other error on the health check — surface it, don't
+        # pretend recovery worked. Caller re-tries once.
+        raise
+    logger.info(
+        "auth-refresh: succeeded for run %s (original error: %s)",
+        run.id,
+        original_exc,
+    )
+    return new_client
 
 
 # ─────────────────────────────────────────────────────────────────────
