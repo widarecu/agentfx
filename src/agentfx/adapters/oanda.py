@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 import random
 import time
 from collections import deque
@@ -10,6 +12,48 @@ import requests  # type: ignore[import-untyped]
 from agentfx.shared.config import oanda_account_id, oanda_api_host, oanda_api_key
 
 ISO8601 = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+# Dedicated logger so `agentfx.adapters.oanda` lines can be filtered
+# separately from the rest of the app. One JSON line per HTTP call
+# for post-mortem forensics — see `_log_call_result`.
+_oanda_log = logging.getLogger("agentfx.adapters.oanda.calls")
+
+
+def _log_call_result(
+    method: str,
+    path: str,
+    status: int | None,
+    elapsed_ms: int,
+    attempt: int,
+    reject_reason: str | None = None,
+    error_class: str | None = None,
+) -> None:
+    """Emit one structured JSON line for an OANDA call.
+
+    Post-mortem forensics: Wilson UAT 2026-07-15 → we had NO record
+    of any of the 6 rejected close_all_positions attempts on staging.
+    This is intentionally lightweight (one line, no bodies, no
+    secrets, no full response) — enough to say "at 15:28:01 UTC we
+    called PUT /accounts/.../positions/close and got HTTP 200 with
+    reject reason POSITION_LOCKED" without leaking anything.
+    """
+    payload = {
+        "ts": datetime.now(UTC).isoformat(),
+        "kind": "oanda_call",
+        "method": method,
+        "path": path,
+        "status": status,
+        "elapsed_ms": elapsed_ms,
+        "attempt": attempt,
+    }
+    if reject_reason:
+        payload["reject_reason"] = reject_reason
+    if error_class:
+        payload["error_class"] = error_class
+    try:
+        _oanda_log.info(json.dumps(payload, default=str))
+    except Exception:  # noqa: BLE001 — logging must never break the caller
+        pass
 
 
 class OandaError(Exception):
@@ -293,6 +337,7 @@ class OandaClient:
         last_error: Exception | None = None
 
         for attempt in range(5):
+            started = time.monotonic()
             try:
                 resp = self.session.request(
                     method,
@@ -305,6 +350,15 @@ class OandaClient:
                 requests.exceptions.Timeout,
                 requests.exceptions.ConnectionError,
             ) as e:
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                _log_call_result(
+                    method,
+                    path,
+                    status=None,
+                    elapsed_ms=elapsed_ms,
+                    attempt=attempt,
+                    error_class=type(e).__name__,
+                )
                 last_error = e
                 if attempt < 4:
                     time.sleep(_backoff_delay_seconds(attempt))
@@ -312,10 +366,19 @@ class OandaClient:
                 self.circuit_breaker.record_failure()
                 raise OandaError(f"connection_error: {e}") from e
 
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+
             # Retry-eligible responses. 429 is explicit rate-limit;
             # 5xx is server-side transient. Both burn an attempt and
             # back off before the next try.
             if resp.status_code == 429 or resp.status_code >= 500:
+                _log_call_result(
+                    method,
+                    path,
+                    status=resp.status_code,
+                    elapsed_ms=elapsed_ms,
+                    attempt=attempt,
+                )
                 last_error = OandaError(f"{resp.status_code} {resp.text[:200]}")
                 if attempt < 4:
                     time.sleep(_backoff_delay_seconds(attempt))
@@ -325,6 +388,13 @@ class OandaClient:
 
             # Non-retryable client errors — surface immediately.
             if resp.status_code >= 400:
+                _log_call_result(
+                    method,
+                    path,
+                    status=resp.status_code,
+                    elapsed_ms=elapsed_ms,
+                    attempt=attempt,
+                )
                 self.circuit_breaker.record_failure()
                 raise OandaError(f"{resp.status_code} {resp.text[:500]}")
 
@@ -333,8 +403,38 @@ class OandaClient:
             # Some OANDA responses (order fills at the exact edge of
             # a rejection) return 200 with an empty body; be defensive.
             if not resp.content:
+                _log_call_result(
+                    method,
+                    path,
+                    status=resp.status_code,
+                    elapsed_ms=elapsed_ms,
+                    attempt=attempt,
+                )
                 return {}
-            return resp.json()
+            body = resp.json()
+            # Detect any embedded reject-transaction so the audit log
+            # captures the reject reason even when higher-level code
+            # would swallow it (e.g., the benign CLOSEOUT case in
+            # close_all_positions).
+            reject_reason = None
+            for reject_key in (
+                "orderRejectTransaction",
+                "longOrderRejectTransaction",
+                "shortOrderRejectTransaction",
+            ):
+                r = body.get(reject_key) if isinstance(body, dict) else None
+                if r and isinstance(r, dict):
+                    reject_reason = r.get("rejectReason") or "UNKNOWN"
+                    break
+            _log_call_result(
+                method,
+                path,
+                status=resp.status_code,
+                elapsed_ms=elapsed_ms,
+                attempt=attempt,
+                reject_reason=reject_reason,
+            )
+            return body
 
         # Exhausted attempts — record failure and raise the last error.
         self.circuit_breaker.record_failure()
