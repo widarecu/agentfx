@@ -1558,10 +1558,10 @@ def _snapshot_balance_if_needed(*, db, run, client) -> None:
         # health tick sets it via a subsequent get_account_balance.
         if run.last_transaction_id is None:
             try:
-                run.last_transaction_id = client.get_last_transaction_id()
+                run.last_transaction_id = _safe_txn_id(client.get_last_transaction_id())
                 db.commit()
             except Exception:  # noqa: BLE001
-                pass
+                db.rollback()
         return
 
     balance = client.get_account_balance()
@@ -1572,10 +1572,26 @@ def _snapshot_balance_if_needed(*, db, run, client) -> None:
     # Seed the reconciler high-water mark on first tick so subsequent
     # `/transactions/sinceid` calls know where to start.
     try:
-        run.last_transaction_id = client.get_last_transaction_id()
+        run.last_transaction_id = _safe_txn_id(client.get_last_transaction_id())
     except Exception:  # noqa: BLE001
         run.last_transaction_id = None
     db.commit()
+
+
+def _safe_txn_id(raw) -> str | None:
+    """Coerce an OANDA transaction ID response to `str | None`.
+
+    OANDA v20 returns transaction IDs as strings (or numeric strings).
+    Defensive: if the adapter is mocked in a test and returns a
+    MagicMock — or the OANDA API surface changes shape unexpectedly —
+    we store None rather than letting a non-string blow up the DB
+    commit (`can't adapt type 'MagicMock'`) and poison the session.
+    """
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, int):
+        return str(raw)
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────
