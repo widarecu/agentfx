@@ -561,6 +561,12 @@ class OandaClient:
             "units": (
                 int(trade_opened["units"]) if "units" in trade_opened else int(units)
             ),
+            # v0.6.1 (Wilson 2026-07-16): financing + commission
+            # accrue separately from pl on OANDA. On an OPEN, both
+            # are usually 0 but we surface them anyway so the caller
+            # doesn't have to special-case entries vs closes.
+            "financing": float(fill["financing"]) if "financing" in fill else 0.0,
+            "commission": float(fill["commission"]) if "commission" in fill else 0.0,
         }
 
     def close_trade(
@@ -606,6 +612,10 @@ class OandaClient:
             "realized_pnl": float(fill["pl"]) if "pl" in fill else 0.0,
             "closed_units": int(fill["units"]) if "units" in fill else 0,
             "close_price": float(fill["price"]) if "price" in fill else None,
+            # v0.6.1: financing accrued through close time + any close
+            # commission. Both live on the fill transaction alongside pl.
+            "financing": float(fill["financing"]) if "financing" in fill else 0.0,
+            "commission": float(fill["commission"]) if "commission" in fill else 0.0,
         }
 
     def close_all_positions(
@@ -694,6 +704,21 @@ class OandaClient:
             ),
             "long_units_closed": int(long_fill.get("units", 0)),
             "short_units_closed": int(short_fill.get("units", 0)),
+            # v0.6.1 (Wilson 2026-07-16): financing + commission on
+            # each side of the close. Runner apportions to Trade rows
+            # in `_close_position_and_persist` alongside the pnl split.
+            "long_financing": (
+                float(long_fill["financing"]) if "financing" in long_fill else 0.0
+            ),
+            "short_financing": (
+                float(short_fill["financing"]) if "financing" in short_fill else 0.0
+            ),
+            "long_commission": (
+                float(long_fill["commission"]) if "commission" in long_fill else 0.0
+            ),
+            "short_commission": (
+                float(short_fill["commission"]) if "commission" in short_fill else 0.0
+            ),
         }
 
     # ─────────────────────────────────────────────────────────────
@@ -786,6 +811,11 @@ class OandaClient:
                     "open_price": float(raw.get("price", 0) or 0),
                     "unrealized_pnl": float(raw.get("unrealizedPL", 0) or 0),
                     "open_time": raw.get("openTime"),
+                    # v0.6.1 (Wilson 2026-07-16): running financing
+                    # accrued on the open trade — updated on each
+                    # DAILY_FINANCING rollover. Zero for a trade that
+                    # hasn't crossed a 5pm NY boundary.
+                    "financing": float(raw.get("financing", 0) or 0),
                 }
             )
         return result

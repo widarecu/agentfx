@@ -281,6 +281,16 @@ class PaperTradePublic(BaseSchema):
     # 'broker_other'. Null while the trade is still open or for legacy
     # rows written before the migration.
     exit_reason: str | None = None
+    # v0.6.1 (Wilson 2026-07-16): accumulated financing (swap/carry
+    # rollover charges) and commission from OANDA. Both signed —
+    # negative financing = we paid, positive = we received. Null on
+    # legacy rows or when neither has been recorded yet.
+    financing: float | None = None
+    commission: float | None = None
+    # Derived: `pnl + financing - commission`. Server-computed so
+    # the frontend doesn't have to redo the arithmetic. Null iff
+    # pnl is null (trade still open with no realized components).
+    net_pnl: float | None = None
 
 
 class PaperTradeList(BaseSchema):

@@ -290,12 +290,16 @@ class TestPlaceMarketOrder:
 
         # v0.6.1 T1: fill_transaction_id added for the reconciler to
         # cross-reference ORDER_FILL events back to Trade rows.
+        # v0.6.1 (Wilson 2026-07-16): financing + commission also
+        # returned so entries with on-fill commission are captured.
         assert result == {
             "order_id": "1234",
             "trade_id": "trade-42",
             "fill_transaction_id": "1235",
             "fill_price": 1.09342,
             "units": 10000,
+            "financing": 0.0,
+            "commission": 0.0,
         }
         call = mock_session.request.call_args
         # Body must serialize `units` as a string per OANDA convention.

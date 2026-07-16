@@ -151,7 +151,37 @@ def reconcile_broker_transactions(*, db, run, client) -> ReconcileResult:
     updated = 0
 
     for txn in txns:
-        if txn.get("type") != "ORDER_FILL":
+        txn_type = txn.get("type")
+        if txn_type == "DAILY_FINANCING":
+            # Overnight rollover — walk positionFinancings[]/
+            # openTradeFinancings[] and accumulate the per-trade
+            # financing charge onto our Trade rows. Idempotent by
+            # transaction id — high-water advancement below prevents
+            # double-application on subsequent reconciler runs.
+            for pf in txn.get("positionFinancings") or []:
+                for otf in pf.get("openTradeFinancings") or []:
+                    broker_tid = str(otf.get("tradeID") or "")
+                    if not broker_tid:
+                        continue
+                    trade = (
+                        db.query(Trade)
+                        .filter(
+                            Trade.run_id == run.id,
+                            Trade.broker_trade_id == broker_tid,
+                        )
+                        .one_or_none()
+                    )
+                    if trade is None:
+                        continue  # not our trade
+                    fin = float(otf.get("financing", 0) or 0)
+                    trade.financing = float(trade.financing or 0.0) + fin
+                    updated += 1
+                    notes.append(
+                        f"daily_financing trade {trade.id} broker_trade_id="
+                        f"{broker_tid} +financing={fin}"
+                    )
+            continue
+        if txn_type != "ORDER_FILL":
             continue
         closed_ids = _closed_trade_ids(txn)
         if not closed_ids:
@@ -173,24 +203,32 @@ def reconcile_broker_transactions(*, db, run, client) -> ReconcileResult:
                 # Already closed on our side (runner-initiated close
                 # or a previous reconciliation). Don't rewrite.
                 continue
-            # Prefer `tradeClosed`/`tradesClosed` entry's pnl if it
-            # matches this specific trade — falls back to the txn's
-            # top-level `pl`.
+            # Prefer `tradeClosed`/`tradesClosed` entry's pnl + financing
+            # if it matches this specific trade — falls back to the txn's
+            # top-level `pl`/`financing`.
             per_trade_pnl: float | None = None
+            per_trade_financing: float | None = None
             solo = txn.get("tradeClosed") or {}
-            if str(solo.get("tradeID")) == broker_tid and "realizedPL" in solo:
-                per_trade_pnl = float(solo["realizedPL"])
+            if str(solo.get("tradeID")) == broker_tid:
+                if "realizedPL" in solo:
+                    per_trade_pnl = float(solo["realizedPL"])
+                if "financing" in solo:
+                    per_trade_financing = float(solo["financing"])
             else:
                 for entry in txn.get("tradesClosed") or []:
                     if (
                         isinstance(entry, dict)
                         and str(entry.get("tradeID")) == broker_tid
-                        and "realizedPL" in entry
                     ):
-                        per_trade_pnl = float(entry["realizedPL"])
+                        if "realizedPL" in entry:
+                            per_trade_pnl = float(entry["realizedPL"])
+                        if "financing" in entry:
+                            per_trade_financing = float(entry["financing"])
                         break
             if per_trade_pnl is None and "pl" in txn:
                 per_trade_pnl = float(txn["pl"])
+            if per_trade_financing is None and "financing" in txn:
+                per_trade_financing = float(txn["financing"])
 
             trade.exit_timestamp = _parse_oanda_time(txn.get("time")) or datetime.now(
                 UTC
@@ -203,12 +241,23 @@ def reconcile_broker_transactions(*, db, run, client) -> ReconcileResult:
                     trade.pnl_pct = (
                         per_trade_pnl / (trade.entry_price * float(trade.quantity))
                     ) * 100
+            # Add the close-time financing on top of any accumulated
+            # DAILY_FINANCING already recorded.
+            if per_trade_financing is not None:
+                trade.financing = float(trade.financing or 0.0) + per_trade_financing
+            # Commission on the close fill. Entry commission would
+            # have been captured at trade-entry time by the runner.
+            if "commission" in txn:
+                trade.commission = float(trade.commission or 0.0) + float(
+                    txn["commission"]
+                )
             trade.exit_reason = _classify_exit_reason(txn.get("reason"))
             trade.broker_close_transaction_id = str(txn.get("id") or "")
             updated += 1
             notes.append(
                 f"reconciled trade {trade.id} broker_trade_id={broker_tid} "
-                f"exit_reason={trade.exit_reason} pnl={per_trade_pnl}"
+                f"exit_reason={trade.exit_reason} pnl={per_trade_pnl} "
+                f"financing={per_trade_financing}"
             )
 
     if new_last != run.last_transaction_id:

@@ -204,6 +204,17 @@ class Trade(Base):
     broker_trade_id = Column(String(length=40), nullable=True, index=True)
     broker_open_transaction_id = Column(String(length=40), nullable=True)
     broker_close_transaction_id = Column(String(length=40), nullable=True)
+    # v0.6.1 (Wilson 2026-07-16): OANDA charges/credits financing
+    # (aka swap/carry) at the 5pm NY rollover on any position held
+    # over. Also charges commission on some accounts. Both live
+    # separately from `pl` on OANDA's fill transactions; without
+    # tracking them our reported `pnl` was incomplete for anything
+    # held across a rollover. `net_pnl` = pnl + financing - commission
+    # is computed at read time (frontend + read helpers) — not stored,
+    # to avoid drift when one of the three gets updated later than
+    # the others.
+    financing = Column(Float, nullable=True)
+    commission = Column(Float, nullable=True)
 
     # Relationships
     run = relationship("Run", back_populates="trades")

@@ -188,6 +188,15 @@ export interface PaperTradePublic {
    *  max_hold / opposite_flip / user_kill / broker_other. Null while
    *  open or on legacy pre-migration rows. */
   exit_reason: string | null;
+  /** Accumulated financing (swap/carry rollover). Signed —
+   *  negative = we paid, positive = we received. Null on legacy rows
+   *  or when no financing has been recorded yet. */
+  financing: number | null;
+  /** Accumulated commission across all fills. Signed as a positive
+   *  cost (subtracted from net). */
+  commission: number | null;
+  /** Server-computed: pnl + financing - commission. Null iff pnl null. */
+  net_pnl: number | null;
 }
 
 export interface PaperTradeList {

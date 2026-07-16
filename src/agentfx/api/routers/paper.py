@@ -350,6 +350,18 @@ def list_paper_run_trades(
                 origin=t.origin,
                 signal_reason=t.signal_reason,
                 exit_reason=t.exit_reason,
+                financing=t.financing,
+                commission=t.commission,
+                # net_pnl = pnl + financing - commission. Compute here so
+                # the frontend never has to redo the arithmetic and can't
+                # accidentally omit one of the three components.
+                net_pnl=(
+                    None
+                    if t.pnl is None
+                    else float(t.pnl)
+                    + float(t.financing or 0.0)
+                    - float(t.commission or 0.0)
+                ),
             )
             for t in items
         ],

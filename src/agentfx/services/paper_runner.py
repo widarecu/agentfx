@@ -1028,6 +1028,8 @@ def _signal_tick(
         signal_reason=signal_reason,
         broker_trade_id=trade_id,
         broker_open_transaction_id=fill_transaction_id,
+        entry_financing=float(result.get("financing") or 0.0),
+        entry_commission=float(result.get("commission") or 0.0),
     )
     # Sizing trace so the operator can audit `why this many units` at
     # a glance — surface balance × risk_pct / (stop × pip_value) plus
@@ -1088,14 +1090,18 @@ def _persist_trade_entry(
     signal_reason: str,
     broker_trade_id: str | None = None,
     broker_open_transaction_id: str | None = None,
+    entry_financing: float = 0.0,
+    entry_commission: float = 0.0,
 ) -> None:
     """Insert a new Trade row for a placed order.
 
     Side convention on the Trade table is 'buy' / 'sell' (legacy). Map
     'long' → 'buy', 'short' → 'sell'. `origin='live'` and
     `signal_reason` were added in migration b3e5c7a1d842. `broker_*_id`
-    fields were added in 6d8a3c9e1f47 (v0.6.1 T1) so the reconciler
-    can match OANDA ORDER_FILL transactions to our Trade rows.
+    fields were added in 6d8a3c9e1f47 (v0.6.1 T1). `financing` and
+    `commission` were added in 9e4b7f2a8c31 (v0.6.1) — usually 0 at
+    entry, but we still capture them so a broker that charges on-fill
+    commission doesn't silently disappear.
     """
     from agentfx.api.models import Trade
 
@@ -1111,6 +1117,8 @@ def _persist_trade_entry(
         signal_reason=signal_reason,
         broker_trade_id=broker_trade_id,
         broker_open_transaction_id=broker_open_transaction_id,
+        financing=entry_financing or None,
+        commission=entry_commission or None,
     )
     db.add(trade)
     db.commit()
@@ -1273,6 +1281,16 @@ def _close_position_and_persist(
     long_pnl = float(result.get("long_realized_pnl", 0.0) or 0.0)
     short_pnl = float(result.get("short_realized_pnl", 0.0) or 0.0)
     total_pnl = long_pnl + short_pnl
+    # v0.6.1: financing and commission accrued on this close — split
+    # across open trades in proportion to quantity, same as pnl. If
+    # the reconciler later runs a DAILY_FINANCING on any of these
+    # trades it will accumulate on top.
+    long_fin = float(result.get("long_financing", 0.0) or 0.0)
+    short_fin = float(result.get("short_financing", 0.0) or 0.0)
+    total_fin = long_fin + short_fin
+    long_com = float(result.get("long_commission", 0.0) or 0.0)
+    short_com = float(result.get("short_commission", 0.0) or 0.0)
+    total_com = long_com + short_com
 
     # Update every open Trade row for this run — a normal single-side
     # position will have exactly one; the multi-fill / partial-close
@@ -1303,6 +1321,13 @@ def _close_position_and_persist(
             t.exit_price = t.entry_price + (t.pnl / t.quantity if t.quantity else 0.0)
             if exit_reason is not None:
                 t.exit_reason = exit_reason
+            # v0.6.1: accumulate financing + commission on this close.
+            # `or 0.0` handles legacy rows where the column is NULL
+            # (pre-migration Trades).
+            if total_fin:
+                t.financing = float(t.financing or 0.0) + total_fin * share
+            if total_com:
+                t.commission = float(t.commission or 0.0) + total_com * share
         db.commit()
 
     _write_decision(

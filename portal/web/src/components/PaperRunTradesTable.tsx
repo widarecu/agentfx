@@ -72,7 +72,13 @@ export function PaperRunTradesTable({
             const sign = t.side === 'buy' ? 1 : -1;
             // Realised PnL for closed trades; approximate unrealised
             // for open trades (latest bar close vs entry, ignoring
-            // spread — off by ~1 pip on majors).
+            // spread — off by ~1 pip on majors). For closed trades we
+            // show NET pnl (pnl + financing - commission); the tooltip
+            // breaks it down. For open trades we still only have the
+            // price-derived unrealised (financing on an open trade is
+            // exposed via t.financing if the reconciler saw a
+            // DAILY_FINANCING event, but the display keeps it in the
+            // tooltip only to avoid a confusing "unrealised net" mix).
             let pnl: number | null;
             let pnlIsUnrealized = false;
             // Pip move: (exit - entry) × side, in pip units. For open
@@ -84,10 +90,38 @@ export function PaperRunTradesTable({
               pipMove = ((latestClose - t.entry_price) * sign) / pipSize;
               pnlIsUnrealized = true;
             } else {
-              pnl = t.pnl;
+              // Prefer server-computed net_pnl (includes financing +
+              // commission); fall back to raw pnl for legacy rows
+              // where net_pnl might be null.
+              pnl = t.net_pnl != null ? t.net_pnl : t.pnl;
               if (t.exit_price != null) {
                 pipMove = ((t.exit_price - t.entry_price) * sign) / pipSize;
               }
+            }
+            // Tooltip breakdown: only interesting when at least one
+            // fee/financing component is non-zero. Format as a
+            // multi-line title string (Tailwind doesn't need a
+            // headless Tooltip for this — native browser tooltip
+            // suffices for now).
+            const priceOnly = t.pnl;
+            const financing = t.financing;
+            const commission = t.commission;
+            const hasAdjustments =
+              (financing != null && financing !== 0) ||
+              (commission != null && commission !== 0);
+            const tooltipLines: string[] = [];
+            if (!open && hasAdjustments && priceOnly != null) {
+              tooltipLines.push(`Price P&L:    ${priceOnly.toFixed(2)}`);
+              if (financing != null && financing !== 0) {
+                tooltipLines.push(
+                  `Financing:    ${financing >= 0 ? '+' : ''}${financing.toFixed(2)}`,
+                );
+              }
+              if (commission != null && commission !== 0) {
+                tooltipLines.push(`Commission:  -${Math.abs(commission).toFixed(2)}`);
+              }
+              tooltipLines.push('─────────────────');
+              tooltipLines.push(`Net:          ${(pnl ?? 0).toFixed(2)}`);
             }
             const pnlClass =
               pnl == null
@@ -132,10 +166,23 @@ export function PaperRunTradesTable({
                 <td className="py-1.5 pr-3 text-right font-mono text-xs">
                   {t.exit_price != null ? t.exit_price.toFixed(5) : '—'}
                 </td>
-                <td className={`py-1.5 pr-3 text-right font-mono text-xs ${pnlClass}`}>
+                <td
+                  className={`py-1.5 pr-3 text-right font-mono text-xs ${pnlClass}`}
+                  title={tooltipLines.length ? tooltipLines.join('\n') : undefined}
+                >
                   {pnl != null ? (
                     <>
-                      <div>{pnl.toFixed(2)}</div>
+                      <div className="flex items-center justify-end gap-1">
+                        <span>{pnl.toFixed(2)}</span>
+                        {tooltipLines.length > 0 && (
+                          <span
+                            className="text-[10px] text-slate-400 dark:text-slate-500 cursor-help"
+                            aria-label="Includes financing / commission — hover for breakdown"
+                          >
+                            *
+                          </span>
+                        )}
+                      </div>
                       {pipMove != null && (
                         <div className="text-[10px] opacity-70">
                           {pipMove >= 0 ? '+' : ''}

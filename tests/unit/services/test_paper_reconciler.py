@@ -91,7 +91,12 @@ def _make_run(user_id: int = 1, last_txn_id: str | None = "100"):
     )
 
 
-def _make_trade(broker_trade_id: str, exit_ts: datetime | None = None):
+def _make_trade(
+    broker_trade_id: str,
+    exit_ts: datetime | None = None,
+    financing: float | None = None,
+    commission: float | None = None,
+):
     return SimpleNamespace(
         id=f"tr_{broker_trade_id}",
         broker_trade_id=broker_trade_id,
@@ -103,6 +108,8 @@ def _make_trade(broker_trade_id: str, exit_ts: datetime | None = None):
         broker_close_transaction_id=None,
         entry_price=1.10000,
         quantity=10_000.0,
+        financing=financing,
+        commission=commission,
     )
 
 
@@ -272,6 +279,126 @@ class TestReconcile:
         # High-water mark still advances so we don't rescan the same
         # transactions next tick.
         assert run.last_transaction_id == "410"
+
+    def test_order_fill_captures_financing_and_commission(self):
+        """v0.6.1 (Wilson 2026-07-16): the close fill's financing
+        and commission fields must land on the Trade row alongside
+        the price pnl. Prior code only extracted `pl`."""
+        db = MagicMock()
+        run = _make_run(last_txn_id="600")
+        client = MagicMock()
+        client.get_transactions_since.return_value = {
+            "transactions": [
+                {
+                    "id": "610",
+                    "type": "ORDER_FILL",
+                    "reason": "STOP_LOSS_ORDER",
+                    "time": "2026-07-15T14:00:00Z",
+                    "price": "1.14167",
+                    "pl": "-22.00",
+                    "financing": "-1.50",
+                    "commission": "0.30",
+                    "tradeClosed": {
+                        "tradeID": "broker-99",
+                        "realizedPL": "-22.00",
+                        "financing": "-1.50",
+                    },
+                }
+            ],
+            "lastTransactionID": "610",
+        }
+        # Pre-existing DAILY_FINANCING accumulated -0.75 during the
+        # hold; close fill adds another -1.50.
+        trade = _make_trade(broker_trade_id="broker-99", financing=-0.75)
+        _wire_trade_lookup(db, {"broker-99": trade})
+
+        result = reconcile_broker_transactions(db=db, run=run, client=client)
+
+        assert result.trades_updated == 1
+        # Financing accumulates: prior -0.75 + close -1.50 = -2.25
+        assert trade.financing == pytest.approx(-2.25)
+        assert trade.commission == pytest.approx(0.30)
+        assert trade.pnl == pytest.approx(-22.00)
+
+    def test_daily_financing_accumulates_on_open_trade(self):
+        """DAILY_FINANCING transactions are issued nightly at 5pm NY
+        for any trade held over the rollover. The reconciler walks
+        positionFinancings → openTradeFinancings and adds each
+        trade's share to Trade.financing."""
+        db = MagicMock()
+        run = _make_run(last_txn_id="700")
+        client = MagicMock()
+        client.get_transactions_since.return_value = {
+            "transactions": [
+                {
+                    "id": "701",
+                    "type": "DAILY_FINANCING",
+                    "time": "2026-07-15T21:00:00Z",
+                    "positionFinancings": [
+                        {
+                            "instrument": "EUR_USD",
+                            "financing": "-2.10",
+                            "openTradeFinancings": [
+                                {"tradeID": "broker-501", "financing": "-2.10"}
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "lastTransactionID": "701",
+        }
+        trade = _make_trade(broker_trade_id="broker-501")
+        assert trade.financing is None  # sanity
+        _wire_trade_lookup(db, {"broker-501": trade})
+
+        result = reconcile_broker_transactions(db=db, run=run, client=client)
+
+        assert result.trades_updated == 1
+        assert trade.financing == pytest.approx(-2.10)
+        # Trade stays open — DAILY_FINANCING doesn't close anything.
+        assert trade.exit_timestamp is None
+
+    def test_daily_financing_multiple_rollovers_accumulate(self):
+        """Two consecutive DAILY_FINANCING events for the same trade
+        both accumulate onto Trade.financing (idempotent because the
+        reconciler advances last_transaction_id and never rescans)."""
+        db = MagicMock()
+        run = _make_run(last_txn_id="800")
+        client = MagicMock()
+        client.get_transactions_since.return_value = {
+            "transactions": [
+                {
+                    "id": "801",
+                    "type": "DAILY_FINANCING",
+                    "positionFinancings": [
+                        {
+                            "openTradeFinancings": [
+                                {"tradeID": "broker-77", "financing": "-1.00"}
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "id": "802",
+                    "type": "DAILY_FINANCING",
+                    "positionFinancings": [
+                        {
+                            "openTradeFinancings": [
+                                {"tradeID": "broker-77", "financing": "-1.20"}
+                            ],
+                        }
+                    ],
+                },
+            ],
+            "lastTransactionID": "802",
+        }
+        trade = _make_trade(broker_trade_id="broker-77")
+        _wire_trade_lookup(db, {"broker-77": trade})
+
+        result = reconcile_broker_transactions(db=db, run=run, client=client)
+
+        assert result.trades_updated == 2  # two accumulations
+        assert trade.financing == pytest.approx(-2.20)
 
     def test_non_order_fill_transactions_ignored(self):
         db = MagicMock()
