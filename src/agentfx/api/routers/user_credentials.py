@@ -389,3 +389,69 @@ def diagnose_my_credentials(
             "failed": sum(1 for c in calls if not c["ok"]),
         },
     }
+
+
+@router.get("/users/me/credentials/oanda-state")
+def oanda_state_dump(
+    account_id: str,
+    instrument: str = "EUR_USD",
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> dict:
+    """Dump the OANDA-side state so we can compare against our DB.
+
+    Wilson UAT 2026-07-16 investigation: runner keeps getting
+    CLOSEOUT_POSITION_REJECT when trying to close a LONG we think
+    we hold. Need to know what OANDA ACTUALLY thinks the account
+    holds — position units, open trades with their SL/TP orders,
+    last transaction ID, most-recent transactions. Read-only.
+    """
+    from agentfx.adapters.oanda import OandaClient
+
+    row = _load_credentials(db, current_user.id)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Set credentials before diagnosing",
+        )
+    plaintext = decrypt_secret(row.oanda_api_key_encrypted)
+    env_value = (
+        row.oanda_environment.value
+        if hasattr(row.oanda_environment, "value")
+        else str(row.oanda_environment)
+    )
+    client = OandaClient(
+        api_key=plaintext,
+        environment=env_value,
+        account_id=account_id,
+    )
+    # Direct raw calls — return whatever OANDA sends so we can eyeball
+    # for anything unexpected (dangling SL/TP orders, hedged position,
+    # unusual trade state).
+    aid = account_id
+    result: dict = {}
+    try:
+        summary = client._request("GET", f"/accounts/{aid}/summary")
+        result["account_summary"] = summary.get("account", {})
+    except Exception as e:  # noqa: BLE001
+        result["account_summary_error"] = str(e)[:400]
+
+    try:
+        pos = client._request("GET", f"/accounts/{aid}/positions/{instrument}")
+        result["position"] = pos.get("position", {})
+    except Exception as e:  # noqa: BLE001
+        result["position_error"] = str(e)[:400]
+
+    try:
+        open_trades = client._request("GET", f"/accounts/{aid}/openTrades")
+        result["open_trades"] = open_trades.get("trades", [])
+    except Exception as e:  # noqa: BLE001
+        result["open_trades_error"] = str(e)[:400]
+
+    try:
+        pending = client._request("GET", f"/accounts/{aid}/pendingOrders")
+        result["pending_orders"] = pending.get("orders", [])
+    except Exception as e:  # noqa: BLE001
+        result["pending_orders_error"] = str(e)[:400]
+
+    return result
