@@ -491,3 +491,134 @@ def oanda_state_dump(
         result["pricing_error"] = str(e)[:400]
 
     return result
+
+
+@router.post("/users/me/credentials/oanda-close-probe")
+def oanda_close_probe(
+    account_id: str,
+    trade_id: str,
+    dry_run: bool = True,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> dict:
+    """Probe OANDA with a real close request to find which SHAPE
+    the broker accepts. Read-only when `dry_run=true` (just returns
+    what our runner would send). Live when `dry_run=false`.
+
+    Tries three shapes in sequence when live:
+      1. PUT /positions/{inst}/close with {longUnits: "ALL", shortUnits: "ALL"}
+         (what the runner does today — this is what's rejecting)
+      2. PUT /positions/{inst}/close with only the side that has units
+      3. PUT /trades/{tradeID}/close with units: "ALL"
+
+    Stops on first success. Reports which shape worked. If ALL fail,
+    reports each reject reason for direct comparison.
+    """
+    from agentfx.adapters.oanda import OandaClient, OandaError
+
+    row = _load_credentials(db, current_user.id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No credentials")
+    plaintext = decrypt_secret(row.oanda_api_key_encrypted)
+    env_value = (
+        row.oanda_environment.value
+        if hasattr(row.oanda_environment, "value")
+        else str(row.oanda_environment)
+    )
+    client = OandaClient(
+        api_key=plaintext, environment=env_value, account_id=account_id
+    )
+
+    # First — get the actual position state so we know what's open.
+    try:
+        pos_resp = client._request("GET", f"/accounts/{account_id}/positions/EUR_USD")
+        pos = pos_resp.get("position", {})
+    except OandaError as e:
+        return {"error": f"position lookup failed: {e}"}
+    long_units = int(pos.get("long", {}).get("units", 0) or 0)
+    short_units = int(pos.get("short", {}).get("units", 0) or 0)
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "position_state": {"long": long_units, "short": short_units},
+            "would_try": [
+                {
+                    "shape": "close_all_both_sides",
+                    "body": {"longUnits": "ALL", "shortUnits": "ALL"},
+                },
+                {
+                    "shape": "close_all_active_side_only",
+                    "body": (
+                        {"longUnits": "ALL"}
+                        if long_units > 0
+                        else {"shortUnits": "ALL"}
+                        if short_units != 0
+                        else "no open side"
+                    ),
+                },
+                {
+                    "shape": "close_trade_by_id",
+                    "body": {"tradeID": trade_id, "units": "ALL"},
+                },
+            ],
+        }
+
+    attempts = []
+
+    # Shape 1: what runner does today
+    try:
+        r = client._request(
+            "PUT",
+            f"/accounts/{account_id}/positions/EUR_USD/close",
+            json_body={"longUnits": "ALL", "shortUnits": "ALL"},
+        )
+        attempts.append({"shape": "close_all_both_sides", "ok": True, "resp": r})
+        return {"attempts": attempts, "winner": "close_all_both_sides"}
+    except OandaError as e:
+        attempts.append(
+            {"shape": "close_all_both_sides", "ok": False, "error": str(e)[:500]}
+        )
+
+    # Shape 2: only the active side
+    if long_units > 0:
+        body = {"longUnits": "ALL"}
+    elif short_units != 0:
+        body = {"shortUnits": "ALL"}
+    else:
+        body = None
+    if body:
+        try:
+            r = client._request(
+                "PUT",
+                f"/accounts/{account_id}/positions/EUR_USD/close",
+                json_body=body,
+            )
+            attempts.append(
+                {"shape": "close_all_active_side_only", "ok": True, "resp": r}
+            )
+            return {"attempts": attempts, "winner": "close_all_active_side_only"}
+        except OandaError as e:
+            attempts.append(
+                {
+                    "shape": "close_all_active_side_only",
+                    "ok": False,
+                    "error": str(e)[:500],
+                }
+            )
+
+    # Shape 3: close specific trade by ID
+    try:
+        r = client._request(
+            "PUT",
+            f"/accounts/{account_id}/trades/{trade_id}/close",
+            json_body={"units": "ALL"},
+        )
+        attempts.append({"shape": "close_trade_by_id", "ok": True, "resp": r})
+        return {"attempts": attempts, "winner": "close_trade_by_id"}
+    except OandaError as e:
+        attempts.append(
+            {"shape": "close_trade_by_id", "ok": False, "error": str(e)[:500]}
+        )
+
+    return {"attempts": attempts, "winner": None, "all_shapes_rejected": True}
