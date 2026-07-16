@@ -454,4 +454,40 @@ def oanda_state_dump(
     except Exception as e:  # noqa: BLE001
         result["pending_orders_error"] = str(e)[:400]
 
+    # Recent transactions of interest — MARKET_ORDER_REJECT tells us
+    # what OANDA has been refusing. Filter to the last ~50 relevant
+    # events so we can see the reject pattern.
+    try:
+        last_id = int(result.get("account_summary", {}).get("lastTransactionID", 0))
+        from_id = str(max(1, last_id - 50))
+        to_id = str(last_id)
+        rng = client._request(
+            "GET",
+            f"/accounts/{aid}/transactions/idrange",
+            params={"from": from_id, "to": to_id},
+        )
+        result["recent_transactions"] = [
+            {
+                "id": t.get("id"),
+                "type": t.get("type"),
+                "time": t.get("time"),
+                "reason": t.get("reason"),
+                "rejectReason": t.get("rejectReason"),
+                "instrument": t.get("instrument"),
+                "units": t.get("units"),
+                "price": t.get("price"),
+                "pl": t.get("pl"),
+            }
+            for t in (rng.get("transactions") or [])
+        ]
+    except Exception as e:  # noqa: BLE001
+        result["recent_transactions_error"] = str(e)[:400]
+
+    # Live pricing so we can see how close bid/ask is to the SL/TP.
+    try:
+        pricing = client.get_pricing(instrument)
+        result["pricing"] = pricing
+    except Exception as e:  # noqa: BLE001
+        result["pricing_error"] = str(e)[:400]
+
     return result
