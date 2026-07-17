@@ -594,6 +594,44 @@ def _execute_loop(
 # ─────────────────────────────────────────────────────────────────────
 
 
+def _count_bars_since(
+    *,
+    db,
+    instrument: str,
+    granularity: str,
+    entry_ts: datetime,
+    now_utc: datetime,
+) -> int:
+    """Count completed candles between `entry_ts` (exclusive) and
+    `now_utc` (inclusive) for the given instrument+granularity.
+
+    Backtest's `_apply_exits` measures `bars_held` as the integer
+    index count within the OHLCV series (t - entry_bar). Paper's
+    equivalent is the row count in the shared candles table over the
+    same window. Weekend gaps and ingestion outages don't advance the
+    counter — same semantics as backtest.
+
+    Excludes the trade's entry bar itself so bars_held starts at 0
+    at open and increments once per closed bar.
+
+    Only counts `complete=True` rows so the currently-forming bar
+    (partially aggregated by the ingester) isn't over-counted.
+    """
+    from agentfx.api.models.market_data import Candle
+
+    return (
+        db.query(Candle)
+        .filter(
+            Candle.instrument == instrument,
+            Candle.timeframe == granularity,
+            Candle.timestamp > entry_ts,
+            Candle.timestamp <= now_utc,
+            Candle.complete.is_(True),
+        )
+        .count()
+    )
+
+
 def _signal_tick(
     *,
     db,
@@ -618,17 +656,17 @@ def _signal_tick(
 
     granularity = _seconds_to_granularity(granularity_seconds)
 
-    # Backtest gates ALL exit paths on `bars_held < min_hold_bars`
+    # Backtest gates ALL exit paths on `bars_held < min_hold_bars` and
+    # expires positions at `bars_held >= max_hold_bars`, where
+    # bars_held is the integer index count within the OHLCV series
     # (see `_apply_exits` in core/dsl/compiler.py). The paper runner
-    # historically skipped this gate, so opposite-flip fired on the
-    # first noisy MACD tick after entry. Wilson UAT 2026-07-17:
-    # genome_gen_evorun_20260712_30f6bc87_017_019 backtest showed max
-    # 11 consecutive losses over 510 trades (min_hold=60 throttling
-    # churn); paper hit 13 consecutive losses in 22h, most closed in
-    # 7-25 min, all opposite_flip. Root cause: paper was running a
-    # strictly noisier, higher-turnover version of the tested
-    # strategy. Compute bars_held once at the top; min_hold gate
-    # suppresses stop/target/max_hold/opposite_flip alike.
+    # previously (a) skipped the min_hold gate entirely — Wilson UAT
+    # 2026-07-17: genome _017_019 hit 13 consecutive losses in 22h vs
+    # backtest max of 11 over 510 trades — and (b) measured max_hold
+    # in WALL-CLOCK seconds, which force-closed positions mid-weekend
+    # when no trading bars had ticked. Fix: count actual completed
+    # candles between entry_timestamp and now_utc; gaps (weekends,
+    # ingestion outages) correctly hold the counter.
     exit_rules_early = getattr(strategy, "spec", None)
     min_hold_bars_early: int | None = None
     max_hold_bars_early: int | None = None
@@ -637,7 +675,7 @@ def _signal_tick(
         max_hold_bars_early = int(exit_rules_early.exit.max_hold_bars)
 
     open_trade_early: Trade | None = None
-    held_seconds_early: float = 0.0
+    bars_held_early: int = 0
     if min_hold_bars_early is not None or max_hold_bars_early is not None:
         open_trade_early = (
             db.query(Trade)
@@ -649,18 +687,24 @@ def _signal_tick(
             entry_ts_early = open_trade_early.entry_timestamp
             if entry_ts_early.tzinfo is None:
                 entry_ts_early = entry_ts_early.replace(tzinfo=UTC)
-            held_seconds_early = (now_utc - entry_ts_early).total_seconds()
+            bars_held_early = _count_bars_since(
+                db=db,
+                instrument=instrument,
+                granularity=granularity,
+                entry_ts=entry_ts_early,
+                now_utc=now_utc,
+            )
 
-    # Min-hold gate: if a trade is younger than min_hold_bars, suppress
-    # every exit path this tick — matches backtest exactly. Silent
-    # no-op (no decision log spam) since it fires every tick during
-    # the hold window. Equity snapshot is still recorded so the
-    # LivePnLChart stays continuous.
+    # Min-hold gate: if the position has held fewer than
+    # min_hold_bars completed bars, suppress every exit path this
+    # tick — matches backtest exactly. Silent no-op (no decision log
+    # spam) since it fires every tick during the hold window. Equity
+    # snapshot is still recorded so the LivePnLChart stays continuous.
     if (
         open_trade_early is not None
         and min_hold_bars_early is not None
         and min_hold_bars_early > 0
-        and held_seconds_early < min_hold_bars_early * granularity_seconds
+        and bars_held_early < min_hold_bars_early
     ):
         try:
             hold_pos = client.get_position(instrument)
@@ -669,15 +713,13 @@ def _signal_tick(
         _persist_equity_snapshot(db=db, run=run, position=hold_pos, now_utc=now_utc)
         return
 
-    # Wall-clock max_hold check — doesn't need candles, so it fires
-    # regardless of stale-guard state. Bug caught 2026-07-15 (Wilson):
-    # trade 2 was overdue for max_hold force-close but the stale-guard
-    # tripped 12× overnight and blocked the check because it lived
-    # after `candle_fetch_fn`. Time-based exits shouldn't depend on
-    # fresh candle ingestion.
+    # Max-hold check — bars, not wall-clock. Runs before the stale-
+    # candle guard so a briefly-lagging ingestion just delays the
+    # force-close by a tick or two; weekend gaps and prolonged
+    # outages correctly hold the counter until real bars resume.
     if max_hold_bars_early is not None:
         if open_trade_early is not None:
-            if held_seconds_early >= max_hold_bars_early * granularity_seconds:
+            if bars_held_early >= max_hold_bars_early:
                 # Before calling close, check whether OANDA still has a
                 # position. If the broker's SL/TP fired between ticks
                 # while we weren't watching (Wilson UAT 2026-07-15:
@@ -715,7 +757,7 @@ def _signal_tick(
                             "paper_run_id": run.id,
                             "trade_id": open_trade_early.id,
                             "exit_reason": "broker_other",
-                            "held_seconds": int(held_seconds_early),
+                            "bars_held": bars_held_early,
                         },
                     )
                     return
@@ -731,8 +773,8 @@ def _signal_tick(
                         now_utc=now_utc,
                         reason=(
                             f"max_hold_bars={max_hold_bars_early} exceeded "
-                            f"(held for {int(held_seconds_early)}s vs limit "
-                            f"{max_hold_bars_early * granularity_seconds}s)"
+                            f"(held for {bars_held_early} bars vs limit "
+                            f"{max_hold_bars_early})"
                         ),
                         exit_reason="max_hold",
                     )
@@ -905,8 +947,16 @@ def _signal_tick(
         if not opp_flag:
             _persist_equity_snapshot(db=db, run=run, position=position, now_utc=now_utc)
             return
-        # opposite_signal=True → close first + return; next tick opens
-        # the new side. Explicit two-step matches backtest's audit trail.
+        # opposite_signal=True → close AND open in the same tick.
+        # Backtest's `_apply_exits` (compiler.py:268-277) atomically
+        # sets `in_position`, `entry_close`, `entry_bar` in one bar.
+        # The earlier two-step "close now, reopen next tick" version
+        # dropped the reopen for crossover-style entry rules
+        # (crosses_above / crosses_below fire on ONE bar only) — Wilson
+        # UAT 2026-07-17 audit. Threshold-style entries (obv < 0) stay
+        # true across bars, so those reopened correctly on tick T+1;
+        # crossover entries silently didn't. Now we fall through to
+        # the entry-from-flat block below on successful close.
         from agentfx.adapters.oanda import OandaOrderRejected
 
         try:
@@ -937,7 +987,12 @@ def _signal_tick(
                     "close_context": "opposite_flip",
                 },
             )
-        return
+            return
+        # Close succeeded — position at OANDA is now flat. Fall through
+        # to the entry-from-flat block to open the new side in the same
+        # tick. `position` is stale (still reflects the pre-close side)
+        # but downstream only reads `signal_direction` and `sl_pips /
+        # tp_pips` from spec, so it's safe.
 
     # net_units == 0 AND raw_entry != 0 → fresh entry from flat.
     # Broker-side SL/TP: the strategy's DSL exit block is the source

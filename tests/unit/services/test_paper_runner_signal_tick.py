@@ -349,11 +349,10 @@ class TestSignalTick:
 
     def test_max_hold_forces_close_of_open_trade(self):
         # OANDA has no concept of a bar-count-based exit — the runner
-        # enforces `spec.exit.max_hold_bars` itself. When the open trade
-        # has been held longer than max_hold * granularity, force-close.
+        # enforces `spec.exit.max_hold_bars` itself. When the count of
+        # candles since entry (bars_held) reaches max_hold_bars,
+        # force-close.
         now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
-        # max_hold_bars=5, granularity=60s → 300s limit. Entry was 400s
-        # ago → over the limit.
         entry_ts = now - timedelta(seconds=400)
         strategy = _make_strategy(signals=[0, 0, 0], max_hold_bars=5)
         candles_df = _mk_candles_df(3, now)
@@ -378,8 +377,13 @@ class TestSignalTick:
         )
         db = _make_db()
         _set_open_trade(db, open_trade)
-        # Second query (inside _close_position_and_persist) fetches all
-        # open trades to update — reuse the same row via .all().
+        # bars_held = 6 (>= max_hold=5) — DB says 6 completed candles
+        # have landed since entry. Wilson UAT 2026-07-17: replaced the
+        # earlier wall-clock check with a DB row count so weekend gaps
+        # (Fri entry → Sat force-close in wall-clock) don't fire.
+        db.query.return_value.filter.return_value.count.return_value = 6
+        # _close_position_and_persist re-queries open trades — reuse
+        # the same row via .all().
         db.query.return_value.filter.return_value.all.return_value = [open_trade]
         run = _make_run()
 
@@ -400,6 +404,56 @@ class TestSignalTick:
         closed = [d for d in decisions if d.action == "USER_POSITION_CLOSED"]
         assert closed
         assert "max_hold_bars=5" in closed[0].reasoning_text
+
+    def test_max_hold_does_not_fire_across_weekend_gap(self):
+        """Wilson UAT 2026-07-17 audit: the old wall-clock max_hold
+        check would force-close a Friday-evening entry at Saturday
+        11:15 UTC (13.25h wall-clock elapsed) even though no trading
+        bars had ticked. Backtest counts bars in the OHLCV series so
+        the counter freezes during weekend gaps. The bar-count version
+        matches: if only 3 bars have landed in the DB since entry,
+        max_hold=795 is far from tripped."""
+        now = datetime(2026, 7, 12, 11, 15, tzinfo=UTC)  # Saturday
+        entry_ts = datetime(2026, 7, 11, 22, 0, tzinfo=UTC)  # Fri evening
+        strategy = _make_strategy(signals=[0, 0, 0], max_hold_bars=795)
+        candles_df = _mk_candles_df(3, now)
+        fetch = MagicMock(return_value=candles_df)
+
+        client = MagicMock()
+        client.get_position.return_value = {"long_units": 10_000, "short_units": 0}
+        open_trade = SimpleNamespace(
+            id="tr_weekend",
+            run_id="run_test",
+            entry_price=1.10,
+            quantity=10_000,
+            entry_timestamp=entry_ts,
+            exit_timestamp=None,
+            pnl=None,
+            pnl_pct=None,
+            exit_price=None,
+        )
+        db = _make_db()
+        _set_open_trade(db, open_trade)
+        # Only 3 M1 bars closed after Fri 22:00 (weekend market close).
+        # Wall-clock would have said ~48,300s elapsed (~13.4h × granularity)
+        # — old logic would have force-closed. Bar count = 3 → hold.
+        db.query.return_value.filter.return_value.count.return_value = 3
+        db.query.return_value.filter.return_value.all.return_value = [open_trade]
+        run = _make_run()
+
+        _signal_tick(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=now,
+        )
+
+        # Must NOT force-close — no bars ticked over the weekend.
+        client.close_all_positions.assert_not_called()
 
     def test_opposite_signal_false_holds_through_opposite_cross(self):
         # DSL with `opposite_signal: false` (Wilson's genome 019_028
@@ -530,10 +584,20 @@ class TestSignalTick:
         decisions = [r for r in added if type(r).__name__ == "DecisionLog"]
         assert any(d.action == "USER_SIGNAL_SKIPPED_STALE" for d in decisions)
 
-    def test_two_step_flip_closes_first(self):
-        # Existing long +10k, fresh short cross fires with
-        # `opposite_signal=True` (mock default) → close first, don't
-        # place yet. Next tick will open the short.
+    def test_atomic_flip_closes_and_opens_same_tick(self):
+        """Wilson UAT 2026-07-17 audit: backtest's `_apply_exits`
+        atomically flips in one bar (close + open opposite in the same
+        `raw_pos` step). The earlier paper runner did a two-step
+        "close now, reopen next tick" which silently dropped the reopen
+        for crossover-style entry rules (`crosses_above` /
+        `crosses_below` fire on ONE bar only). Threshold-style
+        entries (`obv < 0`) stayed true across bars so those reopened
+        on tick T+1; crossover entries didn't.
+
+        Now: existing LONG +10k, short signal fires with
+        opposite_signal=True → close AND place SHORT order in the
+        same _signal_tick call.
+        """
         strategy = _make_strategy(signals=[0, 0, -1])
         candles_df = _mk_candles_df(3, datetime(2026, 7, 10, 12, 0, tzinfo=UTC))
         fetch = MagicMock(return_value=candles_df)
@@ -544,9 +608,16 @@ class TestSignalTick:
             "long_realized_pnl": 5.0,
             "short_realized_pnl": 0.0,
         }
+        client.get_account_balance.return_value = {
+            "balance": 10_000.0,
+            "currency": "USD",
+        }
+        client.place_market_order.return_value = {
+            "trade_id": "trade_after_flip",
+            "fill_price": 1.1020,
+            "units": -25_000,
+        }
         db = _make_db()
-        # No expired-max-hold trade, so the max_hold check is a no-op
-        # and the flip path fires.
         _set_open_trade(db, None)
         db.query.return_value.filter.return_value.all.return_value = []
 
@@ -563,7 +634,11 @@ class TestSignalTick:
         )
 
         client.close_all_positions.assert_called_once_with("EUR_USD")
-        client.place_market_order.assert_not_called()
+        # Atomic flip: the SHORT order MUST be placed in the same tick.
+        # `signed_units < 0` since we're flipping into a short.
+        client.place_market_order.assert_called_once()
+        signed_units = client.place_market_order.call_args.args[1]
+        assert signed_units < 0
 
     def test_min_hold_bars_blocks_opposite_flip_within_window(self):
         """Regression, Wilson UAT 2026-07-17: paper runner didn't
@@ -607,6 +682,8 @@ class TestSignalTick:
         )
         _set_open_trade(db, trade)
         db.query.return_value.filter.return_value.all.return_value = [trade]
+        # 30 bars in DB since entry — inside min_hold=60.
+        db.query.return_value.filter.return_value.count.return_value = 30
 
         run = _make_run()
         _signal_tick(
@@ -624,8 +701,8 @@ class TestSignalTick:
         client.place_market_order.assert_not_called()
 
     def test_min_hold_bars_allows_flip_after_window(self):
-        """Mirror of the block-test: same setup but tick at 13:30
-        (90 min held, past min_hold=60) — flip MUST fire."""
+        """Mirror of the block-test: same setup but at 90 bars held
+        (past min_hold=60) — flip MUST fire."""
         strategy = _make_strategy(
             signals=[0, 0, 1],
             min_hold_bars=60,
@@ -659,6 +736,8 @@ class TestSignalTick:
         )
         _set_open_trade(db, trade)
         db.query.return_value.filter.return_value.all.return_value = [trade]
+        # 90 bars in DB since entry — past min_hold=60.
+        db.query.return_value.filter.return_value.count.return_value = 90
 
         run = _make_run()
         _signal_tick(
