@@ -618,17 +618,27 @@ def _signal_tick(
 
     granularity = _seconds_to_granularity(granularity_seconds)
 
-    # Wall-clock max_hold check FIRST — doesn't need candles, so it
-    # fires regardless of stale-guard state. Bug caught 2026-07-15
-    # (Wilson): trade 2 was overdue for max_hold force-close but the
-    # stale-guard tripped 12× overnight and blocked the check because
-    # it lived after `candle_fetch_fn`. Time-based exits shouldn't
-    # depend on fresh candle ingestion.
+    # Backtest gates ALL exit paths on `bars_held < min_hold_bars`
+    # (see `_apply_exits` in core/dsl/compiler.py). The paper runner
+    # historically skipped this gate, so opposite-flip fired on the
+    # first noisy MACD tick after entry. Wilson UAT 2026-07-17:
+    # genome_gen_evorun_20260712_30f6bc87_017_019 backtest showed max
+    # 11 consecutive losses over 510 trades (min_hold=60 throttling
+    # churn); paper hit 13 consecutive losses in 22h, most closed in
+    # 7-25 min, all opposite_flip. Root cause: paper was running a
+    # strictly noisier, higher-turnover version of the tested
+    # strategy. Compute bars_held once at the top; min_hold gate
+    # suppresses stop/target/max_hold/opposite_flip alike.
     exit_rules_early = getattr(strategy, "spec", None)
+    min_hold_bars_early: int | None = None
     max_hold_bars_early: int | None = None
     if exit_rules_early is not None and exit_rules_early.exit is not None:
+        min_hold_bars_early = int(exit_rules_early.exit.min_hold_bars)
         max_hold_bars_early = int(exit_rules_early.exit.max_hold_bars)
-    if max_hold_bars_early is not None:
+
+    open_trade_early: Trade | None = None
+    held_seconds_early: float = 0.0
+    if min_hold_bars_early is not None or max_hold_bars_early is not None:
         open_trade_early = (
             db.query(Trade)
             .filter(Trade.run_id == run.id, Trade.exit_timestamp.is_(None))
@@ -640,6 +650,33 @@ def _signal_tick(
             if entry_ts_early.tzinfo is None:
                 entry_ts_early = entry_ts_early.replace(tzinfo=UTC)
             held_seconds_early = (now_utc - entry_ts_early).total_seconds()
+
+    # Min-hold gate: if a trade is younger than min_hold_bars, suppress
+    # every exit path this tick — matches backtest exactly. Silent
+    # no-op (no decision log spam) since it fires every tick during
+    # the hold window. Equity snapshot is still recorded so the
+    # LivePnLChart stays continuous.
+    if (
+        open_trade_early is not None
+        and min_hold_bars_early is not None
+        and min_hold_bars_early > 0
+        and held_seconds_early < min_hold_bars_early * granularity_seconds
+    ):
+        try:
+            hold_pos = client.get_position(instrument)
+        except Exception:  # noqa: BLE001 — snapshot is best-effort
+            hold_pos = None
+        _persist_equity_snapshot(db=db, run=run, position=hold_pos, now_utc=now_utc)
+        return
+
+    # Wall-clock max_hold check — doesn't need candles, so it fires
+    # regardless of stale-guard state. Bug caught 2026-07-15 (Wilson):
+    # trade 2 was overdue for max_hold force-close but the stale-guard
+    # tripped 12× overnight and blocked the check because it lived
+    # after `candle_fetch_fn`. Time-based exits shouldn't depend on
+    # fresh candle ingestion.
+    if max_hold_bars_early is not None:
+        if open_trade_early is not None:
             if held_seconds_early >= max_hold_bars_early * granularity_seconds:
                 # Before calling close, check whether OANDA still has a
                 # position. If the broker's SL/TP fired between ticks

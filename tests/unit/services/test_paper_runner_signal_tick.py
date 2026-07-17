@@ -140,6 +140,7 @@ def _make_strategy(
     stop_pips: int = 20,
     target_pips: int = 50,
     max_hold_bars: int = 600,
+    min_hold_bars: int = 0,
     opposite_signal: bool = True,
     risk_pct: float = 0.005,
 ) -> SimpleNamespace:
@@ -166,6 +167,7 @@ def _make_strategy(
         stop_pips=stop_pips,
         target_pips=target_pips,
         max_hold_bars=max_hold_bars,
+        min_hold_bars=min_hold_bars,
         opposite_signal=opposite_signal,
     )
     size_rules = SimpleNamespace(risk_pct=risk_pct)
@@ -562,6 +564,115 @@ class TestSignalTick:
 
         client.close_all_positions.assert_called_once_with("EUR_USD")
         client.place_market_order.assert_not_called()
+
+    def test_min_hold_bars_blocks_opposite_flip_within_window(self):
+        """Regression, Wilson UAT 2026-07-17: paper runner didn't
+        enforce `min_hold_bars` at all. Backtest's `_apply_exits` gates
+        every exit path (stop / target / max_hold / opposite_flip) on
+        `bars_held < min_hold_bars`. Genome
+        genome_gen_evorun_20260712_30f6bc87_017_019 was tested with
+        min_hold=60; paper ran it without the gate and hit 13
+        consecutive losses in 22h (backtest max was 11 over 510
+        trades) — most trades closed in 7-25 min on the first noisy
+        MACD flip signal.
+
+        SHORT open at 12:00, tick at 12:30 (30 min held) with an
+        opposite (LONG) entry event → runner must HOLD (no
+        close_all_positions), matching backtest.
+        """
+        strategy = _make_strategy(
+            signals=[0, 0, 1],  # LONG entry event vs open SHORT = opposite
+            min_hold_bars=60,
+            opposite_signal=True,
+        )
+        candles_df = _mk_candles_df(3, datetime(2026, 7, 10, 12, 30, tzinfo=UTC))
+        fetch = MagicMock(return_value=candles_df)
+
+        client = MagicMock()
+        client.get_position.return_value = {
+            "long_units": 0,
+            "short_units": -10_000,
+            "unrealized_pnl": 5.0,
+        }
+        db = _make_db()
+        # Trade opened 30 min ago at 12:00 — still inside min_hold=60m.
+        trade = SimpleNamespace(
+            id="trade_within_min_hold",
+            entry_timestamp=datetime(2026, 7, 10, 12, 0, tzinfo=UTC),
+            entry_price=1.1000,
+            exit_timestamp=None,
+            exit_price=None,
+            pnl=None,
+            exit_reason=None,
+        )
+        _set_open_trade(db, trade)
+        db.query.return_value.filter.return_value.all.return_value = [trade]
+
+        run = _make_run()
+        _signal_tick(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=datetime(2026, 7, 10, 12, 30, tzinfo=UTC),
+        )
+
+        client.close_all_positions.assert_not_called()
+        client.place_market_order.assert_not_called()
+
+    def test_min_hold_bars_allows_flip_after_window(self):
+        """Mirror of the block-test: same setup but tick at 13:30
+        (90 min held, past min_hold=60) — flip MUST fire."""
+        strategy = _make_strategy(
+            signals=[0, 0, 1],
+            min_hold_bars=60,
+            opposite_signal=True,
+        )
+        candles_df = _mk_candles_df(3, datetime(2026, 7, 10, 13, 30, tzinfo=UTC))
+        fetch = MagicMock(return_value=candles_df)
+
+        client = MagicMock()
+        client.get_position.return_value = {
+            "long_units": 0,
+            "short_units": -10_000,
+            "unrealized_pnl": 5.0,
+        }
+        client.close_all_positions.return_value = {
+            "long_realized_pnl": 0.0,
+            "short_realized_pnl": 5.0,
+        }
+        db = _make_db()
+        trade = SimpleNamespace(
+            id="trade_past_min_hold",
+            entry_timestamp=datetime(2026, 7, 10, 12, 0, tzinfo=UTC),
+            entry_price=1.1000,
+            quantity=10_000,
+            exit_timestamp=None,
+            exit_price=None,
+            pnl=None,
+            exit_reason=None,
+            financing=None,
+            commission=None,
+        )
+        _set_open_trade(db, trade)
+        db.query.return_value.filter.return_value.all.return_value = [trade]
+
+        run = _make_run()
+        _signal_tick(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=datetime(2026, 7, 10, 13, 30, tzinfo=UTC),
+        )
+
+        client.close_all_positions.assert_called_once_with("EUR_USD")
 
     def test_stop_loss_and_take_profit_passed_through(self):
         # SL/TP from risk_config override → passed through to the
