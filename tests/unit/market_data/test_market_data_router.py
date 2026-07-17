@@ -367,3 +367,35 @@ class TestMarketDataRouter:
 
         # Assertions - should get 400 for missing authentication
         assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.unit
+@pytest.mark.market_data
+def test_all_rate_limited_endpoints_are_async():
+    """Regression: `@market_data_rate_limit` wraps every endpoint in an
+    async wrapper that always `await`s the inner function. A sync `def`
+    endpoint under this decorator returns its value (e.g. a Candle
+    ORM object) which then fails at `await <object>` with
+    ``TypeError: object Candle can't be used in 'await' expression``.
+
+    Wilson UAT 2026-07-16: `/candles/latest` was defined as sync `def`
+    and 500'd for every request. Same latent bug on
+    `/exchanges/{exchange_id}`. This test enumerates every route callable
+    on the market-data router and asserts it's a coroutine — catches the
+    regression on any future endpoint the moment it's added.
+    """
+    import asyncio
+
+    from src.agentfx.api.routers.market_data import router
+
+    offenders = [
+        route.endpoint.__name__
+        for route in router.routes
+        if not asyncio.iscoroutinefunction(route.endpoint)
+    ]
+    assert not offenders, (
+        f"market-data router endpoints defined as sync `def`: {offenders}. "
+        "They must be `async def` — the @market_data_rate_limit decorator "
+        "awaits the inner function and will 500 with `TypeError: object X "
+        "can't be used in 'await' expression` on a sync definition."
+    )

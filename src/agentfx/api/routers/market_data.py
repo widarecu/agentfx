@@ -95,7 +95,7 @@ async def get_candles(
 
 @router.get("/candles/latest", response_model=schemas.CandlePublic)
 @market_data_rate_limit(endpoint_type="candles", per_user=True)
-def get_latest_candle(
+async def get_latest_candle(
     request: Request,
     exchange: str = Query(..., description="Exchange identifier (e.g., 'oanda')"),
     instrument: str = Query(..., description="Instrument symbol (e.g., 'AUD_USD')"),
@@ -250,7 +250,7 @@ async def list_timeframes(
 
 @router.get("/exchanges/{exchange_id}", response_model=schemas.ExchangeInfo)
 @market_data_rate_limit(endpoint_type="instruments", per_user=True)
-def get_exchange_info(
+async def get_exchange_info(
     request: Request,
     exchange_id: str,
     db: Session = Depends(get_db),
