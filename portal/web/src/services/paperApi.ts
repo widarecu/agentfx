@@ -93,7 +93,10 @@ export interface ApprovePaperRunRequest {
   oanda_account_id: string;
   name?: string;
   risk_config: {
-    max_position_size_units: number;
+    /** v0.6.2 (Wilson UAT 2026-07-19): removed as a modal input.
+     *  Optional in the wire type so callers can omit it entirely; the
+     *  runner sizes each trade dynamically off risk_pct × balance. */
+    max_position_size_units?: number;
     daily_loss_pct: number;
     kill_switch_dd_pct: number;
     /** v0.6.1 (US-028): optional broker-side SL. When set, passed

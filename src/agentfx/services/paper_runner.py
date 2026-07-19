@@ -400,7 +400,11 @@ def _execute_loop(
     """
     from agentfx.adapters.oanda import OandaCircuitOpen
     from agentfx.api.models import RunStatus
-    from agentfx.services.paper_policy import RiskState, evaluate_all
+    from agentfx.services.paper_policy import (
+        RiskState,
+        check_daily_loss_cap,
+        check_kill_switch_dd,
+    )
 
     if now_fn is None:  # pragma: no cover — trivial
 
@@ -487,29 +491,34 @@ def _execute_loop(
         run.pnl = balance["balance"] - (run.snapshot_balance or 0.0)
         db.commit()
 
-        # Evaluate risk gates against the current balance.
+        # Evaluate risk gates against the current balance. The health
+        # tick only checks halt-gates (kill_switch, daily_loss);
+        # position-size gating happens at order-placement time inside
+        # `_signal_tick` where the real proposed units are known.
+        # v0.6.2 (Wilson UAT 2026-07-19): previously called
+        # `evaluate_all(state, proposed_units=state.max_position_size_units)`
+        # which compared max against itself — a no-op check that
+        # forced legacy runs to carry a stale `max_position_size_units`
+        # value even though sizing is fully dynamic.
         risk_cfg = run.risk_config or {}
         state = RiskState(
             snapshot_balance=run.snapshot_balance or 0.0,
             current_balance=run.current_balance,
             max_position_size_units=int(
-                risk_cfg.get("max_position_size_units", 10_000)
+                risk_cfg.get("max_position_size_units") or 10_000_000
             ),
             daily_loss_pct=float(risk_cfg.get("daily_loss_pct", 2.0)),
             kill_switch_dd_pct=float(risk_cfg.get("kill_switch_dd_pct", 5.0)),
         )
-        gate = evaluate_all(state, proposed_units=state.max_position_size_units)
-        if not gate.ok and gate.reason in {
-            "DAILY_LOSS_LIMIT",
-            "BROKER_CIRCUIT",
-        }:
-            logger.info(
-                "paper runner: gate refused on %s (%s); halting",
-                run.id,
-                gate.reason,
-            )
-            _flatten_and_halt(db, run, client, reason=gate.reason)
-            return
+        for check in (check_kill_switch_dd(state), check_daily_loss_cap(state)):
+            if not check.ok:
+                logger.info(
+                    "paper runner: gate refused on %s (%s); halting",
+                    run.id,
+                    check.reason,
+                )
+                _flatten_and_halt(db, run, client, reason=check.reason)
+                return
 
         # ─── Broker transaction reconciliation (T1 — every 12 ticks) ─
         # Every ~60s, poll OANDA's authoritative transaction log for

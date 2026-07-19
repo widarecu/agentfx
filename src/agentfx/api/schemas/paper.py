@@ -22,11 +22,22 @@ from .base import BaseSchema
 class RiskConfig(BaseSchema):
     """Per-run risk knobs collected from the deploy modal."""
 
-    max_position_size_units: int = Field(
-        default=10000,
+    # v0.6.2 (Wilson UAT 2026-07-19): removed as a modal input; the
+    # runner now sizes each trade off `balance × risk_pct ÷
+    # stop_pips` (matches backtest) and OANDA's own margin/leverage
+    # checks are the real ceiling. Kept in the schema as Optional so
+    # legacy risk_config JSON blobs on pre-2026-07-19 runs still
+    # validate — the runner treats a stored 10_000 as "no cap" and
+    # any explicit value above that as a caller-set safety cap.
+    max_position_size_units: int | None = Field(
+        default=None,
         ge=1,
         le=10_000_000,
-        description="Absolute cap on the signed units of any single order.",
+        description=(
+            "Absolute cap on the signed units of any single order. "
+            "Deprecated as a user-facing input; kept for backward "
+            "compatibility with legacy runs."
+        ),
     )
     daily_loss_pct: float = Field(
         default=2.0,

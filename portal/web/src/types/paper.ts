@@ -55,9 +55,14 @@ export interface PaperRunList {
 }
 
 export interface RiskConfig {
-  max_position_size_units: number;
+  // Optional — v0.6.2 removed the modal input. Present on legacy runs
+  // (pre-2026-07-19); absent on new runs, where sizing is fully
+  // dynamic (`balance × risk_pct ÷ stop_pips`).
+  max_position_size_units?: number;
   daily_loss_pct: number;
   kill_switch_dd_pct: number;
+  stop_loss_pips?: number;
+  take_profit_pips?: number;
 }
 
 export interface PaperRunPublic {

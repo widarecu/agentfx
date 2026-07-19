@@ -46,12 +46,13 @@ export function DeployPaperModal({
   const [name, setName] = useState<string>(
     `${item.instrument} ${item.granularity} — ${new Date().toISOString().slice(0, 10)}`,
   );
-  // Safety cap only (v0.6.1). Blank = no cap; the runner sizes each
-  // trade off `strategy.spec.size.risk_pct × account_balance` (same
-  // formula backtest uses). Setting a value here just clamps the
-  // result — e.g. "never fire more than 500,000 units regardless of
-  // what the strategy asks for."
-  const [maxPositionSize, setMaxPositionSize] = useState<string>('');
+  // v0.6.2 (Wilson UAT 2026-07-19): `max_position_size_units` used to
+  // be an editable "safety cap" input here. Removed entirely — dynamic
+  // sizing (`balance × risk_pct ÷ stop_pips`) is the only ceiling the
+  // runner respects, and OANDA's own margin/leverage checks reject
+  // orders that exceed real capacity. The extra knob confused the UX
+  // (users set numbers that under-sized compounding strategies) and
+  // added no safety over the broker's own controls.
   const [dailyLossPct, setDailyLossPct] = useState<string>('2.0');
   const [killDdPct, setKillDdPct] = useState<string>('5.0');
   // Broker-side SL/TP. Pre-populated from the strategy's DSL exit
@@ -97,7 +98,6 @@ export function DeployPaperModal({
     }
 
     const riskConfig = _buildRiskConfig({
-      maxPositionSize,
       dailyLossPct,
       killDdPct,
       stopLossPips,
@@ -253,13 +253,6 @@ export function DeployPaperModal({
 
             <div className="grid grid-cols-2 gap-4">
               <NumericField
-                label="Max position size (safety cap, units)"
-                hint="Blank = no cap. Runner sizes off strategy risk_pct × balance."
-                value={maxPositionSize}
-                onChange={setMaxPositionSize}
-                placeholder="e.g. 500000"
-              />
-              <NumericField
                 label="Daily loss threshold"
                 hint="Auto-halt at this % below snapshot"
                 suffix="% of balance"
@@ -412,7 +405,6 @@ function NumericField({
  * treats them as "no broker-side SL/TP registered".
  */
 export function _buildRiskConfig(inputs: {
-  maxPositionSize: string;
   dailyLossPct: string;
   killDdPct: string;
   stopLossPips: string;
@@ -422,14 +414,12 @@ export function _buildRiskConfig(inputs: {
     daily_loss_pct: Math.max(0.01, Number(inputs.dailyLossPct) || 2),
     kill_switch_dd_pct: Math.max(0.01, Number(inputs.killDdPct) || 5),
   };
-  // v0.6.1 (Wilson UAT 2026-07-15): max_position_size_units is a
-  // SAFETY CAP now, not the exact size. Blank input → omit the key
-  // entirely so runner treats as unbounded; the strategy's
-  // risk_pct × balance sizing kicks in.
-  const cap = Number(inputs.maxPositionSize);
-  if (inputs.maxPositionSize.trim() !== '' && Number.isFinite(cap) && cap > 0) {
-    cfg.max_position_size_units = cap;
-  }
+  // v0.6.2 (Wilson UAT 2026-07-19): `max_position_size_units` was
+  // dropped as an editable input — sizing is `balance × risk_pct ÷
+  // stop_pips` and OANDA's own margin/leverage checks are the real
+  // ceiling. Legacy risk_config JSON blobs may still carry the key on
+  // pre-2026-07-19 runs; the runner treats a stored 10000 as "no
+  // cap set" so those runs keep working unchanged.
   const sl = Number(inputs.stopLossPips);
   if (inputs.stopLossPips.trim() !== '' && Number.isFinite(sl) && sl > 0) {
     cfg.stop_loss_pips = sl;

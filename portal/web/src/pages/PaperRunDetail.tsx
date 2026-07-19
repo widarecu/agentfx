@@ -1029,8 +1029,15 @@ function RiskConfigPanel({ run }: { run: PaperRunPublic }) {
       <div className="text-sm font-semibold mb-3">Risk config</div>
       <dl className="space-y-2 text-sm">
         <Row label="Max position">
+          {/* v0.6.2 (Wilson UAT 2026-07-19): field removed from the
+              deploy modal — new runs land here with no
+              `max_position_size_units` key. Render "dynamic" so users
+              know sizing is driven by risk_pct × balance. Legacy runs
+              (pre-2026-07-19) still show the stored value. */}
           <span className="font-mono">
-            {cfg?.max_position_size_units.toLocaleString() ?? '—'} units
+            {cfg?.max_position_size_units != null
+              ? `${cfg.max_position_size_units.toLocaleString()} units`
+              : 'dynamic (risk_pct × balance)'}
           </span>
         </Row>
         <Row label="Daily loss cap">

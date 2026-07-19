@@ -1,13 +1,15 @@
 /**
- * Vitest for `_buildRiskConfig` in DeployPaperModal (US-028).
+ * Vitest for `_buildRiskConfig` in DeployPaperModal.
  *
  * Critical invariants:
  * - Empty SL/TP inputs must be OMITTED (not sent as null/0), so the
- *   runner falls back to the strategy DSL's exit block.
- * - v0.6.1 (Wilson UAT 2026-07-15): `max_position_size_units` is a
- *   SAFETY CAP, not the primary sizing input. Empty/zero input
- *   OMITS the field so the runner treats it as unbounded; the DSL's
- *   risk_pct × balance formula owns actual sizing.
+ *   runner falls back to the strategy DSL's exit block (US-028).
+ * - v0.6.2 (Wilson UAT 2026-07-19): `max_position_size_units` has been
+ *   removed as a user-facing input entirely. Sizing is dynamic
+ *   (`balance × risk_pct ÷ stop_pips`) and OANDA's own margin/leverage
+ *   checks are the real ceiling. The regression test at the bottom
+ *   locks that `_buildRiskConfig` no longer emits the key under any
+ *   input path.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -15,7 +17,6 @@ import { _buildRiskConfig } from '../../src/components/DeployPaperModal';
 
 describe('_buildRiskConfig', () => {
   const baseline = {
-    maxPositionSize: '10000',
     dailyLossPct: '2.0',
     killDdPct: '5.0',
     stopLossPips: '',
@@ -25,7 +26,6 @@ describe('_buildRiskConfig', () => {
   it('omits SL/TP when both fields are empty', () => {
     const cfg = _buildRiskConfig(baseline);
     expect(cfg).toEqual({
-      max_position_size_units: 10000,
       daily_loss_pct: 2,
       kill_switch_dd_pct: 5,
     });
@@ -74,35 +74,21 @@ describe('_buildRiskConfig', () => {
     expect(cfg).not.toHaveProperty('stop_loss_pips');
   });
 
-  it('emits max_position_size_units when a positive number is set', () => {
-    // Any positive input is forwarded verbatim as a safety cap.
-    const cfg = _buildRiskConfig({ ...baseline, maxPositionSize: '250000' });
-    expect(cfg.max_position_size_units).toBe(250000);
-  });
-
-  it('emits sub-1 positive input verbatim (backend clamps if needed)', () => {
-    // A decimal fat-finger like '0.5' still passes the >0 test. Backend
-    // policy layer decides whether to reject/clamp — the modal doesn't
-    // silently rewrite user intent.
-    const cfg = _buildRiskConfig({ ...baseline, maxPositionSize: '0.5' });
-    expect(cfg.max_position_size_units).toBe(0.5);
-  });
-
-  it('omits max_position_size_units when input is zero', () => {
-    // 0 is not > 0 → cap intentionally not set → runner runs unbounded.
-    const cfg = _buildRiskConfig({ ...baseline, maxPositionSize: '0' });
-    expect(cfg).not.toHaveProperty('max_position_size_units');
-  });
-
-  it('omits max_position_size_units when input is blank', () => {
-    // Blank = "no safety cap set" — runner sizes purely from DSL
-    // risk_pct × balance. This is the new default post-v0.6.1.
-    const cfg = _buildRiskConfig({ ...baseline, maxPositionSize: '' });
-    expect(cfg).not.toHaveProperty('max_position_size_units');
-  });
-
-  it('omits max_position_size_units when input is non-numeric', () => {
-    const cfg = _buildRiskConfig({ ...baseline, maxPositionSize: 'foo' });
-    expect(cfg).not.toHaveProperty('max_position_size_units');
+  it('regression: never emits max_position_size_units — the input was removed in v0.6.2', () => {
+    // The field was deleted from the modal; the runner sizes each
+    // trade off risk_pct × balance and OANDA enforces the real
+    // ceiling. Any risk_config payload built by this helper must NOT
+    // carry the deprecated key, regardless of what other inputs are
+    // set.
+    const combos = [
+      baseline,
+      { ...baseline, dailyLossPct: '5', killDdPct: '10' },
+      { ...baseline, stopLossPips: '20', takeProfitPips: '40' },
+      { ...baseline, stopLossPips: '20' },
+    ];
+    for (const inputs of combos) {
+      const cfg = _buildRiskConfig(inputs);
+      expect(cfg).not.toHaveProperty('max_position_size_units');
+    }
   });
 });
