@@ -20,7 +20,34 @@ interface ValidatorOverrideModalProps {
   onError: (message: string) => void;
 }
 
-const REASON_MIN_LENGTH = 20;
+export const REASON_MIN_LENGTH = 20;
+
+/**
+ * Pure gate: can the submit button be enabled right now?
+ *
+ * Extracted so Vitest can lock the transition points (below-min,
+ * whitespace-only, at-min, above-min, and while a submit is in
+ * flight) without a jsdom render pass — the project's Vitest config
+ * runs in the `node` environment and has no `@testing-library/react`.
+ */
+export function _canSubmit(reason: string, submitting: boolean): boolean {
+  if (submitting) return false;
+  return reason.trim().length >= REASON_MIN_LENGTH;
+}
+
+/**
+ * Pure payload builder for the OVERRIDE endpoint. Mirrors the
+ * backend Pydantic `ValidatorOverrideRequest` shape one-for-one.
+ */
+export function _buildOverridePayload(
+  newValue: 'true' | 'false',
+  reason: string,
+): { new_value: boolean; reason: string } {
+  return {
+    new_value: newValue === 'true',
+    reason: reason.trim(),
+  };
+}
 
 export function ValidatorOverrideModal({
   genome,
@@ -35,17 +62,17 @@ export function ValidatorOverrideModal({
   const [submitting, setSubmitting] = useState(false);
 
   const reasonLength = reason.trim().length;
-  const canSubmit = !submitting && reasonLength >= REASON_MIN_LENGTH;
+  const canSubmit = _canSubmit(reason, submitting);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!canSubmit) return;
     setSubmitting(true);
     try {
-      const updated = await overrideValidatorVerdict(genome.id, {
-        new_value: newValue === 'true',
-        reason: reason.trim(),
-      });
+      const updated = await overrideValidatorVerdict(
+        genome.id,
+        _buildOverridePayload(newValue, reason),
+      );
       onOverridden(updated);
     } catch (err) {
       onError(err instanceof Error ? err.message : String(err));

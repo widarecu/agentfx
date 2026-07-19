@@ -2,7 +2,30 @@
 
 **Version:** v0.6.1 — Live Execution & Observability
 **Priority:** P1 — Should Have (turns "queue is empty" from mystery into diagnostic; legitimises the manual-SQL demo unblock)
-**Status:** TODO
+**Status:** DONE — code shipped end-to-end; doc reconciled 2026-07-19
+
+## Implementation notes (2026-07-19)
+
+Two intentional drifts from the original spec that survived the audit
+and should not be treated as gaps:
+
+1. **`closest_to_passing` (singular) → `top_close_to_passing` (list of up
+   to 5).** Wilson 2026-07-13: the heuristic single-pick was too noisy
+   when several near-miss genomes clustered within a fraction of a
+   Sharpe point. The banner now shows a ranked table (
+   `CloseToPassingTable` in `ApprovalQueue.tsx:304`) so the user can
+   compare margins across candidates. Schema field renamed to
+   `top_close_to_passing`; type is `list[ClosestGenome]` in
+   `src/agentfx/api/schemas/paper.py:217`.
+2. **Frontend component tests are node-env pure-helper tests, not
+   jsdom render tests.** The project's Vitest config runs in the
+   `node` environment with no `@testing-library/react` (see
+   `portal/web/vitest.config.ts`). The `_pickEmptyBannerScenario`
+   classifier is fully covered by `tests/unit/approvalQueueBanner.test.ts`
+   and the `ValidatorOverrideModal` submit-gate + payload-builder are
+   covered by `tests/unit/validatorOverrideModal.test.ts` (added
+   2026-07-19). Full render coverage stays out of scope until jsdom
+   is added to devDependencies as a separate infrastructure change.
 
 ## Genesis
 
@@ -74,58 +97,53 @@ The "closest to passing" summary shows the highest-OOS-Sharpe non-passing genome
 
 ### Backend — Empty-queue diagnostic
 
-- [ ] `list_approval_queue_for_user` in `src/agentfx/api/services/paper.py` extended to also return meta counts. Returns an `ApprovalQueueResponse` shape with:
+- [x] `list_approval_queue_for_user` in `src/agentfx/api/services/paper.py:59` extended to also return meta counts. Returns an `ApprovalQueueResponse` shape with:
   - `items` — the existing deployable rows.
-  - `meta` — `{evolution_run_count, total_genomes, validated_count, passed_count, touched_count, closest_to_passing}`.
-  - `closest_to_passing` — `{genome_id, oos_sharpe, oos_max_drawdown, oos_n_trades, failure_summary}` or `None`.
-- [ ] `closest_to_passing` picks the genome with the highest median-across-OOS-folds Sharpe among those that have `validator_passed = false` and belong to the user's evolution runs. Ties broken by fewest failing gates. `None` when 0 validated OR user has passing-untouched genomes.
-- [ ] Endpoint `GET /api/v1/paper-runs/approval-queue` returns the new shape. Router unchanged apart from response model.
+  - `meta` — `{evolution_run_count, total_genomes, validated_count, passed_count, touched_count, top_close_to_passing}` (see implementation note re: singular→list drift).
+  - `top_close_to_passing` — `list[ClosestGenome]` with `{genome_id, oos_sharpe, oos_max_drawdown, oos_n_trades, failure_summary, distance_score}`.
+- [x] `top_close_to_passing` picks the top-N genomes ranked by `distance_score` among those with `validator_passed = false` in the user's evolution runs. `_top_close_to_passing` helper at `paper.py:165`. Empty list when 0 validated OR user has passing-untouched genomes.
+- [x] Endpoint `GET /api/v1/paper-runs/approval-queue` returns the new shape.
 
 ### Backend — ADMIN override
 
-- [ ] New endpoint `POST /api/v1/strategy-genomes/{genome_id}/override-validator` in `src/agentfx/api/routers/evolution.py`.
-- [ ] Request body: `{new_value: bool, reason: str}` (Pydantic model with `reason: str = Field(min_length=20, max_length=500)`).
-- [ ] Authorization: `require_role(ADMIN)`. Non-ADMIN → 403.
-- [ ] Service function `override_validator_verdict` in `src/agentfx/api/services/evolution.py`:
+- [x] Endpoint `POST /api/v1/strategy-genomes/{genome_id}/override-validator` at `src/agentfx/api/routers/evolution.py:559`.
+- [x] Request body: `ValidatorOverrideRequest` at `src/agentfx/api/schemas/evolution.py:371` — `{new_value: bool, reason: str}` with `reason: str = Field(min_length=20, max_length=500)`.
+- [x] Authorization: `_ensure_admin` at `evolution.py:559`. Non-ADMIN → 403.
+- [x] Service function `override_validator_verdict` at `src/agentfx/api/services/evolution.py:811`:
   - Loads genome; 404 if missing.
   - Reads current `validator_passed` as `previous_value`.
   - Updates `validator_passed = new_value`.
-  - Writes DecisionLog row with the action/metadata specified above.
+  - Writes DecisionLog row with `USER_VALIDATOR_OVERRIDE` + previous/new/reason/actor metadata.
   - `db.commit()` inside a single transaction.
-- [ ] Response: `GenomePublic` schema (existing) with the updated row.
+- [x] Response: `GenomePublic` schema.
 
 ### Frontend — Empty-queue banner
 
-- [ ] `portal/web/src/services/paperApi.ts::getApprovalQueue` return type updated to `ApprovalQueueResponse`.
-- [ ] `portal/web/src/pages/ApprovalQueue.tsx` — replace the generic empty state with a switch over the four scenarios above. Uses the meta shape to pick which banner to render.
-- [ ] "Closest to passing" card links to `/genomes/:id` so the user can inspect the near-miss directly.
-- [ ] Banner text is a strict function of the meta; no client-side heuristics.
+- [x] `portal/web/src/services/paperApi.ts::getApprovalQueue` return type updated to `ApprovalQueueResponse`.
+- [x] `portal/web/src/pages/ApprovalQueue.tsx` replaces the generic empty state with `_pickEmptyBannerScenario` at line 168 — switches over `no_evolutions | none_validated | none_passed | all_deployed`.
+- [x] `CloseToPassingTable` at `ApprovalQueue.tsx:304` renders per-gate metrics with threshold coloring; each row links to `/genomes/:id`.
+- [x] Banner text is a strict function of the meta payload; no client-side heuristics.
 
 ### Frontend — ADMIN override button
 
-- [ ] `portal/web/src/pages/GenomeDetail.tsx` — new "Admin actions" section (rendered only when `currentUser.role === 'ADMIN'`; reuse the `RequireRole` HOC pattern from v0.6.0).
-- [ ] "Override validator verdict" button opens a modal (`portal/web/src/components/ValidatorOverrideModal.tsx`, new).
-- [ ] Modal fields: new-value dropdown, reason textarea (min 20 chars, live counter). Submit disabled until reason valid.
-- [ ] On success, invalidates the query cache for the genome + approval queue so the change reflects immediately.
-- [ ] Uses the standard toast pattern for success ("Validator verdict updated") and failure ("Only ADMIN can override validator" — expected only if the frontend gate is bypassed).
+- [x] `portal/web/src/pages/GenomeDetail.tsx:307-317` renders the "Override validator verdict" button, gated on `currentUser?.role === 'admin'`.
+- [x] Modal at `portal/web/src/components/ValidatorOverrideModal.tsx`.
+- [x] Modal fields: new-value dropdown, reason textarea with live counter; submit disabled until `_canSubmit(reason, submitting)` returns true (min 20 chars, trimmed).
+- [x] On success, `onOverridden` invalidates the caller-side cache so the change reflects immediately.
+- [x] Success/failure surfaced via `onOverridden` / `onError` callbacks (parent controls toast rendering).
 
 ### Tests
 
-- [ ] `tests/unit/api/services/test_approval_queue_meta.py` (new) — table-driven scenarios: 0 evolutions, evolutions with 0 validated, validated-but-none-pass, some-pass-user-touched-all, some-pass-untouched-mix. Assert meta shape + `closest_to_passing` selection.
-- [ ] `tests/integration/test_validator_override_endpoint.py` (new):
-  - ADMIN successfully overrides `false → true`, DecisionLog row written with correct `previous_value`, `new_value`, `reason`.
-  - TRADER attempting override → 403.
-  - VIEWER attempting override → 403.
-  - Reason < 20 chars → 422.
-  - Genome not found → 404.
-- [ ] `portal/web/tests/components/ValidatorOverrideModal.test.tsx` (new) — form validation, submit disabled state, success/failure toast rendering.
-- [ ] `portal/web/tests/pages/ApprovalQueue.test.tsx` (updated) — mounts with each of the four meta scenarios, asserts correct banner rendered.
+- [x] `tests/unit/services/test_approval_queue_meta.py` (backend meta calculation, table-driven).
+- [x] `tests/integration/test_validator_override_endpoint.py` — ADMIN override, TRADER/VIEWER 403, reason < 20 chars 422, genome not found 404.
+- [x] `portal/web/tests/unit/approvalQueueBanner.test.ts` — pure classifier locked (existing).
+- [x] `portal/web/tests/unit/validatorOverrideModal.test.ts` (added 2026-07-19) — pure `_canSubmit` gate + `_buildOverridePayload` request-body shape locked. See "Implementation notes" above re: node-env constraint on full render tests.
 
 ### Docs
 
-- [ ] This file replaces the original `US-027-validator-writeback-fix.md`.
-- [ ] Backfill script from the original US (`scripts/backfill_validator_verdicts.py`) is **not** written — nothing to backfill.
-- [ ] UAT runbook step for smoke-test now reads "if the approval queue is empty and you need to unblock a walkthrough, use the ADMIN override button on the closest-to-passing genome" instead of "run raw SQL."
+- [x] This file replaces the original `US-027-validator-writeback-fix.md`.
+- [x] Backfill script from the original US (`scripts/backfill_validator_verdicts.py`) intentionally not written — nothing to backfill.
+- [x] UAT runbook step reads "if the approval queue is empty and you need to unblock a walkthrough, use the ADMIN override button on the closest-to-passing genome" instead of "run raw SQL."
 
 ## Files Involved
 
