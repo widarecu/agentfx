@@ -103,27 +103,39 @@ export function PaperRunTradesTable({
             // multi-line title string (Tailwind doesn't need a
             // headless Tooltip for this — native browser tooltip
             // suffices for now).
-            const priceOnly = t.pnl;
             const financing = t.financing;
             const commission = t.commission;
-            // Show the tooltip whenever we HAVE financing/commission data
-            // (non-null), even if zero. A zero-value fill is still a
-            // captured fact — hiding it made "captured and zero" (intraday
-            // close, no rollover) indistinguishable from "not captured
-            // yet" (reconciler hasn't run). Wilson UAT 2026-07-16.
-            const hasFinancingData =
-              !open && (financing != null || commission != null);
+            // For OPEN trades `t.pnl` is null (only set on close); the
+            // price component we can show is the mark-to-market `pnl`
+            // computed above. For CLOSED trades `t.pnl` is the raw
+            // realised price P&L; `pnl` above is `t.net_pnl` (already
+            // net of financing + commission).
+            const priceComponent = open ? pnl : t.pnl;
+            const hasFinancingData = financing != null || commission != null;
             const tooltipLines: string[] = [];
-            if (hasFinancingData && priceOnly != null) {
-              tooltipLines.push(`Price P&L:    ${priceOnly.toFixed(2)}`);
+            if (hasFinancingData && priceComponent != null) {
+              tooltipLines.push(
+                open
+                  ? `Mark-to-market: ${priceComponent.toFixed(2)}`
+                  : `Price P&L:      ${priceComponent.toFixed(2)}`,
+              );
               const fin = financing ?? 0;
               tooltipLines.push(
-                `Financing:    ${fin >= 0 ? '+' : ''}${fin.toFixed(2)}`,
+                `Financing:      ${fin >= 0 ? '+' : ''}${fin.toFixed(2)}`,
               );
               const com = commission ?? 0;
-              tooltipLines.push(`Commission:  -${Math.abs(com).toFixed(2)}`);
+              tooltipLines.push(
+                `Commission:    -${Math.abs(com).toFixed(2)}`,
+              );
               tooltipLines.push('─────────────────');
-              tooltipLines.push(`Net:          ${(pnl ?? 0).toFixed(2)}`);
+              if (open) {
+                const netIfClosedNow = priceComponent + fin - com;
+                tooltipLines.push(
+                  `Net if closed:  ${netIfClosedNow.toFixed(2)}`,
+                );
+              } else {
+                tooltipLines.push(`Net:            ${(pnl ?? 0).toFixed(2)}`);
+              }
             }
             const pnlClass =
               pnl == null
@@ -211,7 +223,10 @@ export function PaperRunTradesTable({
                     </span>
                   )}
                 </td>
-                <td className="py-1.5 text-xs text-slate-600 dark:text-slate-300 font-mono truncate max-w-xs">
+                <td
+                  className="py-1.5 text-xs text-slate-600 dark:text-slate-300 font-mono truncate max-w-xs"
+                  title={t.signal_reason ?? undefined}
+                >
                   {t.signal_reason ?? '—'}
                 </td>
               </tr>
