@@ -55,7 +55,7 @@ import {
 } from '../types/paper';
 import type { CandleData, TradeSignal } from '../types/optimization';
 import type { StrategyGenome } from '../types/evolution';
-import { fetchRecentCandles } from '../utils/candles';
+import { fetchLatestCandle, fetchRecentCandles } from '../utils/candles';
 import { buildIndicatorsFromDsl } from '../utils/dslIndicators';
 import { formatUTC } from '../utils/time';
 
@@ -179,6 +179,13 @@ export default function PaperRunDetail() {
   const [genome, setGenome] = useState<StrategyGenome | null>(null);
   const [candles, setCandles] = useState<CandleData[]>([]);
   const [candlesLoading, setCandlesLoading] = useState(false);
+  // Last-known close for the open-trade unrealised P&L. Separate from
+  // `candles` because `fetchRecentCandles` is windowed by wall-clock
+  // and returns [] over weekends (market closed → no bars in the
+  // requested 25h window). `/candles/latest` returns the newest row
+  // regardless of age, so the mark-to-market display keeps working.
+  // Wilson UAT 2026-07-19.
+  const [latestClose, setLatestClose] = useState<number | null>(null);
 
   useEffect(() => {
     if (!run?.evolution_run_id || !run?.strategy_genome_id) return;
@@ -206,12 +213,14 @@ export default function PaperRunDetail() {
     const load = async () => {
       setCandlesLoading(true);
       try {
-        const c = await fetchRecentCandles(
-          run.instrument,
-          run.granularity,
-          CHART_BARS,
-        );
-        if (!cancelled) setCandles(c);
+        const [windowed, latest] = await Promise.all([
+          fetchRecentCandles(run.instrument, run.granularity, CHART_BARS),
+          fetchLatestCandle(run.instrument, run.granularity),
+        ]);
+        if (!cancelled) {
+          setCandles(windowed);
+          setLatestClose(latest?.close ?? null);
+        }
       } finally {
         if (!cancelled) setCandlesLoading(false);
       }
@@ -605,7 +614,8 @@ export default function PaperRunDetail() {
         <PaperRunTradesTable
           trades={trades}
           latestClose={
-            candles.length > 0 ? candles[candles.length - 1].close : null
+            latestClose ??
+            (candles.length > 0 ? candles[candles.length - 1].close : null)
           }
           instrument={run.instrument}
         />

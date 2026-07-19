@@ -594,6 +594,61 @@ def _execute_loop(
 # ─────────────────────────────────────────────────────────────────────
 
 
+def _emit_stale_transition(
+    *,
+    db,
+    run,
+    reason: str,
+    outputs_extra: dict | None = None,
+) -> None:
+    """Write USER_SIGNAL_SKIPPED_STALE only on the entry-into-stale
+    transition. Subsequent stale ticks are silent.
+
+    State is tracked in `run.parameters['stale_active']`. `_clear_stale`
+    (below) emits USER_SIGNAL_RESUMED and clears the flag when a tick
+    finds fresh candles again. Wilson UAT 2026-07-19: without this the
+    weekend produced 60h × 60 ticks/h = ~3600 identical STALE entries,
+    burying every meaningful decision.
+    """
+    params = dict(run.parameters or {})
+    if params.get("stale_active"):
+        return
+    params["stale_active"] = True
+    # Re-assign a fresh dict so SQLAlchemy's ORM change detection picks
+    # up the JSON column mutation without needing `flag_modified`.
+    run.parameters = params
+    outputs = {"paper_run_id": run.id}
+    if outputs_extra:
+        outputs.update(outputs_extra)
+    _write_decision(
+        db,
+        run,
+        action="USER_SIGNAL_SKIPPED_STALE",
+        reason=reason,
+        outputs=outputs,
+    )
+
+
+def _clear_stale_state(*, db, run, latest_candle_at: str) -> None:
+    """Called from the successful-signal path to log the resume from a
+    previous stale window. Mirror of `_emit_stale_transition`."""
+    params = dict(run.parameters or {})
+    if not params.get("stale_active"):
+        return
+    params["stale_active"] = False
+    run.parameters = params
+    _write_decision(
+        db,
+        run,
+        action="USER_SIGNAL_RESUMED",
+        reason=f"fresh candles arrived — latest {latest_candle_at}",
+        outputs={
+            "paper_run_id": run.id,
+            "latest_candle_at": latest_candle_at,
+        },
+    )
+
+
 def _count_bars_since(
     *,
     db,
@@ -803,18 +858,20 @@ def _signal_tick(
 
     # Stale-candle guard. Ingestion outages (weekend, OANDA maintenance,
     # ingester falling behind) leave the shared `candles` table N bars
-    # behind wall-clock. We skip signal evaluation + log rather than
-    # halt — the runner resumes on next tick when fresh data lands.
+    # behind wall-clock. We skip signal evaluation rather than halt —
+    # the runner resumes on next tick when fresh data lands.
+    #
+    # Wilson UAT 2026-07-19: over a 60h weekend the decision log
+    # accumulated ~3600 identical STALE entries (one per tick), burying
+    # every real event. Only log on state TRANSITIONS: enter-stale
+    # once, exit-stale once, tracked via
+    # `run.parameters['stale_state']`.
     if df.empty:
-        _write_decision(
-            db,
-            run,
-            action="USER_SIGNAL_SKIPPED_STALE",
+        _emit_stale_transition(
+            db=db,
+            run=run,
             reason=f"no candles returned for {instrument} {granularity}",
-            outputs={
-                "paper_run_id": run.id,
-                "reason_detail": "empty_candles",
-            },
+            outputs_extra={"reason_detail": "empty_candles"},
         )
         return
     latest_ts = df.index[-1]
@@ -834,23 +891,24 @@ def _signal_tick(
     # length. See UAT observation 2026-07-13 (Wilson).
     stale_threshold_seconds = granularity_seconds + INGEST_LAG_TOLERANCE_SECONDS
     if (now_utc - latest_dt).total_seconds() > stale_threshold_seconds:
-        _write_decision(
-            db,
-            run,
-            action="USER_SIGNAL_SKIPPED_STALE",
+        _emit_stale_transition(
+            db=db,
+            run=run,
             reason=(
                 f"latest candle {latest_dt.isoformat()} is older than "
                 f"{granularity} + {INGEST_LAG_TOLERANCE_SECONDS}s "
                 f"(={stale_threshold_seconds}s) — ingestion may be behind"
             ),
-            outputs={
-                "paper_run_id": run.id,
+            outputs_extra={
                 "latest_candle_at": latest_dt.isoformat(),
                 "now": now_utc.isoformat(),
                 "threshold_seconds": stale_threshold_seconds,
             },
         )
         return
+
+    # Fresh candles → clear any previous stale flag and log resume.
+    _clear_stale_state(db=db, run=run, latest_candle_at=latest_dt.isoformat())
 
     # Raw entry events at bar-close: +1 = long cross fired at latest
     # bar, -1 = short cross fired, 0 = no event. This replaces

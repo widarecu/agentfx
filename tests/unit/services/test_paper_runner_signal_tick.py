@@ -125,6 +125,7 @@ def _make_run(user_id: int = 42) -> SimpleNamespace:
         pnl=0.0,
         kill_requested_at=None,
         last_transaction_id=None,
+        parameters={},
         risk_config={
             "max_position_size_units": 10_000,
             "daily_loss_pct": 2.0,
@@ -515,10 +516,75 @@ class TestSignalTick:
         # No broker traffic — signal skipped entirely.
         client.get_position.assert_not_called()
         client.place_market_order.assert_not_called()
-        # Skip decision written.
+        # Skip decision written on FIRST stale tick.
         added = [c.args[0] for c in db.add.call_args_list]
         decisions = [r for r in added if type(r).__name__ == "DecisionLog"]
         assert any(d.action == "USER_SIGNAL_SKIPPED_STALE" for d in decisions)
+        # `stale_active` flag now set on run.parameters so subsequent
+        # stale ticks stay silent.
+        assert run.parameters.get("stale_active") is True
+
+    def test_stale_transitions_dont_spam_decision_log(self):
+        """Wilson UAT 2026-07-19: over a 60h weekend the decision log
+        accumulated ~3600 identical STALE entries (one per M1 tick),
+        burying every meaningful event. Now log only on state
+        transitions — enter-stale once, exit-stale once."""
+        strategy = _make_strategy(signals=[0, 0, 0])
+        now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+        stale_df = _mk_candles_df(3, now - timedelta(minutes=5))
+        # Fresh tick fires 10 min later — fresh_df's latest bar must be
+        # recent relative to THAT clock, not `now`.
+        fresh_now = now + timedelta(minutes=10)
+        fresh_df = _mk_candles_df(3, fresh_now - timedelta(seconds=30))
+        client = MagicMock()
+        client.get_position.return_value = {"long_units": 0, "short_units": 0}
+        db = _make_db()
+        run = _make_run()
+
+        # Three consecutive stale ticks — only the first should log.
+        for i in range(3):
+            _signal_tick(
+                db=db,
+                run=run,
+                client=client,
+                strategy=strategy,
+                candle_fetch_fn=MagicMock(return_value=stale_df),
+                instrument="EUR_USD",
+                granularity_seconds=60,
+                now_utc=now + timedelta(minutes=i),
+            )
+        added = [c.args[0] for c in db.add.call_args_list]
+        stale_logs = [
+            r
+            for r in added
+            if type(r).__name__ == "DecisionLog"
+            and r.action == "USER_SIGNAL_SKIPPED_STALE"
+        ]
+        assert len(stale_logs) == 1, (
+            f"expected exactly 1 STALE log across 3 stale ticks, got {len(stale_logs)}"
+        )
+        assert run.parameters.get("stale_active") is True
+
+        # Fresh candle arrives → RESUMED log fires, flag clears.
+        db2 = _make_db()  # fresh db to isolate the resume log
+        _signal_tick(
+            db=db2,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=MagicMock(return_value=fresh_df),
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=fresh_now,
+        )
+        resumed = [
+            c.args[0]
+            for c in db2.add.call_args_list
+            if type(c.args[0]).__name__ == "DecisionLog"
+            and c.args[0].action == "USER_SIGNAL_RESUMED"
+        ]
+        assert len(resumed) == 1
+        assert run.parameters.get("stale_active") is False
 
     def test_normal_ingest_lag_does_not_trip_stale_guard(self):
         # Real UAT pattern (Wilson 2026-07-14): the ingester UPDATEs
@@ -828,6 +894,7 @@ class TestExecuteLoopSignalIntegration:
                 "daily_loss_pct": 2.0,
                 "kill_switch_dd_pct": 5.0,
             },
+            parameters={},
             status=RunStatus.RUNNING,
             stop_reason=None,
             completed_at=None,
@@ -906,6 +973,7 @@ class TestExecuteLoopSignalIntegration:
                 "daily_loss_pct": 2.0,
                 "kill_switch_dd_pct": 5.0,
             },
+            parameters={},
             status=RunStatus.RUNNING,
             stop_reason=None,
             completed_at=None,

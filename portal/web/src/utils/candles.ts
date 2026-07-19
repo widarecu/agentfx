@@ -89,6 +89,46 @@ export function granularityToSeconds(granularity: string): number {
 }
 
 /**
+ * Fetch the single most recent candle for an instrument+granularity.
+ *
+ * Used by the paper run detail page to display an "unrealised P&L"
+ * on open trades. `fetchRecentCandles` is windowed by wall-clock and
+ * returns an empty array on weekends (market closed → no candles in
+ * window). The last-known close is still useful for showing a mark-
+ * to-market price, so this helper reaches for it directly via
+ * `/candles/latest` which returns the newest row regardless of age.
+ *
+ * Wilson UAT 2026-07-19: Sunday view of a Friday-entry trade showed
+ * "—" for P&L because the 25h window was entirely inside the weekend
+ * gap and returned no candles.
+ */
+export async function fetchLatestCandle(
+  instrument: string,
+  granularity: string,
+): Promise<CandleData | null> {
+  const params = new URLSearchParams({
+    exchange: 'oanda',
+    instrument,
+    timeframe: granularity,
+  });
+  const res = await fetch(
+    `${API_BASE_URL}/market-data/candles/latest?${params}`,
+    { headers: authHeaders() },
+  );
+  if (!res.ok) return null;
+  const c = (await res.json()) as Record<string, unknown>;
+  if (!c || typeof c.timestamp !== 'string') return null;
+  return {
+    timestamp: c.timestamp,
+    open: c.open as number,
+    high: c.high as number,
+    low: c.low as number,
+    close: c.close as number,
+    volume: (c.volume as number) ?? 0,
+  };
+}
+
+/**
  * "Give me the last N bars up to now" — computes the `from_time` /
  * `to_time` params and calls `fetchCandles`. The paper run detail
  * page uses this on a 60s cadence so a fresh candle rolls into the
