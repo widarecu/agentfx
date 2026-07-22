@@ -308,6 +308,32 @@ class Settings(BaseSettings):
         description="Maximum gaps to process per instrument/granularity per health check cycle",
     )
 
+    # Notifications (v0.6.2 — Wilson UAT 2026-07-19)
+    # Slack incoming webhook for paper-run terminal / crash alerts.
+    # Empty (default) → notifications short-circuit at every call
+    # site; the runner keeps working unchanged. Set in Railway
+    # dashboard for staging; set in `.env.uat` for local UAT.
+    SLACK_WEBHOOK_URL: str = Field(
+        default="",
+        env="SLACK_WEBHOOK_URL",
+        description=(
+            "Slack incoming webhook URL. Empty = notifications disabled. "
+            "Used by `agentfx.notifications.slack` for paper-run halt / "
+            "crash alerts."
+        ),
+    )
+
+    NOTIFICATIONS_ENABLED: bool = Field(
+        default=True,
+        env="NOTIFICATIONS_ENABLED",
+        description=(
+            "Master on/off for outbound notifications. Set to False in the "
+            "test environment (conftest overrides this) so unit tests can't "
+            "leak real HTTP to Slack. In production, keep True and control "
+            "delivery via SLACK_WEBHOOK_URL presence."
+        ),
+    )
+
     @property
     def instruments_list(self) -> list[str]:
         """Parse CANDLE_INSTRUMENTS into a list."""

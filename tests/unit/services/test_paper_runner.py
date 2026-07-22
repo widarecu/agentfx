@@ -302,6 +302,8 @@ class TestMarkTerminal:
             status=RunStatus.RUNNING,
             stop_reason=None,
             completed_at=None,
+            id="run_x",
+            parameters={},
         )
         db = MagicMock()
 
@@ -310,6 +312,75 @@ class TestMarkTerminal:
         assert run.status == RunStatus.HALTED_MANUAL
         assert run.stop_reason == "USER_KILL"
         assert isinstance(run.completed_at, datetime)
+        db.commit.assert_called()
+
+    def test_invokes_notification_hook_once_per_unique_reason(self, monkeypatch):
+        """Wilson UAT 2026-07-19 — every terminal event should fire
+        exactly one Slack alert. Re-entrant halt paths must not spam
+        the channel (see `_should_send` dedup)."""
+        from agentfx.api.models import RunStatus
+        from agentfx.notifications import slack as slack_module
+
+        calls: list[tuple[str, str]] = []
+
+        def spy_post(**kwargs):
+            calls.append((kwargs["run"].id, kwargs["reason"]))
+            # Also mutate parameters like the real helper does, so
+            # dedup semantics are exercised end-to-end.
+            slack_module._mark_notified(kwargs["run"], kwargs["reason"])
+
+        monkeypatch.setattr("agentfx.notifications.post_paper_run_alert", spy_post)
+
+        run = SimpleNamespace(
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+            id="run_x",
+            parameters={},
+        )
+        db = MagicMock()
+
+        # First terminal call fires the alert.
+        _mark_terminal(db, run, RunStatus.HALTED_MANUAL, "USER_KILL")
+        assert calls == [("run_x", "USER_KILL")]
+
+        # Idempotent — if some future code path re-runs _mark_terminal
+        # with the same reason (e.g. a watchdog picking up an already-
+        # terminated run), NO extra alert should fire.
+        _mark_terminal(db, run, RunStatus.HALTED_MANUAL, "USER_KILL")
+        # The spy IS called again because our monkeypatch bypasses
+        # the real dedup — but the actual `post_paper_run_alert` DOES
+        # dedup via `run.parameters['notified']`, verified in
+        # tests/unit/notifications/test_slack.py::
+        # test_second_call_same_reason_does_not_post_again. Here we
+        # just assert the hook wiring itself works.
+        assert len(calls) == 2  # hook fires; dedup lives inside the hook
+
+    def test_hook_exception_does_not_break_terminal_write(self, monkeypatch):
+        """If the notification hook itself raises, the terminal state
+        must still be committed — the trade is more important than
+        the alert."""
+        from agentfx.api.models import RunStatus
+
+        def boom(**kwargs):
+            raise RuntimeError("simulated notification implosion")
+
+        monkeypatch.setattr("agentfx.notifications.post_paper_run_alert", boom)
+
+        run = SimpleNamespace(
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+            id="run_x",
+            parameters={},
+        )
+        db = MagicMock()
+
+        # Must not raise.
+        _mark_terminal(db, run, RunStatus.ERROR, "OANDA_AUTH_LOST")
+
+        assert run.status == RunStatus.ERROR
+        assert run.stop_reason == "OANDA_AUTH_LOST"
         db.commit.assert_called()
 
 

@@ -1896,6 +1896,22 @@ def _mark_terminal(db, run, status, reason: str) -> None:
     run.stop_reason = reason
     run.completed_at = datetime.now(UTC)
     db.commit()
+    # v0.6.2 (Wilson UAT 2026-07-19): Slack alert on every terminal
+    # event. Idempotent per (run_id, reason) via
+    # `run.parameters['notified']` so re-entrant halt paths + the
+    # watchdog-vs-subprocess race can't spam the channel. Never
+    # re-raises — a notification failure must not affect the trade.
+    try:
+        from agentfx.notifications import post_paper_run_alert
+
+        post_paper_run_alert(run=run, reason=reason, db=db)
+    except Exception:  # noqa: BLE001 — outermost belt-and-braces
+        logger.exception(
+            "paper runner: notification hook errored on %s (%s) — "
+            "ignoring so the terminal state stays committed",
+            run.id,
+            reason,
+        )
 
 
 __all__ = [

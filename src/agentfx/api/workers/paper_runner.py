@@ -196,6 +196,29 @@ def _mark_run_failed_after_crash(run_id: str, exit_code: int | None) -> None:
                     exit_code,
                     "APPROVED" if pre_init else "RUNNING",
                 )
+                # v0.6.2 (Wilson UAT 2026-07-19): Slack alert on
+                # watchdog-detected crash. Idempotent — if the
+                # subprocess got as far as calling `_mark_terminal`
+                # itself before dying, its dedup entry in
+                # `run.parameters['notified'][reason]` already exists
+                # and `post_paper_run_alert` short-circuits. Otherwise
+                # (SIGKILL, OOM, container swap) we're the only path
+                # that fires. Never re-raises.
+                try:
+                    from agentfx.notifications import post_paper_run_alert
+
+                    post_paper_run_alert(
+                        run=run,
+                        reason=run.stop_reason,
+                        extra={"exit_code": exit_code},
+                        db=db,
+                    )
+                except Exception:  # noqa: BLE001 — watchdog stability
+                    logger.exception(
+                        "watchdog: notification hook errored on %s — "
+                        "ignoring so the ERROR state stays committed",
+                        run_id,
+                    )
         finally:
             db.close()
     except Exception:  # noqa: BLE001

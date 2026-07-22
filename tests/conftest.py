@@ -35,6 +35,15 @@ os.environ["TESTING"] = "true"
 # See CLAUDE.md → "Ingestion toggle: three-surface model".
 os.environ["INGESTION_ENABLED"] = "false"
 
+# Test-correctness invariant: outbound Slack notifications MUST be off
+# during pytest. `post_paper_run_alert` short-circuits before any
+# `requests.post` when this is False, so no test can leak real HTTP to
+# Slack via a mocked-but-forgotten path or an integration test that
+# exercises the runner's terminal-state code. Individual notification
+# tests still enable it explicitly via monkeypatch when they need to
+# assert the send path. See `agentfx.notifications.slack`.
+os.environ["NOTIFICATIONS_ENABLED"] = "false"
+
 # Warn if we had to override an incorrect environment setting
 # This helps developers identify when they're not using the correct test command
 if _prev_env and _prev_env != "test":
