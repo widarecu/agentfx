@@ -22,7 +22,10 @@ import React, {
   useState,
 } from 'react';
 
-import type { PaperTradePublic } from '../types/paper';
+import type {
+  BacktestOverlayReason,
+  PaperTradePublic,
+} from '../types/paper';
 import {
   computeDrawdownSeries,
   computeSummaryStrip,
@@ -70,8 +73,13 @@ export interface LivePnLChartProps {
   trades: PaperTradePublic[];
   /** Optional backtest OOS overlay. Empty when the underlying
    *  ValidationFold.equity_series column isn't populated for the
-   *  source genome (a v0.4.0 schema gap). Wired end-to-end in PR 6. */
+   *  source genome (a v0.4.0 schema gap). */
   backtestSeries?: EquityPoint[];
+  /** Backend hint about WHY the overlay is empty. When
+   *  `{ available: false, reason: ... }`, the chart renders an
+   *  amber chip explaining the schema gap in human terms instead of
+   *  the overlay just silently missing. `null`/undefined = no chip. */
+  overlayStatus?: { available: boolean; reason?: BacktestOverlayReason | null };
 }
 
 export function LivePnLChart({
@@ -80,6 +88,7 @@ export function LivePnLChart({
   liveSeries,
   trades,
   backtestSeries = [],
+  overlayStatus,
 }: LivePnLChartProps) {
   // PR 4: range selector. Default 7d; `1 / 2 / A` keyboard shortcuts
   // switch between 24h / 7d / All. Summary strip is always computed
@@ -499,6 +508,11 @@ export function LivePnLChart({
           }
         />
       </div>
+
+      {/* ── OOS overlay unavailable chip (PR 6) ───────────────────── */}
+      {overlayStatus && overlayStatus.available === false && (
+        <OverlayUnavailableChip reason={overlayStatus.reason ?? null} />
+      )}
 
       {/* ── Chart canvas ───────────────────────────────────────────── */}
       <div
@@ -1131,6 +1145,43 @@ interface SummaryTileProps {
   value: React.ReactNode;
   valueClass?: string;
   sublabel?: string;
+}
+
+interface OverlayUnavailableChipProps {
+  reason: BacktestOverlayReason | null;
+}
+
+function OverlayUnavailableChip({ reason }: OverlayUnavailableChipProps) {
+  return (
+    <div
+      role="status"
+      className="mb-3 flex items-start gap-2 rounded border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 px-3 py-2 text-xs text-amber-800 dark:text-amber-200"
+    >
+      <span className="mt-0.5 font-semibold">Backtest OOS overlay unavailable</span>
+      <span className="text-amber-700 dark:text-amber-300">
+        {_overlayReasonMessage(reason)}
+      </span>
+    </div>
+  );
+}
+
+/** Human-readable explanation for each `BacktestOverlayReason`.
+ *  Exported so a future test can lock the wording without spinning
+ *  up a DOM. */
+export function _overlayReasonMessage(
+  reason: BacktestOverlayReason | null,
+): string {
+  switch (reason) {
+    case 'no_associated_evolution_run':
+      return "This run isn't linked to an evolution — the overlay needs a source genome to pull the walk-forward OOS equity from.";
+    case 'no_oos_equity_persisted':
+      return 'No OOS folds were persisted for the source genome, so there is no walk-forward equity to draw.';
+    case 'oos_equity_series_not_persisted':
+      return "The OOS equity-series column isn't populated on the ValidationFold rows for this genome. That per-fold curve was planned for v0.4.0 but never landed; the overlay will remain unavailable until the schema + evolution runner both persist it.";
+    case null:
+    default:
+      return 'The overlay endpoint returned no data.';
+  }
 }
 
 interface RangePillProps {

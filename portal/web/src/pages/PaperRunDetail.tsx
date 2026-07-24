@@ -515,10 +515,10 @@ export default function PaperRunDetail() {
       </div>
 
       {/* v0.6.3 redesign: LivePnLChart owns its own header, legend,
-          8-tile summary strip, and calendar-day X-axis. The wrapper
-          card just provides the surface — no duplicate title / legend
-          / dual-axis blurb. The OOS "unavailable" chip stays below
-          the chart for now; PR 6 folds it inside the chart component. */}
+          8-tile summary strip, calendar-day X-axis, drawdown shading,
+          range selector, hover tooltip, and trade markers. It also
+          owns the "OOS overlay unavailable" chip via `overlayStatus`
+          (PR 6). The wrapper card just provides the surface. */}
       <div className="mt-6 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
         <LivePnLChart
           runStartMs={runStartMs}
@@ -530,18 +530,15 @@ export default function PaperRunDetail() {
             balance: p.balance,
             unrealizedPnl: 0,
           }))}
+          overlayStatus={
+            backtestOverlay
+              ? {
+                  available: backtestOverlay.source !== 'unavailable',
+                  reason: backtestOverlay.reason,
+                }
+              : undefined
+          }
         />
-        {backtestOverlay?.source === 'unavailable' && (
-          <div className="text-xs text-slate-500 dark:text-slate-400 italic mt-3">
-            Backtest OOS overlay unavailable
-            {backtestOverlay.reason === 'no_associated_evolution_run' &&
-              ' — this run isn\'t linked to an evolution.'}
-            {backtestOverlay.reason === 'no_oos_equity_persisted' &&
-              ' — no OOS folds were persisted for the source genome.'}
-            {backtestOverlay.reason === 'oos_equity_series_not_persisted' &&
-              " — the OOS equity-series column isn't populated on the ValidationFold rows for this genome. That per-fold curve was planned for v0.4.0 but never landed; the overlay will remain unavailable until the schema + evolution runner both persist it."}
-          </div>
-        )}
       </div>
 
       {/* Candles + indicators — same StrategyChart the backtest page
