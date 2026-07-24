@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <title>Live vs Backtest Equity — High-fi Mockup</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { darkMode: 'class' };
+  </script>
+  <style>
+    /* Slight sharpening for numeric columns — matches the existing
+       PaperRunTradesTable convention (font-mono at text-xs). */
+    body { font-feature-settings: 'tnum' 1, 'zero' 1; }
+    .tick-label  { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
+    .tt-row      { display: flex; justify-content: space-between; gap: 12px; }
+    .tt-row + .tt-row { margin-top: 2px; }
+    /* Custom SVG markers get pointer events even when nested in
+       a covering hover-hit-rect (we set pointer-events:auto on them). */
+    .marker      { cursor: pointer; }
+    .marker:hover { filter: brightness(1.35); }
+  </style>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen p-6">
+
+  <!-- Framing header outside the actual card (just so the mockup file
+       stands on its own without the full page chrome). -->
+  <div class="max-w-5xl mx-auto mb-6">
+    <div class="text-xs uppercase tracking-wide text-slate-500">High-fi mockup · /paper/:id</div>
+    <h1 class="text-lg font-semibold mt-1">Live vs Backtest Equity — hover the chart / trade markers</h1>
+    <p class="text-xs text-slate-400 mt-1">
+      Representative week-long EUR_USD M1 run · snapshot $100,000 · 12 trades (6W / 4L closed, 2 open) · Fri→Sun weekend gap
+    </p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       THE CARD — this is the piece that would replace the current
+       <LivePnLChart> section on /paper/:id.
+       ═══════════════════════════════════════════════════════════════════ -->
+  <div class="max-w-5xl mx-auto bg-slate-800 border border-slate-700 rounded-lg p-5 shadow-sm">
+
+    <!-- ══════ HEADER ══════ -->
+    <div class="flex items-start justify-between gap-6 flex-wrap">
+      <div>
+        <div class="text-sm font-semibold">Live vs backtest equity</div>
+        <div class="text-xs text-slate-400 mt-0.5 font-mono flex flex-wrap items-center gap-x-3 gap-y-0.5">
+          <span>snapshot <span class="text-slate-200">$100,000.00</span></span>
+          <span class="text-slate-600">·</span>
+          <span>now <span class="text-slate-200">$100,142.30</span></span>
+          <span class="text-slate-600">·</span>
+          <span class="text-emerald-400">+$142.30 (+0.14%)</span>
+          <span class="text-slate-600">·</span>
+          <span>elapsed <span class="text-slate-200">6d 23h 00m</span></span>
+        </div>
+      </div>
+
+      <!-- Range pills -->
+      <div class="inline-flex items-center rounded-md border border-slate-700 overflow-hidden text-xs">
+        <button data-range="24h" class="range-btn px-3 py-1.5 hover:bg-slate-700 text-slate-300">24h</button>
+        <button data-range="7d"  class="range-btn px-3 py-1.5 bg-slate-700 text-slate-100 font-semibold border-l border-slate-600">7d</button>
+        <button data-range="all" class="range-btn px-3 py-1.5 hover:bg-slate-700 text-slate-300 border-l border-slate-600">All</button>
+      </div>
+    </div>
+
+    <!-- ══════ SUMMARY STRIP (8 tiles, 2 rows × 4 cols) ══════ -->
+    <div class="mt-4 grid grid-cols-2 md:grid-cols-4 gap-2">
+      <!-- row 1 -->
+      <div class="bg-slate-900 border border-slate-700 rounded p-3">
+        <div class="text-[10px] uppercase tracking-wider text-slate-500">Live balance</div>
+        <div class="text-base font-mono font-semibold mt-0.5">$100,142.30</div>
+      </div>
+      <div class="bg-slate-900 border border-slate-700 rounded p-3">
+        <div class="text-[10px] uppercase tracking-wider text-slate-500">Realised P&amp;L</div>
+        <div class="text-base font-mono font-semibold mt-0.5 text-emerald-400">+$98.10</div>
+        <div class="text-[10px] text-slate-500 mt-0.5">10 closed trades</div>
+      </div>
+      <div class="bg-slate-900 border border-slate-700 rounded p-3">
+        <div class="text-[10px] uppercase tracking-wider text-slate-500">Unrealised P&amp;L</div>
+        <div class="text-base font-mono font-semibold mt-0.5 text-emerald-400">+$44.20</div>
+        <div class="text-[10px] text-slate-500 mt-0.5">2 open positions</div>
+      </div>
+      <div class="bg-slate-900 border border-slate-700 rounded p-3">
+        <div class="text-[10px] uppercase tracking-wider text-slate-500">Max drawdown</div>
+        <div class="text-base font-mono font-semibold mt-0.5 text-rose-400">−0.04%</div>
+        <div class="text-[10px] text-slate-500 mt-0.5">Thu 06 → Fri 11:30</div>
+      </div>
+      <!-- row 2 -->
+      <div class="bg-slate-900 border border-slate-700 rounded p-3">
+        <div class="text-[10px] uppercase tracking-wider text-slate-500">Trades</div>
+        <div class="text-base font-mono font-semibold mt-0.5">12 <span class="text-amber-400 text-xs font-normal">· 2 open</span></div>
+      </div>
+      <div class="bg-slate-900 border border-slate-700 rounded p-3">
+        <div class="text-[10px] uppercase tracking-wider text-slate-500">Win rate</div>
+        <div class="text-base font-mono font-semibold mt-0.5">60.0%</div>
+        <div class="text-[10px] text-slate-500 mt-0.5">6 W / 4 L</div>
+      </div>
+      <div class="bg-slate-900 border border-slate-700 rounded p-3">
+        <div class="text-[10px] uppercase tracking-wider text-slate-500">Best trade</div>
+        <div class="text-base font-mono font-semibold mt-0.5 text-emerald-400">+$54.20</div>
+        <div class="text-[10px] text-slate-500 mt-0.5">Wed 14:00 · SHORT</div>
+      </div>
+      <div class="bg-slate-900 border border-slate-700 rounded p-3">
+        <div class="text-[10px] uppercase tracking-wider text-slate-500">Worst trade</div>
+        <div class="text-base font-mono font-semibold mt-0.5 text-rose-400">−$28.10</div>
+        <div class="text-[10px] text-slate-500 mt-0.5">Fri 11:30 · SHORT</div>
+      </div>
+    </div>
+
+    <!-- ══════ CHART CANVAS ══════ -->
+    <div class="mt-4 relative bg-slate-900 border border-slate-700 rounded" style="height: 320px;">
+
+      <!-- Legend row (above chart, right-aligned) -->
+      <div class="absolute top-2 right-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-slate-400 z-20">
+        <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-emerald-500 inline-block"></span> Live</span>
+        <span class="flex items-center gap-1.5"><span class="w-3 h-0 border-t border-dashed border-slate-400 inline-block"></span> Backtest OOS</span>
+        <span class="flex items-center gap-1.5"><span class="text-emerald-400 text-[13px] leading-none">▲</span> Long</span>
+        <span class="flex items-center gap-1.5"><span class="text-rose-400 text-[13px] leading-none">▼</span> Short</span>
+        <span class="flex items-center gap-1.5"><span class="inline-block w-2 h-2 rounded-full bg-emerald-500"></span>/<span class="inline-block w-2 h-2 rounded-full bg-rose-500"></span> Exit</span>
+      </div>
+
+      <!-- The SVG — 900×320 view, laid out edge to edge. Content is
+           drawn inside plot rect (60,24)→(880,264). Bottom 40px = x-axis
+           labels; left 60px = y-axis labels. -->
+      <svg id="chart" viewBox="0 0 900 320" preserveAspectRatio="none"
+           class="w-full h-full block" role="img"
+           aria-label="Live equity curve for paper run with trade markers, drawdown shading and dual axes">
+
+        <!-- ─── Weekend gap band (Fri 22:00 → Sun 22:00) ─── -->
+        <!-- Fri 22:00 UTC = h104.93 → x = 60 + (104.93/167)*820 = 60 + 515.3 = 575.3
+             Sun 22:00 UTC = h152.93 → x = 60 + (152.93/167)*820 = 60 + 750.9 = 810.9
+             Width ≈ 235.6 -->
+        <rect x="575" y="24" width="236" height="240" fill="#1e293b" opacity="0.55"/>
+        <text x="693" y="42" text-anchor="middle" fill="#64748b"
+              class="tick-label" style="letter-spacing:1px;">MARKET CLOSED</text>
+
+        <!-- ─── Y-axis grid lines & labels ─── -->
+        <!-- balance range shown: 99,900 → 100,220 (spread $320)
+             plot y: 264 (bottom) → 24 (top), 240 tall
+             y($100,000) = 264 - (100)/320 * 240 = 264 - 75 = 189
+             y($100,050) = 264 - (150)/320 * 240 = 264 - 112.5 = 151.5
+             y($100,100) = 264 - (200)/320 * 240 = 264 - 150 = 114
+             y($100,150) = 264 - (250)/320 * 240 = 264 - 187.5 = 76.5
+             y($100,200) = 264 - (300)/320 * 240 = 264 - 225 = 39 -->
+        <g stroke="#334155" stroke-width="0.5" stroke-dasharray="1 3">
+          <line x1="60" y1="39"  x2="880" y2="39" />
+          <line x1="60" y1="76.5" x2="880" y2="76.5" />
+          <line x1="60" y1="114" x2="880" y2="114" />
+          <line x1="60" y1="151.5" x2="880" y2="151.5" />
+          <line x1="60" y1="228" x2="880" y2="228" />
+        </g>
+        <g fill="#64748b" class="tick-label" text-anchor="end">
+          <text x="55" y="42">$100,200</text>
+          <text x="55" y="80">$100,150</text>
+          <text x="55" y="117">$100,100</text>
+          <text x="55" y="155">$100,050</text>
+          <text x="55" y="231">$99,900</text>
+        </g>
+
+        <!-- Snapshot reference line at $100,000 (y=189) -->
+        <line x1="60" y1="189" x2="880" y2="189"
+              stroke="#94a3b8" stroke-width="0.75" stroke-dasharray="4 3" opacity="0.7"/>
+        <text x="880" y="185" text-anchor="end" fill="#94a3b8" class="tick-label">snapshot $100,000.00</text>
+
+        <!-- ─── Backtest OOS overlay (dashed) — HIDDEN by default; shown
+              here to demonstrate the visual. Toggle via #toggle-oos. ─── -->
+        <path id="oos-path" d="
+          M 60,189
+          C 100,187 140,184 180,181
+          S 260,174 300,170
+          S 380,155 420,150
+          S 500,132 540,125
+          L 575,120
+          L 811,120
+          L 880,113
+        " fill="none" stroke="#94a3b8" stroke-width="1.5"
+          stroke-dasharray="5 4" opacity="0.65" style="display:none;"/>
+
+        <!-- ─── Drawdown shaded region between running peak and equity ───
+              Peak reached at Thu 06:00 ~ y=100 ($100,134). Trough at Fri
+              11:30 ~ y=132 ($100,098). Shaded rose band with soft opacity. -->
+        <path d="
+          M 375,100  L 425,100  L 445,109  L 465,120  L 485,124  L 505,128  L 530,131  L 560,132
+          L 560,140  L 530,140  L 505,140  L 485,140  L 465,140  L 445,140  L 425,140  L 375,140  Z
+        " fill="#f43f5e" opacity="0.10"/>
+
+        <!-- ─── Live equity curve ─── -->
+        <!-- Data points hand-crafted to match the trade table below:
+             each realised trade shifts equity; open trades' unrealised
+             pulls the last segment upward.
+             (t_hours, balance$) samples mapped through:
+                x = 60 + (t/167) * 820
+                y = 264 - (balance - 99900) / 320 * 240
+        -->
+        <path id="live-path" d="
+          M 60,189
+          L 69,189
+          L 79,187
+          L 89,185.4
+          L 109,181.4
+          L 155,181.4
+          L 160,178.2
+          L 170,171.3
+          L 189,164
+          L 189,164
+          L 220,161.5
+          L 262,161.5
+          L 265,157
+          L 271,150
+          L 279,140
+          L 291,116
+          L 292,116
+          L 314,112
+          L 331,116
+          L 336,120
+          L 341,124
+          L 349,127.3
+          L 371,100
+          L 371,100
+          L 400,100
+          L 418,105
+          L 425,108
+          L 431,111.1
+          L 452,116
+          L 452,116
+          L 490,116
+          L 497,125
+          L 505,132
+          L 517,132
+          L 528,132
+          L 540,132
+          L 555,132
+          L 570,132
+          L 575,132
+          L 811,132
+          L 833,113
+          L 880,112.5
+        " fill="none" stroke="#10b981" stroke-width="2"/>
+
+        <!-- ─── Trade entry / exit markers ─── -->
+        <!-- Positioned at (x_time, y_baseline+something) for entry triangles
+             on the timeline strip (below plot), and (x_time, y_equity) for
+             exit circles on the curve. All bound to data-* attrs so a
+             single JS handler renders the tooltip. -->
+        <g id="markers" pointer-events="all">
+
+          <!-- Trade 1 · LONG · Mon 15:00 (h1.9) → Mon 17:30 (h4.4) · +$18.20 -->
+          <polygon class="marker" points="69,255 64,246 74,246"
+                   fill="#10b981"
+                   data-tt="trade" data-id="1" data-side="LONG" data-pnl="+18.20" data-pips="+18.2"
+                   data-entry="Mon Jul 13 · 15:00 UTC · 1.09342" data-exit="Mon Jul 13 · 17:30 UTC · 1.09524"
+                   data-reason="ma_cross_up" data-exit-reason="target"/>
+          <circle class="marker" cx="89" cy="185.4" r="3.5" fill="#10b981" stroke="#0f172a" stroke-width="1"
+                   data-tt="trade" data-id="1" data-side="LONG" data-pnl="+18.20" data-pips="+18.2"
+                   data-entry="Mon Jul 13 · 15:00 UTC · 1.09342" data-exit="Mon Jul 13 · 17:30 UTC · 1.09524"
+                   data-reason="ma_cross_up" data-exit-reason="target"/>
+
+          <!-- Trade 2 · SHORT · Tue 08:30 (h19.4) → Tue 10:00 (h20.9) · +$12.30 -->
+          <polygon class="marker" points="155,246 150,255 160,255"
+                   fill="#f43f5e"
+                   data-tt="trade" data-id="2" data-side="SHORT" data-pnl="+12.30" data-pips="+12.3"
+                   data-entry="Tue Jul 14 · 08:30 UTC · 1.09610" data-exit="Tue Jul 14 · 10:00 UTC · 1.09487"
+                   data-reason="rsi_overbought_down" data-exit-reason="target"/>
+          <circle class="marker" cx="163" cy="178.2" r="3.5" fill="#10b981" stroke="#0f172a" stroke-width="1"
+                   data-tt="trade" data-id="2" data-side="SHORT" data-pnl="+12.30" data-pips="+12.3"
+                   data-entry="Tue Jul 14 · 08:30 UTC · 1.09610" data-exit="Tue Jul 14 · 10:00 UTC · 1.09487"
+                   data-reason="rsi_overbought_down" data-exit-reason="target"/>
+
+          <!-- Trade 3 · LONG · Tue 14:00 (h24.9) → Tue 15:15 (h26.2) · −$8.40 -->
+          <polygon class="marker" points="189,255 184,246 194,246"
+                   fill="#10b981"
+                   data-tt="trade" data-id="3" data-side="LONG" data-pnl="-8.40" data-pips="-8.4"
+                   data-entry="Tue Jul 14 · 14:00 UTC · 1.09502" data-exit="Tue Jul 14 · 15:15 UTC · 1.09418"
+                   data-reason="ma_cross_up" data-exit-reason="stop"/>
+          <circle class="marker" cx="197" cy="171.3" r="3.5" fill="#f43f5e" stroke="#0f172a" stroke-width="1"
+                   data-tt="trade" data-id="3" data-side="LONG" data-pnl="-8.40" data-pips="-8.4"
+                   data-entry="Tue Jul 14 · 14:00 UTC · 1.09502" data-exit="Tue Jul 14 · 15:15 UTC · 1.09418"
+                   data-reason="ma_cross_up" data-exit-reason="stop"/>
+
+          <!-- Trade 4 · LONG · Wed 06:00 (h40.9) → Wed 07:15 (h42.2) · +$32.10 -->
+          <polygon class="marker" points="261,255 256,246 266,246"
+                   fill="#10b981"
+                   data-tt="trade" data-id="4" data-side="LONG" data-pnl="+32.10" data-pips="+32.1"
+                   data-entry="Wed Jul 15 · 06:00 UTC · 1.09201" data-exit="Wed Jul 15 · 07:15 UTC · 1.09522"
+                   data-reason="ma_cross_up" data-exit-reason="target"/>
+          <circle class="marker" cx="268" cy="150" r="3.5" fill="#10b981" stroke="#0f172a" stroke-width="1"
+                   data-tt="trade" data-id="4" data-side="LONG" data-pnl="+32.10" data-pips="+32.1"
+                   data-entry="Wed Jul 15 · 06:00 UTC · 1.09201" data-exit="Wed Jul 15 · 07:15 UTC · 1.09522"
+                   data-reason="ma_cross_up" data-exit-reason="target"/>
+
+          <!-- Trade 5 · SHORT · Wed 12:00 (h46.9) → Wed 14:00 (h48.9) · +$54.20 BEST -->
+          <polygon class="marker" points="289,246 284,255 294,255"
+                   fill="#f43f5e"
+                   data-tt="trade" data-id="5" data-side="SHORT" data-pnl="+54.20" data-pips="+54.2"
+                   data-entry="Wed Jul 15 · 12:00 UTC · 1.09730" data-exit="Wed Jul 15 · 14:00 UTC · 1.09188"
+                   data-reason="regime_shift_down" data-exit-reason="target"/>
+          <circle class="marker" cx="299" cy="116" r="4" fill="#10b981" stroke="#0f172a" stroke-width="1.25"
+                   data-tt="trade" data-id="5" data-side="SHORT" data-pnl="+54.20" data-pips="+54.2"
+                   data-entry="Wed Jul 15 · 12:00 UTC · 1.09730" data-exit="Wed Jul 15 · 14:00 UTC · 1.09188"
+                   data-reason="regime_shift_down" data-exit-reason="target"/>
+
+          <!-- Trade 6 · LONG · Wed 18:00 (h52.9) → Wed 20:30 (h55.4) · −$3.10 -->
+          <polygon class="marker" points="319,255 314,246 324,246"
+                   fill="#10b981"
+                   data-tt="trade" data-id="6" data-side="LONG" data-pnl="-3.10" data-pips="-3.1"
+                   data-entry="Wed Jul 15 · 18:00 UTC · 1.09210" data-exit="Wed Jul 15 · 20:30 UTC · 1.09179"
+                   data-reason="ma_cross_up" data-exit-reason="opposite_flip"/>
+          <circle class="marker" cx="332" cy="118" r="3.5" fill="#f43f5e" stroke="#0f172a" stroke-width="1"
+                   data-tt="trade" data-id="6" data-side="LONG" data-pnl="-3.10" data-pips="-3.1"
+                   data-entry="Wed Jul 15 · 18:00 UTC · 1.09210" data-exit="Wed Jul 15 · 20:30 UTC · 1.09179"
+                   data-reason="ma_cross_up" data-exit-reason="opposite_flip"/>
+
+          <!-- Trade 7 · LONG · Thu 04:00 (h62.9) → Thu 06:00 (h64.9) · +$28.40 -->
+          <polygon class="marker" points="371,255 366,246 376,246"
+                   fill="#10b981"
+                   data-tt="trade" data-id="7" data-side="LONG" data-pnl="+28.40" data-pips="+28.4"
+                   data-entry="Thu Jul 16 · 04:00 UTC · 1.09055" data-exit="Thu Jul 16 · 06:00 UTC · 1.09339"
+                   data-reason="ma_cross_up" data-exit-reason="target"/>
+          <circle class="marker" cx="381" cy="100" r="3.5" fill="#10b981" stroke="#0f172a" stroke-width="1"
+                   data-tt="trade" data-id="7" data-side="LONG" data-pnl="+28.40" data-pips="+28.4"
+                   data-entry="Thu Jul 16 · 04:00 UTC · 1.09055" data-exit="Thu Jul 16 · 06:00 UTC · 1.09339"
+                   data-reason="ma_cross_up" data-exit-reason="target"/>
+
+          <!-- Trade 8 · SHORT · Thu 11:00 (h69.9) → Thu 12:15 (h71.2) · −$14.80 -->
+          <polygon class="marker" points="404,246 399,255 409,255"
+                   fill="#f43f5e"
+                   data-tt="trade" data-id="8" data-side="SHORT" data-pnl="-14.80" data-pips="-14.8"
+                   data-entry="Thu Jul 16 · 11:00 UTC · 1.09402" data-exit="Thu Jul 16 · 12:15 UTC · 1.09550"
+                   data-reason="rsi_overbought_down" data-exit-reason="stop"/>
+          <circle class="marker" cx="410" cy="108" r="3.5" fill="#f43f5e" stroke="#0f172a" stroke-width="1"
+                   data-tt="trade" data-id="8" data-side="SHORT" data-pnl="-14.80" data-pips="-14.8"
+                   data-entry="Thu Jul 16 · 11:00 UTC · 1.09402" data-exit="Thu Jul 16 · 12:15 UTC · 1.09550"
+                   data-reason="rsi_overbought_down" data-exit-reason="stop"/>
+
+          <!-- Trade 9 · LONG · Thu 16:30 (h75.4) → Thu 19:00 (h77.9) · +$7.30 -->
+          <polygon class="marker" points="432,255 427,246 437,246"
+                   fill="#10b981"
+                   data-tt="trade" data-id="9" data-side="LONG" data-pnl="+7.30" data-pips="+7.3"
+                   data-entry="Thu Jul 16 · 16:30 UTC · 1.09312" data-exit="Thu Jul 16 · 19:00 UTC · 1.09385"
+                   data-reason="ma_cross_up" data-exit-reason="max_hold"/>
+          <circle class="marker" cx="442" cy="115" r="3.5" fill="#10b981" stroke="#0f172a" stroke-width="1"
+                   data-tt="trade" data-id="9" data-side="LONG" data-pnl="+7.30" data-pips="+7.3"
+                   data-entry="Thu Jul 16 · 16:30 UTC · 1.09312" data-exit="Thu Jul 16 · 19:00 UTC · 1.09385"
+                   data-reason="ma_cross_up" data-exit-reason="max_hold"/>
+
+          <!-- Trade 10 · SHORT · Fri 09:00 (h91.9) → Fri 11:30 (h94.4) · −$28.10 WORST -->
+          <polygon class="marker" points="511,246 506,255 516,255"
+                   fill="#f43f5e"
+                   data-tt="trade" data-id="10" data-side="SHORT" data-pnl="-28.10" data-pips="-28.1"
+                   data-entry="Fri Jul 17 · 09:00 UTC · 1.09188" data-exit="Fri Jul 17 · 11:30 UTC · 1.09469"
+                   data-reason="rsi_overbought_down" data-exit-reason="stop"/>
+          <circle class="marker" cx="524" cy="132" r="4" fill="#f43f5e" stroke="#0f172a" stroke-width="1.25"
+                   data-tt="trade" data-id="10" data-side="SHORT" data-pnl="-28.10" data-pips="-28.1"
+                   data-entry="Fri Jul 17 · 09:00 UTC · 1.09188" data-exit="Fri Jul 17 · 11:30 UTC · 1.09469"
+                   data-reason="rsi_overbought_down" data-exit-reason="stop"/>
+
+          <!-- Trade 11 · LONG · Sun 22:30 (h153.4) → OPEN · +$34.20 unrealised -->
+          <polygon class="marker" points="812,255 807,246 817,246"
+                   fill="#10b981" opacity="0.85"
+                   data-tt="trade" data-id="11" data-side="LONG" data-pnl="+34.20" data-pips="+34.2"
+                   data-entry="Sun Jul 19 · 22:30 UTC · 1.09010" data-exit="—"
+                   data-reason="ma_cross_up" data-exit-reason="open" data-open="1"/>
+
+          <!-- Trade 12 · SHORT · Mon 04:00 (h159.0) → OPEN · +$10.00 unrealised -->
+          <polygon class="marker" points="845,246 840,255 850,255"
+                   fill="#f43f5e" opacity="0.85"
+                   data-tt="trade" data-id="12" data-side="SHORT" data-pnl="+10.00" data-pips="+10.0"
+                   data-entry="Mon Jul 20 · 04:00 UTC · 1.09520" data-exit="—"
+                   data-reason="rsi_overbought_down" data-exit-reason="open" data-open="1"/>
+        </g>
+
+        <!-- ─── Live current-point marker (pulses) ─── -->
+        <circle cx="880" cy="112.5" r="5" fill="#10b981">
+          <animate attributeName="r" values="5;9;5" dur="1.8s" repeatCount="indefinite"/>
+          <animate attributeName="opacity" values="1;0.15;1" dur="1.8s" repeatCount="indefinite"/>
+        </circle>
+        <circle cx="880" cy="112.5" r="4" fill="#10b981" stroke="#0f172a" stroke-width="1.25"/>
+
+        <!-- ─── X-axis: baseline + day tick labels ─── -->
+        <line x1="60" y1="264" x2="880" y2="264" stroke="#475569" stroke-width="0.75"/>
+        <!-- Day boundaries at 00:00 UTC:
+             Mon 00:00  = h-13.07 (before start) → skip; run starts Mon 13:04
+             Tue 00:00  = h10.93  → x = 60 + 10.93/167*820 = 60+53.66 = 113.7
+             Wed 00:00  = h34.93  → x = 60 + 34.93/167*820 = 60+171.5 = 231.5
+             Thu 00:00  = h58.93  → x = 289.3
+             Fri 00:00  = h82.93  → x = 407.2
+             Sat 00:00  = h106.93 → x = 525.1 (weekend)
+             Sun 00:00  = h130.93 → x = 642.9 (weekend)
+             Mon 00:00  = h154.93 → x = 760.7 -->
+        <g fill="#94a3b8" class="tick-label" text-anchor="middle">
+          <text x="60"    y="280">Mon 13</text>
+          <text x="60"    y="292" fill="#64748b" font-size="9">13:04 (run start)</text>
+          <text x="113.7" y="280">Tue 14</text>
+          <text x="231.5" y="280">Wed 15</text>
+          <text x="289.3" y="280">Thu 16</text>
+          <text x="407.2" y="280">Fri 17</text>
+          <text x="693"   y="280" fill="#64748b">Sat 18 · Sun 19</text>
+          <text x="760.7" y="280">Mon 20</text>
+          <text x="880"   y="280">now</text>
+          <text x="880"   y="292" fill="#64748b" font-size="9">12:04 UTC</text>
+        </g>
+
+        <!-- Trade-timeline strip separator line (subtle) -->
+        <line x1="60" y1="242" x2="880" y2="242" stroke="#334155" stroke-width="0.5" stroke-dasharray="1 2"/>
+
+        <!-- ─── Interaction hit-rect + crosshair (drawn by JS) ─── -->
+        <rect id="hit" x="60" y="24" width="820" height="240" fill="transparent"/>
+        <line id="crosshair" x1="0" y1="24" x2="0" y2="264"
+              stroke="#e2e8f0" stroke-width="0.75" stroke-dasharray="3 3"
+              opacity="0" pointer-events="none"/>
+        <circle id="focus-dot" cx="0" cy="0" r="4.5" fill="#f8fafc" stroke="#10b981"
+                stroke-width="2" opacity="0" pointer-events="none"/>
+      </svg>
+
+      <!-- Tooltip (positioned by JS relative to the chart container) -->
+      <div id="tooltip"
+           class="absolute pointer-events-none opacity-0 transition-opacity
+                  bg-slate-950/95 border border-slate-600 rounded-md shadow-lg
+                  px-3 py-2 text-[11px] font-mono min-w-[220px] z-30 backdrop-blur-sm">
+        <div id="tt-title" class="text-[10px] uppercase tracking-wider text-slate-400 pb-1 mb-1.5 border-b border-slate-700"></div>
+        <div id="tt-body"></div>
+      </div>
+    </div>
+
+    <!-- ══════ FOOTER — degraded state chip + overlay toggle ══════ -->
+    <div class="mt-3 flex items-start justify-between gap-6 flex-wrap">
+      <div id="oos-status"
+           class="flex-1 min-w-[400px] text-[11px] text-slate-400 bg-slate-900/60 border border-slate-700 rounded px-3 py-2">
+        <span class="inline-flex items-center gap-1.5 text-amber-400 font-semibold uppercase text-[10px] tracking-wider mr-2">
+          <span class="w-1.5 h-1.5 bg-amber-400 rounded-full"></span> Backtest overlay unavailable
+        </span>
+        <span>The source genome's per-fold OOS equity series wasn't persisted (v0.4.0 schema gap — <code class="text-slate-300 bg-slate-800 px-1 rounded">ValidationFold.equity_series</code>). The overlay will render automatically once the evolution runner starts writing that column. Tracked in <code class="text-slate-300 bg-slate-800 px-1 rounded">project_swap_spread_todo.md</code>.</span>
+      </div>
+      <button id="toggle-oos"
+              class="text-[11px] px-3 py-1.5 rounded border border-slate-600 hover:bg-slate-700 text-slate-300 whitespace-nowrap self-start">
+        Preview overlay (mockup only)
+      </button>
+    </div>
+
+    <!-- ══════ Keyboard shortcut hint ══════ -->
+    <div class="mt-2 text-[10px] text-slate-500 flex flex-wrap items-center gap-x-4">
+      <span><kbd class="bg-slate-700 px-1 rounded">1</kbd>/<kbd class="bg-slate-700 px-1 rounded">2</kbd>/<kbd class="bg-slate-700 px-1 rounded">A</kbd> range</span>
+      <span><kbd class="bg-slate-700 px-1 rounded">←</kbd>/<kbd class="bg-slate-700 px-1 rounded">→</kbd> nudge crosshair</span>
+      <span>Click a marker → scroll to trade row</span>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       Minimal interactivity to demonstrate the design in-browser.
+       In the React port this becomes state + effects; the pure maths
+       lives in helpers alongside _scaleX/_scaleY.
+       ═══════════════════════════════════════════════════════════════════ -->
+  <script>
+    // Fake equity samples aligned to the SVG path above so the tooltip
+    // reads plausible numbers. In production this is the equity[] array
+    // straight from /paper-runs/:id/equity.
+    // Each entry: [xPixel, balance, unrealised, tradesToDate, winsToDate, elapsedH]
+    const SAMPLES = [
+      [60,   100000.00, 0.00,   0, 0,   0.00],
+      [79,   100000.00, -1.20,  0, 0,   1.50],
+      [89,   100018.20, 0.00,   1, 1,   4.40],
+      [155,  100018.20, 3.20,   1, 1,  19.40],
+      [163,  100030.50, 0.00,   2, 2,  20.90],
+      [189,  100030.50, -4.10,  2, 2,  24.90],
+      [197,  100022.10, 0.00,   3, 2,  26.20],
+      [261,  100022.10, 8.20,   3, 2,  40.90],
+      [268,  100054.20, 0.00,   4, 3,  42.20],
+      [289,  100054.20, 18.30,  4, 3,  46.90],
+      [299,  100108.40, 0.00,   5, 4,  48.90],
+      [319,  100108.40, -1.10,  5, 4,  52.90],
+      [332,  100105.30, 0.00,   6, 4,  55.40],
+      [371,  100105.30, 14.60,  6, 4,  62.90],
+      [381,  100133.70, 0.00,   7, 5,  64.90],
+      [404,  100133.70, -6.20,  7, 5,  69.90],
+      [410,  100118.90, 0.00,   8, 5,  71.20],
+      [432,  100118.90, 4.10,   8, 5,  75.40],
+      [442,  100126.20, 0.00,   9, 6,  77.90],
+      [511,  100126.20, -12.40, 9, 6,  91.90],
+      [524,  100098.10, 0.00,  10, 6,  94.40],
+      [575,  100098.10, 0.00,  10, 6, 104.93],
+      [811,  100098.10, 0.00,  10, 6, 152.93],
+      [833,  100098.10, 24.20, 11, 6, 155.00],
+      [880,  100098.10, 44.20, 12, 6, 167.00],
+    ];
+
+    // Backtest OOS samples aligned to the dashed path (illustrative).
+    const OOS_SAMPLES = new Map([
+      [60,  100000.00], [155, 100015.00], [231, 100040.00], [289, 100070.00],
+      [371, 100100.00], [452, 100135.00], [575, 100155.00], [880, 100190.00],
+    ]);
+
+    const chart = document.getElementById('chart');
+    const hit = document.getElementById('hit');
+    const crosshair = document.getElementById('crosshair');
+    const focusDot = document.getElementById('focus-dot');
+    const tooltip = document.getElementById('tooltip');
+    const ttTitle = document.getElementById('tt-title');
+    const ttBody = document.getElementById('tt-body');
+    const oosPath = document.getElementById('oos-path');
+    const oosStatus = document.getElementById('oos-status');
+
+    // Map SVG viewBox coord → screen coord relative to the container.
+    function svgXToClient(x) {
+      const rect = chart.getBoundingClientRect();
+      return rect.left + (x / 900) * rect.width;
+    }
+    function clientXToSvg(clientX) {
+      const rect = chart.getBoundingClientRect();
+      return ((clientX - rect.left) / rect.width) * 900;
+    }
+
+    // Binary-search-like nearest lookup. In React this is `_nearest`.
+    function nearestSample(svgX) {
+      let best = SAMPLES[0], bestDist = Math.abs(SAMPLES[0][0] - svgX);
+      for (const s of SAMPLES) {
+        const d = Math.abs(s[0] - svgX);
+        if (d < bestDist) { best = s; bestDist = d; }
+      }
+      return best;
+    }
+
+    function balanceToY(bal) {
+      return 264 - ((bal - 99900) / 320) * 240;
+    }
+
+    function fmtElapsed(h) {
+      const d = Math.floor(h / 24), rest = h - d*24;
+      const hh = Math.floor(rest), mm = Math.round((rest - hh) * 60);
+      return `${d}d ${String(hh).padStart(2,'0')}h ${String(mm).padStart(2,'0')}m`;
+    }
+
+    function fmtSignedMoney(v) {
+      const sign = v >= 0 ? '+' : '−';
+      return `${sign}$${Math.abs(v).toFixed(2)}`;
+    }
+
+    function pnlColor(v) {
+      return v > 0 ? 'text-emerald-400' : v < 0 ? 'text-rose-400' : 'text-slate-300';
+    }
+
+    function showEquityTooltip(sample, clientX, clientY) {
+      const [, bal, unreal, trades, wins, h] = sample;
+      const pnl = bal + unreal - 100000;
+      const realised = bal - 100000;
+      const oosVal = interpolateOos(sample[0]);
+      const drift = oosVal !== null ? bal - oosVal : null;
+
+      const runStart = new Date(Date.UTC(2026, 6, 13, 13, 4));
+      const ts = new Date(runStart.getTime() + h * 3600 * 1000);
+      const label = ts.toUTCString().replace('GMT', 'UTC').replace(/(\w+),\s(\d+\s\w+\s\d+)\s(\d+:\d+):\d+/,
+        (_, wd, d, hm) => `${wd} ${d} · ${hm} UTC`);
+
+      ttTitle.textContent = `${label} · +${fmtElapsed(h)}`;
+      ttBody.innerHTML = `
+        <div class="tt-row"><span class="text-slate-400">Live equity</span><span>$${bal.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span></div>
+        ${oosVal !== null ? `<div class="tt-row"><span class="text-slate-400">Backtest OOS</span><span>$${oosVal.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span></div>` : ''}
+        ${drift !== null ? `<div class="tt-row"><span class="text-slate-400">Drift vs BT</span><span class="${pnlColor(drift)}">${fmtSignedMoney(drift)}</span></div>` : ''}
+        <div class="tt-row"><span class="text-slate-400">Total P&L</span><span class="${pnlColor(pnl)}">${fmtSignedMoney(pnl)}</span></div>
+        <div class="tt-row"><span class="text-slate-400">Realised</span><span class="${pnlColor(realised)}">${fmtSignedMoney(realised)}</span></div>
+        <div class="tt-row"><span class="text-slate-400">Unrealised</span><span class="${pnlColor(unreal)}">${fmtSignedMoney(unreal)}</span></div>
+        <div class="tt-row"><span class="text-slate-400">Trades to date</span><span>${trades} <span class="text-slate-500">(${wins}W / ${trades-wins}L)</span></span></div>
+      `;
+      positionTooltip(clientX, clientY);
+    }
+
+    function showTradeTooltip(el, clientX, clientY) {
+      const side = el.dataset.side;
+      const pnl = parseFloat(el.dataset.pnl.replace('+',''));
+      const isOpen = el.dataset.open === '1';
+      const sideColor = side === 'LONG' ? 'text-emerald-400' : 'text-rose-400';
+      const exitReasonMap = {
+        target: 'take-profit hit',
+        stop: 'stop-loss hit',
+        opposite_flip: 'opposite signal',
+        max_hold: 'max-hold expired',
+        broker_other: 'broker (other)',
+        open: 'still open',
+      };
+      ttTitle.innerHTML = `Trade #${el.dataset.id} · <span class="${sideColor}">${side}</span> · ${isOpen ? '<span class="text-amber-400">open</span>' : 'closed'}`;
+      ttBody.innerHTML = `
+        <div class="tt-row"><span class="text-slate-400">Entry</span><span>${el.dataset.entry}</span></div>
+        <div class="tt-row"><span class="text-slate-400">Exit</span><span>${el.dataset.exit}</span></div>
+        <div class="tt-row"><span class="text-slate-400">${isOpen ? 'Unrealised' : 'Net P&L'}</span><span class="${pnlColor(pnl)}">${fmtSignedMoney(pnl)} <span class="text-slate-500">(${el.dataset.pips} pips)</span></span></div>
+        <div class="tt-row"><span class="text-slate-400">Exit reason</span><span>${exitReasonMap[el.dataset.exitReason] || el.dataset.exitReason}</span></div>
+        <div class="tt-row"><span class="text-slate-400">Signal</span><span class="text-slate-300">${el.dataset.reason}</span></div>
+      `;
+      positionTooltip(clientX, clientY);
+    }
+
+    function positionTooltip(clientX, clientY) {
+      const rect = chart.getBoundingClientRect();
+      const relX = clientX - rect.left;
+      const relY = clientY - rect.top;
+      const container = chart.parentElement.getBoundingClientRect();
+      const chartOffsetX = rect.left - container.left;
+      const chartOffsetY = rect.top - container.top;
+
+      // Flip if we'd overflow the right edge.
+      const tooltipW = 260;
+      let x = chartOffsetX + relX + 14;
+      if (relX + 14 + tooltipW > rect.width) x = chartOffsetX + relX - tooltipW - 14;
+      let y = chartOffsetY + relY - 30;
+      if (y < 8) y = 8;
+
+      tooltip.style.left = x + 'px';
+      tooltip.style.top = y + 'px';
+      tooltip.style.opacity = '1';
+    }
+
+    function interpolateOos(svgX) {
+      if (oosPath.style.display === 'none') return null;
+      const xs = Array.from(OOS_SAMPLES.keys()).sort((a,b)=>a-b);
+      if (svgX <= xs[0]) return OOS_SAMPLES.get(xs[0]);
+      if (svgX >= xs[xs.length-1]) return OOS_SAMPLES.get(xs[xs.length-1]);
+      for (let i=0; i<xs.length-1; i++) {
+        if (svgX >= xs[i] && svgX <= xs[i+1]) {
+          const frac = (svgX - xs[i]) / (xs[i+1] - xs[i]);
+          return OOS_SAMPLES.get(xs[i]) + frac * (OOS_SAMPLES.get(xs[i+1]) - OOS_SAMPLES.get(xs[i]));
+        }
+      }
+      return null;
+    }
+
+    hit.addEventListener('mousemove', (e) => {
+      const svgX = clientXToSvg(e.clientX);
+      const sample = nearestSample(svgX);
+      const targetX = sample[0];
+      crosshair.setAttribute('x1', targetX);
+      crosshair.setAttribute('x2', targetX);
+      crosshair.setAttribute('opacity', '1');
+      focusDot.setAttribute('cx', targetX);
+      focusDot.setAttribute('cy', balanceToY(sample[1] + sample[2]));
+      focusDot.setAttribute('opacity', '1');
+      showEquityTooltip(sample, e.clientX, e.clientY);
+    });
+
+    hit.addEventListener('mouseleave', () => {
+      crosshair.setAttribute('opacity', '0');
+      focusDot.setAttribute('opacity', '0');
+      tooltip.style.opacity = '0';
+    });
+
+    document.querySelectorAll('.marker').forEach(el => {
+      el.addEventListener('mouseenter', (e) => {
+        // Suppress the equity tooltip while marker tooltip is up.
+        crosshair.setAttribute('opacity', '0');
+        focusDot.setAttribute('opacity', '0');
+        showTradeTooltip(el, e.clientX, e.clientY);
+        e.stopPropagation();
+      });
+      el.addEventListener('mouseleave', () => {
+        tooltip.style.opacity = '0';
+      });
+    });
+
+    // Range pill state (mockup only — doesn't reflow the chart here).
+    document.querySelectorAll('.range-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.range-btn').forEach(b => {
+          b.classList.remove('bg-slate-700', 'text-slate-100', 'font-semibold');
+          b.classList.add('text-slate-300');
+        });
+        btn.classList.add('bg-slate-700', 'text-slate-100', 'font-semibold');
+        btn.classList.remove('text-slate-300');
+      });
+    });
+
+    // OOS overlay preview toggle
+    document.getElementById('toggle-oos').addEventListener('click', (e) => {
+      const shown = oosPath.style.display !== 'none';
+      if (shown) {
+        oosPath.style.display = 'none';
+        oosStatus.style.opacity = '1';
+        e.target.textContent = 'Preview overlay (mockup only)';
+      } else {
+        oosPath.style.display = '';
+        oosStatus.style.opacity = '0.35';
+        e.target.textContent = 'Hide overlay';
+      }
+    });
+
+    // Keyboard shortcuts (range)
+    document.addEventListener('keydown', (e) => {
+      const map = { '1': '24h', '2': '7d', 'a': 'all', 'A': 'all' };
+      if (map[e.key]) {
+        const btn = document.querySelector(`[data-range="${map[e.key]}"]`);
+        if (btn) btn.click();
+      }
+    });
+  </script>
+</body>
+</html>
