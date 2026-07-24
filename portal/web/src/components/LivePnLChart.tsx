@@ -14,12 +14,19 @@
  * `_scaleX` / `_buildRiskConfig` pattern established elsewhere.
  */
 
-import React, { useCallback, useMemo, useRef, useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 
 import type { PaperTradePublic } from '../types/paper';
 import {
   computeSummaryStrip,
   detectGaps,
+  filterByRange,
   interpolateOverlay,
   nearestSample,
   pickAxisTicks,
@@ -73,34 +80,60 @@ export function LivePnLChart({
   trades,
   backtestSeries = [],
 }: LivePnLChartProps) {
-  // PR 1 renders the full run range; PR 4 will add a range selector.
-  const rangeKey: RangeKey = '7d';
+  // PR 4: range selector. Default 7d; `1 / 2 / A` keyboard shortcuts
+  // switch between 24h / 7d / All. Summary strip is always computed
+  // from the FULL series so the tiles reflect run-total not window-
+  // total; the chart itself narrows to the selected window.
+  const [rangeKey, setRangeKey] = useState<RangeKey>('7d');
 
   const summary = useMemo(
     () => computeSummaryStrip(liveSeries, trades, snapshotBalance),
     [liveSeries, trades, snapshotBalance],
   );
 
-  const now = liveSeries.length
+  const nowMs = liveSeries.length
     ? liveSeries[liveSeries.length - 1].timestampMs
     : runStartMs;
-  const spanMs = Math.max(now - runStartMs, 60_000);
 
-  // Anchor the live line at (runStartMs, snapshotBalance) when there
-  // isn't already a sample close to the run start. Same guard as the
-  // pre-redesign chart.
+  // Local name intentionally NOT `window` — shadowing the global
+  // hoses the `window.addEventListener` call in the keyboard-shortcut
+  // effect below.
+  const rangeFilter = useMemo(
+    () =>
+      filterByRange({
+        rangeKey,
+        runStartMs,
+        nowMs,
+        equity: liveSeries,
+        trades,
+      }),
+    [rangeKey, runStartMs, nowMs, liveSeries, trades],
+  );
+
+  // Alias the window bounds for scale-math clarity. `axisStartMs`
+  // anchors h0 on the plot; `runStartMs` remains the run's original
+  // paper-trading start for the header's "elapsed" sub-line and
+  // tooltip.
+  const axisStartMs = rangeFilter.startMs;
+  const axisEndMs = rangeFilter.endMs;
+  const spanMs = Math.max(axisEndMs - axisStartMs, 60_000);
+  const windowedSeries = rangeFilter.equity;
+  const windowedTrades = rangeFilter.trades;
+
+  // Anchor the live line at (axisStartMs, snapshotBalance) when there
+  // isn't already a sample close to the window start.
   const anchoredSeries: EquityPoint[] =
-    liveSeries.length === 0 ||
-    liveSeries[0].timestampMs - runStartMs > 30_000
+    windowedSeries.length === 0 ||
+    windowedSeries[0].timestampMs - axisStartMs > 30_000
       ? [
           {
-            timestampMs: runStartMs,
+            timestampMs: axisStartMs,
             balance: snapshotBalance,
             unrealizedPnl: 0,
           },
-          ...liveSeries,
+          ...windowedSeries,
         ]
-      : liveSeries;
+      : windowedSeries;
 
   const allBalances = [
     snapshotBalance,
@@ -109,29 +142,53 @@ export function LivePnLChart({
   ];
   const rawMin = Math.min(...allBalances);
   const rawMax = Math.max(...allBalances);
-  // Add a small padding on each side so the curve doesn't touch the
-  // top/bottom edges of the plot rect.
   const rawRange = Math.max(rawMax - rawMin, snapshotBalance * 0.01);
   const minBalance = rawMin - rawRange * 0.08;
   const maxBalance = rawMax + rawRange * 0.08;
   const balanceRange = maxBalance - minBalance;
 
   const scaleX = (ms: number) =>
-    _scaleX(ms, runStartMs, spanMs, PADDING_LEFT, PLOT_WIDTH);
+    _scaleX(ms, axisStartMs, spanMs, PADDING_LEFT, PLOT_WIDTH);
   const scaleY = (balance: number) =>
     _scaleY(balance, minBalance, balanceRange, PADDING_TOP, PLOT_HEIGHT);
 
   const livePath = pointsToPath(anchoredSeries, scaleX, scaleY);
   const backtestPath = pointsToPath(backtestSeries, scaleX, scaleY);
 
-  // Weekend + outage bands — greyed rects behind the curve.
   const gaps = useMemo(() => detectGaps(anchoredSeries), [anchoredSeries]);
 
-  // Calendar-day ticks along the bottom axis.
   const xTicks = useMemo(
-    () => pickAxisTicks(runStartMs, now, rangeKey),
-    [runStartMs, now, rangeKey],
+    () => pickAxisTicks(axisStartMs, axisEndMs, rangeKey),
+    [axisStartMs, axisEndMs, rangeKey],
   );
+
+  // ── Keyboard shortcuts (PR 4) ──────────────────────────────────
+  //
+  // 1 → 24h, 2 → 7d, A → All. Only fire when the chart's own DOM
+  // subtree is mounted (any-focus-outside checks live in the
+  // shortcut hint — we don't consume input when the user is typing
+  // in a form). Uses `keydown` on window with a targeted guard
+  // against text-input focus.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === '1') setRangeKey('24h');
+      else if (e.key === '2') setRangeKey('7d');
+      else if (e.key === 'a' || e.key === 'A') setRangeKey('all');
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
 
   // Y-axis ticks — 5 evenly-spaced balance labels.
   const yTicks = useMemo(() => {
@@ -144,7 +201,7 @@ export function LivePnLChart({
   }, [minBalance, balanceRange]);
 
   const currentLive = liveSeries[liveSeries.length - 1];
-  const elapsedLabel = formatElapsed(runStartMs, now);
+  const elapsedLabel = formatElapsed(runStartMs, nowMs);
 
   // ── Hover crosshair state (PR 2) ────────────────────────────────
   //
@@ -165,7 +222,7 @@ export function LivePnLChart({
         clientX: e.clientX,
         rectLeft: rect.left,
         rectWidth: rect.width,
-        runStartMs,
+        runStartMs: axisStartMs, // clamp to the visible WINDOW, not run
         spanMs,
         paddingLeft: PADDING_LEFT,
         plotWidth: PLOT_WIDTH,
@@ -173,15 +230,15 @@ export function LivePnLChart({
       });
       setHoverMs(ts);
     },
-    [runStartMs, spanMs],
+    [axisStartMs, spanMs],
   );
   const handlePointerLeave = useCallback(() => setHoverMs(null), []);
 
   // Snap the crosshair to the nearest sample so the tooltip's balance
   // matches the drawn curve (not a hypothetical interpolated point).
   const hoverPoint = useMemo(
-    () => (hoverMs != null ? nearestSample(liveSeries, hoverMs) : null),
-    [hoverMs, liveSeries],
+    () => (hoverMs != null ? nearestSample(windowedSeries, hoverMs) : null),
+    [hoverMs, windowedSeries],
   );
   const hoverBacktest = useMemo(
     () =>
@@ -201,9 +258,12 @@ export function LivePnLChart({
   // tooltip; clicking scrolls the trades table row into view using
   // the `data-trade-id` attribute wired in `PaperRunTradesTable`.
   const projections = useMemo(
-    () => trades.map((t) => projectTrade(t, liveSeries, scaleX, scaleY)),
+    () =>
+      windowedTrades.map((t) =>
+        projectTrade(t, anchoredSeries, scaleX, scaleY),
+      ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [trades, liveSeries, runStartMs, spanMs, minBalance, balanceRange],
+    [windowedTrades, anchoredSeries, axisStartMs, spanMs, minBalance, balanceRange],
   );
   const [hoverTradeId, setHoverTradeId] = useState<string | null>(null);
   const hoveredTrade =
@@ -241,7 +301,7 @@ export function LivePnLChart({
 
   return (
     <div className="w-full">
-      {/* ── Header row: chart title + inline stats ─────────────────── */}
+      {/* ── Header row: chart title + inline stats + range pills ──── */}
       <div className="flex items-start justify-between gap-6 flex-wrap mb-3">
         <div>
           <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">
@@ -280,6 +340,32 @@ export function LivePnLChart({
               </span>
             </span>
           </div>
+        </div>
+
+        {/* ── Range selector (PR 4) ─────────────────────────────── */}
+        <div
+          className="inline-flex items-center rounded-md border border-slate-200 dark:border-slate-700 overflow-hidden text-xs"
+          role="tablist"
+          aria-label="Chart time range"
+        >
+          <RangePill
+            active={rangeKey === '24h'}
+            onClick={() => setRangeKey('24h')}
+            label="24h"
+            shortcut="1"
+          />
+          <RangePill
+            active={rangeKey === '7d'}
+            onClick={() => setRangeKey('7d')}
+            label="7d"
+            shortcut="2"
+          />
+          <RangePill
+            active={rangeKey === 'all'}
+            onClick={() => setRangeKey('all')}
+            label="All"
+            shortcut="A"
+          />
         </div>
       </div>
 
@@ -686,6 +772,28 @@ export function LivePnLChart({
           )
         )}
       </div>
+
+      {/* ── Keyboard-shortcut hint (PR 4) ──────────────────────────── */}
+      <div className="mt-2 text-[10px] text-slate-400 dark:text-slate-500 flex items-center gap-3">
+        <span>
+          <kbd className="px-1 py-0.5 border border-slate-300 dark:border-slate-600 rounded font-mono">
+            1
+          </kbd>{' '}
+          24h
+        </span>
+        <span>
+          <kbd className="px-1 py-0.5 border border-slate-300 dark:border-slate-600 rounded font-mono">
+            2
+          </kbd>{' '}
+          7d
+        </span>
+        <span>
+          <kbd className="px-1 py-0.5 border border-slate-300 dark:border-slate-600 rounded font-mono">
+            A
+          </kbd>{' '}
+          All
+        </span>
+      </div>
     </div>
   );
 }
@@ -961,6 +1069,32 @@ interface SummaryTileProps {
   value: React.ReactNode;
   valueClass?: string;
   sublabel?: string;
+}
+
+interface RangePillProps {
+  active: boolean;
+  onClick: () => void;
+  label: string;
+  shortcut: string;
+}
+
+function RangePill({ active, onClick, label, shortcut }: RangePillProps) {
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={active}
+      onClick={onClick}
+      className={`px-3 py-1.5 border-l first:border-l-0 border-slate-200 dark:border-slate-700 transition-colors ${
+        active
+          ? 'bg-slate-100 dark:bg-slate-700 text-slate-900 dark:text-slate-100 font-semibold'
+          : 'text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800'
+      }`}
+      title={`Keyboard shortcut: ${shortcut}`}
+    >
+      {label}
+    </button>
+  );
 }
 
 function SummaryTile({ label, value, valueClass, sublabel }: SummaryTileProps) {

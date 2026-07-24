@@ -417,6 +417,80 @@ export function interpolateOverlay(
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// filterByRange (PR 4) — range selector filter
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Client-side filter over the equity + trades arrays for the range
+ * pill selector. The chart re-renders with a narrower window without
+ * needing a new fetch — the runner writes every sample; the "last
+ * 24h" view is just a slice of what's already in memory.
+ *
+ * Window semantics:
+ * - `24h` → [nowMs - 24h, nowMs], clamped to runStartMs on the left.
+ * - `7d`  → [nowMs - 7d, nowMs], clamped to runStartMs on the left.
+ * - `all` → [runStartMs, nowMs].
+ *
+ * Trades are included when the trade's timeline touches the window
+ * — i.e. entry ≤ end AND (exit == null OR exit ≥ start). Straddling
+ * trades stay visible so their markers don't wink out at the window
+ * boundary.
+ *
+ * Returns a bounded `{startMs, endMs}` that the chart uses as the
+ * X-axis anchor and span. Never returns endMs ≤ startMs — collapses
+ * to a 60s minimum window so the axis is still legible.
+ */
+export interface RangeFilterInput {
+  rangeKey: RangeKey;
+  runStartMs: number;
+  nowMs: number;
+  equity: EquityPoint[];
+  trades: PaperTradePublic[];
+}
+
+export interface RangeFilterOutput {
+  startMs: number;
+  endMs: number;
+  equity: EquityPoint[];
+  trades: PaperTradePublic[];
+}
+
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+export function filterByRange(input: RangeFilterInput): RangeFilterOutput {
+  const { rangeKey, runStartMs, nowMs, equity, trades } = input;
+  let startMs: number;
+  const endMs = nowMs;
+  if (rangeKey === '24h') {
+    startMs = Math.max(runStartMs, nowMs - ONE_DAY_MS);
+  } else if (rangeKey === '7d') {
+    startMs = Math.max(runStartMs, nowMs - 7 * ONE_DAY_MS);
+  } else {
+    startMs = runStartMs;
+  }
+  // Guarantee a legible axis even on brand-new runs (or if the input
+  // window degenerates for any reason).
+  const safeEnd = Math.max(endMs, startMs + 60_000);
+
+  const filteredEquity = equity.filter(
+    (p) => p.timestampMs >= startMs && p.timestampMs <= safeEnd,
+  );
+  const filteredTrades = trades.filter((t) => {
+    const entryMs = new Date(t.entry_timestamp).getTime();
+    if (entryMs > safeEnd) return false;
+    if (t.exit_timestamp == null) return true; // still open — always show
+    const exitMs = new Date(t.exit_timestamp).getTime();
+    return exitMs >= startMs;
+  });
+  return {
+    startMs,
+    endMs: safeEnd,
+    equity: filteredEquity,
+    trades: filteredTrades,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // projectTrade (PR 3) — marker geometry
 // ─────────────────────────────────────────────────────────────────────
 
