@@ -28,6 +28,7 @@ import { useToast } from '../contexts/ToastContext';
 import { KillSwitchButton } from '../components/KillSwitchButton';
 import {
   LivePnLChart,
+  toEquityPoints,
   type EquityPoint,
 } from '../components/LivePnLChart';
 import { PaperRunTradesTable } from '../components/PaperRunTradesTable';
@@ -92,9 +93,15 @@ export default function PaperRunDetail() {
       setRun(data);
       // Accumulate live equity samples if we have a balance.
       if (data.current_balance != null) {
+        // v0.6.3 redesign: EquityPoint now carries `unrealizedPnl` so
+        // the summary strip / hover tooltip can surface the open-
+        // position mark-to-market. The health-tick poll only knows
+        // realized balance; unrealised comes back from the equity
+        // endpoint on the next fetch.
         const point: EquityPoint = {
           timestampMs: Date.now(),
           balance: data.current_balance,
+          unrealizedPnl: 0,
         };
         equityRef.current = [...equityRef.current, point].slice(-MAX_LIVE_SAMPLES);
         setEquity(equityRef.current);
@@ -266,10 +273,7 @@ export default function PaperRunDetail() {
       try {
         const eq = await getEquityForRun(runId);
         if (cancelled) return;
-        const seeded: EquityPoint[] = eq.items.map((s) => ({
-          timestampMs: new Date(s.timestamp).getTime(),
-          balance: s.balance,
-        }));
+        const seeded: EquityPoint[] = toEquityPoints(eq.items);
         equityRef.current = seeded;
         setEquity(seeded);
         equitySeeded.current = true;
@@ -510,41 +514,25 @@ export default function PaperRunDetail() {
         />
       </div>
 
+      {/* v0.6.3 redesign: LivePnLChart owns its own header, legend,
+          8-tile summary strip, and calendar-day X-axis. The wrapper
+          card just provides the surface — no duplicate title / legend
+          / dual-axis blurb. The OOS "unavailable" chip stays below
+          the chart for now; PR 6 folds it inside the chart component. */}
       <div className="mt-6 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
-        <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
-          <div>
-            <div className="text-sm font-semibold">
-              Live vs backtest equity
-            </div>
-            <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Dual x-axis: relative hours (bottom) + local time (top).
-              Curve seeded from persisted signal-tick snapshots, then
-              5s polling appends new samples.
-            </div>
-          </div>
-          <div className="flex gap-4 text-xs">
-            <span className="flex items-center gap-1">
-              <span className="w-3 h-0.5 bg-emerald-500 inline-block" /> Live
-            </span>
-            <span className="flex items-center gap-1 text-slate-500">
-              <span className="w-3 h-0.5 border-t border-dashed border-slate-400 inline-block" />
-              Backtest OOS
-            </span>
-          </div>
-        </div>
-        <div className="h-64 bg-slate-50 dark:bg-slate-900 rounded border border-slate-100 dark:border-slate-700">
-          <LivePnLChart
-            runStartMs={runStartMs}
-            snapshotBalance={snapshot || current || 10_000}
-            liveSeries={equity}
-            backtestSeries={(backtestOverlay?.items ?? []).map((p) => ({
-              timestampMs: runStartMs + p.timestamp_relative_seconds * 1000,
-              balance: p.balance,
-            }))}
-          />
-        </div>
+        <LivePnLChart
+          runStartMs={runStartMs}
+          snapshotBalance={snapshot || current || 10_000}
+          liveSeries={equity}
+          trades={trades}
+          backtestSeries={(backtestOverlay?.items ?? []).map((p) => ({
+            timestampMs: runStartMs + p.timestamp_relative_seconds * 1000,
+            balance: p.balance,
+            unrealizedPnl: 0,
+          }))}
+        />
         {backtestOverlay?.source === 'unavailable' && (
-          <div className="text-xs text-slate-500 dark:text-slate-400 italic mt-2">
+          <div className="text-xs text-slate-500 dark:text-slate-400 italic mt-3">
             Backtest OOS overlay unavailable
             {backtestOverlay.reason === 'no_associated_evolution_run' &&
               ' — this run isn\'t linked to an evolution.'}
