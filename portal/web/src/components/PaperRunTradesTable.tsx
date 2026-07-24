@@ -148,7 +148,13 @@ export function PaperRunTradesTable({
             return (
               <tr
                 key={t.id}
-                className={`border-b border-slate-100 dark:border-slate-800 ${
+                data-trade-id={t.id}
+                // `data-trade-id` is the anchor the LivePnLChart's
+                // trade-marker click handler scrolls to (PR3 of the
+                // v0.6.3 chart redesign). Also lets the ring-highlight
+                // stick to a table row for a moment so the user's eye
+                // catches which row was jumped to.
+                className={`border-b border-slate-100 dark:border-slate-800 transition-shadow duration-500 ${
                   open ? 'bg-amber-50/40 dark:bg-amber-900/10' : ''
                 }`}
               >

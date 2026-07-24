@@ -416,6 +416,69 @@ export function interpolateOverlay(
   return a.balance + t * (b.balance - a.balance);
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// projectTrade (PR 3) — marker geometry
+// ─────────────────────────────────────────────────────────────────────
+
+export interface TradeProjection {
+  tradeId: string;
+  side: 'buy' | 'sell';
+  /** Entry marker triangle apex position (at the bottom of the plot). */
+  entryX: number;
+  entryTsMs: number;
+  /** Exit circle position on the equity curve. Null when the trade is
+   *  still open. */
+  exit: { x: number; y: number; balance: number } | null;
+  /** Realised P&L sign — drives the exit circle colour. Null when
+   *  the trade is open. */
+  outcome: 'win' | 'loss' | 'flat' | null;
+}
+
+/**
+ * Project a `PaperTradePublic` into pixel coordinates for the SVG.
+ * The exit circle sits at the equity value AT the exit timestamp
+ * (from the nearest sample in `liveSeries`), so it always lands
+ * exactly on the drawn curve.
+ *
+ * Trades whose entry falls outside the visible range (e.g. before
+ * the range selector's window) are still projected — the chart
+ * component decides whether to render them by testing against the
+ * plot rect.
+ */
+export function projectTrade(
+  trade: PaperTradePublic,
+  liveSeries: EquityPoint[],
+  scaleX: (ms: number) => number,
+  scaleY: (balance: number) => number,
+): TradeProjection {
+  const entryMs = new Date(trade.entry_timestamp).getTime();
+  const entryX = scaleX(entryMs);
+  let exit: TradeProjection['exit'] = null;
+  let outcome: TradeProjection['outcome'] = null;
+  if (trade.exit_timestamp) {
+    const exitMs = new Date(trade.exit_timestamp).getTime();
+    const nearest = nearestSample(liveSeries, exitMs);
+    const balance =
+      nearest?.balance ??
+      // Very defensive fallback for an exit outside the equity series
+      // range — synthesise a balance from trade quantities. In
+      // practice `nearest` is virtually always non-null since the
+      // exit tick writes an equity snapshot.
+      trade.exit_price ?? 0;
+    exit = { x: scaleX(exitMs), y: scaleY(balance), balance };
+    const p = trade.net_pnl ?? trade.pnl ?? 0;
+    outcome = p > 0 ? 'win' : p < 0 ? 'loss' : 'flat';
+  }
+  return {
+    tradeId: trade.id,
+    side: trade.side === 'buy' ? 'buy' : 'sell',
+    entryX,
+    entryTsMs: entryMs,
+    exit,
+    outcome,
+  };
+}
+
 /** Count wins / losses among trades with `exit_timestamp <= cutoffMs`.
  *  Used by the tooltip's "Trades to date · W / L" row so the number
  *  reflects the moment the cursor is over, not the run-total. */

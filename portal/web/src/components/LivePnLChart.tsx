@@ -23,6 +23,7 @@ import {
   interpolateOverlay,
   nearestSample,
   pickAxisTicks,
+  projectTrade,
   toEquityPoints,
   tradesUpTo,
   type EquityPoint,
@@ -191,6 +192,47 @@ export function LivePnLChart({
     () => (hoverMs != null ? tradesUpTo(trades, hoverMs) : null),
     [hoverMs, trades],
   );
+
+  // ── Trade markers (PR 3) ───────────────────────────────────────
+  //
+  // Project every trade into pixel space once per render; the SVG
+  // then binds the projections to entry triangles + exit circles.
+  // Hovering a marker swaps the crosshair tooltip for a trade-detail
+  // tooltip; clicking scrolls the trades table row into view using
+  // the `data-trade-id` attribute wired in `PaperRunTradesTable`.
+  const projections = useMemo(
+    () => trades.map((t) => projectTrade(t, liveSeries, scaleX, scaleY)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [trades, liveSeries, runStartMs, spanMs, minBalance, balanceRange],
+  );
+  const [hoverTradeId, setHoverTradeId] = useState<string | null>(null);
+  const hoveredTrade =
+    hoverTradeId != null
+      ? trades.find((t) => t.id === hoverTradeId) ?? null
+      : null;
+  const hoveredProjection =
+    hoverTradeId != null
+      ? projections.find((p) => p.tradeId === hoverTradeId) ?? null
+      : null;
+
+  const handleTradeClick = useCallback((tradeId: string) => {
+    // Scroll the matching trade row into view. The row is tagged with
+    // `data-trade-id` by `PaperRunTradesTable`. If the table isn't
+    // mounted yet (unlikely) we just no-op.
+    const row = document.querySelector(
+      `[data-trade-id="${CSS.escape(tradeId)}"]`,
+    );
+    if (row && 'scrollIntoView' in row) {
+      (row as HTMLElement).scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+      });
+      row.classList.add('ring-2', 'ring-amber-400');
+      setTimeout(() => {
+        row.classList.remove('ring-2', 'ring-amber-400');
+      }, 1500);
+    }
+  }, []);
   const pnlTotal =
     summary.liveBalance - snapshotBalance + summary.unrealisedPnl;
   const pnlTotalPct = snapshotBalance > 0
@@ -530,6 +572,61 @@ export function LivePnLChart({
             );
           })}
 
+          {/* ── Trade markers (PR 3) ───────────────────────────────── */}
+          {/* Entry triangles sit on a small strip just above the x-axis
+              baseline; exit circles land on the equity curve. Both are
+              hover-swappable and click-scrollable. */}
+          <g>
+            {projections.map((p) => {
+              const inRange =
+                p.entryX >= PADDING_LEFT &&
+                p.entryX <= PADDING_LEFT + PLOT_WIDTH;
+              if (!inRange) return null;
+              const baseY = PADDING_TOP + PLOT_HEIGHT - 2;
+              const isLong = p.side === 'buy';
+              // ▲ (long) apex up; ▼ (short) apex down.
+              const trianglePts = isLong
+                ? `${p.entryX},${baseY - 8} ${p.entryX - 4},${baseY} ${p.entryX + 4},${baseY}`
+                : `${p.entryX - 4},${baseY - 8} ${p.entryX + 4},${baseY - 8} ${p.entryX},${baseY}`;
+              const sideColor = isLong ? '#10b981' : '#f43f5e';
+              const isHovered = p.tradeId === hoverTradeId;
+              return (
+                <g key={`m-${p.tradeId}`}>
+                  <polygon
+                    points={trianglePts}
+                    fill={sideColor}
+                    opacity={isHovered ? 1 : 0.85}
+                    style={{ cursor: 'pointer' }}
+                    onPointerEnter={() => setHoverTradeId(p.tradeId)}
+                    onPointerLeave={() => setHoverTradeId(null)}
+                    onClick={() => handleTradeClick(p.tradeId)}
+                  />
+                  {p.exit && (
+                    <circle
+                      cx={p.exit.x}
+                      cy={p.exit.y}
+                      r={isHovered ? 5 : 3.5}
+                      fill={
+                        p.outcome === 'win'
+                          ? '#10b981'
+                          : p.outcome === 'loss'
+                            ? '#f43f5e'
+                            : '#94a3b8'
+                      }
+                      stroke="white"
+                      strokeWidth={1}
+                      className="dark:stroke-slate-900"
+                      style={{ cursor: 'pointer' }}
+                      onPointerEnter={() => setHoverTradeId(p.tradeId)}
+                      onPointerLeave={() => setHoverTradeId(null)}
+                      onClick={() => handleTradeClick(p.tradeId)}
+                    />
+                  )}
+                </g>
+              );
+            })}
+          </g>
+
           {/* ── Hover crosshair (PR 2) ─────────────────────────────── */}
           {hoverPoint && hoverMs != null && (
             <g pointerEvents="none">
@@ -568,17 +665,25 @@ export function LivePnLChart({
           />
         </svg>
 
-        {/* ── Floating tooltip (PR 2) ─────────────────────────────── */}
-        {hoverPoint && hoverMs != null && (
-          <ChartTooltip
-            hoverMs={hoverMs}
-            hoverPoint={hoverPoint}
-            hoverBacktest={hoverBacktest}
-            hoverTradeStats={hoverTradeStats}
-            runStartMs={runStartMs}
-            snapshotBalance={snapshotBalance}
-            scaleX={scaleX}
+        {/* ── Floating tooltip (PR 2 crosshair + PR 3 marker swap) ── */}
+        {hoveredTrade && hoveredProjection ? (
+          <TradeTooltip
+            trade={hoveredTrade}
+            projection={hoveredProjection}
           />
+        ) : (
+          hoverPoint &&
+          hoverMs != null && (
+            <ChartTooltip
+              hoverMs={hoverMs}
+              hoverPoint={hoverPoint}
+              hoverBacktest={hoverBacktest}
+              hoverTradeStats={hoverTradeStats}
+              runStartMs={runStartMs}
+              snapshotBalance={snapshotBalance}
+              scaleX={scaleX}
+            />
+          )
         )}
       </div>
     </div>
@@ -710,6 +815,118 @@ function TooltipRow({
       <span className={valueColor}>{value}</span>
     </div>
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// TradeTooltip — PR 3, swaps in when a marker is hovered
+// ─────────────────────────────────────────────────────────────────────
+
+interface TradeTooltipProps {
+  trade: PaperTradePublic;
+  projection: import('../utils/livePnlChart').TradeProjection;
+}
+
+function TradeTooltip({ trade, projection }: TradeTooltipProps) {
+  const isLong = trade.side === 'buy';
+  const isOpen = trade.exit_timestamp == null;
+  const pnl = trade.net_pnl ?? trade.pnl ?? 0;
+  const pips = _computePipsMove(trade);
+  const leftFrac = projection.entryX / VIEWBOX_WIDTH;
+  const flipLeft = leftFrac > 0.55;
+  const style: React.CSSProperties = flipLeft
+    ? { right: `${(1 - leftFrac) * 100}%`, top: 40 }
+    : { left: `${leftFrac * 100}%`, top: 40 };
+  const nudge = flipLeft ? 'mr-2' : 'ml-2';
+
+  return (
+    <div
+      className={`absolute z-30 pointer-events-none ${nudge} min-w-[260px] rounded-md bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-lg text-xs font-mono tabular-nums`}
+      style={style}
+    >
+      <div className="px-3 py-1.5 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
+        <span className="font-semibold text-slate-700 dark:text-slate-200">
+          {isLong ? '▲ LONG' : '▼ SHORT'}{' '}
+          <span className="text-slate-500 dark:text-slate-500 ml-1">
+            {trade.quantity.toLocaleString()} units
+          </span>
+        </span>
+        <span
+          className={
+            isOpen
+              ? 'text-amber-600 dark:text-amber-400 text-[10px] uppercase'
+              : 'text-slate-500 dark:text-slate-500 text-[10px] uppercase'
+          }
+        >
+          {isOpen ? 'open' : trade.exit_reason ?? 'closed'}
+        </span>
+      </div>
+      <div className="px-3 py-1.5 space-y-1">
+        <TooltipRow
+          label="Entry"
+          value={`${_fmtTooltipDate(projection.entryTsMs)} · ${trade.entry_price.toFixed(5)}`}
+        />
+        <TooltipRow
+          label="Exit"
+          value={
+            trade.exit_timestamp && trade.exit_price != null
+              ? `${_fmtTooltipDate(new Date(trade.exit_timestamp).getTime())} · ${trade.exit_price.toFixed(5)}`
+              : 'still open'
+          }
+          muted={isOpen}
+        />
+        {pips != null && (
+          <TooltipRow
+            label="Move"
+            value={`${pips >= 0 ? '+' : ''}${pips.toFixed(1)} pips`}
+            tone={pips >= 0 ? 'up' : 'down'}
+          />
+        )}
+        {!isOpen && (
+          <TooltipRow
+            label="Net P&L"
+            value={_fmtSigned(pnl)}
+            tone={pnl >= 0 ? 'up' : 'down'}
+          />
+        )}
+        {trade.financing != null && trade.financing !== 0 && (
+          <TooltipRow
+            label="Financing"
+            value={_fmtSigned(trade.financing)}
+            tone={trade.financing >= 0 ? 'up' : 'down'}
+          />
+        )}
+        {trade.commission != null && trade.commission !== 0 && (
+          <TooltipRow
+            label="Commission"
+            value={`-${Math.abs(trade.commission).toFixed(2)}`}
+            tone="down"
+          />
+        )}
+        {trade.signal_reason && (
+          <div className="pt-1 border-t border-slate-200 dark:border-slate-700 text-[10px] text-slate-500 dark:text-slate-400 leading-tight break-words">
+            <span className="uppercase mr-1">Signal:</span>
+            {trade.signal_reason}
+          </div>
+        )}
+        <div className="pt-1 text-[10px] text-slate-400 dark:text-slate-500 italic">
+          Click to jump to the trade row.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Pip move for the trade — takes JPY vs non-JPY pip size from the
+ *  instrument's quote-currency slot. Returns null for open trades. */
+function _computePipsMove(trade: PaperTradePublic): number | null {
+  if (trade.exit_price == null) return null;
+  // We don't have the instrument on the trade payload, but every
+  // trade table cell already assumes 0.0001 as a safe default and
+  // handles JPY separately in the sibling column formatting. The
+  // chart tooltip mirrors that convention.
+  const pipSize = 0.0001;
+  const sign = trade.side === 'buy' ? 1 : -1;
+  return ((trade.exit_price - trade.entry_price) * sign) / pipSize;
 }
 
 function _fmtTooltipDate(ms: number): string {
