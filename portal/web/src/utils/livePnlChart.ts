@@ -350,6 +350,94 @@ export function computeSummaryStrip(
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// nearestSample + interpolateOverlay + tradesUpTo (PR 2)
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Return the equity sample whose timestamp is closest to `targetMs`,
+ * or null if the series is empty. Binary search since the series is
+ * already sorted ascending by the API. Used by the hover crosshair
+ * to snap the tooltip dot to the actual curve rather than a
+ * hypothetical interpolated point.
+ */
+export function nearestSample(
+  equity: EquityPoint[],
+  targetMs: number,
+): EquityPoint | null {
+  if (equity.length === 0) return null;
+  if (equity.length === 1) return equity[0];
+  // Clamp to bounds so hover past the last sample snaps to the last.
+  if (targetMs <= equity[0].timestampMs) return equity[0];
+  if (targetMs >= equity[equity.length - 1].timestampMs) {
+    return equity[equity.length - 1];
+  }
+  let lo = 0;
+  let hi = equity.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >>> 1;
+    if (equity[mid].timestampMs < targetMs) lo = mid;
+    else hi = mid;
+  }
+  // lo and hi bracket targetMs — pick whichever is closer.
+  return targetMs - equity[lo].timestampMs <=
+    equity[hi].timestampMs - targetMs
+    ? equity[lo]
+    : equity[hi];
+}
+
+/**
+ * Linearly interpolate the backtest overlay's balance at `targetMs`.
+ * Returns `null` when the overlay is empty or `targetMs` sits
+ * outside the overlay's span (no extrapolation — the tooltip should
+ * show `—` for backtest OOS in those regions).
+ *
+ * The overlay is already sorted ascending; binary search is fine.
+ */
+export function interpolateOverlay(
+  overlay: EquityPoint[],
+  targetMs: number,
+): number | null {
+  if (overlay.length === 0) return null;
+  if (targetMs < overlay[0].timestampMs) return null;
+  if (targetMs > overlay[overlay.length - 1].timestampMs) return null;
+  if (overlay.length === 1) return overlay[0].balance;
+  let lo = 0;
+  let hi = overlay.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >>> 1;
+    if (overlay[mid].timestampMs <= targetMs) lo = mid;
+    else hi = mid;
+  }
+  const a = overlay[lo];
+  const b = overlay[hi];
+  if (b.timestampMs === a.timestampMs) return a.balance;
+  const t = (targetMs - a.timestampMs) / (b.timestampMs - a.timestampMs);
+  return a.balance + t * (b.balance - a.balance);
+}
+
+/** Count wins / losses among trades with `exit_timestamp <= cutoffMs`.
+ *  Used by the tooltip's "Trades to date · W / L" row so the number
+ *  reflects the moment the cursor is over, not the run-total. */
+export function tradesUpTo(
+  trades: PaperTradePublic[],
+  cutoffMs: number,
+): { wins: number; losses: number; closed: number } {
+  let wins = 0;
+  let losses = 0;
+  let closed = 0;
+  for (const t of trades) {
+    if (!t.exit_timestamp) continue;
+    const exitMs = new Date(t.exit_timestamp).getTime();
+    if (exitMs > cutoffMs) continue;
+    closed++;
+    const p = t.net_pnl ?? t.pnl ?? 0;
+    if (p > 0) wins++;
+    else if (p < 0) losses++;
+  }
+  return { wins, losses, closed };
+}
+
 /**
  * Running-peak drawdown across the equity curve. Result is a
  * NEGATIVE percentage (or 0 if no drawdown occurred). Includes the

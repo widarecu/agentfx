@@ -14,14 +14,17 @@
  * `_scaleX` / `_buildRiskConfig` pattern established elsewhere.
  */
 
-import React, { useMemo } from 'react';
+import React, { useCallback, useMemo, useRef, useState } from 'react';
 
 import type { PaperTradePublic } from '../types/paper';
 import {
   computeSummaryStrip,
   detectGaps,
+  interpolateOverlay,
+  nearestSample,
   pickAxisTicks,
   toEquityPoints,
+  tradesUpTo,
   type EquityPoint,
   type RangeKey,
 } from '../utils/livePnlChart';
@@ -141,6 +144,53 @@ export function LivePnLChart({
 
   const currentLive = liveSeries[liveSeries.length - 1];
   const elapsedLabel = formatElapsed(runStartMs, now);
+
+  // ── Hover crosshair state (PR 2) ────────────────────────────────
+  //
+  // Track a single ms timestamp for the cursor position. When null,
+  // no crosshair renders. Pointer events fire on a full-width invisible
+  // capture rect over the plot; `_clientXToTimestamp` translates the
+  // viewport X to the run timeline using getBoundingClientRect on the
+  // SVG (accounts for the container's actual pixel width vs the
+  // 900-unit viewBox).
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const [hoverMs, setHoverMs] = useState<number | null>(null);
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent<SVGRectElement>) => {
+      const svg = svgRef.current;
+      if (!svg) return;
+      const rect = svg.getBoundingClientRect();
+      const ts = _clientXToTimestamp({
+        clientX: e.clientX,
+        rectLeft: rect.left,
+        rectWidth: rect.width,
+        runStartMs,
+        spanMs,
+        paddingLeft: PADDING_LEFT,
+        plotWidth: PLOT_WIDTH,
+        viewBoxWidth: VIEWBOX_WIDTH,
+      });
+      setHoverMs(ts);
+    },
+    [runStartMs, spanMs],
+  );
+  const handlePointerLeave = useCallback(() => setHoverMs(null), []);
+
+  // Snap the crosshair to the nearest sample so the tooltip's balance
+  // matches the drawn curve (not a hypothetical interpolated point).
+  const hoverPoint = useMemo(
+    () => (hoverMs != null ? nearestSample(liveSeries, hoverMs) : null),
+    [hoverMs, liveSeries],
+  );
+  const hoverBacktest = useMemo(
+    () =>
+      hoverMs != null ? interpolateOverlay(backtestSeries, hoverMs) : null,
+    [hoverMs, backtestSeries],
+  );
+  const hoverTradeStats = useMemo(
+    () => (hoverMs != null ? tradesUpTo(trades, hoverMs) : null),
+    [hoverMs, trades],
+  );
   const pnlTotal =
     summary.liveBalance - snapshotBalance + summary.unrealisedPnl;
   const pnlTotalPct = snapshotBalance > 0
@@ -302,6 +352,7 @@ export function LivePnLChart({
         </div>
 
         <svg
+          ref={svgRef}
           viewBox={`0 0 ${VIEWBOX_WIDTH} ${VIEWBOX_HEIGHT}`}
           preserveAspectRatio="none"
           className="w-full h-full block"
@@ -478,10 +529,210 @@ export function LivePnLChart({
               </g>
             );
           })}
+
+          {/* ── Hover crosshair (PR 2) ─────────────────────────────── */}
+          {hoverPoint && hoverMs != null && (
+            <g pointerEvents="none">
+              <line
+                x1={scaleX(hoverPoint.timestampMs)}
+                y1={PADDING_TOP}
+                x2={scaleX(hoverPoint.timestampMs)}
+                y2={PADDING_TOP + PLOT_HEIGHT}
+                stroke="currentColor"
+                strokeWidth={0.75}
+                strokeDasharray="2 2"
+                className="text-slate-400 dark:text-slate-500"
+              />
+              <circle
+                cx={scaleX(hoverPoint.timestampMs)}
+                cy={scaleY(hoverPoint.balance)}
+                r={4}
+                fill="#10b981"
+                stroke="white"
+                strokeWidth={1.5}
+                className="dark:stroke-slate-900"
+              />
+            </g>
+          )}
+
+          {/* ── Pointer capture rect ───────────────────────────────── */}
+          <rect
+            x={PADDING_LEFT}
+            y={PADDING_TOP}
+            width={PLOT_WIDTH}
+            height={PLOT_HEIGHT}
+            fill="transparent"
+            style={{ cursor: 'crosshair' }}
+            onPointerMove={handlePointerMove}
+            onPointerLeave={handlePointerLeave}
+          />
         </svg>
+
+        {/* ── Floating tooltip (PR 2) ─────────────────────────────── */}
+        {hoverPoint && hoverMs != null && (
+          <ChartTooltip
+            hoverMs={hoverMs}
+            hoverPoint={hoverPoint}
+            hoverBacktest={hoverBacktest}
+            hoverTradeStats={hoverTradeStats}
+            runStartMs={runStartMs}
+            snapshotBalance={snapshotBalance}
+            scaleX={scaleX}
+          />
+        )}
       </div>
     </div>
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Floating tooltip — sits over the chart at the crosshair X
+// ─────────────────────────────────────────────────────────────────────
+
+interface ChartTooltipProps {
+  hoverMs: number;
+  hoverPoint: EquityPoint;
+  hoverBacktest: number | null;
+  hoverTradeStats: { wins: number; losses: number; closed: number } | null;
+  runStartMs: number;
+  snapshotBalance: number;
+  scaleX: (ms: number) => number;
+}
+
+function ChartTooltip({
+  hoverMs,
+  hoverPoint,
+  hoverBacktest,
+  hoverTradeStats,
+  runStartMs,
+  snapshotBalance,
+  scaleX,
+}: ChartTooltipProps) {
+  // Position the tooltip near the crosshair X, flipping to the LEFT of
+  // the cursor when we're past the plot midpoint so the tooltip never
+  // extends off the right edge. The viewBox X → pixel offset uses the
+  // container width via CSS `left: %` — accurate at any responsive
+  // width without needing the SVG's actual bounding rect.
+  const vbX = scaleX(hoverPoint.timestampMs);
+  const leftFrac = vbX / VIEWBOX_WIDTH;
+  const flipLeft = leftFrac > 0.55;
+  const style: React.CSSProperties = flipLeft
+    ? { right: `${(1 - leftFrac) * 100}%`, top: 40 }
+    : { left: `${leftFrac * 100}%`, top: 40 };
+  const nudge = flipLeft ? 'mr-2' : 'ml-2';
+
+  const equity = hoverPoint.balance;
+  const unreal = hoverPoint.unrealizedPnl;
+  const realised = equity - snapshotBalance;
+  const total = realised + unreal;
+  const drift = hoverBacktest != null ? equity - hoverBacktest : null;
+
+  return (
+    <div
+      className={`absolute z-30 pointer-events-none ${nudge} min-w-[220px] rounded-md bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-lg text-xs font-mono tabular-nums`}
+      style={style}
+    >
+      <div className="px-3 py-1.5 border-b border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 font-semibold">
+        {_fmtTooltipDate(hoverMs)}
+      </div>
+      <div className="px-3 py-1.5 space-y-1">
+        <TooltipRow
+          label="Elapsed"
+          value={formatElapsed(runStartMs, hoverMs)}
+        />
+        <TooltipRow
+          label="Live equity"
+          value={_fmtCurrency(equity)}
+          tone={equity >= snapshotBalance ? 'up' : 'down'}
+        />
+        <TooltipRow
+          label="Backtest OOS"
+          value={hoverBacktest == null ? '—' : _fmtCurrency(hoverBacktest)}
+          muted={hoverBacktest == null}
+        />
+        <TooltipRow
+          label="Drift vs BT"
+          value={drift == null ? '—' : _fmtSigned(drift)}
+          tone={drift == null ? undefined : drift >= 0 ? 'up' : 'down'}
+          muted={drift == null}
+        />
+        <div className="border-t border-slate-200 dark:border-slate-700 my-1" />
+        <TooltipRow
+          label="Total P&L"
+          value={_fmtSigned(total)}
+          tone={total >= 0 ? 'up' : 'down'}
+        />
+        <TooltipRow
+          label="Realised"
+          value={_fmtSigned(realised)}
+          tone={realised >= 0 ? 'up' : 'down'}
+        />
+        <TooltipRow
+          label="Unrealised"
+          value={_fmtSigned(unreal)}
+          tone={unreal >= 0 ? 'up' : 'down'}
+        />
+        <div className="border-t border-slate-200 dark:border-slate-700 my-1" />
+        <TooltipRow
+          label="Trades to date"
+          value={
+            hoverTradeStats == null
+              ? '—'
+              : `${hoverTradeStats.closed} · ${hoverTradeStats.wins}W / ${hoverTradeStats.losses}L`
+          }
+        />
+      </div>
+    </div>
+  );
+}
+
+function TooltipRow({
+  label,
+  value,
+  tone,
+  muted,
+}: {
+  label: string;
+  value: string;
+  tone?: 'up' | 'down';
+  muted?: boolean;
+}) {
+  const valueColor = muted
+    ? 'text-slate-400 dark:text-slate-500'
+    : tone === 'up'
+      ? 'text-emerald-600 dark:text-emerald-400'
+      : tone === 'down'
+        ? 'text-rose-600 dark:text-rose-400'
+        : 'text-slate-700 dark:text-slate-200';
+  return (
+    <div className="flex justify-between gap-4">
+      <span className="text-slate-500 dark:text-slate-400">{label}</span>
+      <span className={valueColor}>{value}</span>
+    </div>
+  );
+}
+
+function _fmtTooltipDate(ms: number): string {
+  const d = new Date(ms);
+  const wk = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getUTCDay()];
+  const day = d.getUTCDate().toString().padStart(2, '0');
+  const mon = [
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'May',
+    'Jun',
+    'Jul',
+    'Aug',
+    'Sep',
+    'Oct',
+    'Nov',
+    'Dec',
+  ][d.getUTCMonth()];
+  const hh = d.getUTCHours().toString().padStart(2, '0');
+  const mm = d.getUTCMinutes().toString().padStart(2, '0');
+  return `${wk} ${day} ${mon} · ${hh}:${mm} UTC`;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -518,6 +769,39 @@ function SummaryTile({ label, value, valueClass, sublabel }: SummaryTileProps) {
 // ─────────────────────────────────────────────────────────────────────
 // Pure helpers (exposed for Vitest)
 // ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Translate a mouse `clientX` into a wall-clock timestamp along the
+ * chart's X-axis. The SVG is rendered at a variable pixel width but
+ * has a fixed viewBox; scaling by `rectWidth / viewBoxWidth` maps
+ * screen pixels back to viewBox units, then linear-inversed with the
+ * plot rect gives us the fraction of `spanMs` under the cursor.
+ *
+ * Extracted for Vitest so PR 2's hover interaction is testable
+ * without spinning up a DOM. Clamps to [runStartMs, runStartMs +
+ * spanMs] so the crosshair never wanders past the visible range.
+ */
+export interface ClientXToTimestampArgs {
+  clientX: number;
+  rectLeft: number;
+  rectWidth: number;
+  runStartMs: number;
+  spanMs: number;
+  paddingLeft: number;
+  plotWidth: number;
+  viewBoxWidth: number;
+}
+
+export function _clientXToTimestamp(a: ClientXToTimestampArgs): number {
+  if (a.rectWidth <= 0 || a.viewBoxWidth <= 0 || a.spanMs <= 0) {
+    return a.runStartMs;
+  }
+  const scale = a.rectWidth / a.viewBoxWidth;
+  const vbX = (a.clientX - a.rectLeft) / scale;
+  const fracInPlot = (vbX - a.paddingLeft) / a.plotWidth;
+  const clampedFrac = Math.min(1, Math.max(0, fracInPlot));
+  return a.runStartMs + clampedFrac * a.spanMs;
+}
 
 /**
  * Map a timestamp to an SVG x-coordinate. Clamps to the plot area so
