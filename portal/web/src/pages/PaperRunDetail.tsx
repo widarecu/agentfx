@@ -437,10 +437,21 @@ export default function PaperRunDetail() {
   const current = run.current_balance ?? snapshot;
   const pnl = run.pnl ?? current - snapshot;
   const pnlPct = snapshot > 0 ? (pnl / snapshot) * 100 : 0;
-  const runStartMs = run.started_at
-    ? new Date(run.started_at).getTime()
-    : run.approved_at
-      ? new Date(run.approved_at).getTime()
+  // Anchor the chart X-axis + relative-time labels to the run's
+  // ORIGINAL start, not the current subprocess restart. Wilson UAT
+  // 2026-07-24: `started_at` was getting rewritten by the backend
+  // every time the subprocess re-spawned (lifespan orphan-recovery
+  // after a Railway deploy), which collapsed the whole equity series
+  // to `frac=0` because all historical timestamps predated the
+  // "restart" and got clamped to the left edge of the plot. The
+  // backend is now fixed to set `started_at` only once, but this
+  // ordering also survives any pre-fix run rows that still carry a
+  // rewritten `started_at`. `approved_at` is the semantic anchor
+  // ("when did paper trading start") and never mutates.
+  const runStartMs = run.approved_at
+    ? new Date(run.approved_at).getTime()
+    : run.started_at
+      ? new Date(run.started_at).getTime()
       : Date.now();
 
   return (

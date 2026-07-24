@@ -384,6 +384,47 @@ class TestMarkTerminal:
         db.commit.assert_called()
 
 
+class TestEnsureStartedAt:
+    """Wilson UAT 2026-07-24: `started_at` was being rewritten on every
+    subprocess boot (including lifespan orphan-recovery after a Railway
+    container swap). That collapsed the LivePnLChart X-axis because
+    all historical equity samples predated the "restart" and got
+    clamped to `frac=0`. `_ensure_started_at` is the guard: set once
+    when None, never overwrite. Tests call the real helper so a
+    regression in the guard is actually caught (not shadowed by a
+    duplicated test-local implementation)."""
+
+    def test_first_boot_sets_started_at(self):
+        from agentfx.services.paper_runner import _ensure_started_at
+
+        run = SimpleNamespace(started_at=None)
+        _ensure_started_at(run)
+        assert run.started_at is not None
+
+    def test_restart_does_not_overwrite_started_at(self):
+        from datetime import UTC, datetime, timedelta
+
+        from agentfx.services.paper_runner import _ensure_started_at
+
+        original_start = datetime.now(UTC) - timedelta(days=7)
+        run = SimpleNamespace(started_at=original_start)
+        _ensure_started_at(run)
+        assert run.started_at == original_start
+
+    def test_repeated_calls_are_idempotent(self):
+        """Even if run_paper_run were to call the guard twice in one
+        boot for any reason, the value should still equal the FIRST
+        call's timestamp — never advance."""
+        from agentfx.services.paper_runner import _ensure_started_at
+
+        run = SimpleNamespace(started_at=None)
+        _ensure_started_at(run)
+        first = run.started_at
+        # Second call must not advance.
+        _ensure_started_at(run)
+        assert run.started_at == first
+
+
 # Compact type check that `TickAction` behaves as a frozen dataclass —
 # guards a future refactor that swaps to a NamedTuple or plain dict.
 def test_tick_action_is_hashable_and_immutable():

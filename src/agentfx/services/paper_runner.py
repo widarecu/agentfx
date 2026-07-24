@@ -218,6 +218,26 @@ def pip_size_for_pair(pair: str) -> float:
 # ─────────────────────────────────────────────────────────────────────
 
 
+def _ensure_started_at(run) -> None:
+    """Set `run.started_at` to now IF and ONLY IF it's currently None.
+
+    `started_at` records the run's ORIGINAL paper-trading start —
+    downstream consumers (LivePnLChart X-axis, run-tenure calcs, audit
+    ordering) all treat it as immutable-once-set.
+
+    Wilson UAT 2026-07-24: the previous unconditional overwrite in
+    `run_paper_run` was clobbering the anchor on every subprocess
+    boot, including the lifespan orphan-recovery path that fires on
+    every Railway container swap. Callers that need the current
+    subprocess's boot time should read a separate field (or a log
+    line); they should not repurpose `started_at`.
+    """
+    if run.started_at is None:
+        from datetime import UTC, datetime
+
+        run.started_at = datetime.now(UTC)
+
+
 def run_paper_run(
     run_id: str,
 ) -> None:  # pragma: no cover — exercised via subprocess in PR-G integration tests only
@@ -300,7 +320,7 @@ def run_paper_run(
                 strategy = None
 
         run.status = RunStatus.RUNNING
-        run.started_at = datetime.now(UTC)
+        _ensure_started_at(run)
         db.commit()
 
         _execute_loop(
