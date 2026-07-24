@@ -542,21 +542,33 @@ def resume_paper_run(
     run.stop_reason = None
     run.completed_at = None
     run.process_pid = None
-    # Clear the crash_detail on the params dict but keep the rest so
-    # the runner still has dsl_json / instrument / granularity on the
-    # next launch. Push the old detail into a `crash_history` list so
-    # a repeated-crash pattern is visible.
-    if was_error and run.parameters:
+    # Fold the params-dict mutations into one block so ERROR-only
+    # crash_detail history rotation and always-on notification-dedup
+    # reset share the same fresh-dict + flag_modified path.
+    #
+    # v0.6.2 (Wilson 2026-07-24): `parameters['notified']` was
+    # written by the Slack notifier at halt time to dedup a single
+    # halt event across re-entrant call sites. If we left it in
+    # place across a resume, the next occurrence of the SAME reason
+    # (e.g. a BROKER_CIRCUIT a week later after transient OANDA
+    # instability) would be silently swallowed. Clearing on resume
+    # makes each halt-lifecycle its own notification budget: one
+    # ping per reason per halt, with resume opening a fresh window.
+    if run.parameters:
         from sqlalchemy.orm.attributes import flag_modified
 
         params = dict(run.parameters)
-        prior_detail = params.pop("crash_detail", None)
-        if prior_detail is not None:
-            history = list(params.get("crash_history") or [])
-            history.append(prior_detail)
-            params["crash_history"] = history[-5:]  # keep last 5
-        run.parameters = params
-        flag_modified(run, "parameters")
+        changed = params.pop("notified", None) is not None
+        if was_error:
+            prior_detail = params.pop("crash_detail", None)
+            if prior_detail is not None:
+                history = list(params.get("crash_history") or [])
+                history.append(prior_detail)
+                params["crash_history"] = history[-5:]  # keep last 5
+                changed = True
+        if changed:
+            run.parameters = params
+            flag_modified(run, "parameters")
 
     db.add(
         models.DecisionLog(

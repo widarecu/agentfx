@@ -705,6 +705,121 @@ class TestResume:
         assert len(history) == 1
         assert history[0]["exception_type"] == "ConnectionError"
 
+    def test_resume_clears_notified_dedup_dict(
+        self, test_client_with_db, db_session, paper_users
+    ):
+        """Wilson UAT 2026-07-24: without this, the Slack notifier's
+        per-`(run_id, reason)` dedup would silently swallow the second
+        occurrence of the same reason across a resume boundary — e.g.
+        the run halts on BROKER_CIRCUIT, user resumes it, and a week
+        later BROKER_CIRCUIT trips again with no Slack ping. Resume
+        starts a new halt-lifecycle → fresh notification budget."""
+        from unittest.mock import patch
+
+        from src.agentfx.api.models import Run
+
+        run = self._seed_halted(db_session, paper_users["alice"]["user"].id)
+        # Simulate a prior halt's notification bookkeeping — the
+        # runner's Slack hook wrote this at kill time.
+        run.parameters = {
+            **(run.parameters or {}),
+            "notified": {
+                "USER_KILL": "2026-07-23T09:00:00+00:00",
+                "BROKER_CIRCUIT": "2026-07-22T15:30:00+00:00",
+            },
+        }
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(run, "parameters")
+        db_session.commit()
+
+        headers = _auth_headers(
+            test_client_with_db,
+            paper_users["alice"]["email"],
+            paper_users["alice"]["password"],
+        )
+        with patch("agentfx.api.workers.paper_runner.schedule_paper_run"):
+            resp = test_client_with_db.post(
+                f"/api/v1/paper-runs/{run.id}/resume", headers=headers
+            )
+        assert resp.status_code == 200, resp.json()
+
+        db_session.expire_all()
+        refreshed = db_session.query(Run).filter_by(id=run.id).one()
+        params = refreshed.parameters or {}
+        assert "notified" not in params, (
+            "resume must wipe the notified-dedup dict so the next halt-"
+            "lifecycle can send fresh Slack alerts"
+        )
+        # Adjacent keys survive (granularity is required for re-launch).
+        assert params.get("granularity") == "M1"
+
+    def test_resume_from_error_clears_notified_alongside_crash_detail(
+        self, test_client_with_db, db_session, paper_users
+    ):
+        """Same regression as above but starting from ERROR so the
+        crash_history bump AND the notified reset happen in the same
+        params-mutation block. Guards against a future refactor that
+        splits them and forgets one path."""
+        from datetime import UTC, datetime
+        from unittest.mock import patch
+
+        from src.agentfx.api.models import (
+            Run,
+            RunEnvironment,
+            RunStatus,
+        )
+
+        run = Run(
+            id=_mk_id("run"),
+            strategy_id=None,
+            pair="EUR_USD",
+            environment=RunEnvironment.PAPER,
+            status=RunStatus.ERROR,
+            parameters={
+                "granularity": "M1",
+                "crash_detail": {
+                    "exception_type": "ConnectionError",
+                    "message": "OANDA blip",
+                    "crashed_at": "2026-07-24T04:00:00Z",
+                },
+                "notified": {
+                    "process_crashed (exit_code=1)": "2026-07-24T04:01:00+00:00"
+                },
+            },
+            initial_balance=0,
+            current_balance=10_000,
+            pnl=0,
+            user_id=paper_users["alice"]["user"].id,
+            oanda_account_id="101-011-99999-001",
+            snapshot_balance=10_000,
+            stop_reason="process_crashed (exit_code=1)",
+            completed_at=datetime.now(UTC),
+        )
+        db_session.add(run)
+        db_session.commit()
+
+        headers = _auth_headers(
+            test_client_with_db,
+            paper_users["alice"]["email"],
+            paper_users["alice"]["password"],
+        )
+        with patch("agentfx.api.workers.paper_runner.schedule_paper_run"):
+            resp = test_client_with_db.post(
+                f"/api/v1/paper-runs/{run.id}/resume", headers=headers
+            )
+        assert resp.status_code == 200
+
+        db_session.expire_all()
+        refreshed = db_session.query(Run).filter_by(id=run.id).one()
+        params = refreshed.parameters or {}
+        # Both mutations happened in the same block.
+        assert "notified" not in params
+        assert "crash_detail" not in params
+        history = params.get("crash_history") or []
+        assert len(history) == 1
+        assert history[0]["exception_type"] == "ConnectionError"
+
     def test_resume_running_run_returns_409(
         self, test_client_with_db, db_session, paper_users
     ):
