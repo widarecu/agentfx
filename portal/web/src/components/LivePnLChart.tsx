@@ -24,6 +24,7 @@ import React, {
 
 import type { PaperTradePublic } from '../types/paper';
 import {
+  computeDrawdownSeries,
   computeSummaryStrip,
   detectGaps,
   filterByRange,
@@ -156,6 +157,42 @@ export function LivePnLChart({
   const backtestPath = pointsToPath(backtestSeries, scaleX, scaleY);
 
   const gaps = useMemo(() => detectGaps(anchoredSeries), [anchoredSeries]);
+
+  // ── Drawdown shading polygon (PR 5) ────────────────────────────
+  //
+  // Build a filled area between the running peak and the current
+  // balance, filled rose at low opacity so it reads as background
+  // context without competing with the emerald equity line.
+  // Produces a polygon path only when the run has EVER been
+  // underwater within the visible window — no shading on a
+  // monotonically rising curve avoids clutter.
+  const drawdownPath = useMemo(() => {
+    if (anchoredSeries.length === 0) return null;
+    const dd = computeDrawdownSeries(anchoredSeries, snapshotBalance);
+    if (dd.every((p) => p.drawdownPct === 0)) return null;
+    // Peak edge (top of shaded band) — walk left-to-right at peakBalance.
+    const topEdge = dd.map(
+      (p, i) =>
+        `${i === 0 ? 'M' : 'L'}${scaleX(p.timestampMs).toFixed(1)},${scaleY(p.peakBalance).toFixed(1)}`,
+    );
+    // Balance edge (bottom of shaded band) — walk right-to-left at
+    // actual balance so the polygon closes.
+    const bottomEdge = [...dd]
+      .reverse()
+      .map(
+        (p) =>
+          `L${scaleX(p.timestampMs).toFixed(1)},${scaleY(p.balance).toFixed(1)}`,
+      );
+    return [...topEdge, ...bottomEdge, 'Z'].join(' ');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    anchoredSeries,
+    snapshotBalance,
+    axisStartMs,
+    spanMs,
+    minBalance,
+    balanceRange,
+  ]);
 
   const xTicks = useMemo(
     () => pickAxisTicks(axisStartMs, axisEndMs, rangeKey),
@@ -477,6 +514,21 @@ export function LivePnLChart({
             <span className="w-3 h-0 border-t border-dashed border-slate-400 inline-block" />{' '}
             Backtest OOS
           </span>
+          <span className="flex items-center gap-1.5">
+            <span
+              className="w-3 h-2 inline-block"
+              style={{ background: 'rgba(244,63,94,0.2)' }}
+            />{' '}
+            Drawdown
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="text-emerald-500 text-xs leading-none">▲</span>
+            Long
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="text-rose-500 text-xs leading-none">▼</span>
+            Short
+          </span>
         </div>
 
         <svg
@@ -572,6 +624,16 @@ export function LivePnLChart({
           >
             snapshot {_fmtCurrencyShort(snapshotBalance)}
           </text>
+
+          {/* ── Drawdown shaded region (PR 5) ──────────────────────── */}
+          {drawdownPath && (
+            <path
+              d={drawdownPath}
+              fill="#f43f5e"
+              opacity={0.1}
+              stroke="none"
+            />
+          )}
 
           {/* ── Backtest OOS overlay (dashed) ──────────────────────── */}
           {backtestPath && (

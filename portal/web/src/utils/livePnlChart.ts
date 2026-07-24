@@ -417,6 +417,51 @@ export function interpolateOverlay(
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// computeDrawdownSeries (PR 5) — running-peak underwater shape
+// ─────────────────────────────────────────────────────────────────────
+
+export interface DrawdownPoint {
+  timestampMs: number;
+  /** Running maximum balance up to and including this point. */
+  peakBalance: number;
+  /** Actual balance at this point (echo of the equity sample). */
+  balance: number;
+  /** Non-positive: 0 when at-peak, negative when underwater. In %. */
+  drawdownPct: number;
+}
+
+/**
+ * Walk the equity series left-to-right, tracking the running peak.
+ * Emits one `DrawdownPoint` per sample. Consumers (the chart's
+ * shaded band, the summary strip's max-DD tile) can either plot the
+ * `peakBalance` vs `balance` region as a filled polygon or reduce
+ * `drawdownPct` to the min for the run-total figure.
+ *
+ * `initialPeak` seeds the running peak — pass `snapshotBalance` so
+ * a perpetually-underwater run still shows the correct drawdown
+ * from the snapshot line rather than degenerating to 0 for the
+ * first samples.
+ */
+export function computeDrawdownSeries(
+  equity: EquityPoint[],
+  initialPeak: number,
+): DrawdownPoint[] {
+  const out: DrawdownPoint[] = [];
+  let peak = initialPeak;
+  for (const p of equity) {
+    if (p.balance > peak) peak = p.balance;
+    const dd = peak > 0 ? (p.balance - peak) / peak : 0;
+    out.push({
+      timestampMs: p.timestampMs,
+      peakBalance: peak,
+      balance: p.balance,
+      drawdownPct: dd * 100,
+    });
+  }
+  return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // filterByRange (PR 4) — range selector filter
 // ─────────────────────────────────────────────────────────────────────
 
