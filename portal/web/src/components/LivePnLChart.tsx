@@ -83,6 +83,15 @@ export interface LivePnLChartProps {
    *  amber chip explaining the schema gap in human terms instead of
    *  the overlay just silently missing. `null`/undefined = no chip. */
   overlayStatus?: { available: boolean; reason?: BacktestOverlayReason | null };
+  /** Wall-clock "now" ms — anchors the chart's X-axis right edge.
+   *  Distinct from the last equity sample's timestamp. Passing
+   *  Date.now() (from a live-updating parent) lets weekend bands and
+   *  the axis extend past the last real sample, so a mid-weekend view
+   *  correctly shows we're inside a MARKET CLOSED region even though
+   *  no new equity samples are being written. Defaults to Date.now()
+   *  when omitted. Parents on TERMINAL runs should pass the last
+   *  sample's timestamp so the axis doesn't drift into the future. */
+  nowMs?: number;
 }
 
 export function LivePnLChart({
@@ -92,6 +101,7 @@ export function LivePnLChart({
   trades,
   backtestSeries = [],
   overlayStatus,
+  nowMs: nowMsProp,
 }: LivePnLChartProps) {
   // PR 4: range selector. Default 7d; `1 / 2 / A` keyboard shortcuts
   // switch between 24h / 7d / All. Summary strip is always computed
@@ -105,9 +115,18 @@ export function LivePnLChart({
   );
   const streaks = useMemo(() => computeStreaks(trades), [trades]);
 
-  const nowMs = liveSeries.length
+  // "Now" for axis + weekend-band purposes = wall clock (or an
+  // explicit override from the parent for terminal runs). The last
+  // equity sample can be hours behind — the runner stops writing
+  // samples over the weekend, but we still want the axis to advance
+  // so a mid-weekend view renders the current MARKET CLOSED region.
+  const lastSampleMs = liveSeries.length
     ? liveSeries[liveSeries.length - 1].timestampMs
     : runStartMs;
+  const nowMs = Math.max(
+    lastSampleMs,
+    nowMsProp ?? Date.now(),
+  );
 
   // Local name intentionally NOT `window` — shadowing the global
   // hoses the `window.addEventListener` call in the keyboard-shortcut
@@ -166,7 +185,30 @@ export function LivePnLChart({
   const scaleY = (balance: number) =>
     _scaleY(balance, minBalance, balanceRange, PADDING_TOP, PLOT_HEIGHT);
 
-  const livePath = pointsToPath(anchoredSeries, scaleX, scaleY);
+  // Extend the visible line horizontally from the last real sample
+  // to `axisEndMs` when the runner has stopped writing samples
+  // (weekend, ingester lag). This is a DISPLAY-only extension: the
+  // synthetic tail point is not used for hover snap or trade-marker
+  // projections, so nothing downstream can accidentally treat it as
+  // real data. Skip if the tail would be < 5min (visually
+  // indistinguishable) or if the run is terminal and the sample
+  // is already at/past the axis end.
+  const renderLiveSeries: EquityPoint[] = useMemo(() => {
+    if (anchoredSeries.length === 0) return anchoredSeries;
+    const last = anchoredSeries[anchoredSeries.length - 1];
+    const tailMs = Math.min(nowMs, axisEndMs);
+    if (tailMs - last.timestampMs < 5 * 60_000) return anchoredSeries;
+    return [
+      ...anchoredSeries,
+      {
+        timestampMs: tailMs,
+        balance: last.balance,
+        unrealizedPnl: last.unrealizedPnl,
+      },
+    ];
+  }, [anchoredSeries, nowMs, axisEndMs]);
+
+  const livePath = pointsToPath(renderLiveSeries, scaleX, scaleY);
   const backtestPath = pointsToPath(backtestSeries, scaleX, scaleY);
 
   const gaps = useMemo(
@@ -989,15 +1031,10 @@ function ChartTooltip({
     : { left: `${leftFrac * 100}%`, top: 40 };
   const nudge = flipLeft ? 'mr-2' : 'ml-2';
 
-  // Wilson UAT 2026-07-25: title now shows the SNAPPED sample's
-  // timestamp, not the raw cursor position — because of weekend
-  // gaps + poll-throttling, `nearestSample` can snap to a sample
-  // hours away from where the cursor points. Titling the tooltip
-  // with the actual sample ts keeps the header and body agreeing
-  // on WHEN the numbers below apply.
+  // Tooltip title shows the sample's timestamp — matches the numbers
+  // the body renders (which come from the snapped sample, not from
+  // a hypothetical interpolated point under the cursor).
   const sampleMs = hoverPoint.timestampMs;
-  const cursorFar =
-    Math.abs(hoverMs - sampleMs) > 5 * 60_000; // 5-min gap ≈ interpolated
   const equity = hoverPoint.balance;
   const unreal = hoverPoint.unrealizedPnl;
   const balanceChange = equity - snapshotBalance;
@@ -1016,16 +1053,8 @@ function ChartTooltip({
       className={`absolute z-30 pointer-events-none ${nudge} min-w-[240px] rounded-md bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-lg text-xs font-mono tabular-nums`}
       style={style}
     >
-      <div className="px-3 py-1.5 border-b border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 font-semibold flex items-center justify-between gap-2">
-        <span>{_fmtTooltipDate(sampleMs)}</span>
-        {cursorFar && (
-          <span
-            className="text-[9px] uppercase tracking-wide text-amber-600 dark:text-amber-400"
-            title={`Cursor at ${_fmtTooltipDate(hoverMs)} — snapped to nearest sample.`}
-          >
-            snapped
-          </span>
-        )}
+      <div className="px-3 py-1.5 border-b border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 font-semibold">
+        {_fmtTooltipDate(sampleMs)}
       </div>
       <div className="px-3 py-1.5 space-y-1">
         <TooltipRow

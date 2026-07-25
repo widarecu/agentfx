@@ -82,6 +82,11 @@ export default function PaperRunDetail() {
   const [loading, setLoading] = useState(true);
   const equityRef = useRef<EquityPoint[]>([]);
   const [equity, setEquity] = useState<EquityPoint[]>([]);
+  // Wall-clock ticker so the LivePnLChart's axis advances into the
+  // current weekend even between /equity refetches. Ticks every 30s
+  // — the interval is torn down for terminal runs since the axis is
+  // frozen there.
+  const [nowTick, setNowTick] = useState<number>(() => Date.now());
 
   // v0.6.1 (US-025 + US-026): Trades / decisions / backtest overlay
   // now come from real endpoints. State + polling live below; the
@@ -324,6 +329,16 @@ export default function PaperRunDetail() {
     };
   }, [runId, run?.status]);
 
+  // Wall-clock ticker for the chart's X-axis right edge. Advances
+  // every 30s while the run is live so weekend / axis rendering
+  // stays fresh between the 60s /equity refetches. Terminal runs
+  // don't need this — chartNowMs is pinned to the last sample.
+  useEffect(() => {
+    if (run && isTerminal(run.status)) return;
+    const interval = setInterval(() => setNowTick(Date.now()), 30_000);
+    return () => clearInterval(interval);
+  }, [run?.status]);
+
   useEffect(() => {
     if (!runId) return;
     let cancelled = false;
@@ -500,6 +515,17 @@ export default function PaperRunDetail() {
       ? new Date(run.started_at).getTime()
       : Date.now();
 
+  // Chart X-axis right edge. For a live run this is wall-clock now
+  // (ticks every 30s below so the axis advances even between
+  // /equity refetches); for a terminal run we clamp to when the run
+  // actually stopped so the axis doesn't drift into the future.
+  const runTerminal = isTerminal(run.status);
+  const chartNowMs = runTerminal
+    ? equity.length > 0
+      ? equity[equity.length - 1].timestampMs
+      : runStartMs
+    : nowTick;
+
   return (
     <div className="container mx-auto px-4 py-8 max-w-7xl">
       <Link
@@ -564,6 +590,7 @@ export default function PaperRunDetail() {
       <div className="mt-6 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-5">
         <LivePnLChart
           runStartMs={runStartMs}
+          nowMs={chartNowMs}
           snapshotBalance={snapshot || current || 10_000}
           liveSeries={equity}
           trades={trades}

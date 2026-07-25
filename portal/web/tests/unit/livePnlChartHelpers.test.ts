@@ -8,12 +8,15 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  _mergeAdjacentBands,
   _weekendBandsInRange,
+  BAND_MERGE_GAP_MS,
   detectGaps,
   DEFAULT_MIN_GAP_MS,
   pickAxisTicks,
   toEquityPoints,
   type EquityPoint,
+  type GapBand,
 } from '../../src/utils/livePnlChart';
 
 const HOUR = 60 * 60 * 1000;
@@ -243,19 +246,49 @@ describe('detectGaps', () => {
     expect(gapsStraddling.some((g) => g.isWeekend)).toBe(true);
     expect(gapsStraddling.filter((g) => !g.isWeekend)).toEqual([]);
 
-    // Case 3: an outage that only clips the tail of a weekend but
-    // extends deep into the trading week — < 50% overlap → survives.
+    // Case 3: an outage that starts well after the weekend ends (10h
+    // past Sun 22:00 UTC) — no overlap AND far enough from the
+    // weekend that the adjacent-band merge (Wilson UAT 2026-07-25)
+    // doesn't absorb it. Survives as a standalone GAP band.
     const gapsPartial = detectGaps(
       [
-        mkPoint('2026-07-19T21:00:00Z'), // 1h before weekend end
-        mkPoint('2026-07-20T18:00:00Z'), // 20h into Monday
+        mkPoint('2026-07-20T08:00:00Z'), // Mon 08:00
+        mkPoint('2026-07-20T20:00:00Z'), // Mon 20:00 (12h outage)
       ],
       undefined,
       rangeStart,
       new Date('2026-07-21T00:00:00Z').getTime(),
     );
-    // Overlap = 1h out of 21h ≈ 4.7% → not suppressed.
     expect(gapsPartial.some((g) => !g.isWeekend)).toBe(true);
+  });
+
+  it('merges near-adjacent outages into the weekend band (Wilson UAT 2026-07-25)', () => {
+    // The exact case Wilson caught: weekend Fri 22 → Sun 22, then a
+    // 2h "live" strip (Sun 22 → Mon 00), then a 13h runner outage
+    // (Mon 00 → Mon 13:03). Previously rendered as two shaded blobs
+    // with a confusing thin trapezoidal live-strip between them.
+    // The 4h merge threshold collapses them into a single MARKET
+    // CLOSED region spanning the whole weekend + early Monday.
+    const rangeStart = new Date('2026-07-17T00:00:00Z').getTime();
+    const rangeEnd = new Date('2026-07-21T00:00:00Z').getTime();
+    const gaps = detectGaps(
+      [
+        mkPoint('2026-07-17T21:00:00Z'), // Fri pre-weekend
+        mkPoint('2026-07-20T00:00:00Z'), // Mon 00:00 (long calendar gap → weekend catches it)
+        mkPoint('2026-07-20T13:03:00Z'), // Mon 13:03 (13h outage on top)
+      ],
+      undefined,
+      rangeStart,
+      rangeEnd,
+    );
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0].isWeekend).toBe(true);
+    expect(gaps[0].startMs).toBe(
+      new Date('2026-07-17T22:00:00Z').getTime(),
+    );
+    expect(gaps[0].endMs).toBe(
+      new Date('2026-07-20T13:03:00Z').getTime(),
+    );
   });
 
   it('returns weekend bands even when the equity series is empty', () => {
@@ -265,6 +298,77 @@ describe('detectGaps', () => {
     const gaps = detectGaps([], undefined, rangeStart, rangeEnd);
     expect(gaps).toHaveLength(1);
     expect(gaps[0].isWeekend).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// _mergeAdjacentBands — near-adjacent band collapse
+// ─────────────────────────────────────────────────────────────────────
+
+describe('_mergeAdjacentBands', () => {
+  const band = (
+    startIso: string,
+    endIso: string,
+    isWeekend: boolean,
+  ): GapBand => ({
+    startMs: new Date(startIso).getTime(),
+    endMs: new Date(endIso).getTime(),
+    isWeekend,
+  });
+
+  it('returns [] on empty input', () => {
+    expect(_mergeAdjacentBands([], BAND_MERGE_GAP_MS)).toEqual([]);
+  });
+
+  it('keeps well-separated bands independent', () => {
+    // Two weekends a full week apart — no merge.
+    const bands = [
+      band('2026-07-10T22:00:00Z', '2026-07-12T22:00:00Z', true),
+      band('2026-07-17T22:00:00Z', '2026-07-19T22:00:00Z', true),
+    ];
+    const merged = _mergeAdjacentBands(bands, BAND_MERGE_GAP_MS);
+    expect(merged).toHaveLength(2);
+  });
+
+  it('collapses a weekend + adjacent outage (2h apart)', () => {
+    // Weekend Fri 22 → Sun 22, outage Mon 00 → Mon 13. Gap = 2h.
+    const bands = [
+      band('2026-07-17T22:00:00Z', '2026-07-19T22:00:00Z', true),
+      band('2026-07-20T00:00:00Z', '2026-07-20T13:00:00Z', false),
+    ];
+    const merged = _mergeAdjacentBands(bands, BAND_MERGE_GAP_MS);
+    expect(merged).toHaveLength(1);
+    expect(merged[0].startMs).toBe(
+      new Date('2026-07-17T22:00:00Z').getTime(),
+    );
+    expect(merged[0].endMs).toBe(
+      new Date('2026-07-20T13:00:00Z').getTime(),
+    );
+    // Merged band inherits weekend labelling.
+    expect(merged[0].isWeekend).toBe(true);
+  });
+
+  it('does NOT merge a distant outage (10h after weekend end)', () => {
+    // Weekend Fri 22 → Sun 22, outage Mon 08 → Mon 20. Gap = 10h,
+    // above the 4h threshold → stays as separate GAP band.
+    const bands = [
+      band('2026-07-17T22:00:00Z', '2026-07-19T22:00:00Z', true),
+      band('2026-07-20T08:00:00Z', '2026-07-20T20:00:00Z', false),
+    ];
+    const merged = _mergeAdjacentBands(bands, BAND_MERGE_GAP_MS);
+    expect(merged).toHaveLength(2);
+    expect(merged[0].isWeekend).toBe(true);
+    expect(merged[1].isWeekend).toBe(false);
+  });
+
+  it('does not mutate the input array', () => {
+    const bands = [
+      band('2026-07-17T22:00:00Z', '2026-07-19T22:00:00Z', true),
+      band('2026-07-20T00:00:00Z', '2026-07-20T13:00:00Z', false),
+    ];
+    const snapshot = bands.map((b) => ({ ...b }));
+    _mergeAdjacentBands(bands, BAND_MERGE_GAP_MS);
+    expect(bands).toEqual(snapshot);
   });
 });
 

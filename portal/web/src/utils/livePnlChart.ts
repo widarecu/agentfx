@@ -116,6 +116,18 @@ export function toEquityPoints(items: EquitySnapshotPublic[]): EquityPoint[] {
  *  cleanly separates real halts / weekends from routine jitter. */
 export const DEFAULT_MIN_GAP_MS = 6 * 60 * 60 * 1000;
 
+/** Two shaded bands whose visible gap ≤ this threshold get merged
+ *  into a single visual band. Prevents the "confusing 2h break"
+ *  Wilson caught on 2026-07-25 where the runner didn't pick up
+ *  trading until ~2h after Sunday's market re-open — the calendar
+ *  weekend band ended at Sun 22:00 UTC, then the runner-outage band
+ *  started at Mon 00:00 UTC, rendering two adjacent dark regions
+ *  with a thin trapezoidal live-strip between them. 4h is tight
+ *  enough that only near-adjacent bands merge; a mid-week outage
+ *  that happens 10+ hours after the previous weekend stays as its
+ *  own GAP band. */
+export const BAND_MERGE_GAP_MS = 4 * 60 * 60 * 1000;
+
 /**
  * Return timestamp windows where the chart should render a shaded
  * band. Combines two sources:
@@ -180,7 +192,40 @@ export function detectGaps(
   }
 
   // Merge + sort by startMs so the chart renders left-to-right.
-  return [...weekends, ...outages].sort((a, b) => a.startMs - b.startMs);
+  const sorted = [...weekends, ...outages].sort(
+    (a, b) => a.startMs - b.startMs,
+  );
+  // Collapse near-adjacent bands into one visual region so the eye
+  // doesn't see a suspicious 2h "live" strip separating a MARKET
+  // CLOSED band from an immediately-following outage band. If any of
+  // the merged bands is a weekend, the merged band is a weekend
+  // (labels as MARKET CLOSED) — extended-halt-after-weekend reads
+  // more naturally as "market was closed" than "gap in trading".
+  return _mergeAdjacentBands(sorted, BAND_MERGE_GAP_MS);
+}
+
+/**
+ * Collapse bands separated by <= `mergeGapMs` into a single band.
+ * Assumes input is sorted ascending by `startMs`. Exported for
+ * Vitest.
+ */
+export function _mergeAdjacentBands(
+  bands: GapBand[],
+  mergeGapMs: number,
+): GapBand[] {
+  if (bands.length === 0) return [];
+  const merged: GapBand[] = [{ ...bands[0] }];
+  for (let i = 1; i < bands.length; i++) {
+    const prev = merged[merged.length - 1];
+    const curr = bands[i];
+    if (curr.startMs - prev.endMs <= mergeGapMs) {
+      prev.endMs = Math.max(prev.endMs, curr.endMs);
+      prev.isWeekend = prev.isWeekend || curr.isWeekend;
+    } else {
+      merged.push({ ...curr });
+    }
+  }
+  return merged;
 }
 
 /** Every Fri 22:00 UTC → Sun 22:00 UTC window (inclusive of edges)
