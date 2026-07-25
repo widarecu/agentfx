@@ -207,37 +207,55 @@ describe('detectGaps', () => {
     ).toEqual([]);
   });
 
-  it('skips a data gap that is entirely covered by the weekend band', () => {
-    // Data gap Fri 21:00 → Sun 21:00 sits inside the weekend
-    // Fri 22:00 → Sun 22:00 window. Should NOT emit a second
-    // GAP band on top of the weekend one.
-    const series = [
-      mkPoint('2026-07-17T21:00:00Z'),
-      mkPoint('2026-07-19T21:00:00Z'),
-    ];
-    // Data gap is 21:00 → 21:00; weekend is 22:00 → 22:00. The
-    // data gap start (21:00 Fri) sits BEFORE the weekend start
-    // (22:00 Fri), so it isn't strictly within the weekend band.
-    // detectGaps only skips data gaps entirely contained; this one
-    // extends past both edges, so it renders as an extra outage.
-    // Widen data gap boundaries to lie inside the weekend to
-    // exercise the actual skip logic:
-    const series2 = [
-      mkPoint('2026-07-17T22:30:00Z'), // inside weekend
-      mkPoint('2026-07-19T21:30:00Z'), // inside weekend
-    ];
+  it('suppresses outages that mostly overlap a weekend band', () => {
+    // Wilson UAT 2026-07-25: the previous "fully contained" check
+    // let outages that straddled the weekend by a few minutes escape
+    // and render a redundant GAP band on top of the weekend. The new
+    // rule: if the outage's overlap with any weekend > 50% of the
+    // outage duration, suppress it.
+
     const rangeStart = new Date('2026-07-17T00:00:00Z').getTime();
     const rangeEnd = new Date('2026-07-20T00:00:00Z').getTime();
-    const gapsWithin = detectGaps(series2, undefined, rangeStart, rangeEnd);
-    // Only the weekend band; the data gap is suppressed because it's
-    // fully inside the weekend.
-    expect(gapsWithin).toHaveLength(1);
-    expect(gapsWithin[0].isWeekend).toBe(true);
-    // The straddling data gap (series1) is NOT fully contained and
-    // survives as an outage in addition to the weekend.
-    const gapsStraddling = detectGaps(series, undefined, rangeStart, rangeEnd);
+
+    // Case 1: outage entirely inside the weekend — clearly suppressed.
+    const gapsWithin = detectGaps(
+      [
+        mkPoint('2026-07-17T22:30:00Z'),
+        mkPoint('2026-07-19T21:30:00Z'),
+      ],
+      undefined,
+      rangeStart,
+      rangeEnd,
+    );
+    expect(gapsWithin.filter((g) => !g.isWeekend)).toEqual([]);
+
+    // Case 2: outage straddles the weekend by an hour on each side —
+    // overlap is ~98% of the outage duration → still suppressed.
+    const gapsStraddling = detectGaps(
+      [
+        mkPoint('2026-07-17T21:00:00Z'), // 1h before weekend start
+        mkPoint('2026-07-19T23:00:00Z'), // 1h after weekend end
+      ],
+      undefined,
+      rangeStart,
+      rangeEnd,
+    );
     expect(gapsStraddling.some((g) => g.isWeekend)).toBe(true);
-    expect(gapsStraddling.some((g) => !g.isWeekend)).toBe(true);
+    expect(gapsStraddling.filter((g) => !g.isWeekend)).toEqual([]);
+
+    // Case 3: an outage that only clips the tail of a weekend but
+    // extends deep into the trading week — < 50% overlap → survives.
+    const gapsPartial = detectGaps(
+      [
+        mkPoint('2026-07-19T21:00:00Z'), // 1h before weekend end
+        mkPoint('2026-07-20T18:00:00Z'), // 20h into Monday
+      ],
+      undefined,
+      rangeStart,
+      new Date('2026-07-21T00:00:00Z').getTime(),
+    );
+    // Overlap = 1h out of 21h ≈ 4.7% → not suppressed.
+    expect(gapsPartial.some((g) => !g.isWeekend)).toBe(true);
   });
 
   it('returns weekend bands even when the equity series is empty', () => {

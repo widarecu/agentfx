@@ -160,14 +160,22 @@ export function detectGaps(
   for (let i = 1; i < equity.length; i++) {
     const startMs = equity[i - 1].timestampMs;
     const endMs = equity[i].timestampMs;
-    if (endMs - startMs < minGapMs) continue;
-    // Skip gaps that are entirely covered by a weekend band — the
-    // weekend already renders as MARKET CLOSED, no need for a
-    // second overlapping "GAP" label on top.
-    const overlapsWeekend = weekends.some(
-      (w) => startMs >= w.startMs && endMs <= w.endMs,
-    );
-    if (overlapsWeekend) continue;
+    const duration = endMs - startMs;
+    if (duration < minGapMs) continue;
+    // Suppress gaps that mostly (> 50%) overlap a weekend band —
+    // the weekend already renders as MARKET CLOSED, no need for
+    // a second GAP label on top. Wilson UAT 2026-07-25: the prior
+    // "fully contained" check let outages that straddled the
+    // weekend by a few minutes on either edge escape and render
+    // as a bigger GAP band on top of the weekend.
+    const overlapWithWeekend = weekends.reduce((sum, w) => {
+      const overlap = Math.max(
+        0,
+        Math.min(w.endMs, endMs) - Math.max(w.startMs, startMs),
+      );
+      return sum + overlap;
+    }, 0);
+    if (overlapWithWeekend / duration > 0.5) continue;
     outages.push({ startMs, endMs, isWeekend: false });
   }
 
@@ -706,6 +714,78 @@ export function tradesUpTo(
     else if (p < 0) losses++;
   }
   return { wins, losses, closed, realisedPnl };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// detectFinancingEvents — balance changes not caused by a trade close
+// ─────────────────────────────────────────────────────────────────────
+
+export interface FinancingEvent {
+  /** Millisecond timestamp of the equity sample where the change
+   *  first became visible. */
+  timestampMs: number;
+  /** Balance AT this event (after the delta). */
+  balance: number;
+  /** Change from the prior sample. Negative = charge, positive =
+   *  credit (rare but possible on OANDA short positions). */
+  delta: number;
+}
+
+/**
+ * Wilson UAT 2026-07-25: the chart's balance line jumps at every
+ * OANDA account-balance change. Most jumps are trade closes and get
+ * a green/red exit-dot marker. Overnight financing (swap) also
+ * changes the balance without a trade close — no dot, so the jump
+ * looked "unexplained". This helper attributes every balance-change
+ * sample to either a trade close (matched exit_timestamp within
+ * `toleranceMs`) or a financing event. The chart renders the
+ * financing events as small amber diamonds so the eye can tell
+ * "this drop was overnight swap" from "this drop was a losing
+ * trade".
+ *
+ * Threshold: any balance change ≥ $0.10 that isn't within
+ * `toleranceMs` of a closed-trade `exit_timestamp`.
+ */
+export function detectFinancingEvents(
+  equity: EquityPoint[],
+  trades: PaperTradePublic[],
+  toleranceMs: number = 2 * 60_000,
+): FinancingEvent[] {
+  if (equity.length < 2) return [];
+  const exitTimes = trades
+    .filter((t) => t.exit_timestamp != null)
+    .map((t) => new Date(t.exit_timestamp!).getTime())
+    .sort((a, b) => a - b);
+
+  const events: FinancingEvent[] = [];
+  for (let i = 1; i < equity.length; i++) {
+    const prev = equity[i - 1];
+    const curr = equity[i];
+    const delta = curr.balance - prev.balance;
+    if (Math.abs(delta) < 0.1) continue;
+    // Binary search for a trade exit within tolerance of curr.timestampMs.
+    let lo = 0;
+    let hi = exitTimes.length - 1;
+    let hasNearbyTrade = false;
+    while (lo <= hi) {
+      const mid = (lo + hi) >>> 1;
+      const diff = exitTimes[mid] - curr.timestampMs;
+      if (Math.abs(diff) <= toleranceMs) {
+        hasNearbyTrade = true;
+        break;
+      }
+      if (diff < 0) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    if (!hasNearbyTrade) {
+      events.push({
+        timestampMs: curr.timestampMs,
+        balance: curr.balance,
+        delta,
+      });
+    }
+  }
+  return events;
 }
 
 // ─────────────────────────────────────────────────────────────────────

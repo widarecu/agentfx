@@ -30,6 +30,7 @@ import {
   computeDrawdownSeries,
   computeStreaks,
   computeSummaryStrip,
+  detectFinancingEvents,
   detectGaps,
   filterByRange,
   interpolateOverlay,
@@ -39,6 +40,7 @@ import {
   toEquityPoints,
   tradesUpTo,
   type EquityPoint,
+  type FinancingEvent,
   type RangeKey,
 } from '../utils/livePnlChart';
 import { formatElapsed } from '../utils/time';
@@ -324,12 +326,6 @@ export function LivePnLChart({
   );
 
   // ── Trade markers (PR 3) ───────────────────────────────────────
-  //
-  // Project every trade into pixel space once per render; the SVG
-  // then binds the projections to entry triangles + exit circles.
-  // Hovering a marker swaps the crosshair tooltip for a trade-detail
-  // tooltip; clicking scrolls the trades table row into view using
-  // the `data-trade-id` attribute wired in `PaperRunTradesTable`.
   const projections = useMemo(
     () =>
       windowedTrades.map((t) =>
@@ -337,6 +333,20 @@ export function LivePnLChart({
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [windowedTrades, anchoredSeries, axisStartMs, spanMs, minBalance, balanceRange],
+  );
+
+  // ── Financing events (Wilson UAT 2026-07-25) ────────────────────
+  // Balance changes not matched to a trade close = overnight
+  // financing / swap. Rendered as small amber diamonds so the eye
+  // can tell "this drop was a losing trade" from "this drop was
+  // overnight interest". Restricted to the visible window so the
+  // range selector prunes them too.
+  const financingEvents: FinancingEvent[] = useMemo(
+    () => detectFinancingEvents(windowedSeries, trades),
+    [windowedSeries, trades],
+  );
+  const [hoverFinancingIdx, setHoverFinancingIdx] = useState<number | null>(
+    null,
   );
   const [hoverTradeId, setHoverTradeId] = useState<string | null>(null);
   const hoveredTrade =
@@ -569,6 +579,13 @@ export function LivePnLChart({
             <span className="inline-block w-2 h-2 rounded-full bg-rose-500" />
             Trade exit (W / L)
           </span>
+          <span className="flex items-center gap-1.5">
+            <span
+              className="inline-block w-2 h-2 bg-amber-500"
+              style={{ transform: 'rotate(45deg)' }}
+            />
+            Financing / swap
+          </span>
           {/* Wilson UAT 2026-07-25: direction markers removed — the
               StrategyChart candles below already surface trade
               direction against price, and the extra triangles cluttered
@@ -763,6 +780,46 @@ export function LivePnLChart({
               </g>
             );
           })}
+
+          {/* ── Financing markers (Wilson UAT 2026-07-25) ──────────── */}
+          {/* Rendered BEFORE trade dots so a coincident trade dot
+              stacks on top (a rare case: the runner writes a
+              close-fill sample within seconds of the daily financing
+              debit — in practice the tolerance in
+              `detectFinancingEvents` suppresses one or the other). */}
+          <g>
+            {financingEvents.map((ev, i) => {
+              const x = scaleX(ev.timestampMs);
+              if (x < PADDING_LEFT || x > PADDING_LEFT + PLOT_WIDTH) {
+                return null;
+              }
+              const y = scaleY(ev.balance);
+              const hovered = hoverFinancingIdx === i;
+              const size = hovered ? 5 : 3.5;
+              // Diamond via rotated square: 4-point polygon.
+              const pts = `${x},${y - size} ${x + size},${y} ${x},${y + size} ${x - size},${y}`;
+              return (
+                <polygon
+                  key={`fin-${i}`}
+                  points={pts}
+                  fill="#f59e0b"
+                  stroke="white"
+                  strokeWidth={1}
+                  className="dark:stroke-slate-900"
+                  style={{ cursor: 'help' }}
+                  onPointerEnter={() => setHoverFinancingIdx(i)}
+                  onPointerLeave={() => setHoverFinancingIdx(null)}
+                >
+                  <title>
+                    Financing / swap on{' '}
+                    {new Date(ev.timestampMs).toISOString().slice(0, 16)}Z ·{' '}
+                    {ev.delta >= 0 ? '+' : ''}
+                    {ev.delta.toFixed(2)} (balance {ev.balance.toFixed(2)})
+                  </title>
+                </polygon>
+              );
+            })}
+          </g>
 
           {/* ── Trade exit markers (PR 3, revised 2026-07-25) ──────── */}
           {/* Wilson UAT 2026-07-25: direction (long/short) markers
@@ -1444,22 +1501,27 @@ function _fmtShortDate(ms: number): string {
   return `${wk} ${day} ${hh}:${mm}`;
 }
 
-/** Sublabel for the Trades summary tile — one-line current streak
- *  + max streak in parens. Wilson UAT 2026-07-25: "N W in a row"
- *  is a sharper drawdown-onset signal than run-total win rate. */
+/** Sublabel for the Trades summary tile — current + max streaks
+ *  across the WHOLE run. Wilson UAT 2026-07-25: previous format
+ *  "1W streak · max 2W / 7L" got misread as "1-week view", the "W"
+ *  looking like a week abbreviation rather than "win". Now uses
+ *  plain words and an explicit "whole run" qualifier so it can't
+ *  be mistaken for the visible-range summary. */
 function _streakSublabel(streaks: import('../utils/livePnlChart').StreakStats): string | undefined {
   const { current, maxWinStreak, maxLossStreak } = streaks;
   if (current == null) return undefined;
   const currentLabel =
     current.kind === 'win'
-      ? `${current.count}W streak`
+      ? `${current.count} win${current.count === 1 ? '' : 's'} in a row`
       : current.kind === 'loss'
-        ? `${current.count}L streak`
+        ? `${current.count} loss${current.count === 1 ? '' : 'es'} in a row`
         : `${current.count} flat`;
   const maxParts: string[] = [];
-  if (maxWinStreak > 0) maxParts.push(`${maxWinStreak}W`);
-  if (maxLossStreak > 0) maxParts.push(`${maxLossStreak}L`);
-  const maxLabel = maxParts.length ? ` · max ${maxParts.join(' / ')}` : '';
+  if (maxWinStreak > 0)
+    maxParts.push(`${maxWinStreak} win${maxWinStreak === 1 ? '' : 's'}`);
+  if (maxLossStreak > 0)
+    maxParts.push(`${maxLossStreak} loss${maxLossStreak === 1 ? '' : 'es'}`);
+  const maxLabel = maxParts.length ? ` · max ${maxParts.join(' / ')} (whole run)` : '';
   return `${currentLabel}${maxLabel}`;
 }
 
