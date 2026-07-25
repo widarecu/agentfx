@@ -169,17 +169,19 @@ describe('tradesUpTo', () => {
       wins: 0,
       losses: 0,
       closed: 0,
+      realisedPnl: 0,
     });
   });
 
   it('counts only trades exited at or before the cutoff', () => {
-    // Cursor at 14:30 → a (13:00 W) + b (14:00 L) counted; c (15:00) and
-    // d (open) excluded.
+    // Cursor at 14:30 → a (13:00 W +5) + b (14:00 L -3) counted;
+    // c (15:00) and d (open) excluded. Realised sum = 5 + -3 = 2.
     const cutoff = new Date('2026-07-17T14:30:00Z').getTime();
     expect(tradesUpTo(trades, cutoff)).toEqual({
       wins: 1,
       losses: 1,
       closed: 2,
+      realisedPnl: 2,
     });
   });
 
@@ -190,19 +192,21 @@ describe('tradesUpTo', () => {
       wins: 1,
       losses: 1,
       closed: 2,
+      realisedPnl: 2,
     });
   });
 
   it('never counts open trades regardless of cutoff', () => {
     const cutoff = new Date('2030-01-01T00:00:00Z').getTime();
     const stats = tradesUpTo(trades, cutoff);
-    // All 3 closed + 0 open.
+    // All 3 closed + 0 open. Realised = 5 + -3 + 8 = 10.
     expect(stats.closed).toBe(3);
     expect(stats.wins).toBe(2);
     expect(stats.losses).toBe(1);
+    expect(stats.realisedPnl).toBe(10);
   });
 
-  it('treats net_pnl=0 as neither win nor loss', () => {
+  it('treats net_pnl=0 as neither win nor loss but still adds to realised', () => {
     const flat = [
       trade({ id: 'flat', exit_timestamp: '2026-07-17T13:00:00Z', net_pnl: 0 }),
     ];
@@ -210,6 +214,7 @@ describe('tradesUpTo', () => {
       wins: 0,
       losses: 0,
       closed: 1,
+      realisedPnl: 0,
     });
   });
 
@@ -226,6 +231,7 @@ describe('tradesUpTo', () => {
       wins: 1,
       losses: 0,
       closed: 1,
+      realisedPnl: 12,
     });
   });
 });

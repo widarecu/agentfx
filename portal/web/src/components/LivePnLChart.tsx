@@ -28,6 +28,7 @@ import type {
 } from '../types/paper';
 import {
   computeDrawdownSeries,
+  computeStreaks,
   computeSummaryStrip,
   detectGaps,
   filterByRange,
@@ -100,6 +101,7 @@ export function LivePnLChart({
     () => computeSummaryStrip(liveSeries, trades, snapshotBalance),
     [liveSeries, trades, snapshotBalance],
   );
+  const streaks = useMemo(() => computeStreaks(trades), [trades]);
 
   const nowMs = liveSeries.length
     ? liveSeries[liveSeries.length - 1].timestampMs
@@ -465,6 +467,7 @@ export function LivePnLChart({
               String(summary.tradeCount)
             )
           }
+          sublabel={_streakSublabel(streaks)}
         />
         <SummaryTile
           label="Win rate"
@@ -882,7 +885,12 @@ interface ChartTooltipProps {
   hoverMs: number;
   hoverPoint: EquityPoint;
   hoverBacktest: number | null;
-  hoverTradeStats: { wins: number; losses: number; closed: number } | null;
+  hoverTradeStats: {
+    wins: number;
+    losses: number;
+    closed: number;
+    realisedPnl: number;
+  } | null;
   runStartMs: number;
   snapshotBalance: number;
   scaleX: (ms: number) => number;
@@ -910,24 +918,48 @@ function ChartTooltip({
     : { left: `${leftFrac * 100}%`, top: 40 };
   const nudge = flipLeft ? 'mr-2' : 'ml-2';
 
+  // Wilson UAT 2026-07-25: title now shows the SNAPPED sample's
+  // timestamp, not the raw cursor position — because of weekend
+  // gaps + poll-throttling, `nearestSample` can snap to a sample
+  // hours away from where the cursor points. Titling the tooltip
+  // with the actual sample ts keeps the header and body agreeing
+  // on WHEN the numbers below apply.
+  const sampleMs = hoverPoint.timestampMs;
+  const cursorFar =
+    Math.abs(hoverMs - sampleMs) > 5 * 60_000; // 5-min gap ≈ interpolated
   const equity = hoverPoint.balance;
   const unreal = hoverPoint.unrealizedPnl;
-  const realised = equity - snapshotBalance;
-  const total = realised + unreal;
+  const balanceChange = equity - snapshotBalance;
+  // Wilson UAT 2026-07-25: separate "balance change" (any account
+  // movement — realised P&L, financing, commissions, external
+  // activity) from strict "realised (trades)" (sum of closed-trade
+  // net_pnl to this cursor position). Prior code labelled balance
+  // change as "Realised" which was misleading when overnight swap
+  // moved the balance without any closes.
+  const tradesRealised = hoverTradeStats?.realisedPnl ?? 0;
+  const total = balanceChange + unreal;
   const drift = hoverBacktest != null ? equity - hoverBacktest : null;
 
   return (
     <div
-      className={`absolute z-30 pointer-events-none ${nudge} min-w-[220px] rounded-md bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-lg text-xs font-mono tabular-nums`}
+      className={`absolute z-30 pointer-events-none ${nudge} min-w-[240px] rounded-md bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-lg text-xs font-mono tabular-nums`}
       style={style}
     >
-      <div className="px-3 py-1.5 border-b border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 font-semibold">
-        {_fmtTooltipDate(hoverMs)}
+      <div className="px-3 py-1.5 border-b border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 font-semibold flex items-center justify-between gap-2">
+        <span>{_fmtTooltipDate(sampleMs)}</span>
+        {cursorFar && (
+          <span
+            className="text-[9px] uppercase tracking-wide text-amber-600 dark:text-amber-400"
+            title={`Cursor at ${_fmtTooltipDate(hoverMs)} — snapped to nearest sample.`}
+          >
+            snapped
+          </span>
+        )}
       </div>
       <div className="px-3 py-1.5 space-y-1">
         <TooltipRow
           label="Elapsed"
-          value={formatElapsed(runStartMs, hoverMs)}
+          value={formatElapsed(runStartMs, sampleMs)}
         />
         <TooltipRow
           label="Live equity"
@@ -952,9 +984,14 @@ function ChartTooltip({
           tone={total >= 0 ? 'up' : 'down'}
         />
         <TooltipRow
-          label="Realised"
-          value={_fmtSigned(realised)}
-          tone={realised >= 0 ? 'up' : 'down'}
+          label="Realised (trades)"
+          value={_fmtSigned(tradesRealised)}
+          tone={tradesRealised >= 0 ? 'up' : 'down'}
+        />
+        <TooltipRow
+          label="Balance change"
+          value={_fmtSigned(balanceChange)}
+          tone={balanceChange >= 0 ? 'up' : 'down'}
         />
         <TooltipRow
           label="Unrealised"
@@ -1362,6 +1399,25 @@ function _fmtShortDate(ms: number): string {
   const hh = d.getUTCHours().toString().padStart(2, '0');
   const mm = d.getUTCMinutes().toString().padStart(2, '0');
   return `${wk} ${day} ${hh}:${mm}`;
+}
+
+/** Sublabel for the Trades summary tile — one-line current streak
+ *  + max streak in parens. Wilson UAT 2026-07-25: "N W in a row"
+ *  is a sharper drawdown-onset signal than run-total win rate. */
+function _streakSublabel(streaks: import('../utils/livePnlChart').StreakStats): string | undefined {
+  const { current, maxWinStreak, maxLossStreak } = streaks;
+  if (current == null) return undefined;
+  const currentLabel =
+    current.kind === 'win'
+      ? `${current.count}W streak`
+      : current.kind === 'loss'
+        ? `${current.count}L streak`
+        : `${current.count} flat`;
+  const maxParts: string[] = [];
+  if (maxWinStreak > 0) maxParts.push(`${maxWinStreak}W`);
+  if (maxLossStreak > 0) maxParts.push(`${maxLossStreak}L`);
+  const maxLabel = maxParts.length ? ` · max ${maxParts.join(' / ')}` : '';
+  return `${currentLabel}${maxLabel}`;
 }
 
 function _sideLabel(side: string): string {

@@ -599,25 +599,101 @@ export function projectTrade(
 }
 
 /** Count wins / losses among trades with `exit_timestamp <= cutoffMs`.
+ *  Also sums realised net_pnl so the tooltip's "Realised (trades)"
+ *  row can render an honest number that agrees with the summary
+ *  strip tile (both compute from the trades array, not from balance
+ *  delta — balance delta additionally reflects overnight financing
+ *  and any external account activity).
+ *
  *  Used by the tooltip's "Trades to date · W / L" row so the number
  *  reflects the moment the cursor is over, not the run-total. */
 export function tradesUpTo(
   trades: PaperTradePublic[],
   cutoffMs: number,
-): { wins: number; losses: number; closed: number } {
+): { wins: number; losses: number; closed: number; realisedPnl: number } {
   let wins = 0;
   let losses = 0;
   let closed = 0;
+  let realisedPnl = 0;
   for (const t of trades) {
     if (!t.exit_timestamp) continue;
     const exitMs = new Date(t.exit_timestamp).getTime();
     if (exitMs > cutoffMs) continue;
     closed++;
     const p = t.net_pnl ?? t.pnl ?? 0;
+    realisedPnl += p;
     if (p > 0) wins++;
     else if (p < 0) losses++;
   }
-  return { wins, losses, closed };
+  return { wins, losses, closed, realisedPnl };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// computeStreaks — consecutive W/L runs for the Trades summary tile
+// ─────────────────────────────────────────────────────────────────────
+
+export interface StreakStats {
+  /** The currently-active streak (based on the most recently closed
+   *  trade). `null` when there are no closed trades. Flat trades
+   *  (net_pnl == 0) break both streaks — a flat sequence has
+   *  `kind: 'flat'`, count = 1 (or however many consecutive flats). */
+  current: { kind: 'win' | 'loss' | 'flat'; count: number } | null;
+  /** Longest winning streak ever recorded across all closed trades. */
+  maxWinStreak: number;
+  /** Longest losing streak ever recorded across all closed trades. */
+  maxLossStreak: number;
+}
+
+/**
+ * Compute current + max consecutive-win / consecutive-loss streaks
+ * across a run's closed trades. Wilson UAT 2026-07-25: an "N W in
+ * a row" or "M L in a row" is a much sharper signal than "win rate
+ * 60%" when watching a live paper run — you want to spot a
+ * regime-change losing streak the moment it starts, not average it
+ * across the whole run.
+ *
+ * Reads `net_pnl` (post financing / commission), falls back to
+ * `pnl` for legacy rows. Trades are re-sorted internally by
+ * `exit_timestamp` ascending so the caller doesn't need to
+ * pre-sort — the equity endpoint returns oldest-first but callers
+ * that mix sources shouldn't have to know.
+ */
+export function computeStreaks(trades: PaperTradePublic[]): StreakStats {
+  const closed = trades
+    .filter((t) => t.exit_timestamp != null)
+    .slice()
+    .sort(
+      (a, b) =>
+        new Date(a.exit_timestamp!).getTime() -
+        new Date(b.exit_timestamp!).getTime(),
+    );
+
+  let current: StreakStats['current'] = null;
+  let maxWinStreak = 0;
+  let maxLossStreak = 0;
+  let runningKind: 'win' | 'loss' | 'flat' | null = null;
+  let runningCount = 0;
+
+  for (const t of closed) {
+    const p = t.net_pnl ?? t.pnl ?? 0;
+    const kind: 'win' | 'loss' | 'flat' =
+      p > 0 ? 'win' : p < 0 ? 'loss' : 'flat';
+    if (kind === runningKind) {
+      runningCount += 1;
+    } else {
+      runningKind = kind;
+      runningCount = 1;
+    }
+    if (kind === 'win' && runningCount > maxWinStreak) {
+      maxWinStreak = runningCount;
+    }
+    if (kind === 'loss' && runningCount > maxLossStreak) {
+      maxLossStreak = runningCount;
+    }
+    current = { kind, count: runningCount };
+  }
+
+  return { current, maxWinStreak, maxLossStreak };
 }
 
 /**

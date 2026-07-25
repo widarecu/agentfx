@@ -63,7 +63,20 @@ import { formatUTC } from '../utils/time';
 const POLL_INTERVAL_MS = 5_000;
 const CANDLES_POLL_INTERVAL_MS = 60_000; // fresh candles every minute
 const CHART_BARS = 1500;
-const MAX_LIVE_SAMPLES = 720; // ~1h at 5s cadence — plenty for the SVG.
+// Wilson UAT 2026-07-25: the previous MAX_LIVE_SAMPLES=720 clamp
+// silently dropped the whole seeded equity history after ~1h of
+// viewing the page (poll appends every 5s, .slice(-720) trims the
+// 5000-sample seed down to the most recent 720 poll-synthetic
+// points). That made the chart's hover tooltip snap to arbitrary
+// samples far from the cursor's actual timestamp, producing
+// tooltips like "Sun 19 Jul 11:20 UTC · $97,165.75" where the
+// balance actually came from a Jul 22-23 sample. Fix: no seed
+// trimming; append poll samples only when the previous sample is
+// older than the throttle window; hard cap at 20k as a safety net
+// (~14 days of 60s cadence — way above any realistic multi-week
+// paper run).
+const MAX_EQUITY_SAMPLES = 20_000;
+const POLL_APPEND_THROTTLE_MS = 30_000;
 
 export default function PaperRunDetail() {
   const { runId } = useParams<{ runId: string }>();
@@ -91,20 +104,31 @@ export default function PaperRunDetail() {
     try {
       const data = await getPaperRun(runId);
       setRun(data);
-      // Accumulate live equity samples if we have a balance.
+      // Accumulate live equity samples if we have a balance. Throttle
+      // to POLL_APPEND_THROTTLE_MS so a 5s poll cadence doesn't flood
+      // the array with duplicates — the equity endpoint's real
+      // samples land at signal-tick cadence (M1 = 60s), so ~30s
+      // throttling on the poll-synthesised points keeps the two
+      // sources density-compatible.
       if (data.current_balance != null) {
-        // v0.6.3 redesign: EquityPoint now carries `unrealizedPnl` so
-        // the summary strip / hover tooltip can surface the open-
-        // position mark-to-market. The health-tick poll only knows
-        // realized balance; unrealised comes back from the equity
-        // endpoint on the next fetch.
-        const point: EquityPoint = {
-          timestampMs: Date.now(),
-          balance: data.current_balance,
-          unrealizedPnl: 0,
-        };
-        equityRef.current = [...equityRef.current, point].slice(-MAX_LIVE_SAMPLES);
-        setEquity(equityRef.current);
+        const nowMs = Date.now();
+        const prev = equityRef.current[equityRef.current.length - 1];
+        const stale = !prev || nowMs - prev.timestampMs > POLL_APPEND_THROTTLE_MS;
+        if (stale) {
+          // v0.6.3 redesign: EquityPoint now carries `unrealizedPnl`.
+          // The health-tick poll only knows realised balance; the
+          // full unrealised comes back on the next equity-endpoint
+          // refetch (below).
+          const point: EquityPoint = {
+            timestampMs: nowMs,
+            balance: data.current_balance,
+            unrealizedPnl: 0,
+          };
+          equityRef.current = [...equityRef.current, point].slice(
+            -MAX_EQUITY_SAMPLES,
+          );
+          setEquity(equityRef.current);
+        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
