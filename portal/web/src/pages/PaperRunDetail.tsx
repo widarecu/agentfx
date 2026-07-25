@@ -316,7 +316,12 @@ export default function PaperRunDetail() {
     let cancelled = false;
     const loadTrades = async () => {
       try {
-        const resp = await getTradesForRun(runId, { limit: 100 });
+        // Wilson UAT 2026-07-25: streaks + summary tiles compute
+        // over this array, so we need the FULL run history — not
+        // just the most recent 100. A multi-month paper run should
+        // still fit comfortably below 5000 trades even at M1
+        // cadence + high-frequency strategies.
+        const resp = await getTradesForRun(runId, { limit: 5000 });
         if (!cancelled) setTrades(resp.items);
       } catch {
         /* non-fatal */

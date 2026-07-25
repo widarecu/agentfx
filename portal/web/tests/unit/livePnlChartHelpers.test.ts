@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  _containsSaturday,
+  _weekendBandsInRange,
   detectGaps,
   DEFAULT_MIN_GAP_MS,
   pickAxisTicks,
@@ -59,69 +59,115 @@ function mkPoint(ts: string, balance = 100): EquityPoint {
   };
 }
 
-describe('_containsSaturday', () => {
-  it('flags a window ending on Saturday', () => {
-    // Fri 22:00 UTC → Sat 06:00 UTC (FX close through pre-dawn Saturday)
-    expect(
-      _containsSaturday(
-        new Date('2026-07-17T22:00:00Z').getTime(), // Friday
-        new Date('2026-07-18T06:00:00Z').getTime(), // Saturday
-      ),
-    ).toBe(true);
+describe('_weekendBandsInRange', () => {
+  it('emits one weekend band per Fri22→Sun22 UTC window in the range', () => {
+    // Range Wed Jul 15 → Wed Jul 29 contains TWO Fri→Sun weekends:
+    // Fri Jul 17 22:00 → Sun Jul 19 22:00, and
+    // Fri Jul 24 22:00 → Sun Jul 26 22:00.
+    const bands = _weekendBandsInRange(
+      new Date('2026-07-15T00:00:00Z').getTime(),
+      new Date('2026-07-29T00:00:00Z').getTime(),
+    );
+    expect(bands).toHaveLength(2);
+    expect(new Date(bands[0].startMs).toISOString()).toBe(
+      '2026-07-17T22:00:00.000Z',
+    );
+    expect(new Date(bands[0].endMs).toISOString()).toBe(
+      '2026-07-19T22:00:00.000Z',
+    );
+    expect(bands[0].isWeekend).toBe(true);
+    expect(new Date(bands[1].startMs).toISOString()).toBe(
+      '2026-07-24T22:00:00.000Z',
+    );
+    expect(new Date(bands[1].endMs).toISOString()).toBe(
+      '2026-07-26T22:00:00.000Z',
+    );
   });
 
-  it('flags a window that spans a full Saturday', () => {
-    expect(
-      _containsSaturday(
-        new Date('2026-07-17T22:00:00Z').getTime(), // Fri 22:00
-        new Date('2026-07-19T22:00:00Z').getTime(), // Sun 22:00 — FX reopen
-      ),
-    ).toBe(true);
+  it('clips the LEFT edge to rangeStart when the weekend started before the visible window', () => {
+    // 7-day range starting Sun Jul 19 12:00 — first weekend
+    // (Fri 17 22:00 → Sun 19 22:00) starts BEFORE the range but its
+    // right half is visible → band should start at rangeStart.
+    const rangeStart = new Date('2026-07-19T12:00:00Z').getTime();
+    const rangeEnd = new Date('2026-07-26T00:00:00Z').getTime();
+    const bands = _weekendBandsInRange(rangeStart, rangeEnd);
+    // First visible weekend is the tail end of Fri-Sun (clipped
+    // left) + the next weekend Fri Jul 24 22:00.
+    expect(bands).toHaveLength(2);
+    expect(bands[0].startMs).toBe(rangeStart);
+    expect(new Date(bands[0].endMs).toISOString()).toBe(
+      '2026-07-19T22:00:00.000Z',
+    );
   });
 
-  it('does NOT flag a Sunday-only window (runner outage vs market close)', () => {
-    // If the runner recovered from Sunday 06:00 to Sunday 15:00,
-    // Saturday was never touched — label the band `GAP`, not
-    // `MARKET CLOSED`.
-    expect(
-      _containsSaturday(
-        new Date('2026-07-19T06:00:00Z').getTime(), // Sunday 06:00
-        new Date('2026-07-19T15:00:00Z').getTime(), // Sunday 15:00
-      ),
-    ).toBe(false);
+  it('clips the RIGHT edge to rangeEnd when the weekend continues past the visible window', () => {
+    // Range ends Sat Jul 25 12:00 UTC — mid-weekend. Band should
+    // start at Fri 22:00 and end at rangeEnd (mid-Sat).
+    const rangeStart = new Date('2026-07-20T00:00:00Z').getTime();
+    const rangeEnd = new Date('2026-07-25T12:00:00Z').getTime();
+    const bands = _weekendBandsInRange(rangeStart, rangeEnd);
+    expect(bands).toHaveLength(1);
+    expect(new Date(bands[0].startMs).toISOString()).toBe(
+      '2026-07-24T22:00:00.000Z',
+    );
+    expect(bands[0].endMs).toBe(rangeEnd);
   });
 
-  it('does NOT flag a mid-week gap (ingestion outage on Wednesday)', () => {
+  it('emits nothing when the range is entirely mid-week', () => {
+    const bands = _weekendBandsInRange(
+      new Date('2026-07-20T00:00:00Z').getTime(), // Mon
+      new Date('2026-07-24T00:00:00Z').getTime(), // Fri BEFORE 22:00
+    );
+    expect(bands).toEqual([]);
+  });
+
+  it('handles reversed / empty ranges defensively', () => {
     expect(
-      _containsSaturday(
-        new Date('2026-07-15T10:00:00Z').getTime(), // Wed
-        new Date('2026-07-15T20:00:00Z').getTime(), // Wed
+      _weekendBandsInRange(
+        new Date('2026-07-25T00:00:00Z').getTime(),
+        new Date('2026-07-20T00:00:00Z').getTime(),
       ),
-    ).toBe(false);
+    ).toEqual([]);
   });
 });
 
 describe('detectGaps', () => {
-  it('returns [] for a series with no gap > threshold', () => {
+  it('returns [] for a series with no gap > threshold and no weekends in range', () => {
+    // Mid-Wed → mid-Wed, no weekend anywhere.
     const series = [
-      mkPoint('2026-07-17T12:00:00Z'),
-      mkPoint('2026-07-17T12:01:00Z'),
-      mkPoint('2026-07-17T12:02:00Z'),
+      mkPoint('2026-07-15T12:00:00Z'),
+      mkPoint('2026-07-15T12:01:00Z'),
+      mkPoint('2026-07-15T12:02:00Z'),
     ];
-    expect(detectGaps(series)).toEqual([]);
+    expect(
+      detectGaps(
+        series,
+        undefined,
+        new Date('2026-07-15T00:00:00Z').getTime(),
+        new Date('2026-07-15T23:59:59Z').getTime(),
+      ),
+    ).toEqual([]);
   });
 
-  it('flags the FX weekend as a MARKET CLOSED band', () => {
-    // Fri 22:00 UTC → Sun 22:00 UTC — 48h — well above default 6h.
+  it('emits a calendar-anchored weekend band even when the data spans it', () => {
+    // Data samples at Fri 22 and Sun 22 (exact FX close/open times).
+    // The weekend band comes from the calendar, not the data gap —
+    // so the band's edges match Fri 22:00 / Sun 22:00 exactly.
     const series = [
       mkPoint('2026-07-17T22:00:00Z'),
       mkPoint('2026-07-19T22:00:00Z'),
     ];
-    const gaps = detectGaps(series);
+    const rangeStart = new Date('2026-07-17T00:00:00Z').getTime();
+    const rangeEnd = new Date('2026-07-20T00:00:00Z').getTime();
+    const gaps = detectGaps(series, undefined, rangeStart, rangeEnd);
     expect(gaps).toHaveLength(1);
     expect(gaps[0].isWeekend).toBe(true);
-    expect(gaps[0].startMs).toBe(new Date('2026-07-17T22:00:00Z').getTime());
-    expect(gaps[0].endMs).toBe(new Date('2026-07-19T22:00:00Z').getTime());
+    expect(new Date(gaps[0].startMs).toISOString()).toBe(
+      '2026-07-17T22:00:00.000Z',
+    );
+    expect(new Date(gaps[0].endMs).toISOString()).toBe(
+      '2026-07-19T22:00:00.000Z',
+    );
   });
 
   it('flags a Wednesday runner outage as a plain GAP (isWeekend=false)', () => {
@@ -129,51 +175,78 @@ describe('detectGaps', () => {
       mkPoint('2026-07-15T04:00:00Z'), // Wed 04:00
       mkPoint('2026-07-15T20:00:00Z'), // Wed 20:00 — 16h outage
     ];
-    const gaps = detectGaps(series);
+    const gaps = detectGaps(
+      series,
+      undefined,
+      new Date('2026-07-15T00:00:00Z').getTime(),
+      new Date('2026-07-15T23:59:59Z').getTime(),
+    );
     expect(gaps).toHaveLength(1);
     expect(gaps[0].isWeekend).toBe(false);
   });
 
-  it('does not flag a gap just under the threshold', () => {
+  it('does not flag a data gap just under the threshold', () => {
     const series = [
-      mkPoint('2026-07-17T12:00:00Z'),
-      mkPoint(new Date(
-        new Date('2026-07-17T12:00:00Z').getTime() + DEFAULT_MIN_GAP_MS - 60_000,
-      ).toISOString()),
+      mkPoint('2026-07-15T12:00:00Z'),
+      mkPoint(
+        new Date(
+          new Date('2026-07-15T12:00:00Z').getTime() +
+            DEFAULT_MIN_GAP_MS -
+            60_000,
+        ).toISOString(),
+      ),
     ];
-    expect(detectGaps(series)).toEqual([]);
+    // Range is entirely mid-week, so no weekend band either.
+    expect(
+      detectGaps(
+        series,
+        undefined,
+        new Date('2026-07-15T00:00:00Z').getTime(),
+        new Date('2026-07-16T00:00:00Z').getTime(),
+      ),
+    ).toEqual([]);
   });
 
-  it('detects multiple gaps in a single series', () => {
-    // Weekend + a mid-next-week 8h outage. Pack trading-week samples
-    // tightly (every 4h) so adjacent-point deltas stay under the 6h
-    // default threshold — only the weekend and the deliberate 8h
-    // outage register as gaps.
-    const series: EquityPoint[] = [
-      mkPoint('2026-07-17T22:00:00Z'), // Fri 22
-      mkPoint('2026-07-19T22:00:00Z'), // Sun 22 — first gap here (weekend)
+  it('skips a data gap that is entirely covered by the weekend band', () => {
+    // Data gap Fri 21:00 → Sun 21:00 sits inside the weekend
+    // Fri 22:00 → Sun 22:00 window. Should NOT emit a second
+    // GAP band on top of the weekend one.
+    const series = [
+      mkPoint('2026-07-17T21:00:00Z'),
+      mkPoint('2026-07-19T21:00:00Z'),
     ];
-    // Sun 22 → Wed 22 with samples every 4h keeps every adjacent
-    // delta under 6h.
-    const trading: string[] = [];
-    for (let t = 0; t < 3 * 24; t += 4) {
-      const ts = new Date(
-        new Date('2026-07-19T22:00:00Z').getTime() + t * 60 * 60 * 1000,
-      ).toISOString();
-      trading.push(ts);
-    }
-    trading.forEach((ts) => series.push(mkPoint(ts)));
-    // Wed 22 → Thu 06 = 8h outage.
-    series.push(mkPoint('2026-07-23T06:00:00Z'));
-    const gaps = detectGaps(series);
-    expect(gaps).toHaveLength(2);
+    // Data gap is 21:00 → 21:00; weekend is 22:00 → 22:00. The
+    // data gap start (21:00 Fri) sits BEFORE the weekend start
+    // (22:00 Fri), so it isn't strictly within the weekend band.
+    // detectGaps only skips data gaps entirely contained; this one
+    // extends past both edges, so it renders as an extra outage.
+    // Widen data gap boundaries to lie inside the weekend to
+    // exercise the actual skip logic:
+    const series2 = [
+      mkPoint('2026-07-17T22:30:00Z'), // inside weekend
+      mkPoint('2026-07-19T21:30:00Z'), // inside weekend
+    ];
+    const rangeStart = new Date('2026-07-17T00:00:00Z').getTime();
+    const rangeEnd = new Date('2026-07-20T00:00:00Z').getTime();
+    const gapsWithin = detectGaps(series2, undefined, rangeStart, rangeEnd);
+    // Only the weekend band; the data gap is suppressed because it's
+    // fully inside the weekend.
+    expect(gapsWithin).toHaveLength(1);
+    expect(gapsWithin[0].isWeekend).toBe(true);
+    // The straddling data gap (series1) is NOT fully contained and
+    // survives as an outage in addition to the weekend.
+    const gapsStraddling = detectGaps(series, undefined, rangeStart, rangeEnd);
+    expect(gapsStraddling.some((g) => g.isWeekend)).toBe(true);
+    expect(gapsStraddling.some((g) => !g.isWeekend)).toBe(true);
+  });
+
+  it('returns weekend bands even when the equity series is empty', () => {
+    const rangeStart = new Date('2026-07-15T00:00:00Z').getTime();
+    const rangeEnd = new Date('2026-07-22T00:00:00Z').getTime();
+    // One weekend Fri Jul 17 22 → Sun Jul 19 22 in this range.
+    const gaps = detectGaps([], undefined, rangeStart, rangeEnd);
+    expect(gaps).toHaveLength(1);
     expect(gaps[0].isWeekend).toBe(true);
-    expect(gaps[1].isWeekend).toBe(false);
-  });
-
-  it('handles empty and single-item series without crashing', () => {
-    expect(detectGaps([])).toEqual([]);
-    expect(detectGaps([mkPoint('2026-07-17T12:00:00Z')])).toEqual([]);
   });
 });
 

@@ -38,11 +38,23 @@ export interface GapBand {
   startMs: number;
   /** Right edge in wall-clock ms. */
   endMs: number;
-  /** True when the gap is a Fri22→Sun22 FX-market close, so the label
-   *  becomes "MARKET CLOSED" instead of a generic gap band. Heuristic:
-   *  the gap contains a Saturday. */
+  /** True when the band corresponds to the FX-market closed window.
+   *  Computed from calendar (Fri 22:00 UTC → Sun 22:00 UTC), NOT
+   *  from data gaps — so the "MARKET CLOSED" label lines up with
+   *  actual market hours rather than the last-sample-before-gap
+   *  drift Wilson caught on 2026-07-25. */
   isWeekend: boolean;
 }
+
+// FX market weekly close/open, expressed in UTC:
+// - Fri 22:00 UTC (17:00 NY close in DST)
+// - Sun 22:00 UTC (17:00 NY open / Sydney open)
+// Non-DST months shift by 1 hour but the majority of trading weeks
+// use this window; the ±1h drift is acceptable for a visual band.
+const WEEKEND_CLOSE_DOW_UTC = 5; // Friday
+const WEEKEND_CLOSE_HOUR_UTC = 22;
+const WEEKEND_OPEN_DOW_UTC = 0; // Sunday
+const WEEKEND_OPEN_HOUR_UTC = 22;
 
 /** Values consumed by the 8-tile summary strip above the chart. */
 export interface SummaryStripData {
@@ -105,43 +117,111 @@ export function toEquityPoints(items: EquitySnapshotPublic[]): EquityPoint[] {
 export const DEFAULT_MIN_GAP_MS = 6 * 60 * 60 * 1000;
 
 /**
- * Return timestamp windows where no equity samples arrived for longer
- * than `minGapMs`. Used to render greyed-out bands on the chart
- * canvas so a flat curve during market close doesn't read as
- * "strategy did nothing".
+ * Return timestamp windows where the chart should render a shaded
+ * band. Combines two sources:
  *
- * Assumes `equity` is sorted ascending by `timestampMs` (the equity
- * endpoint returns oldest-first). If it isn't, gaps are still
- * detected but the `startMs` / `endMs` fields may be reversed.
+ * 1. **Weekend bands** — computed from the calendar. Every Fri
+ *    22:00 UTC → Sun 22:00 UTC window intersecting `[axisStartMs,
+ *    axisEndMs]` becomes an `isWeekend: true` band. This makes the
+ *    "MARKET CLOSED" label line up with actual FX market hours —
+ *    NOT with the last-sample-before-gap drift Wilson caught on
+ *    2026-07-25 where the previous gap-based band ended near Mon
+ *    00:00 instead of Sun 22:00.
+ * 2. **Outage bands** — data gaps > `minGapMs` between adjacent
+ *    equity samples that DO NOT overlap a weekend window. These
+ *    label as "GAP" and cover unexpected runner outages / ingester
+ *    failures.
+ *
+ * Assumes `equity` is sorted ascending by `timestampMs`.
  */
 export function detectGaps(
   equity: EquityPoint[],
   minGapMs: number = DEFAULT_MIN_GAP_MS,
+  axisStartMs?: number,
+  axisEndMs?: number,
 ): GapBand[] {
-  const gaps: GapBand[] = [];
+  // Determine the visible range for weekend calculation. Fall back
+  // to the equity series bounds when not passed (older callers).
+  let rangeStart = axisStartMs;
+  let rangeEnd = axisEndMs;
+  if (rangeStart == null && equity.length > 0) {
+    rangeStart = equity[0].timestampMs;
+  }
+  if (rangeEnd == null && equity.length > 0) {
+    rangeEnd = equity[equity.length - 1].timestampMs;
+  }
+
+  const weekends: GapBand[] =
+    rangeStart != null && rangeEnd != null
+      ? _weekendBandsInRange(rangeStart, rangeEnd)
+      : [];
+
+  const outages: GapBand[] = [];
   for (let i = 1; i < equity.length; i++) {
     const startMs = equity[i - 1].timestampMs;
     const endMs = equity[i].timestampMs;
     if (endMs - startMs < minGapMs) continue;
-    gaps.push({ startMs, endMs, isWeekend: _containsSaturday(startMs, endMs) });
+    // Skip gaps that are entirely covered by a weekend band — the
+    // weekend already renders as MARKET CLOSED, no need for a
+    // second overlapping "GAP" label on top.
+    const overlapsWeekend = weekends.some(
+      (w) => startMs >= w.startMs && endMs <= w.endMs,
+    );
+    if (overlapsWeekend) continue;
+    outages.push({ startMs, endMs, isWeekend: false });
   }
-  return gaps;
+
+  // Merge + sort by startMs so the chart renders left-to-right.
+  return [...weekends, ...outages].sort((a, b) => a.startMs - b.startMs);
 }
 
-/** Any part of the [startMs, endMs] window landing on a Saturday
- *  (UTC day-of-week === 6) means we treat it as a weekend market
- *  close band. Sunday alone doesn't qualify — FX reopens Sunday
- *  ~22:00 UTC, so a purely-Sunday gap is more likely a stale-runner
- *  outage than a weekend. */
-export function _containsSaturday(startMs: number, endMs: number): boolean {
-  if (endMs < startMs) return false;
-  // Walk day-by-day (max 7 iterations for any realistic gap).
-  const stepMs = 24 * 60 * 60 * 1000;
-  for (let t = startMs; t <= endMs; t += stepMs) {
-    if (new Date(t).getUTCDay() === 6) return true;
+/** Every Fri 22:00 UTC → Sun 22:00 UTC window (inclusive of edges)
+ *  intersecting `[rangeStart, rangeEnd]`. Bands are clipped to the
+ *  visible range so the chart doesn't over-draw.
+ *
+ *  Exported for Vitest. */
+export function _weekendBandsInRange(
+  rangeStart: number,
+  rangeEnd: number,
+): GapBand[] {
+  if (rangeEnd < rangeStart) return [];
+  const bands: GapBand[] = [];
+  // Find the Friday of the week containing rangeStart (or the week
+  // before, if rangeStart is before Fri of its own week).
+  const startD = new Date(rangeStart);
+  // Rewind to the Friday at or before rangeStart.
+  const dow = startD.getUTCDay();
+  // Days to subtract to reach the Friday of this week (or last week).
+  // Fri (5) → 0; Sat (6) → 1; Sun (0) → 2; Mon (1) → 3; Tue (2) → 4;
+  // Wed (3) → 5; Thu (4) → 6.
+  const daysBackToFri = (dow - WEEKEND_CLOSE_DOW_UTC + 7) % 7;
+  const friAtOrBeforeStart = Date.UTC(
+    startD.getUTCFullYear(),
+    startD.getUTCMonth(),
+    startD.getUTCDate() - daysBackToFri,
+    WEEKEND_CLOSE_HOUR_UTC,
+    0,
+    0,
+  );
+
+  const oneWeekMs = 7 * 24 * 60 * 60 * 1000;
+  const twoDaysMs = 2 * 24 * 60 * 60 * 1000;
+
+  for (
+    let friClose = friAtOrBeforeStart;
+    friClose <= rangeEnd;
+    friClose += oneWeekMs
+  ) {
+    const sunOpen = friClose + twoDaysMs; // Fri 22 + 48h = Sun 22
+    // Skip weekends entirely outside the visible range.
+    if (sunOpen < rangeStart || friClose > rangeEnd) continue;
+    bands.push({
+      startMs: Math.max(friClose, rangeStart),
+      endMs: Math.min(sunOpen, rangeEnd),
+      isWeekend: true,
+    });
   }
-  // Handle the case where the loop stepped past endMs — check endMs itself.
-  return new Date(endMs).getUTCDay() === 6;
+  return bands;
 }
 
 // ─────────────────────────────────────────────────────────────────────

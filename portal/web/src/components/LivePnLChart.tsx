@@ -167,7 +167,10 @@ export function LivePnLChart({
   const livePath = pointsToPath(anchoredSeries, scaleX, scaleY);
   const backtestPath = pointsToPath(backtestSeries, scaleX, scaleY);
 
-  const gaps = useMemo(() => detectGaps(anchoredSeries), [anchoredSeries]);
+  const gaps = useMemo(
+    () => detectGaps(anchoredSeries, undefined, axisStartMs, axisEndMs),
+    [anchoredSeries, axisStartMs, axisEndMs],
+  );
 
   // ── Drawdown shading polygon (PR 5) ────────────────────────────
   //
@@ -181,20 +184,42 @@ export function LivePnLChart({
     if (anchoredSeries.length === 0) return null;
     const dd = computeDrawdownSeries(anchoredSeries, snapshotBalance);
     if (dd.every((p) => p.drawdownPct === 0)) return null;
-    // Peak edge (top of shaded band) — walk left-to-right at peakBalance.
-    const topEdge = dd.map(
-      (p, i) =>
-        `${i === 0 ? 'M' : 'L'}${scaleX(p.timestampMs).toFixed(1)},${scaleY(p.peakBalance).toFixed(1)}`,
+    // Wilson UAT 2026-07-25: both edges of the drawdown band now
+    // use step-after so the shading follows the equity line's
+    // staircase profile exactly. Straight-line edges bled outside
+    // the emerald line at every close event.
+    const topEdge = _stepAfterPath(
+      dd.map((p) => ({
+        timestampMs: p.timestampMs,
+        balance: p.peakBalance,
+        unrealizedPnl: 0,
+      })),
+      scaleX,
+      scaleY,
     );
-    // Balance edge (bottom of shaded band) — walk right-to-left at
-    // actual balance so the polygon closes.
-    const bottomEdge = [...dd]
-      .reverse()
-      .map(
-        (p) =>
-          `L${scaleX(p.timestampMs).toFixed(1)},${scaleY(p.balance).toFixed(1)}`,
-      );
-    return [...topEdge, ...bottomEdge, 'Z'].join(' ');
+    // Bottom edge walks right-to-left over the balance curve so the
+    // polygon closes. Reverse the series + reverse the step pattern:
+    // for a right-to-left step-after equivalent, we do step-BEFORE
+    // (vertical first, then horizontal to the prev sample's x).
+    const rev = [...dd].reverse();
+    const bottomSegs: string[] = [];
+    let prevY = scaleY(rev[0].balance);
+    // Path continues from topEdge's last point at (rev[0].x, peakBalance).
+    // Move vertically to (rev[0].x, balance) then horizontally step-before.
+    bottomSegs.push(`L${scaleX(rev[0].timestampMs).toFixed(1)},${prevY.toFixed(1)}`);
+    for (let i = 1; i < rev.length; i++) {
+      const p = rev[i];
+      const x = scaleX(p.timestampMs).toFixed(1);
+      const y = scaleY(p.balance);
+      // step-before (walking right→left): vertical first at prev x,
+      // then horizontal to (x, prevY = y)... but here we're going
+      // backwards, so we go horizontal to x at prevY, then vertical
+      // to y. Same shape as step-after in the other direction.
+      bottomSegs.push(`L${x},${prevY.toFixed(1)}`);
+      bottomSegs.push(`L${x},${y.toFixed(1)}`);
+      prevY = y;
+    }
+    return `${topEdge} ${bottomSegs.join(' ')} Z`;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     anchoredSeries,
@@ -539,13 +564,15 @@ export function LivePnLChart({
             Drawdown
           </span>
           <span className="flex items-center gap-1.5">
-            <span className="text-emerald-500 text-xs leading-none">▲</span>
-            Long
+            <span className="inline-block w-2 h-2 rounded-full bg-emerald-500" />
+            <span>/</span>
+            <span className="inline-block w-2 h-2 rounded-full bg-rose-500" />
+            Trade exit (W / L)
           </span>
-          <span className="flex items-center gap-1.5">
-            <span className="text-rose-500 text-xs leading-none">▼</span>
-            Short
-          </span>
+          {/* Wilson UAT 2026-07-25: direction markers removed — the
+              StrategyChart candles below already surface trade
+              direction against price, and the extra triangles cluttered
+              the equity plot without adding signal. */}
         </div>
 
         <svg
@@ -737,57 +764,44 @@ export function LivePnLChart({
             );
           })}
 
-          {/* ── Trade markers (PR 3) ───────────────────────────────── */}
-          {/* Entry triangles sit on a small strip just above the x-axis
-              baseline; exit circles land on the equity curve. Both are
-              hover-swappable and click-scrollable. */}
+          {/* ── Trade exit markers (PR 3, revised 2026-07-25) ──────── */}
+          {/* Wilson UAT 2026-07-25: direction (long/short) markers
+              removed — the sibling StrategyChart owns direction
+              analysis against price. Only exit circles remain
+              here, positioned on the equity curve at (exitTs,
+              equityAtExit) and coloured by W/L. Trades that have
+              no P&L yet (null net_pnl AND null pnl — reconciler
+              hasn't finalised) DON'T render a dot; a flat trade
+              (exactly 0) renders neither W nor L colour so it
+              doesn't get mistaken for a financing charge. */}
           <g>
             {projections.map((p) => {
+              if (!p.exit) return null;
+              // Only render dot when outcome is a definitive W or L.
+              // Null (pending reconciliation) and 'flat' (exact 0)
+              // are both skipped — they'd otherwise appear as grey
+              // and be indistinguishable from a financing marker.
+              if (p.outcome !== 'win' && p.outcome !== 'loss') return null;
               const inRange =
-                p.entryX >= PADDING_LEFT &&
-                p.entryX <= PADDING_LEFT + PLOT_WIDTH;
+                p.exit.x >= PADDING_LEFT &&
+                p.exit.x <= PADDING_LEFT + PLOT_WIDTH;
               if (!inRange) return null;
-              const baseY = PADDING_TOP + PLOT_HEIGHT - 2;
-              const isLong = p.side === 'buy';
-              // ▲ (long) apex up; ▼ (short) apex down.
-              const trianglePts = isLong
-                ? `${p.entryX},${baseY - 8} ${p.entryX - 4},${baseY} ${p.entryX + 4},${baseY}`
-                : `${p.entryX - 4},${baseY - 8} ${p.entryX + 4},${baseY - 8} ${p.entryX},${baseY}`;
-              const sideColor = isLong ? '#10b981' : '#f43f5e';
               const isHovered = p.tradeId === hoverTradeId;
               return (
-                <g key={`m-${p.tradeId}`}>
-                  <polygon
-                    points={trianglePts}
-                    fill={sideColor}
-                    opacity={isHovered ? 1 : 0.85}
-                    style={{ cursor: 'pointer' }}
-                    onPointerEnter={() => setHoverTradeId(p.tradeId)}
-                    onPointerLeave={() => setHoverTradeId(null)}
-                    onClick={() => handleTradeClick(p.tradeId)}
-                  />
-                  {p.exit && (
-                    <circle
-                      cx={p.exit.x}
-                      cy={p.exit.y}
-                      r={isHovered ? 5 : 3.5}
-                      fill={
-                        p.outcome === 'win'
-                          ? '#10b981'
-                          : p.outcome === 'loss'
-                            ? '#f43f5e'
-                            : '#94a3b8'
-                      }
-                      stroke="white"
-                      strokeWidth={1}
-                      className="dark:stroke-slate-900"
-                      style={{ cursor: 'pointer' }}
-                      onPointerEnter={() => setHoverTradeId(p.tradeId)}
-                      onPointerLeave={() => setHoverTradeId(null)}
-                      onClick={() => handleTradeClick(p.tradeId)}
-                    />
-                  )}
-                </g>
+                <circle
+                  key={`m-${p.tradeId}`}
+                  cx={p.exit.x}
+                  cy={p.exit.y}
+                  r={isHovered ? 5 : 3.5}
+                  fill={p.outcome === 'win' ? '#10b981' : '#f43f5e'}
+                  stroke="white"
+                  strokeWidth={1}
+                  className="dark:stroke-slate-900"
+                  style={{ cursor: 'pointer' }}
+                  onPointerEnter={() => setHoverTradeId(p.tradeId)}
+                  onPointerLeave={() => setHoverTradeId(null)}
+                  onClick={() => handleTradeClick(p.tradeId)}
+                />
               );
             })}
           </g>
@@ -1344,12 +1358,41 @@ function pointsToPath(
   scaleX: (ms: number) => number,
   scaleY: (balance: number) => number,
 ): string | null {
+  // Wilson UAT 2026-07-25: switched from a straight-line join to a
+  // "step-after" path. Realised balance only changes at trade-close
+  // moments; the samples in between hold the previous balance flat.
+  // A straight-line join between two samples across a close event
+  // draws a slanted line that visually implies balance drifted
+  // between measurements — the truth is that balance stayed at A
+  // until the close, then jumped to B. Step-after models that:
+  // horizontal segment at A until the next sample's x, then a
+  // vertical jump to B, then continue horizontally.
   if (!series.length) return null;
-  const segments = series.map((p, i) => {
-    const cmd = i === 0 ? 'M' : 'L';
-    return `${cmd}${scaleX(p.timestampMs).toFixed(1)},${scaleY(p.balance).toFixed(1)}`;
-  });
-  return segments.join(' ');
+  return _stepAfterPath(series, scaleX, scaleY);
+}
+
+/** Build a step-after SVG path string. Exported for Vitest. */
+export function _stepAfterPath(
+  series: EquityPoint[],
+  scaleX: (ms: number) => number,
+  scaleY: (balance: number) => number,
+): string {
+  if (series.length === 0) return '';
+  const segs: string[] = [];
+  const first = series[0];
+  let prevY = scaleY(first.balance);
+  segs.push(`M${scaleX(first.timestampMs).toFixed(1)},${prevY.toFixed(1)}`);
+  for (let i = 1; i < series.length; i++) {
+    const p = series[i];
+    const x = scaleX(p.timestampMs).toFixed(1);
+    const y = scaleY(p.balance);
+    // Horizontal segment to (x, prevY), then vertical to (x, y).
+    // When y === prevY the vertical L is a no-op; SVG collapses it.
+    segs.push(`L${x},${prevY.toFixed(1)}`);
+    segs.push(`L${x},${y.toFixed(1)}`);
+    prevY = y;
+  }
+  return segs.join(' ');
 }
 
 // ─────────────────────────────────────────────────────────────────────
