@@ -1038,13 +1038,16 @@ function ChartTooltip({
   const equity = hoverPoint.balance;
   const unreal = hoverPoint.unrealizedPnl;
   const balanceChange = equity - snapshotBalance;
-  // Wilson UAT 2026-07-25: separate "balance change" (any account
-  // movement — realised P&L, financing, commissions, external
-  // activity) from strict "realised (trades)" (sum of closed-trade
-  // net_pnl to this cursor position). Prior code labelled balance
-  // change as "Realised" which was misleading when overnight swap
-  // moved the balance without any closes.
+  // Wilson UAT 2026-07-26: split account movement into its three
+  // meaningful components rather than showing the raw balance
+  // delta. `tradesRealised` = sum of closed-trade net_pnl up to
+  // the cursor; `interestCharged` = residual (balance change
+  // minus trade P&L) — typically overnight financing / swap, but
+  // absorbs commission and any other non-trade account activity
+  // too. Rendered separately so Wilson can eyeball how much the
+  // strategy actually earned vs how much interest ate.
   const tradesRealised = hoverTradeStats?.realisedPnl ?? 0;
+  const interestCharged = balanceChange - tradesRealised;
   const total = balanceChange + unreal;
   const drift = hoverBacktest != null ? equity - hoverBacktest : null;
 
@@ -1084,14 +1087,14 @@ function ChartTooltip({
           tone={total >= 0 ? 'up' : 'down'}
         />
         <TooltipRow
-          label="Realised (trades)"
+          label="Realised"
           value={_fmtSigned(tradesRealised)}
           tone={tradesRealised >= 0 ? 'up' : 'down'}
         />
         <TooltipRow
-          label="Balance change"
-          value={_fmtSigned(balanceChange)}
-          tone={balanceChange >= 0 ? 'up' : 'down'}
+          label="Interest charged"
+          value={_fmtSigned(interestCharged)}
+          tone={interestCharged >= 0 ? 'up' : 'down'}
         />
         <TooltipRow
           label="Unrealised"
