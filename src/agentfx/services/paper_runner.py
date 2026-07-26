@@ -1470,6 +1470,14 @@ def _close_position_and_persist(
     long_com = float(result.get("long_commission", 0.0) or 0.0)
     short_com = float(result.get("short_commission", 0.0) or 0.0)
     total_com = long_com + short_com
+    # v0.6.4: capture the OANDA fill transaction IDs so the reconciler
+    # can tell "runner already reconciled this exact close" apart from
+    # "runner marked closed with a local estimate". Prefer whichever
+    # side actually filled; both being present in the same close is
+    # possible (hedged position) but rare.
+    close_txn_id = result.get("long_fill_transaction_id") or result.get(
+        "short_fill_transaction_id"
+    )
 
     # Update every open Trade row for this run — a normal single-side
     # position will have exactly one; the multi-fill / partial-close
@@ -1507,6 +1515,15 @@ def _close_position_and_persist(
                 t.financing = float(t.financing or 0.0) + total_fin * share
             if total_com:
                 t.commission = float(t.commission or 0.0) + total_com * share
+            # v0.6.4: stamp the OANDA fill txn ID so the reconciler's
+            # idempotency guard recognises this close is already fully
+            # reconciled with authoritative OANDA numbers. Without
+            # this, the reconciler's new txn-ID-based guard treats the
+            # runner's close as unreconciled and would re-write pnl
+            # from the ORDER_FILL — which is fine (same value) but
+            # double-writes financing.
+            if close_txn_id:
+                t.broker_close_transaction_id = str(close_txn_id)
         db.commit()
 
     _write_decision(

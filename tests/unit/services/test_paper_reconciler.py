@@ -213,11 +213,16 @@ class TestReconcile:
         assert trade.exit_reason == "target"
         assert trade.pnl == pytest.approx(50.00)
 
-    def test_already_closed_trade_not_rewritten(self):
-        """If our runner already closed the trade (e.g., via
-        opposite_flip), the reconciler must not overwrite the values
-        with the broker's later ORDER_FILL for what's essentially
-        the same close event."""
+    def test_already_reconciled_same_txn_not_rewritten(self):
+        """Idempotency: if the trade's `broker_close_transaction_id`
+        already matches this ORDER_FILL's id, the reconciler must
+        not re-write. Wilson UAT 2026-07-26 changed this guard from
+        "any exit_timestamp present" to "same txn id" so that trades
+        the runner marked closed with a LOCAL estimate still get
+        overwritten with OANDA's authoritative realizedPL — while
+        genuine repeat reconciliations of the same close event stay
+        idempotent.
+        """
         db = MagicMock()
         run = _make_run(last_txn_id="300")
         client = MagicMock()
@@ -238,17 +243,64 @@ class TestReconcile:
         pre_existing_exit = datetime(2026, 7, 15, 13, 40, tzinfo=UTC)
         trade = _make_trade(broker_trade_id="broker-42", exit_ts=pre_existing_exit)
         trade.exit_reason = "opposite_flip"
-        trade.pnl = -5.0  # runner-recorded value
+        trade.pnl = -5.0
+        trade.broker_close_transaction_id = "305"  # already reconciled this txn
         _wire_trade_lookup(db, {"broker-42": trade})
 
         result = reconcile_broker_transactions(db=db, run=run, client=client)
 
-        # No update — trade was already closed.
         assert result.trades_updated == 0
-        # Original runner-recorded values preserved.
         assert trade.exit_timestamp == pre_existing_exit
         assert trade.exit_reason == "opposite_flip"
         assert trade.pnl == -5.0
+
+    def test_local_estimate_gets_overwritten_by_oanda_realizedpl(self):
+        """Wilson UAT 2026-07-26 regression: OANDA's SL/TP closed a
+        position while the runner's local `_reconcile_broker_side_close`
+        wrote a placeholder pnl (either 0 for the "broker_other"
+        classification path, or an in-wrong-currency estimate for
+        non-USD accounts). The reconciler MUST overwrite that
+        placeholder when the ORDER_FILL with matching broker_trade_id
+        arrives, because OANDA's realizedPL is the only authoritative
+        source. Under the pre-fix guard (`exit_timestamp is not None
+        → skip`) the placeholder stuck around and the tooltip's
+        Realised line was off by a combined $271 across Wilson's run.
+        """
+        db = MagicMock()
+        run = _make_run(last_txn_id="900")
+        client = MagicMock()
+        client.get_transactions_since.return_value = {
+            "transactions": [
+                {
+                    "id": "918",
+                    "type": "ORDER_FILL",
+                    "reason": "MARKET_ORDER_POSITION_CLOSEOUT",
+                    "time": "2026-07-20T00:01:09.820Z",
+                    "price": "1.14286",
+                    "pl": "-81.1604",
+                    "financing": "0.0000",
+                    "tradesClosed": [{"tradeID": "914", "realizedPL": "-81.1604"}],
+                }
+            ],
+            "lastTransactionID": "918",
+        }
+        # Trade already marked "closed" by the runner's local
+        # estimator with the placeholder values Wilson saw.
+        placeholder_exit = datetime(2026, 7, 20, 0, 1, 9, tzinfo=UTC)
+        trade = _make_trade(broker_trade_id="914", exit_ts=placeholder_exit)
+        trade.exit_price = 1.1425  # runner defaulted to entry_price
+        trade.pnl = 0.0  # placeholder
+        trade.exit_reason = "broker_other"
+        trade.broker_close_transaction_id = None  # NOT yet reconciled
+        _wire_trade_lookup(db, {"914": trade})
+
+        result = reconcile_broker_transactions(db=db, run=run, client=client)
+
+        assert result.trades_updated == 1
+        assert trade.pnl == -81.1604  # OANDA truth now stored
+        assert trade.exit_price == 1.14286  # OANDA fill price replaces estimate
+        assert trade.exit_reason == "broker_other"  # already classified — kept
+        assert trade.broker_close_transaction_id == "918"  # idempotency stamp
 
     def test_unknown_broker_trade_id_noted_not_updated(self):
         """A close for a trade we don't have (e.g., manual OANDA-side

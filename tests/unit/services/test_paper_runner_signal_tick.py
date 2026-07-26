@@ -406,6 +406,59 @@ class TestSignalTick:
         assert closed
         assert "max_hold_bars=5" in closed[0].reasoning_text
 
+    def test_runner_close_stamps_broker_close_transaction_id(self):
+        """Wilson UAT 2026-07-26: `_close_position_and_persist` must
+        stamp the OANDA fill txn id onto the Trade row so the
+        reconciler's idempotency guard recognises this close as
+        already-authoritatively-reconciled and doesn't overwrite
+        the runner's pnl with what would be the same value from a
+        subsequent /transactions/sinceid poll.
+        """
+        now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+        entry_ts = now - timedelta(seconds=400)
+        strategy = _make_strategy(signals=[0, 0, 0], max_hold_bars=5)
+        candles_df = _mk_candles_df(3, now)
+        fetch = MagicMock(return_value=candles_df)
+
+        client = MagicMock()
+        client.get_position.return_value = {"long_units": 10_000, "short_units": 0}
+        client.close_all_positions.return_value = {
+            "long_realized_pnl": 3.30,
+            "short_realized_pnl": 0.0,
+            "long_fill_transaction_id": "12345",
+            "short_fill_transaction_id": None,
+        }
+        open_trade = SimpleNamespace(
+            id="tr_open",
+            run_id="run_test",
+            entry_price=1.10,
+            quantity=10_000,
+            entry_timestamp=entry_ts,
+            exit_timestamp=None,
+            pnl=None,
+            pnl_pct=None,
+            exit_price=None,
+            broker_close_transaction_id=None,
+        )
+        db = _make_db()
+        _set_open_trade(db, open_trade)
+        db.query.return_value.filter.return_value.count.return_value = 6
+        db.query.return_value.filter.return_value.all.return_value = [open_trade]
+        run = _make_run()
+
+        _signal_tick(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=now,
+        )
+
+        assert open_trade.broker_close_transaction_id == "12345"
+
     def test_max_hold_does_not_fire_across_weekend_gap(self):
         """Wilson UAT 2026-07-17 audit: the old wall-clock max_hold
         check would force-close a Friday-evening entry at Saturday

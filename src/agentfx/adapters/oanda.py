@@ -657,6 +657,8 @@ class OandaClient:
                 "short_financing": 0.0,
                 "long_commission": 0.0,
                 "short_commission": 0.0,
+                "long_fill_transaction_id": None,
+                "short_fill_transaction_id": None,
             }
         try:
             resp = self._request(
@@ -743,6 +745,16 @@ class OandaClient:
             "short_commission": (
                 float(short_fill["commission"]) if "commission" in short_fill else 0.0
             ),
+            # v0.6.4 (Wilson UAT 2026-07-26): OANDA fill transaction
+            # IDs so the runner can stamp `broker_close_transaction_id`
+            # on the corresponding Trade rows. Without this the OANDA
+            # reconciler can't tell a runner-initiated close (that
+            # already has authoritative pnl from THIS response) apart
+            # from a broker-side SL/TP close where the pnl is only a
+            # local estimate — and it would either double-write or
+            # (before the 2026-07-26 fix) skip the trade entirely.
+            "long_fill_transaction_id": str(long_fill.get("id") or "") or None,
+            "short_fill_transaction_id": str(short_fill.get("id") or "") or None,
         }
 
     # ─────────────────────────────────────────────────────────────

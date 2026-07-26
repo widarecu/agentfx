@@ -199,9 +199,25 @@ def reconcile_broker_transactions(*, db, run, client) -> ReconcileResult:
             if trade is None:
                 notes.append(f"unknown broker_trade_id={broker_tid}")
                 continue
-            if trade.exit_timestamp is not None:
-                # Already closed on our side (runner-initiated close
-                # or a previous reconciliation). Don't rewrite.
+            # Idempotency: skip only if we've ALREADY reconciled this
+            # trade against this exact OANDA transaction. `exit_timestamp
+            # is not None` was too broad — it also skipped trades that
+            # the runner had marked closed with a LOCAL estimate (e.g.
+            # `_reconcile_broker_side_close` populates exit_timestamp +
+            # exit_price + a locally-computed pnl the moment it detects
+            # OANDA has flatted the position). Under the old guard the
+            # authoritative OANDA `realizedPL` never overwrote that
+            # estimate. Wilson UAT 2026-07-26 audit found 2 trades in
+            # his EUR_USD run with pnl off by a combined $271: one
+            # with pnl=0 (broker_other classification during weekend
+            # rollover) and one with pnl=$742 vs OANDA's $1094 (local
+            # multiplication in the wrong currency for a non-USD
+            # account). Switching to txn-id-based idempotency lets the
+            # reconciler overwrite the estimate on its next tick.
+            already_reconciled = trade.broker_close_transaction_id and str(
+                trade.broker_close_transaction_id
+            ) == str(txn.get("id") or "")
+            if already_reconciled:
                 continue
             # Prefer `tradeClosed`/`tradesClosed` entry's pnl + financing
             # if it matches this specific trade — falls back to the txn's
