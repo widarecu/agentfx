@@ -14,6 +14,7 @@
 import { describe, expect, it } from 'vitest';
 import type { PaperTradePublic } from '../../src/types/paper';
 import {
+  _isInFinancingWindow,
   detectFinancingEvents,
   interestChargedUpTo,
   type EquityPoint,
@@ -48,119 +49,139 @@ function trade(overrides: Partial<PaperTradePublic>): PaperTradePublic {
 describe('detectFinancingEvents', () => {
   it('returns [] on too-short input', () => {
     expect(detectFinancingEvents([], [])).toEqual([]);
-    expect(detectFinancingEvents([ep('2026-07-17T13:00:00Z', 100)], [])).toEqual(
+    expect(detectFinancingEvents([ep('2026-07-17T21:00:00Z', 100)], [])).toEqual(
       [],
     );
   });
 
-  it('flat-balance series → no events', () => {
+  it('flat-balance series across the financing window → no events', () => {
     const series = [
-      ep('2026-07-17T13:00:00Z', 100_000),
-      ep('2026-07-17T14:00:00Z', 100_000),
-      ep('2026-07-17T15:00:00Z', 100_000),
+      ep('2026-07-17T20:00:00Z', 100_000),
+      ep('2026-07-17T21:00:00Z', 100_000),
+      ep('2026-07-17T22:00:00Z', 100_000),
     ];
     expect(detectFinancingEvents(series, [])).toEqual([]);
   });
 
-  it('single balance change matched to a trade close → suppressed', () => {
-    // Balance drops from 100k → 99.8k at exactly the trade's exit_ts.
+  it('balance drop at 21:00 UTC with no trades in the interval → financing event', () => {
+    // OANDA's daily 21:00 UTC financing charge — no trades closing
+    // nearby → residual is the full delta.
     const series = [
-      ep('2026-07-17T13:00:00Z', 100_000),
-      ep('2026-07-17T14:00:00Z', 99_800),
+      ep('2026-07-17T20:59:00Z', 100_000),
+      ep('2026-07-17T21:01:00Z', 99_983),
     ];
     const trades = [
-      trade({ id: 'a', exit_timestamp: '2026-07-17T14:00:00Z', net_pnl: -200 }),
-    ];
-    expect(detectFinancingEvents(series, trades)).toEqual([]);
-  });
-
-  it('balance change with NO nearby trade → financing event', () => {
-    // Overnight swap: balance dips by $17 at 21:00 UTC (5pm NY),
-    // no trade closed anywhere near that time.
-    const series = [
-      ep('2026-07-17T20:00:00Z', 100_000),
-      ep('2026-07-17T21:00:00Z', 99_983),
-    ];
-    const trades = [
-      // Some earlier close that shouldn't match.
       trade({ id: 'a', exit_timestamp: '2026-07-17T13:00:00Z', net_pnl: 5 }),
     ];
     const events = detectFinancingEvents(series, trades);
     expect(events).toHaveLength(1);
     expect(events[0].timestampMs).toBe(
-      new Date('2026-07-17T21:00:00Z').getTime(),
+      new Date('2026-07-17T21:01:00Z').getTime(),
     );
     expect(events[0].delta).toBeCloseTo(-17, 6);
-    expect(events[0].balance).toBe(99_983);
   });
 
-  it('tolerance window is symmetric — trade close 90s before still counts as match', () => {
-    // Trade exited at 13:59, balance change recorded at 14:00 (60s
-    // later) — within 2min default tolerance → suppressed.
+  it('balance drop INTRADAY (not near 21:00 UTC) → no financing event', () => {
+    // Wilson UAT 2026-07-26 regression: a trade close at Jul 20
+    // 00:01:09 that hit the balance while the runner was down and
+    // only appeared in the equity series at 13:03 UTC — MUST NOT
+    // be flagged as financing, because 13:03 is far from OANDA's
+    // 21:00 UTC daily charge window. Under the old algorithm this
+    // dropped -$81.16 into Wilson's cumulative "interest charged"
+    // even though OANDA had charged $0 financing at that moment.
     const series = [
-      ep('2026-07-17T13:58:00Z', 100_000),
-      ep('2026-07-17T14:00:00Z', 100_050),
+      ep('2026-07-19T23:14:00Z', 98_285.35),
+      ep('2026-07-20T13:03:00Z', 98_138.82), // 13h gap, -$146.53 delta
     ];
+    // Two real trade closes that happened during the equity gap.
     const trades = [
-      trade({ id: 'a', exit_timestamp: '2026-07-17T13:59:00Z', net_pnl: 50 }),
+      trade({
+        id: 'close-2314',
+        exit_timestamp: '2026-07-19T23:14:01Z',
+        net_pnl: -65.37,
+      }),
+      trade({
+        id: 'close-0001',
+        exit_timestamp: '2026-07-20T00:01:09Z',
+        net_pnl: -81.16,
+      }),
     ];
+    // No financing event should be emitted — the delta is fully
+    // explained by the sum of trade closes.
     expect(detectFinancingEvents(series, trades)).toEqual([]);
   });
 
-  it('trade close outside the tolerance → still counts as financing', () => {
-    // Trade exited at 13:00, next balance change at 21:00 (8h later).
-    // Well past the 2-min tolerance → recorded as financing.
-    const series = [
-      ep('2026-07-17T20:00:00Z', 100_000),
-      ep('2026-07-17T21:00:00Z', 99_970),
-    ];
-    const trades = [
-      trade({ id: 'a', exit_timestamp: '2026-07-17T13:00:00Z', net_pnl: 5 }),
-    ];
-    const events = detectFinancingEvents(series, trades);
-    expect(events).toHaveLength(1);
-  });
-
-  it('ignores balance changes smaller than $0.10 (floating-point noise)', () => {
+  it('intraday balance movement WITHOUT any trade close → still no event (not financing time)', () => {
+    // A mystery balance drop at 14:00 UTC (not near 21:00). Even
+    // though no trade explains it, we do NOT emit an event — the
+    // "Interest charged" total only counts real OANDA financing,
+    // which always posts at ~21:00 UTC. Unexplained intraday
+    // movement is a data-quality issue for a different report, not
+    // something to bucket as interest.
     const series = [
       ep('2026-07-17T13:00:00Z', 100_000),
-      ep('2026-07-17T13:01:00Z', 100_000.05), // 5c change — noise
+      ep('2026-07-17T14:00:00Z', 99_800),
     ];
     expect(detectFinancingEvents(series, [])).toEqual([]);
   });
 
-  it('multiple financing events across a week are all captured', () => {
-    // Simulate 5 nights of overnight swap; no trades ever.
+  it('trade close AT 21:00 UTC alongside financing → residual is only the financing', () => {
+    // Rare but real: a trade closes at 21:00 UTC on the same tick
+    // as the daily financing charge. Balance moves by (pnl + fin);
+    // the residual after subtracting the close is just the fin.
+    const series = [
+      ep('2026-07-17T20:58:00Z', 100_000),
+      ep('2026-07-17T21:01:00Z', 100_040), // +$50 close + -$10 fin = +$40
+    ];
+    const trades = [
+      trade({
+        id: 'a',
+        exit_timestamp: '2026-07-17T21:00:00Z',
+        net_pnl: 50,
+      }),
+    ];
+    const events = detectFinancingEvents(series, trades);
+    expect(events).toHaveLength(1);
+    expect(events[0].delta).toBeCloseTo(-10, 6);
+  });
+
+  it('ignores balance changes smaller than $0.10 (floating-point noise)', () => {
+    const series = [
+      ep('2026-07-17T20:59:00Z', 100_000),
+      ep('2026-07-17T21:01:00Z', 100_000.05), // 5c change — noise
+    ];
+    expect(detectFinancingEvents(series, [])).toEqual([]);
+  });
+
+  it('multiple daily financing events across a week are all captured', () => {
+    // 5 nights of overnight swap at 21:00 UTC; no trades ever.
     const series: EquityPoint[] = [];
     let bal = 100_000;
     for (let day = 0; day < 5; day++) {
-      const preMs = Date.UTC(2026, 6, 17 + day, 20, 0);
-      const postMs = Date.UTC(2026, 6, 17 + day, 21, 0);
       series.push({
-        timestampMs: preMs,
+        timestampMs: Date.UTC(2026, 6, 17 + day, 20, 59),
         balance: bal,
         unrealizedPnl: 0,
       });
       bal -= 17;
       series.push({
-        timestampMs: postMs,
+        timestampMs: Date.UTC(2026, 6, 17 + day, 21, 1),
         balance: bal,
         unrealizedPnl: 0,
       });
     }
     const events = detectFinancingEvents(series, []);
     expect(events).toHaveLength(5);
-    // Each event's delta should be ~-17.
     for (const e of events) {
       expect(e.delta).toBeCloseTo(-17, 6);
     }
   });
 
   it('handles open trades correctly (no exit_timestamp to match against)', () => {
-    // Balance drop during an open trade with no close event → financing.
+    // Balance drop at 21:00 with an open trade in flight.
     const series = [
-      ep('2026-07-17T20:00:00Z', 100_000),
-      ep('2026-07-17T21:00:00Z', 99_980),
+      ep('2026-07-17T20:59:00Z', 100_000),
+      ep('2026-07-17T21:01:00Z', 99_980),
     ];
     const trades = [
       trade({
@@ -172,6 +193,70 @@ describe('detectFinancingEvents', () => {
     ];
     const events = detectFinancingEvents(series, trades);
     expect(events).toHaveLength(1);
+    expect(events[0].delta).toBeCloseTo(-20, 6);
+  });
+
+  it('OANDA-truth reconciliation: 6 nights match to the cent', () => {
+    // The exact sequence from Wilson's Jul 17–24 EUR_USD paper run,
+    // reconciled against OANDA's DAILY_FINANCING transaction log.
+    // OANDA charged/credited 6 times: -17.22, +2.98, +2.88, +8.61,
+    // +2.89, +2.87 → total +3.01. This helper against the same
+    // shape of samples must return the same set.
+    const financing = [-17.22, 2.98, 2.88, 8.61, 2.89, 2.87];
+    const dates = [
+      '2026-07-17',
+      '2026-07-20',
+      '2026-07-21',
+      '2026-07-22',
+      '2026-07-23',
+      '2026-07-24',
+    ];
+    const series: EquityPoint[] = [];
+    let bal = 98_302.57;
+    // Anchor sample at 20:00 UTC each day, financing post-charge at 21:01 UTC.
+    dates.forEach((date, i) => {
+      series.push({
+        timestampMs: new Date(`${date}T20:00:00Z`).getTime(),
+        balance: bal,
+        unrealizedPnl: 0,
+      });
+      bal += financing[i];
+      series.push({
+        timestampMs: new Date(`${date}T21:01:00Z`).getTime(),
+        balance: bal,
+        unrealizedPnl: 0,
+      });
+    });
+    const events = detectFinancingEvents(series, []);
+    expect(events).toHaveLength(6);
+    const total = events.reduce((s, e) => s + e.delta, 0);
+    expect(total).toBeCloseTo(3.01, 2);
+  });
+});
+
+describe('_isInFinancingWindow', () => {
+  const check = (iso: string) =>
+    _isInFinancingWindow(new Date(iso).getTime());
+
+  it('accepts 21:00 UTC on the nose', () => {
+    expect(check('2026-07-17T21:00:00Z')).toBe(true);
+  });
+
+  it('accepts through 21:20 UTC (upper bound)', () => {
+    expect(check('2026-07-17T21:20:00Z')).toBe(true);
+    expect(check('2026-07-17T21:21:00Z')).toBe(false);
+  });
+
+  it('accepts back to 20:40 UTC (lower bound)', () => {
+    expect(check('2026-07-17T20:40:00Z')).toBe(true);
+    expect(check('2026-07-17T20:39:00Z')).toBe(false);
+  });
+
+  it('rejects other times of day', () => {
+    expect(check('2026-07-17T00:00:00Z')).toBe(false);
+    expect(check('2026-07-17T12:00:00Z')).toBe(false);
+    expect(check('2026-07-17T13:03:00Z')).toBe(false);
+    expect(check('2026-07-17T22:00:00Z')).toBe(false);
   });
 });
 

@@ -326,6 +326,38 @@ class TestListEquityForRun:
 
         assert [s.id for s in items] == ["snap_1", "snap_2", "snap_3"]
 
+    def test_limit_returns_newest_samples(self, db):
+        """Regression: Wilson UAT 2026-07-26. The old ASC + LIMIT
+        query silently truncated to the OLDEST N samples; a 9-day
+        paper run wrote 6,860 samples but the chart only ever saw
+        the first 5,000 (through Jul 23). All downstream calcs
+        (financing detection, tooltip totals) were off by whatever
+        happened in the truncated tail. The endpoint must always
+        return the NEWEST N samples in chronological (oldest-first)
+        order so the chart's right edge is always current.
+        """
+        user = _make_user(db)
+        run = _make_paper_run(db, user.id)
+        base = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+        for i in range(10):
+            db.add(
+                models.PaperEquitySnapshot(
+                    id=f"snap_{i:02}",
+                    run_id=run.id,
+                    timestamp=base + timedelta(minutes=i),
+                    balance=10_000.0 + i,
+                    unrealized_pnl=0.0,
+                )
+            )
+        db.commit()
+
+        # Ask for the newest 3 — should get snap_07, snap_08, snap_09
+        # in chronological order (NOT snap_00..snap_02, the oldest).
+        items = paper_service.list_equity_for_run(db, run.id, limit=3)
+        assert [s.id for s in items] == ["snap_07", "snap_08", "snap_09"]
+        # Balances also confirm chronological order.
+        assert [s.balance for s in items] == [10_007.0, 10_008.0, 10_009.0]
+
 
 # ─────────────────────────────────────────────────────────────────────
 # get_backtest_overlay

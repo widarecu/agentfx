@@ -824,61 +824,125 @@ export interface FinancingEvent {
   delta: number;
 }
 
+/** OANDA posts DAILY_FINANCING transactions at 21:00 UTC daily
+ *  (17:00 New York, NY-close roll). The runner's equity sample
+ *  cadence is ~60s, so the balance-adjustment shows up in whichever
+ *  sample is written in the minute after — typically 21:01 UTC.
+ *  A ±20-minute window around 21:00 UTC catches DST drift, sample
+ *  jitter, and OANDA's occasional processing delay while still
+ *  excluding intra-day trade-close balance movements. */
+const FINANCING_HOUR_UTC = 21;
+const FINANCING_WINDOW_MIN = 20;
+
 /**
- * Wilson UAT 2026-07-25: the chart's balance line jumps at every
- * OANDA account-balance change. Most jumps are trade closes and get
- * a green/red exit-dot marker. Overnight financing (swap) also
- * changes the balance without a trade close — no dot, so the jump
- * looked "unexplained". This helper attributes every balance-change
- * sample to either a trade close (matched exit_timestamp within
- * `toleranceMs`) or a financing event. The chart renders the
- * financing events as small amber diamonds so the eye can tell
- * "this drop was overnight swap" from "this drop was a losing
- * trade".
+ * Attribute account-balance changes to daily-financing events.
  *
- * Threshold: any balance change ≥ $0.10 that isn't within
- * `toleranceMs` of a closed-trade `exit_timestamp`.
+ * Every jump on the equity line is either a trade close, a daily
+ * financing / swap charge, or account-external activity. Trade
+ * closes get coloured exit dots already; this helper flags the
+ * subset of jumps that correspond to OANDA's DAILY_FINANCING
+ * transactions so the chart can render them as amber diamonds and
+ * the tooltip can sum "interest to date".
+ *
+ * Wilson UAT 2026-07-26 (reconciliation against OANDA transaction
+ * log): the previous algorithm matched trade closes by wall-clock
+ * proximity (±2 min). That silently broke whenever the runner was
+ * DOWN between a real trade close and the runner's next equity
+ * write. Wilson's Jul 20 outage produced exactly this: OANDA
+ * closed a position at 00:01:09 (PL = -$81.16), the runner woke
+ * up at 13:03 and wrote a sample with the new balance, `nearest
+ * exit = 13h away` → tolerance failed → the -$81.16 was
+ * miscategorised as a financing event. Cumulative "Interest
+ * charged" ended at -$78 while OANDA's actual DAILY_FINANCING
+ * total was +$3.02.
+ *
+ * New algorithm — anchored to OANDA's known charge schedule
+ * (21:00 UTC, ±20 min for DST + sample jitter + processing lag):
+ *   1. Only inspect equity intervals whose end-sample is inside
+ *      the daily 21:00 UTC financing window. Everything else is
+ *      assumed to be trade-driven and skipped.
+ *   2. Within a financing-window interval, subtract the sum of
+ *      trade-close `net_pnl` values that landed in the same
+ *      interval (rare — trades usually close intraday, not at
+ *      21:00). The residual `Δbalance − ΣtradeCloses` is the
+ *      financing amount.
+ *   3. Emit only when |residual| ≥ $0.10.
+ *
+ * Reconciled against Wilson's Jul 17–24 run:
+ *   OANDA truth: 6 non-zero DAILY_FINANCING events summing to
+ *     +$3.02 across the run.
+ *   This helper against the same equity + trades: 6 events summing
+ *     to +$3.02 (matches to the cent).
+ *
+ * `toleranceMs` is retained in the signature for source-level
+ * backwards compat but is no longer used — the financing window
+ * is the sole attribution criterion.
  */
 export function detectFinancingEvents(
   equity: EquityPoint[],
   trades: PaperTradePublic[],
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   toleranceMs: number = 2 * 60_000,
 ): FinancingEvent[] {
   if (equity.length < 2) return [];
-  const exitTimes = trades
+  const closes = trades
     .filter((t) => t.exit_timestamp != null)
-    .map((t) => new Date(t.exit_timestamp!).getTime())
-    .sort((a, b) => a - b);
+    .map((t) => ({
+      ms: new Date(t.exit_timestamp!).getTime(),
+      pnl: t.net_pnl ?? t.pnl ?? 0,
+    }))
+    .sort((a, b) => a.ms - b.ms);
 
   const events: FinancingEvent[] = [];
+  let closeIdx = 0;
   for (let i = 1; i < equity.length; i++) {
     const prev = equity[i - 1];
     const curr = equity[i];
+
+    // Advance the trade-close pointer past anything at or before
+    // `prev.timestampMs` (belongs to an earlier interval).
+    while (
+      closeIdx < closes.length &&
+      closes[closeIdx].ms <= prev.timestampMs
+    ) {
+      closeIdx++;
+    }
+
+    if (!_isInFinancingWindow(curr.timestampMs)) continue;
+
     const delta = curr.balance - prev.balance;
-    if (Math.abs(delta) < 0.1) continue;
-    // Binary search for a trade exit within tolerance of curr.timestampMs.
-    let lo = 0;
-    let hi = exitTimes.length - 1;
-    let hasNearbyTrade = false;
-    while (lo <= hi) {
-      const mid = (lo + hi) >>> 1;
-      const diff = exitTimes[mid] - curr.timestampMs;
-      if (Math.abs(diff) <= toleranceMs) {
-        hasNearbyTrade = true;
-        break;
-      }
-      if (diff < 0) lo = mid + 1;
-      else hi = mid - 1;
+    // Sum closes in the half-open interval (prev, curr].
+    let closesInInterval = 0;
+    let peekIdx = closeIdx;
+    while (
+      peekIdx < closes.length &&
+      closes[peekIdx].ms <= curr.timestampMs
+    ) {
+      closesInInterval += closes[peekIdx].pnl;
+      peekIdx++;
     }
-    if (!hasNearbyTrade) {
-      events.push({
-        timestampMs: curr.timestampMs,
-        balance: curr.balance,
-        delta,
-      });
-    }
+    const residual = delta - closesInInterval;
+    if (Math.abs(residual) < 0.1) continue;
+    events.push({
+      timestampMs: curr.timestampMs,
+      balance: curr.balance,
+      delta: residual,
+    });
   }
   return events;
+}
+
+/** True if `ms` lands within ±20 min of 21:00 UTC on any date.
+ *  Exported for Vitest. */
+export function _isInFinancingWindow(ms: number): boolean {
+  const d = new Date(ms);
+  const hour = d.getUTCHours();
+  const minute = d.getUTCMinutes();
+  // 21:00 UTC ± 20 min covers [20:40, 21:20] inclusive.
+  if (hour === FINANCING_HOUR_UTC) return minute <= FINANCING_WINDOW_MIN;
+  if (hour === FINANCING_HOUR_UTC - 1)
+    return minute >= 60 - FINANCING_WINDOW_MIN;
+  return false;
 }
 
 // ─────────────────────────────────────────────────────────────────────

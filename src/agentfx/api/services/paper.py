@@ -804,10 +804,27 @@ def list_equity_for_run(
     *,
     from_ts: datetime | None = None,
     to_ts: datetime | None = None,
-    limit: int = 5000,
+    limit: int = 20000,
 ) -> list[models.PaperEquitySnapshot]:
     """Persisted equity snapshots for `run_id`, chart-friendly (oldest
     first). `from_ts` / `to_ts` narrow to a visible window on the chart.
+
+    Wilson UAT 2026-07-26: fixed a silent truncation bug. The old code
+    used `ORDER BY timestamp ASC LIMIT 5000` which, for any run with
+    >5000 samples, would silently return the OLDEST 5000 samples and
+    drop everything after that. Wilson's 9-day EUR_USD run had 6860
+    samples; the chart never saw anything past Jul 23 even though the
+    run was still writing samples on Jul 24. All downstream
+    calculations (financing detection, balance sum reconciliation,
+    tooltip totals) were off by whatever happened in the truncated
+    tail.
+
+    Fix: query `ORDER BY timestamp DESC LIMIT N` to grab the NEWEST N
+    samples, then reverse to hand the chart the oldest-first ordering
+    it expects. Raised the default limit to 20000 (~14 days of M1
+    signal-tick cadence) so a longer paper run still fits without
+    truncation. Callers passing an explicit `from_ts`/`to_ts` window
+    still get an ordered slice within that window.
     """
     q = db.query(models.PaperEquitySnapshot).filter(
         models.PaperEquitySnapshot.run_id == run_id
@@ -816,7 +833,9 @@ def list_equity_for_run(
         q = q.filter(models.PaperEquitySnapshot.timestamp >= from_ts)
     if to_ts is not None:
         q = q.filter(models.PaperEquitySnapshot.timestamp <= to_ts)
-    return q.order_by(models.PaperEquitySnapshot.timestamp).limit(limit).all()
+    rows = q.order_by(models.PaperEquitySnapshot.timestamp.desc()).limit(limit).all()
+    rows.reverse()
+    return rows
 
 
 # ─────────────────────────────────────────────────────────────────────
