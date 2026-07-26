@@ -33,6 +33,7 @@ import {
   detectFinancingEvents,
   detectGaps,
   filterByRange,
+  interestChargedUpTo,
   interpolateOverlay,
   nearestSample,
   pickAxisTicks,
@@ -366,6 +367,10 @@ export function LivePnLChart({
     () => (hoverMs != null ? tradesUpTo(trades, hoverMs) : null),
     [hoverMs, trades],
   );
+  // Financing events computed later (they need windowedSeries), but
+  // "interest to date" should be computed against the FULL trade set
+  // + FULL financing event set — the summary is cumulative from run
+  // start, not from the current range-selector window.
 
   // ── Trade markers (PR 3) ───────────────────────────────────────
   const projections = useMemo(
@@ -386,6 +391,21 @@ export function LivePnLChart({
   const financingEvents: FinancingEvent[] = useMemo(
     () => detectFinancingEvents(windowedSeries, trades),
     [windowedSeries, trades],
+  );
+  // Full-history financing events for the tooltip's cumulative
+  // "Interest charged" line. Computed against the un-windowed
+  // liveSeries so a user on the 24h range still sees the correct
+  // run-total (not "interest paid in the last 24h").
+  const allFinancingEvents: FinancingEvent[] = useMemo(
+    () => detectFinancingEvents(liveSeries, trades),
+    [liveSeries, trades],
+  );
+  const hoverInterestCharged = useMemo(
+    () =>
+      hoverMs != null
+        ? interestChargedUpTo(trades, allFinancingEvents, hoverMs)
+        : 0,
+    [hoverMs, trades, allFinancingEvents],
   );
   const [hoverFinancingIdx, setHoverFinancingIdx] = useState<number | null>(
     null,
@@ -957,6 +977,7 @@ export function LivePnLChart({
               hoverPoint={hoverPoint}
               hoverBacktest={hoverBacktest}
               hoverTradeStats={hoverTradeStats}
+              hoverInterestCharged={hoverInterestCharged}
               runStartMs={runStartMs}
               snapshotBalance={snapshotBalance}
               scaleX={scaleX}
@@ -1004,6 +1025,10 @@ interface ChartTooltipProps {
     closed: number;
     realisedPnl: number;
   } | null;
+  /** Cumulative interest / financing paid from run start to the
+   *  cursor. Signed (negative = charge). See
+   *  `interestChargedUpTo` for derivation. */
+  hoverInterestCharged: number;
   runStartMs: number;
   snapshotBalance: number;
   scaleX: (ms: number) => number;
@@ -1014,6 +1039,7 @@ function ChartTooltip({
   hoverPoint,
   hoverBacktest,
   hoverTradeStats,
+  hoverInterestCharged,
   runStartMs,
   snapshotBalance,
   scaleX,
@@ -1038,16 +1064,20 @@ function ChartTooltip({
   const equity = hoverPoint.balance;
   const unreal = hoverPoint.unrealizedPnl;
   const balanceChange = equity - snapshotBalance;
-  // Wilson UAT 2026-07-26: split account movement into its three
-  // meaningful components rather than showing the raw balance
-  // delta. `tradesRealised` = sum of closed-trade net_pnl up to
-  // the cursor; `interestCharged` = residual (balance change
-  // minus trade P&L) — typically overnight financing / swap, but
-  // absorbs commission and any other non-trade account activity
-  // too. Rendered separately so Wilson can eyeball how much the
-  // strategy actually earned vs how much interest ate.
+  // Wilson UAT 2026-07-26 (second round): the earlier "Interest
+  // charged = balanceChange - tradesRealised" residual was
+  // non-monotonic — trade closes moved held-financing INTO the
+  // trade's net_pnl (which is `pnl + financing - commission`
+  // per paper_runner.py:1508), snapping the residual back toward
+  // zero. Wilson observed -17 → 0 → -81 → -78 as the cursor
+  // moved forward, which correctly reflects "interest not yet
+  // absorbed into a closed trade" but does NOT match the
+  // requested semantic of "total interest paid over the whole
+  // period to date". Now sourced from `interestChargedUpTo`,
+  // which sums closed-trade `financing` fields + overnight-swap
+  // FinancingEvent deltas up to the cursor — a strictly
+  // cumulative signed number.
   const tradesRealised = hoverTradeStats?.realisedPnl ?? 0;
-  const interestCharged = balanceChange - tradesRealised;
   const total = balanceChange + unreal;
   const drift = hoverBacktest != null ? equity - hoverBacktest : null;
 
@@ -1093,8 +1123,8 @@ function ChartTooltip({
         />
         <TooltipRow
           label="Interest charged"
-          value={_fmtSigned(interestCharged)}
-          tone={interestCharged >= 0 ? 'up' : 'down'}
+          value={_fmtSigned(hoverInterestCharged)}
+          tone={hoverInterestCharged >= 0 ? 'up' : 'down'}
         />
         <TooltipRow
           label="Unrealised"

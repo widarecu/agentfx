@@ -15,7 +15,9 @@ import { describe, expect, it } from 'vitest';
 import type { PaperTradePublic } from '../../src/types/paper';
 import {
   detectFinancingEvents,
+  interestChargedUpTo,
   type EquityPoint,
+  type FinancingEvent,
 } from '../../src/utils/livePnlChart';
 
 function ep(ts: string, balance: number): EquityPoint {
@@ -170,5 +172,137 @@ describe('detectFinancingEvents', () => {
     ];
     const events = detectFinancingEvents(series, trades);
     expect(events).toHaveLength(1);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// interestChargedUpTo — Wilson UAT 2026-07-26
+// ─────────────────────────────────────────────────────────────────────
+
+function fev(ts: string, delta: number, balance = 0): FinancingEvent {
+  return { timestampMs: new Date(ts).getTime(), delta, balance };
+}
+
+describe('interestChargedUpTo', () => {
+  it('returns 0 when nothing to sum', () => {
+    expect(
+      interestChargedUpTo(
+        [],
+        [],
+        new Date('2026-07-17T13:00:00Z').getTime(),
+      ),
+    ).toBe(0);
+  });
+
+  it('sums closed-trade financing fields up to the cursor', () => {
+    const trades = [
+      trade({
+        id: 'a',
+        exit_timestamp: '2026-07-17T14:00:00Z',
+        financing: -3,
+      }),
+      trade({
+        id: 'b',
+        exit_timestamp: '2026-07-18T14:00:00Z',
+        financing: -5,
+      }),
+      trade({
+        id: 'c',
+        exit_timestamp: '2026-07-19T14:00:00Z',
+        financing: -7,
+      }),
+    ];
+    // Cursor at Jul 18 15:00 UTC — first two closed, third not yet.
+    const cursor = new Date('2026-07-18T15:00:00Z').getTime();
+    expect(interestChargedUpTo(trades, [], cursor)).toBe(-8);
+  });
+
+  it('sums financing events up to the cursor', () => {
+    const events = [
+      fev('2026-07-17T21:00:00Z', -17),
+      fev('2026-07-18T21:00:00Z', -18),
+      fev('2026-07-19T21:00:00Z', -19),
+    ];
+    const cursor = new Date('2026-07-18T22:00:00Z').getTime();
+    expect(interestChargedUpTo([], events, cursor)).toBe(-35);
+  });
+
+  it('combines trade financing + events without double-counting', () => {
+    // Realistic mix: one closed trade with financing embedded, plus
+    // one overnight-swap event on a still-open position.
+    const trades = [
+      trade({
+        id: 'closed',
+        exit_timestamp: '2026-07-18T14:00:00Z',
+        financing: -4,
+      }),
+    ];
+    const events = [fev('2026-07-18T21:00:00Z', -12)];
+    const cursor = new Date('2026-07-19T00:00:00Z').getTime();
+    expect(interestChargedUpTo(trades, events, cursor)).toBe(-16);
+  });
+
+  it('is monotonically non-increasing (Wilson UAT 2026-07-26)', () => {
+    // The exact shape Wilson wanted: cursor moves right over time,
+    // the returned magnitude only grows (or stays flat) — never
+    // snaps back toward zero the way the old residual formula did.
+    const trades = [
+      trade({
+        id: 'a',
+        exit_timestamp: '2026-07-18T14:00:00Z',
+        financing: -3,
+      }),
+      trade({
+        id: 'b',
+        exit_timestamp: '2026-07-20T14:00:00Z',
+        financing: -5,
+      }),
+    ];
+    const events = [
+      fev('2026-07-17T21:00:00Z', -2),
+      fev('2026-07-19T21:00:00Z', -2),
+      fev('2026-07-21T21:00:00Z', -2),
+    ];
+    const cursors = [
+      '2026-07-17T00:00:00Z',
+      '2026-07-18T00:00:00Z',
+      '2026-07-19T00:00:00Z',
+      '2026-07-20T00:00:00Z',
+      '2026-07-21T00:00:00Z',
+      '2026-07-22T00:00:00Z',
+    ].map((c) => new Date(c).getTime());
+    const values = cursors.map((c) => interestChargedUpTo(trades, events, c));
+    // Each successive value should be ≤ the previous (monotone
+    // non-increasing) since financing is a debit.
+    for (let i = 1; i < values.length; i++) {
+      expect(values[i]).toBeLessThanOrEqual(values[i - 1]);
+    }
+  });
+
+  it('ignores open trades (no exit_timestamp)', () => {
+    const trades = [
+      trade({
+        id: 'open',
+        exit_timestamp: null,
+        financing: -99,
+        net_pnl: null,
+      }),
+    ];
+    const cursor = new Date('2026-07-30T00:00:00Z').getTime();
+    // Open trade's financing accrues via daily overnight swap events;
+    // it does NOT contribute to this sum until the trade closes.
+    expect(interestChargedUpTo(trades, [], cursor)).toBe(0);
+  });
+
+  it('handles null financing field on legacy trade rows', () => {
+    const trades = [
+      trade({
+        id: 'a',
+        exit_timestamp: '2026-07-17T14:00:00Z',
+        financing: null,
+      }),
+    ];
+    const cursor = new Date('2026-07-18T00:00:00Z').getTime();
+    expect(interestChargedUpTo(trades, [], cursor)).toBe(0);
   });
 });

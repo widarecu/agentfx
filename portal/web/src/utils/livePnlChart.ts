@@ -731,6 +731,54 @@ export function projectTrade(
   };
 }
 
+/**
+ * Cumulative interest / financing charged from run start to the
+ * cursor. Wilson UAT 2026-07-26: the prior residual formula
+ * `balanceChange - tradesRealised` was non-monotonic — a trade
+ * close moves financing that had been "residual" into that trade's
+ * `net_pnl` (which is `pnl + financing - commission`), so the
+ * residual snapped back toward zero at every close. Wrong shape:
+ * Wilson wanted a running total that only grows (more negative)
+ * over time as more swap is paid.
+ *
+ * Two sources for a strictly-cumulative number:
+ *   - Every closed trade's `financing` field, summed for trades
+ *     whose `exit_timestamp <= cutoffMs`. Captures financing that
+ *     was accrued during the trade's hold and posted at close.
+ *   - Every `FinancingEvent` (balance delta not matched to a trade
+ *     close), summed for `timestampMs <= cutoffMs`. Captures the
+ *     daily overnight swap that hits the account while a position
+ *     is still open (no close event nearby to attribute it to).
+ *
+ * The two sources do NOT overlap: `detectFinancingEvents` explicitly
+ * suppresses balance changes that fall within 2min of any trade's
+ * `exit_timestamp`, so a close-event financing hit is counted only
+ * via the trade row.
+ *
+ * Sign convention matches the underlying fields — negative for a
+ * charge (typical), positive for a credit (rare short-position
+ * swap). The tooltip renders with `_fmtSigned` which prefixes the
+ * sign.
+ */
+export function interestChargedUpTo(
+  trades: PaperTradePublic[],
+  events: FinancingEvent[],
+  cutoffMs: number,
+): number {
+  let sum = 0;
+  for (const t of trades) {
+    if (!t.exit_timestamp) continue;
+    const exitMs = new Date(t.exit_timestamp).getTime();
+    if (exitMs > cutoffMs) continue;
+    sum += t.financing ?? 0;
+  }
+  for (const e of events) {
+    if (e.timestampMs > cutoffMs) break;
+    sum += e.delta;
+  }
+  return sum;
+}
+
 /** Count wins / losses among trades with `exit_timestamp <= cutoffMs`.
  *  Also sums realised net_pnl so the tooltip's "Realised (trades)"
  *  row can render an honest number that agrees with the summary
