@@ -403,7 +403,18 @@ def list_paper_run_equity(
     run_id: str,
     from_ts: datetime | None = None,
     to_ts: datetime | None = None,
-    limit: int = 5000,
+    # Wilson UAT 2026-07-27: bumped from 5000 to 20000. The earlier
+    # `list_equity_for_run` fix (returns newest N samples via ORDER BY
+    # DESC + reverse) was silently overridden by THIS router-level
+    # default — Wilson's 9-day EUR_USD run had ~9,500 samples but the
+    # chart still saw only the newest 5,000, meaning nothing before
+    # Jul 22 rendered. Trade markers from Jul 17–21 got snapped to
+    # the earliest available sample at Jul 22 balance ($97,750),
+    # appearing "outside the balance line" while the flat anchor
+    # ran across days at snapshot balance ($98,303). 20,000 samples
+    # covers ~14 days of the runner's ~60s equity write cadence,
+    # comfortably above the horizon Wilson runs paper trades over.
+    limit: int = 20_000,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(user_service.get_current_active_user),
 ) -> schemas.EquityList:
