@@ -218,6 +218,21 @@ export function PaperRunTradesTable({
                         </div>
                       )}
                     </>
+                  ) : !open ? (
+                    // Wilson UAT 2026-07-28 (v0.6.5): trade shows as
+                    // closed (exit_timestamp is set) but pnl is null →
+                    // OANDA's SL/TP fired between our ticks, the
+                    // runner marked it closed with an estimated exit
+                    // price, and the reconciler will fill in the real
+                    // realizedPL on its next tick (up to ~12 min).
+                    // Distinct from open trades (which show a
+                    // mark-to-market above).
+                    <div
+                      className="text-[10px] uppercase italic font-sans text-amber-600 dark:text-amber-400"
+                      title="Broker-side close (SL/TP fired between ticks). Reconciler will populate the authoritative OANDA realized P&L within ~12 min."
+                    >
+                      pending
+                    </div>
                   ) : (
                     '—'
                   )}

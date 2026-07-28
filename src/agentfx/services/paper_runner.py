@@ -1394,23 +1394,31 @@ def _reconcile_broker_side_close(
         classified = "broker_other"
         exit_price_est = latest_close
 
-    # Approximate pnl in account currency: (exit - entry) * qty for
-    # long; (entry - exit) * qty for short. Same shape as the
-    # backtest engine's per-trade calc — good enough for the chart
-    # marker + trades table. Broker's exact pnl would need a
-    # transaction-history query.
-    signed_move = (
-        exit_price_est - entry_price if is_long else entry_price - exit_price_est
-    )
+    # Wilson UAT 2026-07-28 (v0.6.5): DO NOT write a local pnl
+    # estimate. The prior code computed `(exit - entry) × qty` in
+    # the quote currency, then stored that as `pnl`. Two problems:
+    #   1. For a non-USD account (Wilson's is AUD) this skips
+    #      OANDA's homeConversionFactor — the stored value is off
+    #      by roughly the AUD/USD ratio (~30% under-report).
+    #   2. `exit_price_est` is a stop/target level or bar close, not
+    #      the actual OANDA fill price. Real slippage compounds the
+    #      error.
+    # The reconciler picks up the corresponding ORDER_FILL txn
+    # within one reconciler tick and writes the authoritative
+    # OANDA `realizedPL` (in account currency, from the fill
+    # response). Until then the trade renders as "pending
+    # reconciliation" in the UI — honest and self-heals within
+    # ~12 min. Never shows a wrong number.
+    #
+    # Kept: exit_timestamp + exit_price_est + exit_reason so the
+    # chart's marker + trades table still show the trade as closed.
+    # Pips derived from (entry_price, exit_price_est) are currency-
+    # agnostic and stay approximately correct even without
+    # conversion.
     open_trade.exit_timestamp = now_utc
     open_trade.exit_price = exit_price_est
-    open_trade.pnl = signed_move * float(open_trade.quantity)
-    open_trade.pnl_pct = (
-        (open_trade.pnl / (entry_price * float(open_trade.quantity))) * 100
-        if entry_price
-        else 0.0
-    )
     open_trade.exit_reason = classified
+    # pnl / pnl_pct intentionally left NULL — see comment above.
     db.commit()
 
     _write_decision(
@@ -1420,14 +1428,14 @@ def _reconcile_broker_side_close(
         reason=(
             f"broker-side {classified} fill detected — trade {open_trade.id} "
             f"closed at ~{exit_price_est:.5f} (entry {entry_price:.5f}), "
-            f"pnl ~{open_trade.pnl:.2f}"
+            f"pnl pending reconciler"
         ),
         outputs={
             "paper_run_id": run.id,
             "trade_id": open_trade.id,
             "exit_reason": classified,
             "exit_price": exit_price_est,
-            "pnl": open_trade.pnl,
+            "pnl": None,
         },
     )
 
