@@ -56,13 +56,23 @@ import {
 } from '../types/paper';
 import type { CandleData, TradeSignal } from '../types/optimization';
 import type { StrategyGenome } from '../types/evolution';
-import { fetchLatestCandle, fetchRecentCandles } from '../utils/candles';
+import {
+  fetchCandles,
+  fetchLatestCandle,
+  granularityToSeconds,
+} from '../utils/candles';
 import { buildIndicatorsFromDsl } from '../utils/dslIndicators';
 import { formatUTC } from '../utils/time';
 
 const POLL_INTERVAL_MS = 5_000;
 const CANDLES_POLL_INTERVAL_MS = 60_000; // fresh candles every minute
-const CHART_BARS = 1500;
+// Wilson UAT 2026-07-28: previous CHART_BARS=1500 gave only the last
+// 25h of M1 candles — a 12-day paper run's StrategyChart truncated to
+// today only. Also caused the "X flip" marker bug: entries older than
+// the visible window had no paired price for pip computation. Now
+// pulled dynamically per-run from run.approved_at → now, capped to
+// avoid runaway fetches on very long runs.
+const MAX_CHART_BARS = 30_000; // ~20 days of M1 during market hours
 // Wilson UAT 2026-07-25 (second round): the throttled-append fix
 // wasn't enough. Any poll-synthesised point with `timestampMs:
 // Date.now()` extends the chart's right edge past the last REAL
@@ -224,14 +234,35 @@ export default function PaperRunDetail() {
     };
   }, [run?.evolution_run_id, run?.strategy_genome_id]);
 
+  const [candlesPaused, setCandlesPaused] = useState(false);
   useEffect(() => {
     if (!run) return;
     let cancelled = false;
     const load = async () => {
       setCandlesLoading(true);
       try {
+        // Fetch from run.approved_at (or a bounded lookback if the
+        // run predates the cap) up to now. Prevents the "chart only
+        // shows the last N hours" bug Wilson caught on 2026-07-28.
+        const now = new Date();
+        const runStartMs = run.approved_at
+          ? new Date(run.approved_at).getTime()
+          : run.started_at
+            ? new Date(run.started_at).getTime()
+            : now.getTime() - 24 * 60 * 60 * 1000;
+        const capMs =
+          MAX_CHART_BARS *
+          granularityToSeconds(run.granularity) *
+          1000;
+        const fromMs = Math.max(runStartMs, now.getTime() - capMs);
+        const fromIso = new Date(fromMs).toISOString();
         const [windowed, latest] = await Promise.all([
-          fetchRecentCandles(run.instrument, run.granularity, CHART_BARS),
+          fetchCandles(
+            run.instrument,
+            run.granularity,
+            fromIso,
+            now.toISOString(),
+          ),
           fetchLatestCandle(run.instrument, run.granularity),
         ]);
         if (!cancelled) {
@@ -245,7 +276,13 @@ export default function PaperRunDetail() {
     void load();
     // Only auto-refresh candles for non-terminal runs — a completed
     // or halted run's chart doesn't need to keep pulling new bars.
+    // Also respects the user's pause toggle (Wilson UAT 2026-07-28).
     if (run && isTerminal(run.status)) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    if (candlesPaused) {
       return () => {
         cancelled = true;
       };
@@ -255,7 +292,14 @@ export default function PaperRunDetail() {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [run?.instrument, run?.granularity, run?.status]);
+  }, [
+    run?.instrument,
+    run?.granularity,
+    run?.status,
+    run?.approved_at,
+    run?.started_at,
+    candlesPaused,
+  ]);
 
   const indicators = useMemo(
     () => buildIndicatorsFromDsl(genome?.dsl_json ?? null, candles),
@@ -622,22 +666,42 @@ export default function PaperRunDetail() {
               Price + indicators — {run.instrument} {run.granularity}
             </div>
             <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Live candles refresh every 60s. Indicators are computed from
-              the same DSL the runner executes. Entry / exit markers land
-              once the /paper-runs/{`{id}`}/trades endpoint ships in v0.6.1.
+              {candlesPaused
+                ? 'Auto-refresh paused — click Resume to pull fresh bars.'
+                : `Live candles refresh every ${CANDLES_POLL_INTERVAL_MS / 1000}s. Indicators are computed from the same DSL the runner executes.`}
             </div>
           </div>
-          {candlesLoading && (
-            <span className="text-xs text-slate-500 dark:text-slate-400 inline-flex items-center gap-1">
-              <Loader2 className="w-3 h-3 animate-spin" />
-              refreshing…
-            </span>
-          )}
-          {!candlesLoading && candles.length > 0 && (
-            <span className="text-xs text-slate-500 dark:text-slate-400">
-              {candles.length.toLocaleString()} bars loaded
-            </span>
-          )}
+          <div className="inline-flex items-center gap-3">
+            {candlesLoading && (
+              <span className="text-xs text-slate-500 dark:text-slate-400 inline-flex items-center gap-1">
+                <Loader2 className="w-3 h-3 animate-spin" />
+                refreshing…
+              </span>
+            )}
+            {!candlesLoading && candles.length > 0 && (
+              <span className="text-xs text-slate-500 dark:text-slate-400">
+                {candles.length.toLocaleString()} bars loaded
+              </span>
+            )}
+            {!isTerminal(run.status) && (
+              <button
+                type="button"
+                onClick={() => setCandlesPaused((p) => !p)}
+                className={`text-xs px-2 py-1 rounded border transition-colors ${
+                  candlesPaused
+                    ? 'border-emerald-400 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-50 dark:hover:bg-emerald-950'
+                    : 'border-slate-300 dark:border-slate-600 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
+                }`}
+                title={
+                  candlesPaused
+                    ? 'Resume auto-refresh (60s cadence)'
+                    : 'Pause auto-refresh so the chart stops jumping while you inspect it'
+                }
+              >
+                {candlesPaused ? '▶ Resume' : '⏸ Pause'}
+              </button>
+            )}
+          </div>
         </div>
         {candlesLoading && candles.length === 0 ? (
           <div className="flex items-center justify-center h-[500px] border border-slate-200 dark:border-slate-700 rounded-lg">

@@ -273,18 +273,37 @@ export default function StrategyChart({
 
       const tMin = data[0].time as number;
       const tMax = data[data.length - 1].time as number;
-      const filtered = signals.filter(s => { const t = toTime(s.timestamp); return t >= tMin && t <= tMax; });
-
-      // Exit P&L map
+      // Wilson UAT 2026-07-28: pair entries with exits across the
+      // FULL `signals` list, then filter for display. The previous
+      // implementation paired only within the visible candle window
+      // — when a trade's entry was older than the leftmost visible
+      // bar, its exit landed alone, `exitPnl.get(...)` returned
+      // undefined, pips defaulted to 0, and the marker rendered as
+      // "X flip". By pairing across the full list first we always
+      // have the entry price available even when the entry itself
+      // is off-screen.
       const exitPnl = new Map<string, number>();
       let lastEntry: { price: number; dir: string } | null = null;
-      for (const s of filtered) {
-        if (s.signalType.startsWith('entry')) { lastEntry = { price: s.price, dir: s.signalType.includes('long') ? 'long' : 'short' }; }
-        else if (lastEntry && s.price) {
-          exitPnl.set(s.timestamp, lastEntry.dir === 'long' ? (s.price - lastEntry.price) / 0.0001 : (lastEntry.price - s.price) / 0.0001);
+      for (const s of signals) {
+        if (s.signalType.startsWith('entry')) {
+          lastEntry = {
+            price: s.price,
+            dir: s.signalType.includes('long') ? 'long' : 'short',
+          };
+        } else if (lastEntry && s.price) {
+          exitPnl.set(
+            s.timestamp,
+            lastEntry.dir === 'long'
+              ? (s.price - lastEntry.price) / 0.0001
+              : (lastEntry.price - s.price) / 0.0001,
+          );
           lastEntry = null;
         }
       }
+      const filtered = signals.filter((s) => {
+        const t = toTime(s.timestamp);
+        return t >= tMin && t <= tMax;
+      });
 
       const markers: SeriesMarker<Time>[] = filtered.map(sig => {
         const isEntry = sig.signalType.startsWith('entry');
