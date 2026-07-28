@@ -245,14 +245,23 @@ export async function getEquityForRun(
   {
     fromTs,
     toTs,
-    limit = 5000,
+    limit,
   }: { fromTs?: string; toTs?: string; limit?: number } = {},
 ): Promise<EquityList> {
-  const params = new URLSearchParams({ limit: String(limit) });
+  // Wilson UAT 2026-07-28: DO NOT hardcode a default limit here. The
+  // backend router owns the default; sending `?limit=5000` from the
+  // frontend silently truncated Wilson's 9-day paper run (9,141
+  // samples exist, chart got only newest 5,000 = from Jul 22 on).
+  // Every previous "fix" that changed the backend limit was no-op'd
+  // by this URL param overriding it. Only send `limit` when the
+  // caller explicitly asks for one.
+  const params = new URLSearchParams();
+  if (limit != null) params.set('limit', String(limit));
   if (fromTs) params.set('from_ts', fromTs);
   if (toTs) params.set('to_ts', toTs);
+  const qs = params.toString();
   const res = await fetch(
-    `${API_BASE_URL}/paper-runs/${runId}/equity?${params}`,
+    `${API_BASE_URL}/paper-runs/${runId}/equity${qs ? `?${qs}` : ''}`,
     { headers: authHeaders() },
   );
   return handleResponse(res);
