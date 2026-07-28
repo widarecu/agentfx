@@ -234,7 +234,7 @@ export default function PaperRunDetail() {
     };
   }, [run?.evolution_run_id, run?.strategy_genome_id]);
 
-  const [candlesPaused, setCandlesPaused] = useState(false);
+  const [livePaused, setLivePaused] = useState(false);
   useEffect(() => {
     if (!run) return;
     let cancelled = false;
@@ -282,7 +282,7 @@ export default function PaperRunDetail() {
         cancelled = true;
       };
     }
-    if (candlesPaused) {
+    if (livePaused) {
       return () => {
         cancelled = true;
       };
@@ -298,7 +298,7 @@ export default function PaperRunDetail() {
     run?.status,
     run?.approved_at,
     run?.started_at,
-    candlesPaused,
+    livePaused,
   ]);
 
   const indicators = useMemo(
@@ -366,12 +366,17 @@ export default function PaperRunDetail() {
     // signal-tick cadence (~60s), so refetching at the same cadence
     // picks them up without ever inventing a phantom "now" that
     // would stretch the chart axis past the last real tick.
+    if (livePaused) {
+      return () => {
+        cancelled = true;
+      };
+    }
     const interval = setInterval(refetchEquity, 60_000);
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [runId, run?.status]);
+  }, [runId, run?.status, livePaused]);
 
   // Wall-clock ticker for the chart's X-axis right edge. Advances
   // every 30s while the run is live so weekend / axis rendering
@@ -379,9 +384,10 @@ export default function PaperRunDetail() {
   // don't need this — chartNowMs is pinned to the last sample.
   useEffect(() => {
     if (run && isTerminal(run.status)) return;
+    if (livePaused) return;
     const interval = setInterval(() => setNowTick(Date.now()), 30_000);
     return () => clearInterval(interval);
-  }, [run?.status]);
+  }, [run?.status, livePaused]);
 
   useEffect(() => {
     if (!runId) return;
@@ -405,12 +411,23 @@ export default function PaperRunDetail() {
         cancelled = true;
       };
     }
+    // Wilson UAT 2026-07-28: honour the live-pause toggle. Trades
+    // poll at 5s cadence; every poll replaces the trades array
+    // reference which forces `chartSignals` to recompute and
+    // StrategyChart to re-render — resetting the lightweight-charts
+    // viewport back to default. The chart "resets every 5s" symptom
+    // was this, not the candle refresh.
+    if (livePaused) {
+      return () => {
+        cancelled = true;
+      };
+    }
     const interval = setInterval(loadTrades, POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [runId, run?.status]);
+  }, [runId, run?.status, livePaused]);
 
   useEffect(() => {
     if (!runId) return;
@@ -440,12 +457,17 @@ export default function PaperRunDetail() {
         cancelled = true;
       };
     }
+    if (livePaused) {
+      return () => {
+        cancelled = true;
+      };
+    }
     const interval = setInterval(loadDecisions, POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [runId, run?.status]);
+  }, [runId, run?.status, livePaused]);
 
   useEffect(() => {
     if (!runId) return;
@@ -666,9 +688,9 @@ export default function PaperRunDetail() {
               Price + indicators — {run.instrument} {run.granularity}
             </div>
             <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              {candlesPaused
-                ? 'Auto-refresh paused — click Resume to pull fresh bars.'
-                : `Live candles refresh every ${CANDLES_POLL_INTERVAL_MS / 1000}s. Indicators are computed from the same DSL the runner executes.`}
+              {livePaused
+                ? 'Live updates paused — candles, trades, decisions and equity are frozen. Click Resume to catch up.'
+                : `Live candles refresh every ${CANDLES_POLL_INTERVAL_MS / 1000}s; trades and decisions every ${POLL_INTERVAL_MS / 1000}s. Indicators computed from the same DSL the runner executes.`}
             </div>
           </div>
           <div className="inline-flex items-center gap-3">
@@ -686,19 +708,19 @@ export default function PaperRunDetail() {
             {!isTerminal(run.status) && (
               <button
                 type="button"
-                onClick={() => setCandlesPaused((p) => !p)}
+                onClick={() => setLivePaused((p) => !p)}
                 className={`text-xs px-2 py-1 rounded border transition-colors ${
-                  candlesPaused
+                  livePaused
                     ? 'border-emerald-400 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-50 dark:hover:bg-emerald-950'
                     : 'border-slate-300 dark:border-slate-600 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
                 }`}
                 title={
-                  candlesPaused
-                    ? 'Resume auto-refresh (60s cadence)'
-                    : 'Pause auto-refresh so the chart stops jumping while you inspect it'
+                  livePaused
+                    ? 'Resume live updates (candles + trades + decisions + equity)'
+                    : 'Pause live updates so the chart stops jumping while you inspect it (kill switch still works)'
                 }
               >
-                {candlesPaused ? '▶ Resume' : '⏸ Pause'}
+                {livePaused ? '▶ Resume live' : '⏸ Pause live'}
               </button>
             )}
           </div>
