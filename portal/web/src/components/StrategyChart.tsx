@@ -332,7 +332,19 @@ export default function StrategyChart({
           const shape: 'arrowUp' | 'arrowDown' = isLong ? 'arrowUp' : 'arrowDown';
           return { time: toTime(sig.timestamp), position, color: isLong ? '#22c55e' : '#ef4444', shape, text, size: 1 };
         }
-        const pips = sig.pnl != null ? sig.pnl * 10000 : exitPnl.get(sig.timestamp) ?? 0;
+        // Wilson UAT 2026-07-28: previous code did
+        //   `sig.pnl != null ? sig.pnl * 10000 : exitPnl.get(...)`
+        // The first branch assumed `sig.pnl` was a RAW PRICE DIFF
+        // (e.g. 0.0028 for a 28-pip move) so `× 10000` yielded pips.
+        // For paper runs `sig.pnl` is populated with the trade's
+        // DOLLAR pnl (from `paper_trades.pnl`), so the multiply
+        // returned nonsense — a −$247.65 loss rendered as −2,476,524.
+        // `exitPnl` above already computes pips correctly from
+        // entry / exit prices for BOTH backtest and paper (paper's
+        // TradeSignal carries entry via the paired entry signal),
+        // so drop the broken branch entirely. `sig.pnl` is unused
+        // here and can stay on the type for future consumers.
+        const pips = exitPnl.get(sig.timestamp) ?? 0;
         const win = pips > 0;
         // Annotate exit markers with the structural reason the
         // compiler emitted (stop / target / max_hold / opposite_flip)
