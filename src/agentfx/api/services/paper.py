@@ -310,6 +310,32 @@ def approve_and_deploy(
     )
     now = datetime.now(UTC)
 
+    # Wilson UAT 2026-07-29 Fix A: stash the genome's OOS fold length
+    # on the run so the paper runner can anchor cumulative-indicator
+    # windows (OBV, ad_line) to the same span validation used. Without
+    # this, live OBV cumulates over an arbitrary rolling window and
+    # produces signals on completely different bars than backtest.
+    # Median of OOS folds' durations is used to be robust against
+    # oddly-sized folds (walk-forward can end early on data
+    # availability); fall back to 30d if the genome has no OOS folds.
+    oos_folds = [
+        f for f in (genome.validation_folds or []) if getattr(f, "is_oos", False)
+    ]
+    if oos_folds:
+        fold_days_list = [
+            (f.fold_end - f.fold_start).total_seconds() / 86400.0 for f in oos_folds
+        ]
+        fold_days_list.sort()
+        n = len(fold_days_list)
+        median = (
+            fold_days_list[n // 2]
+            if n % 2 == 1
+            else ((fold_days_list[n // 2 - 1] + fold_days_list[n // 2]) / 2.0)
+        )
+        fold_length_days = max(1, int(round(median)))
+    else:
+        fold_length_days = 30
+
     run = models.Run(
         id=_new_paper_run_id(body.instrument, body.granularity),
         # `strategy_id` remains nullable for paper runs; the genome
@@ -324,6 +350,10 @@ def approve_and_deploy(
             "instrument": body.instrument,
             "granularity": body.granularity,
             "dsl_json": genome.dsl_json,
+            # Wilson UAT 2026-07-29 Fix A: fold-anchored candle fetch.
+            # See `paper_runner._fold_anchor_from_time` for the semantic.
+            "fold_length_days": fold_length_days,
+            "current_fold_index": 0,
         },
         # Historical initial_balance column stays populated with the
         # snapshot's future landing value once the runner ticks; keep

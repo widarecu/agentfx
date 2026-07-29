@@ -425,6 +425,126 @@ class TestEnsureStartedAt:
         assert run.started_at == first
 
 
+# ─────────────────────────────────────────────────────────────────────
+# _fold_anchor_from_time (Wilson UAT 2026-07-29 Fix A)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestFoldAnchorFromTime:
+    """The paper runner must anchor cumulative indicators (OBV,
+    ad_line) to fold-length windows that match validation semantics,
+    not a fixed rolling window. Full details in the docstring on
+    `_fold_anchor_from_time` and the Wilson UAT 2026-07-29 audit."""
+
+    def _make(
+        self,
+        *,
+        fold_days: int = 22,
+        current_fold_index: int = 0,
+        approved_days_ago: float = 5.0,
+        has_open_position: bool = False,
+    ):
+        from datetime import UTC, datetime, timedelta
+
+        now = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+        approved = now - timedelta(days=approved_days_ago)
+        run = SimpleNamespace(
+            id="run_test",
+            approved_at=approved,
+            parameters={
+                "fold_length_days": fold_days,
+                "current_fold_index": current_fold_index,
+            },
+        )
+        db = MagicMock()
+        # Trades query — count() returns 1 if open position, else 0.
+        db.query.return_value.filter.return_value.count.return_value = (
+            1 if has_open_position else 0
+        )
+        return db, run, now
+
+    def test_within_first_fold_anchor_is_approved_at(self):
+        from agentfx.services.paper_runner import _fold_anchor_from_time
+
+        db, run, now = self._make(approved_days_ago=5.0, fold_days=22)
+        from_time, idx = _fold_anchor_from_time(run=run, db=db, now_utc=now)
+        assert from_time == run.approved_at
+        assert idx == 0
+
+    def test_rolls_to_next_fold_when_boundary_crossed_and_flat(self):
+        """22-day fold + 25 days elapsed + flat position → advance to
+        fold_index=1, anchor becomes approved + 22 days."""
+        from datetime import timedelta
+
+        from agentfx.services.paper_runner import _fold_anchor_from_time
+
+        db, run, now = self._make(
+            approved_days_ago=25.0, fold_days=22, has_open_position=False
+        )
+        from_time, idx = _fold_anchor_from_time(run=run, db=db, now_utc=now)
+        assert idx == 1
+        assert from_time == run.approved_at + timedelta(days=22)
+        # And the run.parameters got updated.
+        assert run.parameters["current_fold_index"] == 1
+        db.commit.assert_called_once()
+
+    def test_does_not_roll_when_position_open(self):
+        """Same 25-day elapsed but a position is open → hold at old
+        anchor. Walk-forward training never carried positions across
+        fold boundaries, so we mirror that: wait for the position to
+        close naturally before advancing."""
+        from agentfx.services.paper_runner import _fold_anchor_from_time
+
+        db, run, now = self._make(
+            approved_days_ago=25.0, fold_days=22, has_open_position=True
+        )
+        from_time, idx = _fold_anchor_from_time(run=run, db=db, now_utc=now)
+        assert idx == 0
+        assert from_time == run.approved_at
+        assert run.parameters["current_fold_index"] == 0
+        db.commit.assert_not_called()
+
+    def test_defaults_to_30d_when_fold_length_missing(self):
+        """Legacy runs deployed before Fix A won't have fold_length_days
+        in parameters. Fall back to a sensible 30-day default rather
+        than crash."""
+        from datetime import UTC, datetime, timedelta
+
+        from agentfx.services.paper_runner import _fold_anchor_from_time
+
+        now = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+        approved = now - timedelta(days=10.0)
+        run = SimpleNamespace(
+            id="run_legacy",
+            approved_at=approved,
+            parameters={},  # empty
+        )
+        db = MagicMock()
+        db.query.return_value.filter.return_value.count.return_value = 0
+        from_time, idx = _fold_anchor_from_time(run=run, db=db, now_utc=now)
+        # 10 days < 30 default → still fold 0.
+        assert idx == 0
+        assert from_time == approved
+
+    def test_multi_fold_boundary_jumps_directly_to_current(self):
+        """If a run was quiet for a long time and multiple fold
+        boundaries elapsed, jump to the CURRENT fold (not just +1)."""
+        from datetime import timedelta
+
+        from agentfx.services.paper_runner import _fold_anchor_from_time
+
+        db, run, now = self._make(
+            approved_days_ago=70.0,
+            fold_days=22,
+            current_fold_index=0,
+            has_open_position=False,
+        )
+        # 70/22 = 3.18 → target_fold_index = 3
+        from_time, idx = _fold_anchor_from_time(run=run, db=db, now_utc=now)
+        assert idx == 3
+        assert from_time == run.approved_at + timedelta(days=66)
+
+
 # Compact type check that `TickAction` behaves as a frozen dataclass —
 # guards a future refactor that swaps to a NamedTuple or plain dict.
 def test_tick_action_is_hashable_and_immutable():

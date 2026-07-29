@@ -38,7 +38,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal, Protocol
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -339,32 +339,64 @@ def run_paper_run(
 def _default_candle_fetch(
     db,
 ) -> Callable[
-    [str, str, int], pd.DataFrame
+    ..., pd.DataFrame
 ]:  # pragma: no cover — thin adapter, exercised by integration test
-    """Return a `(instrument, granularity, bars) -> DataFrame` closure
-    that pulls the last N candles from the shared `candles` table.
+    """Return a `(instrument, granularity, *, bars | from_time, to_time)
+    -> DataFrame` closure that pulls candles from the shared `candles`
+    table.
+
+    Two calling modes:
+
+    - `bars=N` (legacy): return the last N closed candles. Used by the
+      pre-Fix-A rolling-window path and by tests that mock candles by
+      count.
+    - `from_time=T`, optional `to_time=U` (Wilson UAT 2026-07-29 Fix A):
+      return all closed candles in the closed interval `[T, U]`. Used
+      by the fold-anchored signal path so cumulative indicators (OBV,
+      ad_line) cumulate over exactly the same window backtest would.
 
     Extracted as a factory so `_execute_loop` doesn't take a DB
     dependency directly and unit tests inject their own arrays.
     """
     from agentfx.api.services.market_data import market_data_service
 
-    def _fetch(instrument: str, granularity: str, bars: int):
+    def _fetch(
+        instrument: str,
+        granularity: str,
+        bars: int | None = None,
+        *,
+        from_time: datetime | None = None,
+        to_time: datetime | None = None,
+    ):
         import pandas as pd
 
-        # Fetch one extra so if the newest row is still-in-flight
-        # (`complete = False`) we drop it and still return `bars` closed
-        # bars. Signals MUST run on closed OHLC only — an in-flight bar's
-        # close moves tick-by-tick, so evaluating on it produces
-        # non-deterministic entries that don't match backtest (backtest
-        # only sees closed bars).
-        candles, _total = market_data_service.get_candles(
-            db=db,
-            exchange="oanda",
-            instrument=instrument,
-            timeframe=granularity,
-            limit=bars + 1,
-        )
+        if from_time is not None:
+            # Time-range mode. Fetch every closed candle in [from_time,
+            # to_time]. Cap at a generous limit to avoid runaway;
+            # bounded above by fold_length (~22d = 31680 M1 bars).
+            candles, _total = market_data_service.get_candles(
+                db=db,
+                exchange="oanda",
+                instrument=instrument,
+                timeframe=granularity,
+                from_time=from_time,
+                to_time=to_time,
+                limit=100_000,
+            )
+        else:
+            # Legacy last-N-bars mode. Fetch one extra so if the newest
+            # row is still-in-flight (`complete = False`) we drop it and
+            # still return `bars` closed bars. Signals MUST run on
+            # closed OHLC only — an in-flight bar's close moves
+            # tick-by-tick, so evaluating on it produces non-
+            # deterministic entries that don't match backtest.
+            candles, _total = market_data_service.get_candles(
+                db=db,
+                exchange="oanda",
+                instrument=instrument,
+                timeframe=granularity,
+                limit=(bars or DEFAULT_LOOKBACK_BARS) + 1,
+            )
         # market_data_service.get_candles returns newest-first when no
         # time range is specified — reverse to chronological order for
         # `generate_signals`.
@@ -386,6 +418,81 @@ def _default_candle_fetch(
         )
 
     return _fetch
+
+
+def _fold_anchor_from_time(
+    *,
+    run,
+    db,
+    now_utc: datetime,
+) -> tuple[datetime | None, int]:
+    """Compute the effective from_time for signal-tick candle fetch,
+    walk-forward-fold style.
+
+    Wilson UAT 2026-07-29 Fix A. The DSL evaluator was fed only the
+    last 500 candles per tick; for cumulative-sum indicators (OBV,
+    ad_line) this produced completely different values than backtest
+    saw during validation, because those indicators anchor to bar 0
+    of whatever DataFrame you hand them. Backtest and training used
+    fold-anchored windows (each OOS fold ~22 days, its own bar-0);
+    live paper was using an ~8h rolling window. Result: 42% of bars
+    disagreed on `obv < 0` and paper opened trades on bars backtest
+    would never have entered.
+
+    Fix: mirror validation-fold semantics. Every `fold_length_days`
+    (stored on `run.parameters` at deploy time from the genome's OOS
+    fold length), reset the anchor to that fold boundary. Fetch from
+    the current fold's start, so OBV cumulates over the same window
+    length the genome was validated on.
+
+    Boundary hold-through: only advance the current fold pointer
+    when the position is FLAT. Matches walk-forward training's
+    clean-slate-per-fold semantics — no position was ever carried
+    across a fold boundary in training. If we're holding when the
+    calendar rolls, keep the previous anchor until the position
+    closes naturally (SL/TP/opposite-flip/max-hold), then roll on
+    the next signal tick.
+
+    Returns `(from_time, current_fold_index)`. Caller passes
+    `from_time` to `candle_fetch_fn`.
+    """
+    from agentfx.api.models import Trade
+
+    # Defensive: some legacy tests + very early Run rows lack
+    # `approved_at`. Callers should fall back to the bar-count fetch
+    # (mode signalled by returning (None, 0)) — fold-anchoring requires
+    # a run start to anchor against.
+    approved = getattr(run, "approved_at", None)
+    if approved is None:
+        return None, 0
+
+    params = getattr(run, "parameters", None) or {}
+    fold_days = int(params.get("fold_length_days") or 30)
+    if approved.tzinfo is None:
+        approved = approved.replace(tzinfo=UTC)
+
+    days_since_approved = (now_utc - approved).total_seconds() / 86400
+    target_fold_index = max(0, int(days_since_approved // fold_days))
+    current_fold_index = int(params.get("current_fold_index") or 0)
+
+    if target_fold_index > current_fold_index:
+        has_open = (
+            db.query(Trade)
+            .filter(
+                Trade.run_id == run.id,
+                Trade.exit_timestamp.is_(None),
+            )
+            .count()
+            > 0
+        )
+        if not has_open:
+            # Safe to advance.
+            current_fold_index = target_fold_index
+            run.parameters = {**params, "current_fold_index": current_fold_index}
+            db.commit()
+
+    from_time = approved + timedelta(days=current_fold_index * fold_days)
+    return from_time, current_fold_index
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -883,7 +990,25 @@ def _signal_tick(
                     )
                 return
 
-    df = candle_fetch_fn(instrument, granularity, DEFAULT_LOOKBACK_BARS)
+    # Wilson UAT 2026-07-29 Fix A: cumulative indicators (OBV,
+    # ad_line) need to see the same window backtest cumulated over.
+    # Compute the fold-anchored `from_time` and fetch the closed-
+    # candle range from that anchor to now. Legacy runs without
+    # `approved_at` (or fetch functions that don't accept from_time,
+    # e.g. test doubles) fall back to the last-N-bars mode.
+    from_time, _fold_idx = _fold_anchor_from_time(run=run, db=db, now_utc=now_utc)
+    if from_time is not None:
+        try:
+            df = candle_fetch_fn(
+                instrument,
+                granularity,
+                from_time=from_time,
+                to_time=now_utc,
+            )
+        except TypeError:
+            df = candle_fetch_fn(instrument, granularity, DEFAULT_LOOKBACK_BARS)
+    else:
+        df = candle_fetch_fn(instrument, granularity, DEFAULT_LOOKBACK_BARS)
 
     # Stale-candle guard. Ingestion outages (weekend, OANDA maintenance,
     # ingester falling behind) leave the shared `candles` table N bars
