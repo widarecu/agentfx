@@ -371,9 +371,11 @@ def _default_candle_fetch(
         import pandas as pd
 
         if from_time is not None:
-            # Time-range mode. Fetch every closed candle in [from_time,
-            # to_time]. Cap at a generous limit to avoid runaway;
-            # bounded above by fold_length (~22d = 31680 M1 bars).
+            # Time-range mode (Wilson UAT 2026-07-29 Fix A). Fetch every
+            # closed candle in [from_time, to_time]. Cap at a generous
+            # limit; bounded above by fold_length (~22d M1 = 31,680 bars).
+            # `get_candles` orders ASC when from_time is set, so no
+            # reversal needed here — already chronological.
             candles, _total = market_data_service.get_candles(
                 db=db,
                 exchange="oanda",
@@ -390,6 +392,9 @@ def _default_candle_fetch(
             # closed OHLC only — an in-flight bar's close moves
             # tick-by-tick, so evaluating on it produces non-
             # deterministic entries that don't match backtest.
+            # `get_candles` without from_time returns DESC (newest-first);
+            # we reverse below to hand `generate_signals` chronological
+            # order.
             candles, _total = market_data_service.get_candles(
                 db=db,
                 exchange="oanda",
@@ -397,10 +402,7 @@ def _default_candle_fetch(
                 timeframe=granularity,
                 limit=(bars or DEFAULT_LOOKBACK_BARS) + 1,
             )
-        # market_data_service.get_candles returns newest-first when no
-        # time range is specified — reverse to chronological order for
-        # `generate_signals`.
-        candles = list(reversed(candles))
+            candles = list(reversed(candles))
         candles = [c for c in candles if c.complete]
         if not candles:
             return pd.DataFrame(
