@@ -375,6 +375,64 @@ The current evolve → evaluate → repeat loop is optimization without learning
 
 ---
 
+## v0.7.0 — DSL / evolution guardrails (post UAT 2026-07-28)
+
+**Theme:** Prevent silent runner-vs-backtest divergence from ever
+happening again by tightening what the evolution/validator layer
+allows into the paper-deployment queue.
+
+### Wilson UAT 2026-07-28 — cumulative-indicator drift
+
+The `genome_gen_evorun_20260712_30f6bc87_017_019` paper run
+diverged from the backtest by 42% of signal bars because the DSL
+used `obv < 0` (a cumulative-sum indicator compared to an absolute
+constant). Live OBV cumulates from run start; backtest OBV
+cumulates from fold start; the same bar has different OBV values
+under each anchor, so the boolean flips on completely different
+bars. Fix A (paper runner uses fold-length-anchored candle window,
+matching validation-fold OBV cumulation) resolves this specific
+run. This section covers guardrails for FUTURE genomes.
+
+- [ ] `TODO` **DSL validator warning for start-point-sensitive
+  indicators.** Static-analyse every genome's `dsl_json` at
+  validator time. If any leaf indicator is state-dependent (`obv`,
+  `ad_line`, or any indicator whose body contains `cumsum`) AND
+  it's compared to an absolute constant (not to another indicator
+  or moving average of itself), emit a soft warning attached to
+  the genome row: "This indicator is start-point sensitive; its
+  live value at bar T depends on where cumulation started. The
+  paper runner anchors at the validation fold length to
+  approximate training behaviour, but portable formulations
+  (`obv < sma(obv, N)`, `obv_change`, etc.) generalise across
+  time windows without this anchoring dependency."
+
+- [ ] `TODO` **Grammar-level guidance on cumulative comparisons.**
+  Update `core/dsl/grammar.py` doc-strings for OBV / AD_LINE /
+  future cumulative indicators to explicitly document the
+  anchor-sensitivity and recommend relative comparisons. Add a
+  `docs/dsl-writing-strategies.md` best-practices note that the
+  LLM discovery agent (`agents/discovery.py`) reads before
+  proposing new genomes.
+
+- [ ] `TODO` **Evolution/validator consistency audit.** During
+  training, the walk-forward evaluator computes per-fold metrics
+  with each fold's own OBV cumulation window (fold-anchored).
+  The on-demand backtest endpoint
+  (`/evolution-runs/{id}/genomes/{gid}/backtest?window=oos`)
+  runs ONE continuous backtest across all OOS folds (window-
+  anchored). Users comparing paper-vs-backtest see different
+  numbers depending on which reference they pick. Refactor the
+  backtest endpoint to walk fold-by-fold when `window=oos` so
+  the reference matches training methodology.
+
+- [ ] `TODO` **Compare-mode UI badge on genome detail.** When a
+  genome has the warning above, surface it as an amber chip on
+  the approval-queue row + the deploy modal, with a hover
+  tooltip explaining that live-signal frequency may drift from
+  backtest under different market regimes.
+
+---
+
 ## v1.0.0 - Live Trading + Portfolio
 
 **Theme:** Self-sustaining strategy factory in production.
