@@ -51,12 +51,13 @@ CATCH_UP_HEALTH_CHECK_INTERVAL = 300  # 5 minutes
 
 # Wilson UAT 2026-08-02: buffer added to the minute-boundary alignment
 # in the polling loop. OANDA marks a closed bar available within ~1s of
-# bar close; a 3s buffer gives comfortable margin without adding
-# unnecessary latency. Kept as a module constant (not env-configurable)
-# because the value is a broker-behavior property, not a deployment
-# preference — if OANDA ever changes their post-close latency this is
-# where the fix goes.
-INGESTION_ALIGNMENT_BUFFER_SECONDS = 3
+# bar close; the default 3s gives comfortable margin without wasted
+# latency. Now env-configurable via `INGESTION_ALIGNMENT_BUFFER_SECONDS`
+# on Railway so it can be tuned without a redeploy if OANDA's
+# post-close latency ever changes. Module constant kept as a legacy
+# name pointing at `settings.INGESTION_ALIGNMENT_BUFFER_SECONDS` so
+# existing test imports keep working.
+INGESTION_ALIGNMENT_BUFFER_SECONDS = settings.INGESTION_ALIGNMENT_BUFFER_SECONDS
 
 
 def _next_poll_wake_time(
@@ -1267,7 +1268,7 @@ async def ingestion_loop():
             wake_at = _next_poll_wake_time(
                 datetime.now(UTC),
                 boundary_seconds=settings.INGESTION_POLL_INTERVAL,
-                buffer_seconds=INGESTION_ALIGNMENT_BUFFER_SECONDS,
+                buffer_seconds=settings.INGESTION_ALIGNMENT_BUFFER_SECONDS,
             )
             sleep_seconds = max(1.0, (wake_at - datetime.now(UTC)).total_seconds())
             await asyncio.wait_for(

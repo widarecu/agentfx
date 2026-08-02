@@ -273,6 +273,32 @@ class Settings(BaseSettings):
         description="Interval in seconds between candle ingestion cycles",
     )
 
+    INGESTION_ALIGNMENT_BUFFER_SECONDS: int = Field(
+        default=3,
+        env="INGESTION_ALIGNMENT_BUFFER_SECONDS",
+        description=(
+            "Seconds after each minute boundary to wake the ingestion "
+            "loop. OANDA typically has closed bars available within "
+            "~1s of bar close; 3s gives comfortable margin without "
+            "wasted latency. Bump if OANDA's post-close latency ever "
+            "grows. Must be < SIGNAL_TICK_OFFSET_SECONDS or the paper "
+            "runner will race the ingester."
+        ),
+    )
+
+    SIGNAL_TICK_OFFSET_SECONDS: int = Field(
+        default=10,
+        env="SIGNAL_TICK_OFFSET_SECONDS",
+        description=(
+            "Seconds after each granularity boundary to fire paper-run "
+            "signal ticks. Must be > INGESTION_ALIGNMENT_BUFFER_SECONDS "
+            "+ typical ingestion cycle duration (observed 2-6s), so the "
+            "just-closed bar is guaranteed to be in the DB when the "
+            "runner evaluates. Default 10s: ingester finishes by ~:09, "
+            "runner ticks at :10, order placement lands ~:10-:11."
+        ),
+    )
+
     BACKFILL_DAYS: int = Field(
         default=7,
         env="BACKFILL_DAYS",

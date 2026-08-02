@@ -545,8 +545,21 @@ def _execute_loop(
     signal_enabled = (
         strategy is not None and candle_fetch_fn is not None and instrument is not None
     )
+    # Wilson UAT 2026-08-02: signal ticks are offset PAST the granularity
+    # boundary so ingestion has time to write the just-closed bar to
+    # the DB before the runner evaluates. Without this offset, the tick
+    # fires at :00 while ingestion doesn't write the bar until :03-:09
+    # → runner sees stale df, misses the bar, then Fix D's watermark
+    # catches it 60s later. With the offset, tick fires at :10, bar is
+    # already in DB, order lands within seconds of the signal.
+    # `SIGNAL_TICK_OFFSET_SECONDS` from settings — configurable via
+    # Railway env var. Must be greater than
+    # `INGESTION_ALIGNMENT_BUFFER_SECONDS` + typical cycle work.
+    from agentfx.api.core.config import settings
+
+    _tick_offset = float(settings.SIGNAL_TICK_OFFSET_SECONDS)
     next_signal_at = (
-        align_to_granularity(now_fn(), granularity_seconds)
+        align_to_granularity(now_fn(), granularity_seconds) + _tick_offset
         if signal_enabled
         else float("inf")
     )
@@ -710,7 +723,9 @@ def _execute_loop(
             # 12:48 boundary. Result: every M1 tick was on 2-minute
             # cadence, missing half the signals. Wilson lost the 13:03
             # MACD cross_up because the 13:06 catch-up tick was skipped.
-            next_signal_at = align_to_granularity(now, granularity_seconds)
+            next_signal_at = (
+                align_to_granularity(now, granularity_seconds) + _tick_offset
+            )
 
         # Cadence — health tick every 5s, or sooner if the next signal
         # tick is closer. Injectable `sleep_fn` so tests skip the wait

@@ -1163,19 +1163,20 @@ class TestExecuteLoopSignalIntegration:
         candles_df = _mk_candles_df(3, datetime.now(UTC))
         fetch = MagicMock(return_value=candles_df)
 
-        # Clock: initial align at t=100 → next_signal_at=120. First iter
-        # sees now=120.230 (past boundary, tick fires with 230ms of
-        # jitter). Next iter is at 180 (should be inside the next
-        # boundary at 180). Under the old bug, next_signal_at would
-        # advance to 240 instead of 180, and the second iter would
-        # NOT fire the tick at 180.
+        # Clock updated for Wilson UAT 2026-08-02: signal ticks now
+        # fire at (boundary + SIGNAL_TICK_OFFSET_SECONDS=10), so with
+        # granularity=60 they land at 130, 190, 250, ...
+        # Original test intent preserved: fires at TWO consecutive
+        # boundaries with slight jitter. Under the old advance-by-two
+        # bug, the second tick at 190 would have been skipped.
+        # Initial align(110, 60) = 120; +10 offset = 130.
         clock = iter(
             [
-                100.0,  # initial align_to_granularity call
-                120.230,  # iter 1 "now" (past 120 boundary with jitter)
-                120.230,  # iter 1 sleep calc
-                180.0,  # iter 2 "now" (exactly on 180 boundary — should fire)
-                180.0,  # iter 2 sleep calc
+                110.0,  # initial align_to_granularity call → 130
+                130.230,  # iter 1 "now" (past 130 with 230ms jitter, fires)
+                130.230,  # iter 1 sleep calc
+                190.0,  # iter 2 "now" (exactly on 190 = 180+10, should fire)
+                190.0,  # iter 2 sleep calc
             ]
         )
 
@@ -1202,6 +1203,71 @@ class TestExecuteLoopSignalIntegration:
         added = [c.args[0] for c in db.add.call_args_list]
         snapshots = [r for r in added if type(r).__name__ == "PaperEquitySnapshot"]
         assert len(snapshots) == 2, (
-            f"expected 2 signal ticks (120 + 180), got {len(snapshots)} — "
+            f"expected 2 signal ticks (130 + 190), got {len(snapshots)} — "
             "the 2-minute-cadence bug is back"
+        )
+
+    def test_signal_tick_fires_at_boundary_plus_configured_offset(self):
+        """Wilson UAT 2026-08-02: tick must fire at
+        (bar_boundary + SIGNAL_TICK_OFFSET_SECONDS), NOT at the raw
+        boundary. Otherwise the runner races the ingester and misses
+        the just-closed bar every minute.
+        """
+        from agentfx.api.models import RunStatus
+
+        run = SimpleNamespace(
+            id="run_test",
+            pair="EUR_USD",
+            user_id=1,
+            snapshot_balance=10_000.0,
+            current_balance=10_000.0,
+            pnl=0.0,
+            kill_requested_at=None,
+            last_transaction_id=None,
+            risk_config={"daily_loss_pct": 2.0, "kill_switch_dd_pct": 5.0},
+            parameters={},
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+        )
+        client = MagicMock()
+        client.get_account_balance.return_value = {
+            "balance": 10_000.0,
+            "currency": "USD",
+        }
+        client.get_position.return_value = {"long_units": 0, "short_units": 0}
+        db = _make_db()
+        strategy = _make_strategy(signals=[0, 0, 0])
+        candles_df = _mk_candles_df(3, datetime.now(UTC))
+        fetch = MagicMock(return_value=candles_df)
+
+        # Iter 1 now=120.5 — PAST the raw :00 boundary by 500ms.
+        # Under the pre-offset code, tick would have fired here.
+        # Under the offset code (default offset=10), next_signal_at=130
+        # → 120.5 < 130 → tick does NOT fire. Good.
+        clock = iter([100.0, 120.5, 120.5, 120.5, 120.5])
+
+        def now_fn() -> float:
+            return next(clock)
+
+        _execute_loop(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_fn=now_fn,
+            sleep_fn=MagicMock(),
+            max_iterations=2,
+        )
+
+        # NO tick fired — 120.5 is past raw boundary but not past
+        # boundary + offset.
+        added = [c.args[0] for c in db.add.call_args_list]
+        snapshots = [r for r in added if type(r).__name__ == "PaperEquitySnapshot"]
+        assert len(snapshots) == 0, (
+            f"expected 0 ticks fired (offset guards :00-:10 window), "
+            f"got {len(snapshots)} — runner is racing the ingester"
         )
