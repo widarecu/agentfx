@@ -491,6 +491,35 @@ The `planning/` directory contains project governance:
 - **architecture/** - PRINCIPLES.md, STANDARDS.md, NFRS.md
 - **archive/** - Historical planning documents (FEAT-, ADR-, TECH-)
 
+### Backlog hygiene — mandatory
+
+The backlog is only useful if it matches reality. Two rules:
+
+1. **When you ship a backlog item, flip the checkbox in the SAME
+   commit.** Don't defer the doc update. `[ ] TODO` → `[x] DONE`
+   goes in the diff alongside the code change. If the change is
+   spread across many commits, flip the checkbox in the last one
+   that closes the item. Never leave "will update backlog later"
+   as a mental TODO — the backlog rot from that pattern is what
+   made Wilson lose an hour on 2026-08-02 when I quoted Slack
+   notifications as unshipped (the code + tests + Railway env
+   were all live; only the backlog line was stale).
+
+2. **Before recommending or scheduling work, VERIFY the item is
+   actually open.** The backlog is a starting point, not the
+   final answer. For anything that touches shipped code, grep
+   the codebase first:
+
+     - Slack alerts → `ls src/agentfx/notifications/slack.py`
+     - Env var → `grep -n VAR src/agentfx/api/core/config.py`
+     - UI component → `ls portal/web/src/components/...`
+     - Endpoint → `grep -rn "@router.get.*/path" src/`
+
+   A shipped feature with an unchecked backlog line is common;
+   don't be the one who re-plans it.
+
+Both rules apply to Wilson and to Claude Code sessions equally.
+
 ### User Story Format
 
 Each user story in `planning/requirements/` follows this executable format:
