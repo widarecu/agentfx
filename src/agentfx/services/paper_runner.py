@@ -1066,8 +1066,8 @@ def _signal_tick(
     # Fresh candles → clear any previous stale flag and log resume.
     _clear_stale_state(db=db, run=run, latest_candle_at=latest_dt.isoformat())
 
-    # Raw entry events at bar-close: +1 = long cross fired at latest
-    # bar, -1 = short cross fired, 0 = no event. This replaces
+    # Raw entry events at bar-close: +1 = long cross fired at bar T,
+    # -1 = short cross fired, 0 = no event. This replaces
     # `generate_signals` (which projected `_apply_exits` state across
     # the full lookback window). Wilson's UAT 2026-07-13 finding: the
     # projected-state model treated a hypothetical pre-deploy trade as
@@ -1080,7 +1080,66 @@ def _signal_tick(
     raw_entries = strategy.raw_entry_signals(df)
     if len(raw_entries) < 1:
         return
-    raw_entry = int(raw_entries.iloc[-1])
+
+    # Wilson UAT 2026-08-02 Fix D: per-bar watermark evaluation.
+    # Previous code read `raw_entries.iloc[-1]` — only the latest bar.
+    # But signal ticks fire ~every 60s while candle ingestion lags
+    # 0–78s (see cadence report in commit message). If a bar's
+    # complete=True flag lands in the DB AFTER the corresponding
+    # signal tick but BEFORE the next one, the runner would jump
+    # straight from bar T-2 → bar T+1, silently skipping T-1 →
+    # `iloc[-1]` returns raw_entry[T+1], which may be 0 or opposite
+    # even when raw_entry[T-1] fired a cross.
+    #
+    # Wilson audit 2026-08-02 found paper missed the LONG entry at
+    # 14:20 (raw_entry[14:20]=+1, MACD cross fired at bar 14:19)
+    # because bar 14:20 became complete in the DB at 14:22:09 —
+    # AFTER the 14:22 tick fired at ~14:22:00. Next tick (14:23:00)
+    # saw bars up through 14:21 and `iloc[-1]` = raw_entry[14:21] =
+    # -1 (SHORT). Paper entered SHORT; backtest went LONG.
+    #
+    # Fix: track a watermark of the last evaluated bar timestamp on
+    # `run.parameters['last_evaluated_bar_ts']`. On each tick, scan
+    # every bar strictly newer than the watermark for a nonzero
+    # raw_entry, and act on the FIRST (earliest) one. Matches
+    # backtest's sequential bar walk. Update the watermark to the
+    # latest bar in df regardless of whether a signal fired, so
+    # subsequent ticks don't re-fire on bars we already considered.
+    #
+    # Cross events (transient) are the only kind that can be missed
+    # by iloc[-1]; persistent conditions (obv<0) stay true across
+    # bars and get caught anyway. But since a genome mixing both is
+    # common, this fix is required for fidelity in general.
+    params = getattr(run, "parameters", None) or {}
+    last_eval_iso = params.get("last_evaluated_bar_ts")
+    last_eval_ts = datetime.fromisoformat(last_eval_iso) if last_eval_iso else None
+    if last_eval_ts is not None:
+        new_bars = raw_entries[raw_entries.index > last_eval_ts]
+    else:
+        # First tick of the run — take only the latest bar, don't
+        # backfill entries from bars that closed before we started.
+        new_bars = raw_entries.tail(1)
+    # Which bar to act on? Earliest new bar with a nonzero signal
+    # (matches backtest's "first entry wins" semantics — later bars
+    # with opposite signals would flip mid-hold, gated by min_hold).
+    fired = new_bars[new_bars != 0]
+    if len(fired) > 0:
+        raw_entry = int(fired.iloc[0])
+        acted_bar_ts = fired.index[0]
+    else:
+        raw_entry = 0
+        acted_bar_ts = None
+    # Advance watermark to the latest bar we CONSIDERED so subsequent
+    # ticks don't re-scan. Persisted so the watermark survives a
+    # subprocess restart (kill/resume).
+    latest_bar_ts = raw_entries.index[-1]
+    if latest_bar_ts != last_eval_ts:
+        run.parameters = {
+            **params,
+            "last_evaluated_bar_ts": latest_bar_ts.isoformat(),
+        }
+        db.commit()
+
     signal_direction: Direction = (
         "long" if raw_entry > 0 else "short" if raw_entry < 0 else "flat"
     )

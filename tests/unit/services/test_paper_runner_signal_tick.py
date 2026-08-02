@@ -158,6 +158,12 @@ def _make_strategy(
     series = pd.Series(signals, dtype=int)
 
     def _generate(_df):
+        # Wilson UAT 2026-08-02 Fix D: return with the DataFrame's
+        # DatetimeIndex so the runner's per-bar watermark logic can
+        # read `.index[-1]`. Production `raw_entry_signals` always
+        # returns a DatetimeIndex-indexed Series.
+        if hasattr(_df, "index") and len(_df.index) == len(series):
+            return pd.Series(signals, index=_df.index, dtype=int)
         return series
 
     lhs = SimpleNamespace(ind=entry_long_ind, args=[20])
@@ -220,6 +226,116 @@ class TestSignalTick:
     """The signal tick is the whole point of US-024 — placement, close,
     and skip paths get direct coverage here so `_execute_loop` only
     needs to wire them together."""
+
+    def test_bar_watermark_backfill_catches_missed_cross_event(self):
+        """Wilson UAT 2026-08-02 Fix D regression.
+
+        Setup mirrors the exact bug from the 2026-07-29 audit: bar T
+        fires a LONG cross event, but its `complete=True` marker lands
+        in the DB AFTER the tick corresponding to T fires. The next
+        tick, without Fix D, would read `raw_entries.iloc[-1]` which
+        by then is bar T+1's value (say 0 or opposite), silently
+        skipping the T event.
+
+        Fix D: the runner walks EVERY bar since the last-evaluated
+        watermark and acts on the earliest nonzero raw_entry. Cross
+        events that lag one tick get caught on the next tick instead
+        of being permanently lost.
+
+        Scenario: run has `last_evaluated_bar_ts = 12:00`. Fresh tick
+        fires with a candle df ending at 12:03. `raw_entries` at bars
+        12:01, 12:02, 12:03 = [1, 0, 0] — LONG cross fired at 12:01
+        (the bar that got ingested late). Fix D should enter LONG.
+        Without Fix D, `iloc[-1] = 0` would silently no-op.
+        """
+        base = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+        # Signal series: bar 12:01 fires +1 (LONG), 12:02 and 12:03
+        # are 0. Under iloc[-1] the runner would see 0 → skip.
+        strategy = _make_strategy(signals=[1, 0, 0])
+        # Candles [12:01, 12:02, 12:03] — first bar is what we want
+        # the watermark walk to catch.
+        candles_df = _mk_candles_df(3, base + timedelta(minutes=3))
+        # candles_df's index is [12:01, 12:02, 12:03] since
+        # _mk_candles_df ends at `latest_ts` and steps back N-1 mins.
+        fetch = MagicMock(return_value=candles_df)
+
+        client = MagicMock()
+        client.get_position.return_value = {"long_units": 0, "short_units": 0}
+        client.get_account_balance.return_value = {
+            "balance": 10_000.0,
+            "currency": "USD",
+        }
+        client.place_market_order.return_value = {
+            "trade_id": "trade_broker_watermark",
+            "fill_price": 1.1005,
+            "units": 25_000,
+        }
+        db = _make_db()
+        run = _make_run()
+        # Watermark set to 12:00 — BEFORE the first candle in df.
+        # Fix D should treat all three bars as "new" and act on the
+        # first nonzero one (12:01 LONG).
+        run.parameters["last_evaluated_bar_ts"] = base.isoformat()
+
+        _signal_tick(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=base + timedelta(minutes=3, seconds=5),
+        )
+
+        # LONG order placed despite iloc[-1] being 0.
+        client.place_market_order.assert_called_once()
+        args, kwargs = client.place_market_order.call_args
+        assert args[1] > 0, f"expected LONG (positive units), got {args[1]}"
+
+        # Watermark advanced to the LATEST bar (12:03), not just 12:01.
+        # So the next tick won't re-fire on 12:01.
+        assert (
+            run.parameters["last_evaluated_bar_ts"]
+            == (base + timedelta(minutes=3)).isoformat()
+        )
+
+    def test_watermark_first_tick_uses_only_latest_bar(self):
+        """When the run is fresh (no watermark yet), Fix D takes only
+        the latest bar's raw_entry — not the whole history. Prevents
+        the runner from "backfilling" a trade against a cross that
+        fired 20 bars ago (before we were watching)."""
+        base = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+        # Series [1, 0, 0, 0, 0] — cross fired 4 bars ago. Latest bar
+        # is 0. Without watermark, Fix D should NOT catch the stale
+        # cross → no order.
+        strategy = _make_strategy(signals=[1, 0, 0, 0, 0])
+        candles_df = _mk_candles_df(5, base + timedelta(minutes=5))
+        fetch = MagicMock(return_value=candles_df)
+
+        client = MagicMock()
+        client.get_position.return_value = {"long_units": 0, "short_units": 0}
+        db = _make_db()
+        run = _make_run()
+        # No watermark on run.parameters — first tick.
+
+        _signal_tick(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=base + timedelta(minutes=5, seconds=5),
+        )
+
+        client.place_market_order.assert_not_called()
+        # But watermark IS set so subsequent ticks scan from here forward.
+        assert (
+            run.parameters["last_evaluated_bar_ts"]
+            == (base + timedelta(minutes=5)).isoformat()
+        )
 
     def test_long_signal_from_flat_places_order_and_persists_trade(self):
         # Signal series ends with +1 → long entry from flat.
