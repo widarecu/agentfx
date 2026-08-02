@@ -433,6 +433,259 @@ run. This section covers guardrails for FUTURE genomes.
 
 ---
 
+## v0.7.x — Cross-user genome sharing (import/export)
+
+**Theme:** Enable users to exchange validated strategies. Users A
+and B are on separate OANDA accounts and independent evolution
+tracks; today there is no way for A to hand B a promising genome
+so B can evaluate it against their own conditions and, if they
+approve, deploy it to their own paper account.
+
+### Wilson request 2026-08-02
+
+Full spec below. Every piece is deliberate — the approval queue,
+deploy modal, paper runner, fold-anchored candle fetch, backtest
+endpoint, and lineage view all read genome metadata in specific
+shapes. A naive "just copy the dsl_json" import breaks the
+approval queue (which filters via `evolution_run.created_by ==
+user_id`), the fold-anchored fetch (which needs `validation_folds`
+attached), and the compare-vs-backtest reference (which reads
+`fitness` + fold metrics).
+
+### Data to export
+
+The exporter's genome + everything needed for the importer to
+evaluate + deploy WITHOUT the exporter's evolution run rows:
+
+- **Genome core**: `id`, `dsl_json`, `fitness`, `origin` (llm /
+  mutation / crossover / seed), `llm_reasoning` (nullable — for
+  attribution), `validator_passed`, `validation_failures`, DSL
+  grammar `version`.
+- **Validation folds** (all rows): `fold_index`, `fold_start`,
+  `fold_end`, `is_oos`, `sharpe`, `max_drawdown`, `hit_rate`,
+  `n_trades`, `cagr`, `passed_gate_b`, regime tags.
+- **Provenance**: exporter's user email + display name (opt-in),
+  original evolution_run `instrument` + `granularity` + `id`,
+  export timestamp, exporter's app version.
+- **Signature**: HMAC over the payload with a shared secret, or
+  ECDSA if we ever want cross-instance verification. v1: SHA-256
+  content hash for tamper detection (not authentication).
+
+### File format
+
+`{genome_id}.agenome.json` — plain JSON, schema-versioned:
+
+    {
+      "schema_version": 1,
+      "exported_at": "...",
+      "exported_by": {"email": "...", "display_name": "..."},
+      "app_version": "0.7.x",
+      "genome": { ...core fields... },
+      "validation_folds": [ ... ],
+      "provenance": {
+        "source_evolution_run_id": "evorun_...",
+        "source_instrument": "EUR_USD",
+        "source_granularity": "M1",
+      },
+      "content_hash": "sha256:...",
+    }
+
+### Import flow
+
+1. Frontend: **Import Genome** button on Approval Queue page →
+   file picker → POST `/genomes/import` with the JSON payload.
+2. Backend validates:
+   - `schema_version` supported
+   - `content_hash` matches recomputed hash
+   - DSL grammar version compatible with current build
+   - DSL passes static validation (`_check_indicator_call` etc.)
+   - Instrument is one the importer has candles for (or offer to
+     backfill)
+3. Backend creates SHADOW rows scoped to the importer:
+   - New `EvolutionRun` row with `created_by = importer.user_id`,
+     `id = "imported_" + original_evolution_run_id`, tagged with
+     `origin_kind: "import"` and `exported_by_email` on a new
+     column so the UI can attribute it.
+   - Corresponding `Generation` shadow row.
+   - New `StrategyGenome` row with a NEW id (`imported_gen_...`
+     prefix) so it can't collide with the exporter's if they're
+     on the same DB.
+   - `ValidationFold` rows duplicated with new ids and
+     `genome_id` FK pointing at the shadow genome.
+4. Importer's approval queue picks up the new genome (its shadow
+   `EvolutionRun.created_by == user_id` gate).
+5. Importer's deploy flow uses it exactly like a native genome —
+   `approve_and_deploy` reads `genome.validation_folds` to compute
+   `fold_length_days` for Fix A. Since we duplicated the folds
+   verbatim, this Just Works.
+
+### UI surfaces
+
+- **Approval queue row**: imported genomes get an amber `IMPORTED`
+  chip with hover tooltip "Shared by wilson@… on 2026-08-15."
+- **Deploy modal**: same chip near the genome id. No behavioural
+  change — importer still owns the paper run outright.
+- **Evolution runs list**: shadow `EvolutionRun` rows show under a
+  separate "Imported strategies" tab so they don't pollute the
+  user's own evolution tracks.
+- **Lineage tree**: shadow runs have no parent_ids (empty family
+  tree). Rendered as a single node with the `IMPORTED` chip.
+
+### Compatibility checkpoints (verify each)
+
+- [ ] Approval queue query (`list_approval_queue_for_user`) — the
+  `evolution_run.created_by == user_id` filter already scopes to
+  the importer; verified naturally by using shadow rows.
+- [ ] Deploy flow (`approve_and_deploy`) — reads
+  `genome.validation_folds` for `fold_length_days`. Folds ARE
+  duplicated on import → works.
+- [ ] Fold-anchored paper runner (Fix A) — reads
+  `run.parameters['fold_length_days']` set at deploy time. Works.
+- [ ] Backtest re-run endpoint
+  (`/evolution-runs/{id}/genomes/{gid}/backtest`) — takes
+  `run_id` + `genome_id` from URL. Both are shadow rows, both
+  belong to importer, both point at the same DSL. Works BUT the
+  backtest window (`training` / `oos` / `full`) is derived from
+  `EvolutionRun.data_range_start/end`. Import must carry these
+  fields on the source `EvolutionRun` snapshot so window
+  selectors show sensible dates. Verify.
+- [ ] Lineage tree (`GenomeLineageTree.tsx`) — shadow genome has
+  empty `parent_ids`; renders as single-node tree. Verify no
+  crash on the empty-parents case.
+- [ ] Slack notifications (v0.6.2) — same as native genomes; no
+  change needed.
+- [ ] Validator warnings (v0.7.0 items above) — re-run on import
+  so the importer sees the same amber chip if the DSL uses
+  start-point-sensitive indicators.
+
+### Attribution + trust posture
+
+v1: no signature verification, no allowlist. Anyone can send anyone
+an `.agenome.json` file; importer trusts it because they got it
+from a person they trust. Content hash detects file corruption /
+tampering but doesn't authenticate the sender. Sufficient for the
+"share with a friend" workflow.
+
+v2 (if needed): sign exports with the exporter's platform account
+key so `exported_by.email` is provable. Add a "Received from" ledger
+so users can audit the provenance of every deployed strategy.
+
+### Test scope
+
+- Round-trip: export a genome → parse → re-import as a different
+  user → verify approval queue picks it up → verify deploy path
+  writes correct `fold_length_days`.
+- Version-skew: export from schema_version=1, import into a build
+  supporting v2 → schema upgrade path.
+- Grammar-skew: export uses DSL feature the importing build
+  doesn't support → clean rejection with a specific error, not a
+  500.
+- ID collision: export from a DB where genome_id happens to
+  already exist as an import from another user → new id must not
+  collide.
+
+### Non-goals
+
+- Cross-DB import (e.g. moving genomes between staging and prod).
+  All imports are within one platform instance.
+- Runtime dependency on the source platform being up. Import
+  payload is self-contained.
+- Editing the DSL after import. Importer can only approve/reject
+  the genome as-is. Modifications require running their own
+  evolution.
+
+---
+
+## v0.7.x — Mobile-first paper-run monitoring view
+
+**Theme:** Portal is unusable on mobile. `/paper/:id` renders 8
+tiles + full equity chart + full price-and-indicators chart +
+trades table + decisions log; on a phone screen tiles wrap
+awkwardly, charts don't downscale, tables scroll horizontally,
+and the whole thing is too dense to actually monitor a running
+strategy on the go.
+
+### Wilson request 2026-08-02
+
+"When I try to access my staging environment from mobile it is
+quite unusable, as things are not rendering properly, we should
+have a lighter set of information with the most meaningful set of
+information a mobile user would need while monitoring a run."
+
+### What a mobile user actually needs (in priority order)
+
+1. **Status pill** — RUNNING / HALTED / ERROR / etc. with visual
+   colour. First glance answer to "is it still on?"
+2. **Live P&L headline** — `-$1,477 · -1.54%` and elapsed time.
+3. **Open position card** — side / size / entry price / unrealised
+   P&L / duration held. Empty state "no open position" when flat.
+4. **Kill switch** — big red button, always accessible.
+5. **Last 5 trades** — compact rows: `date · side · pnl · reason`.
+6. **Last 3 decisions** — timestamped, one-line, colour-coded by
+   severity (stale/skip = amber, error = red, order = green).
+7. **Sparkline equity chart** — one-line height, 24h window,
+   no axes, no tooltip. Just gives the shape of the day.
+
+### What can be hidden / progressively disclosed
+
+- Full equity chart with tiles, drawdown, overlay — collapsed
+  behind "Show detail" toggle.
+- Price + indicators chart — collapsed behind toggle.
+- Full trades table — link to a `/paper/:id/trades` sub-route.
+- Full decisions log — link to a `/paper/:id/decisions` sub-route.
+- Backtest OOS overlay explanations — hidden by default (they're
+  chatty).
+
+### Design decisions to make
+
+- **Route strategy**: same URL, media-query breakpoint at ~640px
+  → different top-level layout component? OR separate
+  `/paper/:id/mobile` sub-route? Suggest media-query approach so
+  desktop→mobile via window resize doesn't require nav.
+- **Chart library**: LightweightCharts (used for price chart)
+  supports mobile touch out of the box but the paper chart uses
+  raw SVG. Sparkline probably needs a simple SVG polyline — small
+  enough to hand-roll, no new dep.
+- **Kill switch layout**: sticky footer or sticky top? Sticky top
+  keeps status + kill co-located. Suggest sticky top on mobile.
+- **Auto-refresh cadence**: same 60s / 5s cadences as desktop.
+  Mobile users on cellular shouldn't hammer the backend more than
+  desktop does.
+- **Landscape**: not optimised in v1; portrait only. Note in the
+  layout copy.
+
+### Implementation shape (frontend only, no backend change)
+
+- New `MobilePaperRunDetail.tsx` component with the priority-list
+  above. Chooses the layout based on `useMediaQuery('(max-width: 640px)')`.
+- Sub-components extracted from the desktop version where
+  practical: `KillSwitchButton`, `SummaryStripTile` (with a
+  `variant="compact"` prop) — keep one source of truth for the
+  data.
+- `PaperRunDetail.tsx` becomes a router that picks Mobile vs
+  Desktop based on the media query, so the URL and data-fetching
+  effects don't change.
+
+### Non-goals
+
+- Redesigning the desktop view. Only the mobile breakpoint.
+- Mobile app (native / PWA). Just a responsive web layout.
+- Charts as complex as desktop (no drawdown shading, no OOS
+  overlay, no financing markers). Sparkline only.
+- Approval queue / evolution-run pages — separate scope, tackle
+  after paper-run monitoring lands.
+
+### Tests
+
+- Playwright test at 375×667 viewport (iPhone SE) verifying:
+  - Kill switch visible without horizontal scroll
+  - Status pill + P&L visible in first viewport
+  - Trades table doesn't overflow
+- Existing desktop Playwright tests continue to pass (breakpoint
+  gates on >640px).
+
+---
+
 ## v1.0.0 - Live Trading + Portfolio
 
 **Theme:** Self-sustaining strategy factory in production.
