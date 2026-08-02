@@ -8,11 +8,13 @@ from src.agentfx.api.core.config import settings
 from src.agentfx.api.workers.candle_ingestion import (
     GAP_DETECTION_MULTIPLIER,
     GRANULARITY_SECONDS,
+    INGESTION_ALIGNMENT_BUFFER_SECONDS,
     LARGE_GAP_CHUNK_DAYS,
     LARGE_GAP_THRESHOLD_SECONDS,
     MAX_CANDLES_PER_REQUEST,
     _get_backfill_start_time,
     _merge_nearby_gaps,
+    _next_poll_wake_time,
     backfill_instrument,
     detect_and_heal_gaps,
     fetch_and_store_recent,
@@ -1239,3 +1241,54 @@ class TestGapPrioritization:
 
 # NOTE: Market closure tests have been moved to test_market_calendar.py
 # The is_market_closure function is now in src.agentfx.api.workers.market_calendar
+
+
+class TestNextPollWakeTime:
+    """Wilson UAT 2026-08-02: ingestion loop now sleeps until the next
+    minute boundary + buffer instead of a fixed 60s. `_next_poll_wake_time`
+    is the pure helper that decides when to wake — locked here so we
+    don't regress the boundary math."""
+
+    def test_aligns_to_next_minute_boundary_plus_buffer(self):
+        # 12:00:15 with 60s boundary + 3s buffer → 12:01:03
+        now = datetime(2026, 8, 2, 12, 0, 15, tzinfo=UTC)
+        wake = _next_poll_wake_time(now, boundary_seconds=60, buffer_seconds=3)
+        assert wake == datetime(2026, 8, 2, 12, 1, 3, tzinfo=UTC)
+
+    def test_when_before_boundary_buffer_within_same_boundary(self):
+        # 12:00:01 with buffer=3 → 12:00:03 (still within the current
+        # boundary's buffer window — DON'T advance to next minute).
+        now = datetime(2026, 8, 2, 12, 0, 1, tzinfo=UTC)
+        wake = _next_poll_wake_time(now, boundary_seconds=60, buffer_seconds=3)
+        assert wake == datetime(2026, 8, 2, 12, 0, 3, tzinfo=UTC)
+
+    def test_when_past_boundary_buffer_jumps_to_next(self):
+        # 12:00:05 with buffer=3 → next boundary + buffer = 12:01:03
+        now = datetime(2026, 8, 2, 12, 0, 5, tzinfo=UTC)
+        wake = _next_poll_wake_time(now, boundary_seconds=60, buffer_seconds=3)
+        assert wake == datetime(2026, 8, 2, 12, 1, 3, tzinfo=UTC)
+
+    def test_exactly_on_boundary_plus_buffer_advances(self):
+        # 12:01:03 exactly with buffer=3 → next is 12:02:03. Otherwise
+        # we'd bounce immediately with sleep=0 → tight loop.
+        now = datetime(2026, 8, 2, 12, 1, 3, tzinfo=UTC)
+        wake = _next_poll_wake_time(now, boundary_seconds=60, buffer_seconds=3)
+        assert wake == datetime(2026, 8, 2, 12, 2, 3, tzinfo=UTC)
+
+    def test_sub_second_now_still_aligns_cleanly(self):
+        # 12:00:00.500 with buffer=3 → 12:00:03 (buffer still ahead).
+        now = datetime(2026, 8, 2, 12, 0, 0, 500_000, tzinfo=UTC)
+        wake = _next_poll_wake_time(now, boundary_seconds=60, buffer_seconds=3)
+        assert wake == datetime(2026, 8, 2, 12, 0, 3, tzinfo=UTC)
+
+    def test_zero_buffer_wakes_right_at_boundary(self):
+        # No buffer → wake at exact minute boundary.
+        now = datetime(2026, 8, 2, 12, 0, 30, tzinfo=UTC)
+        wake = _next_poll_wake_time(now, boundary_seconds=60, buffer_seconds=0)
+        assert wake == datetime(2026, 8, 2, 12, 1, 0, tzinfo=UTC)
+
+    def test_default_buffer_is_three_seconds(self):
+        # Constant hasn't drifted — the paper runner's assumption of
+        # "~3s post bar close before ingestion completes" depends on
+        # this value.
+        assert INGESTION_ALIGNMENT_BUFFER_SECONDS == 3

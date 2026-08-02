@@ -49,6 +49,44 @@ GAP_DETECTION_MULTIPLIER = 5
 # Adaptive health check: re-run after this many seconds when gaps remain
 CATCH_UP_HEALTH_CHECK_INTERVAL = 300  # 5 minutes
 
+# Wilson UAT 2026-08-02: buffer added to the minute-boundary alignment
+# in the polling loop. OANDA marks a closed bar available within ~1s of
+# bar close; a 3s buffer gives comfortable margin without adding
+# unnecessary latency. Kept as a module constant (not env-configurable)
+# because the value is a broker-behavior property, not a deployment
+# preference — if OANDA ever changes their post-close latency this is
+# where the fix goes.
+INGESTION_ALIGNMENT_BUFFER_SECONDS = 3
+
+
+def _next_poll_wake_time(
+    now: datetime,
+    boundary_seconds: int,
+    buffer_seconds: float,
+) -> datetime:
+    """Compute the next wall-clock instant to wake the ingestion loop.
+
+    Aligns to the next `boundary_seconds` boundary (typically 60s for
+    M1) plus `buffer_seconds` to give OANDA time to publish the just-
+    closed bar. Ensures cycle wake-ups happen at consistent times
+    relative to bar closes (e.g. every :03s past minute for buffer=3).
+
+    Never returns a time in the past: if `now` is already past the
+    current boundary + buffer, jumps to the NEXT boundary + buffer.
+
+    Extracted as a pure function so a Vitest-style unit test can lock
+    the boundary math without spinning up asyncio.
+    """
+    epoch = now.timestamp()
+    # First candidate: the boundary at or before `now`, plus buffer.
+    boundary_at_or_before = (epoch // boundary_seconds) * boundary_seconds
+    candidate = boundary_at_or_before + buffer_seconds
+    if candidate <= epoch:
+        # We're already past this boundary's buffer — jump to next.
+        candidate += boundary_seconds
+    return datetime.fromtimestamp(candidate, tz=UTC)
+
+
 # Granularity to seconds mapping for time-based pagination
 # OANDA API doesn't allow count + from/to together, so we paginate by time windows
 GRANULARITY_SECONDS = {
@@ -1210,10 +1248,31 @@ async def ingestion_loop():
             consecutive_failures = 0
             backoff_seconds = INITIAL_BACKOFF_SECONDS
 
-            # Wait for next poll interval
+            # Wilson UAT 2026-08-02: align the next poll to the M1 bar
+            # boundary + buffer. Previously we slept for a fixed
+            # INGESTION_POLL_INTERVAL (60s) after cycle END; because
+            # each cycle takes 3-6s of work, wake-ups drifted forward
+            # ~5-19s per iteration relative to minute boundaries. That
+            # made bar-close-to-DB-complete latency uniformly random in
+            # [0, 78s] with mean ~39s. The paper runner's signal-tick
+            # would frequently fire BEFORE its own bar had been
+            # ingested and miss cross-event entries (see Fix D in
+            # paper_runner.py for the runner-side robustness).
+            #
+            # Now: sleep until (next M1 boundary + buffer), so we wake
+            # up ~3s after every :00. OANDA's closed-bar data is
+            # available within ~1s of close, so a 3s buffer gives
+            # comfortable margin without wasted latency. Worst-case
+            # ingest lag drops from 78s → ~5-10s (buffer + cycle work).
+            wake_at = _next_poll_wake_time(
+                datetime.now(UTC),
+                boundary_seconds=settings.INGESTION_POLL_INTERVAL,
+                buffer_seconds=INGESTION_ALIGNMENT_BUFFER_SECONDS,
+            )
+            sleep_seconds = max(1.0, (wake_at - datetime.now(UTC)).total_seconds())
             await asyncio.wait_for(
                 _shutdown_event.wait(),
-                timeout=settings.INGESTION_POLL_INTERVAL,
+                timeout=sleep_seconds,
             )
 
         except TimeoutError:
