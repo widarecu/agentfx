@@ -12,6 +12,10 @@ without spawning processes.
 
 from __future__ import annotations
 
+import json
+import logging
+import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -27,6 +31,8 @@ from ..schemas.paper import (
     ClosestGenome,
     DeployPaperRequest,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -1004,6 +1010,91 @@ def find_orphaned_running_paper_runs(db: Session) -> Iterable[models.Run]:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# LLM-suggested deployment name (v0.6.2)
+# ─────────────────────────────────────────────────────────────────────
+
+_SUGGEST_NAME_MODEL = "claude-haiku-4-5"
+_SUGGEST_NAME_MAX_TOKENS = 48
+_SUGGEST_NAME_MAX_LEN = 60
+
+_SUGGEST_NAME_PROMPT_TEMPLATE = """You name forex paper-trading strategies for a solo trader's dashboard.
+
+Given this Strategy DSL (indicators, entry, exit), propose ONE short memorable name that reflects the strategy's character (2-4 words, Title Case, no quotes, no punctuation, no instrument names).
+
+Examples of the vibe (do NOT reuse verbatim):
+- MACD Momentum Rider
+- RSI Reversal Scalper
+- OBV Trend Follower
+- SMA Breakout Chaser
+
+DSL:
+{dsl_json}
+
+Reply with ONLY the name. Nothing else."""
+
+
+def _sanitize_suggested_name(raw: str) -> str:
+    """Trim quotes, punctuation, whitespace, and cap length. LLM
+    occasionally wraps the response in quotes or adds a trailing period
+    despite the instruction; strip both without complaint."""
+    # Take only the first non-empty line — belt against the LLM adding
+    # an explanation on the next line.
+    first_line = next((line for line in raw.splitlines() if line.strip()), "")
+    stripped = first_line.strip().strip('"').strip("'").strip("`").strip()
+    # Drop trailing punctuation.
+    stripped = re.sub(r"[.!?,;:]+$", "", stripped).strip()
+    return stripped[:_SUGGEST_NAME_MAX_LEN]
+
+
+def suggest_deployment_name(
+    db: Session,
+    strategy_genome_id: str,
+    current_user: models.User,
+) -> str:
+    """LLM-suggested short name summarising the genome's DSL character.
+
+    Purely a suggestion — the caller still submits `POST /paper-runs/approve`
+    with whatever name they want. On the way in the caller must own the
+    genome (same authorization as approve). On the way out, an empty
+    string is treated as failure and surfaced to the router as a 502.
+    """
+    genome = _load_owned_validated_genome(db, strategy_genome_id, current_user.id)
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY is not configured on this environment")
+
+    # Lazy import so environments without the anthropic dep (unit tests
+    # that don't hit this path) don't pay the import cost.
+    import anthropic
+
+    dsl_snippet = json.dumps(genome.dsl_json, sort_keys=True)[:4000]
+    prompt = _SUGGEST_NAME_PROMPT_TEMPLATE.format(dsl_json=dsl_snippet)
+
+    client = anthropic.Anthropic(api_key=api_key)
+    resp = client.messages.create(
+        model=_SUGGEST_NAME_MODEL,
+        max_tokens=_SUGGEST_NAME_MAX_TOKENS,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = ""
+    for block in resp.content or []:
+        text = getattr(block, "text", None)
+        if isinstance(text, str) and text.strip():
+            raw = text
+            break
+    name = _sanitize_suggested_name(raw)
+    if not name:
+        raise RuntimeError("LLM returned an empty name suggestion")
+    logger.info(
+        "suggest_deployment_name genome=%s user=%s → %r",
+        strategy_genome_id,
+        current_user.id,
+        name,
+    )
+    return name
+
+
 __all__ = [
     "approve_and_deploy",
     "delete_paper_run",
@@ -1014,4 +1105,5 @@ __all__ = [
     "reject_genome",
     "request_kill",
     "resume_paper_run",
+    "suggest_deployment_name",
 ]

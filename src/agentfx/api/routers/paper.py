@@ -263,6 +263,36 @@ def approve_paper_run(
     )
 
 
+@router.post(
+    "/paper-runs/suggest-name",
+    response_model=schemas.SuggestDeploymentNameResponse,
+)
+def suggest_deployment_name(
+    body: schemas.SuggestDeploymentNameRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> schemas.SuggestDeploymentNameResponse:
+    """LLM-suggested short deployment name for the approve modal (v0.6.2).
+
+    - `ValueError` (genome not found / not owned / not validated) → 400
+    - `RuntimeError` (no ANTHROPIC_API_KEY, empty LLM response) → 502
+    """
+    _ensure_trader(current_user)
+    try:
+        name = paper_service.suggest_deployment_name(
+            db, body.strategy_genome_id, current_user
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+        ) from e
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)
+        ) from e
+    return schemas.SuggestDeploymentNameResponse(suggested_name=name)
+
+
 @router.post("/paper-runs/reject")
 def reject_paper_run(
     body: schemas.RejectGenomeRequest,

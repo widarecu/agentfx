@@ -112,6 +112,8 @@ from .paper import (
     PaperTradePublic,
     RejectGenomeRequest,
     RiskConfig,
+    SuggestDeploymentNameRequest,
+    SuggestDeploymentNameResponse,
 )
 from .user_credentials import (
     UserOandaAccountPublic,
@@ -218,6 +220,8 @@ __all__ = [
     "RiskConfig",
     "DeployPaperRequest",
     "RejectGenomeRequest",
+    "SuggestDeploymentNameRequest",
+    "SuggestDeploymentNameResponse",
     "PaperRunApproval",
     "PaperRunPublic",
     "PaperRunListItem",

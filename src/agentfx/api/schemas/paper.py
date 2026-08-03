@@ -98,6 +98,22 @@ class RejectGenomeRequest(BaseSchema):
     )
 
 
+class SuggestDeploymentNameRequest(BaseSchema):
+    """`POST /paper-runs/suggest-name` body (v0.6.2)."""
+
+    strategy_genome_id: str = Field(..., min_length=1, max_length=200)
+
+
+class SuggestDeploymentNameResponse(BaseSchema):
+    """LLM-generated short name for the DeployPaperModal name field.
+
+    Purely a suggestion — the user can still edit or ignore it before
+    submitting `POST /paper-runs/approve`.
+    """
+
+    suggested_name: str = Field(..., max_length=200)
+
+
 class PaperRunApproval(BaseSchema):
     """Response body for approve/reject."""
 

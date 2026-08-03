@@ -13,11 +13,12 @@
  */
 
 import React, { useEffect, useState } from 'react';
-import { Loader2, X } from 'lucide-react';
+import { Loader2, Sparkles, X } from 'lucide-react';
 
 import { listMyAccounts } from '../services/credentialsApi';
 import {
   approvePaperRun,
+  suggestDeploymentName,
   type ApprovePaperRunRequest,
 } from '../services/paperApi';
 import type { UserOandaAccountPublic } from '../types/credentials';
@@ -70,6 +71,22 @@ export function DeployPaperModal({
   );
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  // v0.6.2: Sparkle-button state for LLM-suggested deployment name.
+  const [suggesting, setSuggesting] = useState(false);
+  const [suggestError, setSuggestError] = useState<string | null>(null);
+
+  async function handleSuggestName() {
+    setSuggesting(true);
+    setSuggestError(null);
+    try {
+      const suggested = await suggestDeploymentName(item.strategy_genome_id);
+      setName(suggested);
+    } catch (err) {
+      setSuggestError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSuggesting(false);
+    }
+  }
 
   useEffect(() => {
     (async () => {
@@ -166,13 +183,34 @@ export function DeployPaperModal({
               >
                 Deployment name
               </label>
-              <input
-                id="deploy-name"
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                className="mt-1 w-full px-3 py-2 border border-slate-300 dark:border-slate-600 dark:bg-slate-900 rounded text-sm"
-              />
+              <div className="mt-1 flex items-center gap-2">
+                <input
+                  id="deploy-name"
+                  type="text"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  className="flex-1 px-3 py-2 border border-slate-300 dark:border-slate-600 dark:bg-slate-900 rounded text-sm"
+                />
+                <button
+                  type="button"
+                  onClick={handleSuggestName}
+                  disabled={suggesting}
+                  className="inline-flex items-center gap-1 px-3 py-2 border border-slate-300 dark:border-slate-600 rounded text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+                  title="LLM-suggest a memorable name based on the strategy DSL"
+                >
+                  {suggesting ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Sparkles className="w-3.5 h-3.5" />
+                  )}
+                  Suggest
+                </button>
+              </div>
+              {suggestError && (
+                <div className="mt-1 text-[11px] text-rose-700 dark:text-rose-400">
+                  {suggestError}
+                </div>
+              )}
             </div>
 
             <div>

@@ -148,6 +148,25 @@ export async function rejectGenome(
   return handleResponse(res);
 }
 
+/**
+ * v0.6.2: LLM-suggested deployment name for the approve modal. The
+ * backend calls Anthropic Haiku, sanitizes the response, and returns
+ * a short (2-4 word) name summarizing the genome's DSL character.
+ * Purely a suggestion — user still submits `approvePaperRun` with
+ * whatever name they typed.
+ */
+export async function suggestDeploymentName(
+  strategyGenomeId: string,
+): Promise<string> {
+  const res = await fetch(`${API_BASE_URL}/paper-runs/suggest-name`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ strategy_genome_id: strategyGenomeId }),
+  });
+  const data = await handleResponse<{ suggested_name: string }>(res);
+  return data.suggested_name;
+}
+
 export async function killPaperRun(
   runId: string,
 ): Promise<KillPaperRunResponse> {
