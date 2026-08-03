@@ -14,23 +14,26 @@ import { ChevronLeft, Loader2 } from 'lucide-react';
 
 import StrategyChart from '../components/StrategyChart';
 import { PaperRunDecisionLog } from '../components/PaperRunDecisionLog';
-import { PaperRunTradesTable } from '../components/PaperRunTradesTable';
 import {
   getDecisionsForRun,
   getPaperRun,
   getTradesForRun,
 } from '../services/paperApi';
+import { getGenome } from '../services/evolutionApi';
+import { pipSizeFor, resolveSlTpPips } from './MobilePaperRunDetail';
 import type {
   PaperDecisionPublic,
   PaperRunPublic,
   PaperTradePublic,
 } from '../types/paper';
 import type { CandleData, TradeSignal } from '../types/optimization';
+import type { StrategyGenome } from '../types/evolution';
 import {
   fetchCandles,
   fetchLatestCandle,
   granularityToSeconds,
 } from '../utils/candles';
+import { formatUTC } from '../utils/time';
 
 const POLL_INTERVAL_MS = 5_000;
 const CANDLES_POLL_INTERVAL_MS = 60_000;
@@ -96,6 +99,25 @@ function useRun(runId: string | undefined) {
     };
   }, [runId]);
   return { run, error };
+}
+
+function useGenomeForRun(run: PaperRunPublic | null) {
+  const [genome, setGenome] = useState<StrategyGenome | null>(null);
+  useEffect(() => {
+    if (!run?.evolution_run_id || !run.strategy_genome_id) return;
+    let cancelled = false;
+    getGenome(run.evolution_run_id, run.strategy_genome_id)
+      .then((g) => {
+        if (!cancelled) setGenome(g);
+      })
+      .catch(() => {
+        /* best-effort */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [run?.evolution_run_id, run?.strategy_genome_id]);
+  return genome;
 }
 
 function Loading() {
@@ -270,6 +292,12 @@ export function MobilePaperTradesRoute(): React.ReactElement {
     };
   }, [run?.instrument, run?.granularity]);
 
+  // Wilson UAT 2026-08-03: open trades ALWAYS at the top; closed trades
+  // below in newest-first order (by exit_timestamp). Previously the
+  // desktop table ordering leaked through and open trades sank below
+  // recent closes.
+  const sortedTrades = React.useMemo(() => sortTradesOpenFirst(trades), [trades]);
+
   if (error) {
     return (
       <SubRouteShell runId={runId ?? ''} title="Trades">
@@ -284,21 +312,147 @@ export function MobilePaperTradesRoute(): React.ReactElement {
       </SubRouteShell>
     );
   }
+
+  const openCount = trades.filter((t) => t.exit_timestamp === null).length;
+
   return (
     <SubRouteShell
       runId={runId ?? ''}
       title="All trades"
-      subtitle={`${trades.length} · ${run.instrument} · ${run.granularity}`}
+      subtitle={`${trades.length} total · ${openCount} open · ${run.instrument}`}
     >
-      <div className="bg-slate-800 border border-slate-700 rounded-lg p-3">
-        <PaperRunTradesTable
-          trades={trades}
-          latestClose={latestClose}
-          instrument={run.instrument}
-        />
-      </div>
+      {sortedTrades.length === 0 ? (
+        <div className="text-sm text-slate-500 italic py-8 px-1">
+          No trades yet.
+        </div>
+      ) : (
+        <ul className="flex flex-col gap-2" style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+          {sortedTrades.map((t) => (
+            <TradeCard
+              key={t.id}
+              trade={t}
+              instrument={run.instrument}
+              latestClose={latestClose}
+            />
+          ))}
+        </ul>
+      )}
     </SubRouteShell>
   );
+}
+
+/**
+ * Open trades first (there is usually 0 or 1 for this single-position
+ * runner but the ordering must survive multi-position edge cases too),
+ * then closed trades newest-first by exit_timestamp.
+ */
+export function sortTradesOpenFirst(
+  trades: PaperTradePublic[],
+): PaperTradePublic[] {
+  const open = trades
+    .filter((t) => t.exit_timestamp === null)
+    .sort((a, b) => b.entry_timestamp.localeCompare(a.entry_timestamp));
+  const closed = trades
+    .filter((t) => t.exit_timestamp !== null)
+    .sort((a, b) =>
+      (b.exit_timestamp ?? b.entry_timestamp).localeCompare(
+        a.exit_timestamp ?? a.entry_timestamp,
+      ),
+    );
+  return [...open, ...closed];
+}
+
+function TradeCard({
+  trade,
+  instrument,
+  latestClose,
+}: {
+  trade: PaperTradePublic;
+  instrument: string;
+  latestClose: number | null;
+}) {
+  const long = trade.side === 'buy';
+  const open = trade.exit_timestamp === null;
+  const pip = pipSizeFor(instrument);
+  const sign = long ? 1 : -1;
+
+  let pnlUsd = trade.net_pnl ?? trade.pnl ?? null;
+  let pipMove: number | null = null;
+  if (open) {
+    if (latestClose != null) {
+      pipMove = ((latestClose - trade.entry_price) * sign) / pip;
+      pnlUsd = pipMove * trade.quantity * pip; // rough — matches main-view estimate
+    }
+  } else if (trade.exit_price != null) {
+    pipMove = ((trade.exit_price - trade.entry_price) * sign) / pip;
+  }
+
+  const positive = (pnlUsd ?? 0) >= 0;
+  const pnlColor = positive ? 'text-emerald-400' : 'text-rose-400';
+
+  return (
+    <li className="bg-slate-800 border border-slate-700 rounded-lg p-3 flex flex-col gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span
+          className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold font-mono uppercase tracking-wider border ${long ? 'text-emerald-400 border-emerald-500/40 bg-emerald-500/10' : 'text-rose-400 border-rose-500/40 bg-rose-500/10'}`}
+        >
+          {long ? '▲' : '▼'}
+          {long ? 'Long' : 'Short'}
+        </span>
+        {open && (
+          <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono uppercase tracking-wider border text-amber-400 border-amber-500/40 bg-amber-500/10">
+            Open
+          </span>
+        )}
+        <span className="text-sm font-mono font-semibold text-slate-100">
+          {trade.quantity.toLocaleString()}
+        </span>
+        <span className="ml-auto text-right">
+          <div className={`text-sm font-mono font-semibold tabular-nums ${pnlColor}`}>
+            {pnlUsd != null ? (pnlUsd >= 0 ? '+' : '−') + '$' + Math.abs(pnlUsd).toFixed(2) : '—'}
+          </div>
+          {pipMove != null && (
+            <div className={`text-[10px] font-mono tabular-nums ${pnlColor}`}>
+              {pipMove >= 0 ? '+' : '−'}
+              {Math.abs(pipMove).toFixed(1)}p
+            </div>
+          )}
+        </span>
+      </div>
+      <div className="flex items-center gap-1 text-[11px] font-mono text-slate-400 flex-wrap">
+        <span>{trade.entry_price.toFixed(5)}</span>
+        <span className="text-slate-600">→</span>
+        <span>{trade.exit_price != null ? trade.exit_price.toFixed(5) : 'open'}</span>
+      </div>
+      <div className="flex items-center justify-between text-[10px] font-mono text-slate-500 gap-2">
+        <span className="truncate">
+          {open
+            ? `entry ${formatCompactTime(trade.entry_timestamp)}`
+            : `${formatCompactTime(trade.entry_timestamp)} → ${formatCompactTime(trade.exit_timestamp!)}`}
+        </span>
+        {trade.exit_reason && (
+          <span className="text-slate-400 shrink-0">{trade.exit_reason}</span>
+        )}
+      </div>
+      {trade.signal_reason && (
+        <div className="text-[10px] font-mono text-slate-500 truncate">
+          {trade.signal_reason}
+        </div>
+      )}
+    </li>
+  );
+}
+
+/** DD-MMM HH:MM (UTC) — short enough for a 375px card. */
+function formatCompactTime(iso: string): string {
+  const d = new Date(iso);
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  const mon = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][
+    d.getUTCMonth()
+  ];
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  const mm = String(d.getUTCMinutes()).padStart(2, '0');
+  return `${dd} ${mon} ${hh}:${mm}`;
 }
 
 // ─── /paper/:runId/decisions ─────────────────────────────────────────
@@ -355,6 +509,7 @@ export function MobilePaperDecisionsRoute(): React.ReactElement {
 export function MobilePaperRiskRoute(): React.ReactElement {
   const { runId } = useParams<{ runId: string }>();
   const { run, error } = useRun(runId);
+  const genome = useGenomeForRun(run);
 
   if (error) {
     return (
@@ -372,14 +527,26 @@ export function MobilePaperRiskRoute(): React.ReactElement {
   }
 
   const risk = run.risk_config;
+  // Wilson UAT 2026-08-03: mirror the runner's SL/TP fallback so we
+  // show the values that are actually protecting the position, even
+  // when the deploy modal didn't set them explicitly.
+  const resolved = resolveSlTpPips(run, genome);
+  const slLabel =
+    resolved.slPips > 0
+      ? `${resolved.slPips} pips${resolved.source === 'genome_dsl' ? ' (from genome DSL)' : ''}`
+      : '—';
+  const tpLabel =
+    resolved.tpPips > 0
+      ? `${resolved.tpPips} pips${resolved.source === 'genome_dsl' ? ' (from genome DSL)' : ''}`
+      : '—';
   const rows: Array<{ label: string; value: string }> = [
     {
       label: 'Stop loss',
-      value: risk?.stop_loss_pips != null ? `${risk.stop_loss_pips} pips` : '—',
+      value: slLabel,
     },
     {
       label: 'Take profit',
-      value: risk?.take_profit_pips != null ? `${risk.take_profit_pips} pips` : '—',
+      value: tpLabel,
     },
     {
       label: 'Daily loss cap',

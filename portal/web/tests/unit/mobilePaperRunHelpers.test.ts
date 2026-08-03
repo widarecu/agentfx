@@ -13,11 +13,15 @@ import {
   _computeScaleInner,
   buildActivity,
   pipSizeFor,
+  resolveSlTpPips,
 } from '../../src/pages/MobilePaperRunDetail';
+import { sortTradesOpenFirst } from '../../src/pages/MobilePaperSubRoutes';
 import type {
   PaperDecisionPublic,
+  PaperRunPublic,
   PaperTradePublic,
 } from '../../src/types/paper';
+import type { StrategyGenome } from '../../src/types/evolution';
 
 // ──────────────────────────────────────────────────────────────────────
 // pipSizeFor
@@ -249,5 +253,147 @@ describe('buildActivity', () => {
       }),
     );
     expect(buildActivity(many, [], 6)).toHaveLength(6);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// resolveSlTpPips — runner-fallback parity
+// ──────────────────────────────────────────────────────────────────────
+
+function makeRun(overrides: Partial<PaperRunPublic> = {}): PaperRunPublic {
+  return {
+    id: 'run_1',
+    status: 'RUNNING',
+    strategy_genome_id: 'g1',
+    evolution_run_id: 'e1',
+    instrument: 'EUR_USD',
+    granularity: 'M15',
+    oanda_account_id: null,
+    oanda_environment: null,
+    snapshot_balance: 100_000,
+    current_balance: 100_000,
+    pnl: null,
+    risk_config: null,
+    stop_reason: null,
+    kill_requested_at: null,
+    approved_at: null,
+    approved_by_user_id: null,
+    created_at: null,
+    started_at: null,
+    completed_at: null,
+    user_id: null,
+    crash_detail: null,
+    ...overrides,
+  };
+}
+
+function makeGenome(exit: { stop_pips?: number; target_pips?: number } | null): StrategyGenome {
+  return {
+    id: 'g1',
+    dsl_json: exit ? { exit } as StrategyGenome['dsl_json'] : ({} as StrategyGenome['dsl_json']),
+  } as StrategyGenome;
+}
+
+describe('resolveSlTpPips', () => {
+  it('prefers risk_config when both SL and TP are set there', () => {
+    const run = makeRun({
+      risk_config: {
+        stop_loss_pips: 22,
+        take_profit_pips: 40,
+        daily_loss_pct: 2,
+        kill_switch_dd_pct: 10,
+      },
+    });
+    const genome = makeGenome({ stop_pips: 999, target_pips: 999 });
+    const r = resolveSlTpPips(run, genome);
+    expect(r.slPips).toBe(22);
+    expect(r.tpPips).toBe(40);
+    expect(r.source).toBe('risk_config');
+  });
+
+  it('falls back to genome DSL when risk_config has no SL/TP (Wilson UAT case)', () => {
+    const run = makeRun({
+      risk_config: {
+        daily_loss_pct: 2,
+        kill_switch_dd_pct: 10,
+      },
+    });
+    const genome = makeGenome({ stop_pips: 22, target_pips: 40 });
+    const r = resolveSlTpPips(run, genome);
+    expect(r.slPips).toBe(22);
+    expect(r.tpPips).toBe(40);
+    expect(r.source).toBe('genome_dsl');
+  });
+
+  it('returns 0/unknown when neither source has SL/TP', () => {
+    const run = makeRun({ risk_config: null });
+    const genome = makeGenome(null);
+    const r = resolveSlTpPips(run, genome);
+    expect(r.slPips).toBe(0);
+    expect(r.tpPips).toBe(0);
+    expect(r.source).toBe('unknown');
+  });
+
+  it('tolerates a null genome (fetch still in flight)', () => {
+    const run = makeRun({
+      risk_config: {
+        stop_loss_pips: 15,
+        take_profit_pips: 30,
+        daily_loss_pct: 2,
+        kill_switch_dd_pct: 10,
+      },
+    });
+    const r = resolveSlTpPips(run, null);
+    expect(r.slPips).toBe(15);
+    expect(r.tpPips).toBe(30);
+    expect(r.source).toBe('risk_config');
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// sortTradesOpenFirst — open trades pinned, closed newest-first
+// ──────────────────────────────────────────────────────────────────────
+
+describe('sortTradesOpenFirst', () => {
+  it('places open trades before ALL closed trades regardless of open trade age', () => {
+    const old_open = makeTrade({
+      id: 'open',
+      entry_timestamp: '2026-08-02T08:00:00Z',
+      exit_timestamp: null,
+    });
+    const recent_close = makeTrade({
+      id: 'recent',
+      entry_timestamp: '2026-08-02T17:00:00Z',
+      exit_timestamp: '2026-08-02T17:30:00Z',
+    });
+    const sorted = sortTradesOpenFirst([recent_close, old_open]);
+    expect(sorted[0].id).toBe('open');
+    expect(sorted[1].id).toBe('recent');
+  });
+
+  it('sorts closed trades newest-first by exit_timestamp', () => {
+    const older = makeTrade({
+      id: 'older',
+      entry_timestamp: '2026-08-01T10:00:00Z',
+      exit_timestamp: '2026-08-01T11:00:00Z',
+    });
+    const newer = makeTrade({
+      id: 'newer',
+      entry_timestamp: '2026-08-02T10:00:00Z',
+      exit_timestamp: '2026-08-02T11:00:00Z',
+    });
+    const sorted = sortTradesOpenFirst([older, newer]);
+    expect(sorted[0].id).toBe('newer');
+    expect(sorted[1].id).toBe('older');
+  });
+
+  it('does not mutate the input array', () => {
+    const input = [
+      makeTrade({ id: 'a', exit_timestamp: '2026-08-02T10:00:00Z' }),
+      makeTrade({ id: 'b', exit_timestamp: null }),
+    ];
+    const originalOrder = input.map((t) => t.id);
+    sortTradesOpenFirst(input);
+    expect(input.map((t) => t.id)).toEqual(originalOrder);
   });
 });

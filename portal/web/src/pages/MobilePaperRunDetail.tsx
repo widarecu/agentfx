@@ -26,6 +26,7 @@ import {
   getTradesForRun,
   killPaperRun,
 } from '../services/paperApi';
+import { getGenome } from '../services/evolutionApi';
 import {
   isTerminal,
   type PaperDecisionPublic,
@@ -34,6 +35,7 @@ import {
   type PaperTradePublic,
   type EquitySnapshotPublic,
 } from '../types/paper';
+import type { StrategyGenome } from '../types/evolution';
 import type { CandleData } from '../types/optimization';
 import {
   fetchCandles,
@@ -48,6 +50,36 @@ const PREVIEW_POLL_INTERVAL_MS = 60_000;
 const HEARTBEAT_TICK_MS = 30_000;
 const PREVIEW_CANDLE_COUNT = 30;
 const ACTIVITY_FEED_LIMIT = 6;
+
+// ─── SL/TP resolution ────────────────────────────────────────────────
+// The runner (paper_runner.py:1291–1297) resolves SL/TP with a fallback:
+//   1. run.risk_config.stop_loss_pips / take_profit_pips (deploy modal)
+//   2. otherwise the genome's DSL exit rules
+// Wilson UAT 2026-08-03: main view + risk sub-route were reading only
+// (1); runs where SL/TP live in the DSL rendered "No SL/TP configured".
+// This helper mirrors the runner so the mobile UI stays in agreement.
+export function resolveSlTpPips(
+  run: PaperRunPublic | null | undefined,
+  genome: StrategyGenome | null | undefined,
+): { slPips: number; tpPips: number; source: 'risk_config' | 'genome_dsl' | 'unknown' } {
+  const rcSl = run?.risk_config?.stop_loss_pips;
+  const rcTp = run?.risk_config?.take_profit_pips;
+  if (rcSl != null && rcTp != null) {
+    return { slPips: rcSl, tpPips: rcTp, source: 'risk_config' };
+  }
+  const dslExit = genome?.dsl_json?.exit ?? {};
+  const dslSl = typeof dslExit.stop_pips === 'number' ? dslExit.stop_pips : null;
+  const dslTp = typeof dslExit.target_pips === 'number' ? dslExit.target_pips : null;
+  const slPips = rcSl ?? dslSl ?? 0;
+  const tpPips = rcTp ?? dslTp ?? 0;
+  const source: 'risk_config' | 'genome_dsl' | 'unknown' =
+    slPips > 0 || tpPips > 0
+      ? rcSl != null || rcTp != null
+        ? 'risk_config'
+        : 'genome_dsl'
+      : 'unknown';
+  return { slPips, tpPips, source };
+}
 
 // ─── pip helpers (mirrors PaperRunTradesTable's local copy — kept small
 //      and duplicated intentionally). ─────────────────────────────────
@@ -294,6 +326,7 @@ export default function MobilePaperRunDetail(): React.ReactElement {
   const { showToast } = useToast();
 
   const [run, setRun] = useState<PaperRunPublic | null>(null);
+  const [genome, setGenome] = useState<StrategyGenome | null>(null);
   const [trades, setTrades] = useState<PaperTradePublic[]>([]);
   const [decisions, setDecisions] = useState<PaperDecisionPublic[]>([]);
   const [equity, setEquity] = useState<EquitySnapshotPublic[]>([]);
@@ -371,6 +404,22 @@ export default function MobilePaperRunDetail(): React.ReactElement {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadRun, loadTrades, loadDecisions, loadEquity, run?.status]);
+
+  // ── genome (one-shot; used only for SL/TP fallback) ──────────────
+  useEffect(() => {
+    if (!run?.evolution_run_id || !run.strategy_genome_id) return;
+    let cancelled = false;
+    getGenome(run.evolution_run_id, run.strategy_genome_id)
+      .then((g) => {
+        if (!cancelled) setGenome(g);
+      })
+      .catch(() => {
+        /* genome fetch is best-effort; SL/TP just fall through to "—". */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [run?.evolution_run_id, run?.strategy_genome_id]);
 
   // ── preview candles + latest close ───────────────────────────────
   useEffect(() => {
@@ -497,8 +546,7 @@ export default function MobilePaperRunDetail(): React.ReactElement {
   if (!run) return <div />;
 
   const primaryOpen = openPositions[0] ?? null;
-  const slPips = run.risk_config?.stop_loss_pips ?? 0;
-  const tpPips = run.risk_config?.take_profit_pips ?? 0;
+  const { slPips, tpPips } = resolveSlTpPips(run, genome);
   const scale =
     primaryOpen && latestClose != null && slPips > 0 && tpPips > 0
       ? _computeScaleInner(
