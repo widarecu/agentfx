@@ -37,7 +37,15 @@ import { formatUTC } from '../utils/time';
 
 const POLL_INTERVAL_MS = 5_000;
 const CANDLES_POLL_INTERVAL_MS = 60_000;
+/** Baseline fallback when the run has no approved_at and no trades yet. */
 const CHART_BAR_COUNT = 500;
+/** Cap for how far back we'll fetch. Keeps mobile from pulling months of
+ *  M1 on a long-lived run. StrategyChart's own visible-range default
+ *  keeps rendering snappy after fetch. */
+const CHART_MAX_BARS = 5_000;
+/** Extra bars either side of the trade window so entry/exit markers
+ *  aren't crammed against the chart edges. */
+const CHART_BAR_PAD = 20;
 
 // ─── shared shell ────────────────────────────────────────────────────
 
@@ -138,29 +146,6 @@ export function MobilePaperChartRoute(): React.ReactElement {
   const [trades, setTrades] = useState<PaperTradePublic[]>([]);
   const [candlesLoading, setCandlesLoading] = useState(false);
 
-  const loadCandles = useCallback(async () => {
-    if (!run) return;
-    setCandlesLoading(true);
-    try {
-      const granSec = granularityToSeconds(run.granularity);
-      const to = new Date().toISOString();
-      const from = new Date(
-        Date.now() - granSec * CHART_BAR_COUNT * 1000,
-      ).toISOString();
-      const [bars, latest] = await Promise.all([
-        fetchCandles(run.instrument, run.granularity, from, to),
-        fetchLatestCandle(run.instrument, run.granularity),
-      ]);
-      const merged =
-        latest && (bars.length === 0 || bars[bars.length - 1].timestamp !== latest.timestamp)
-          ? [...bars, latest]
-          : bars;
-      setCandles(merged);
-    } finally {
-      setCandlesLoading(false);
-    }
-  }, [run]);
-
   const loadTrades = useCallback(async () => {
     if (!runId) return;
     try {
@@ -171,16 +156,64 @@ export function MobilePaperChartRoute(): React.ReactElement {
     }
   }, [runId]);
 
+  // Wilson UAT 2026-08-03: chart markers were silently dropped because
+  // StrategyChart (line 303-306) filters signals to the visible candle
+  // range. Mobile was pulling only the last 500 bars from now — any
+  // trade older than the window had no bar match and its markers
+  // vanished. Match desktop's strategy: anchor to the earliest of
+  // {run.approved_at, earliest trade entry}, capped to CHART_MAX_BARS
+  // so a long-lived run doesn't pull months of M1 to a phone.
+  const loadCandles = useCallback(
+    async (currentTrades: PaperTradePublic[]) => {
+      if (!run) return;
+      setCandlesLoading(true);
+      try {
+        const granSec = granularityToSeconds(run.granularity);
+        const now = Date.now();
+        const anchors: number[] = [];
+        if (run.approved_at) anchors.push(new Date(run.approved_at).getTime());
+        for (const t of currentTrades) {
+          anchors.push(new Date(t.entry_timestamp).getTime());
+        }
+        // Fallback (no approval, no trades yet): CHART_BAR_COUNT back.
+        const anchor =
+          anchors.length > 0
+            ? Math.min(...anchors)
+            : now - granSec * CHART_BAR_COUNT * 1000;
+        const maxLookback = granSec * CHART_MAX_BARS * 1000;
+        const from = new Date(
+          Math.max(anchor - granSec * CHART_BAR_PAD * 1000, now - maxLookback),
+        ).toISOString();
+        const to = new Date(now).toISOString();
+        const [bars, latest] = await Promise.all([
+          fetchCandles(run.instrument, run.granularity, from, to),
+          fetchLatestCandle(run.instrument, run.granularity),
+        ]);
+        const merged =
+          latest && (bars.length === 0 || bars[bars.length - 1].timestamp !== latest.timestamp)
+            ? [...bars, latest]
+            : bars;
+        setCandles(merged);
+      } finally {
+        setCandlesLoading(false);
+      }
+    },
+    [run],
+  );
+
   useEffect(() => {
-    void loadCandles();
     void loadTrades();
-    const c = setInterval(loadCandles, CANDLES_POLL_INTERVAL_MS);
     const t = setInterval(loadTrades, POLL_INTERVAL_MS);
-    return () => {
-      clearInterval(c);
-      clearInterval(t);
-    };
-  }, [loadCandles, loadTrades]);
+    return () => clearInterval(t);
+  }, [loadTrades]);
+
+  // Re-fetch candles when either the run resolves OR the trade set
+  // changes (a new entry could push the anchor further back).
+  useEffect(() => {
+    void loadCandles(trades);
+    const c = setInterval(() => void loadCandles(trades), CANDLES_POLL_INTERVAL_MS);
+    return () => clearInterval(c);
+  }, [loadCandles, trades]);
 
   const chartSignals: TradeSignal[] = useMemo(() => {
     const out: TradeSignal[] = [];
@@ -251,7 +284,9 @@ export function MobilePaperChartRoute(): React.ReactElement {
           strategy="dsl"
           params={{}}
           timeframe={run.granularity}
-          defaultVisibleBars={200}
+          /* Omit defaultVisibleBars so the chart fits ALL bars in view.
+             Guarantees every trade marker is on-screen at first paint;
+             user can pinch to zoom into specific windows. */
         />
       )}
     </SubRouteShell>
