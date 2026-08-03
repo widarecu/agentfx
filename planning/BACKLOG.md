@@ -597,7 +597,22 @@ so users can audit the provenance of every deployed strategy.
 
 ---
 
-## v0.7.x — Mobile-first paper-run monitoring view
+## v0.7.x — Mobile-first paper-run monitoring view — **DONE**
+
+**Shipped:** 2026-08-03. Commits `9b909ff` (initial view + 4 sub-routes
++ router branch + collateral desktop fixes), `7844f94` (SL/TP genome
+DSL fallback + trades card layout + open-first sort — Wilson UAT
+phone-test corrections), `3100a71` (chart marker window fix). Verified
+by Wilson on iPhone via staging. `MobilePaperRunDetail` + 4 sub-routes
+at `/paper/:runId/{chart,trades,decisions,risk}`; `PaperRunDetail`
+branches on `useIsMobile()` at <640px.
+
+Follow-ups deferred:
+- Playwright test at 375×667 viewport (unit tests shipped for the
+  pure helpers only — `resolveSlTpPips`, `sortTradesOpenFirst`,
+  `_computeScaleInner`, `buildActivity`).
+
+Original theme kept below for context.
 
 **Theme:** Portal is unusable on mobile. `/paper/:id` renders 8
 tiles + full equity chart + full price-and-indicators chart +
