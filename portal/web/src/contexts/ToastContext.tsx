@@ -62,7 +62,10 @@ export function ToastProvider({ children }: ToastProviderProps) {
   return (
     <ToastContext.Provider value={{ showToast }}>
       {children}
-      <div className="fixed top-4 right-4 z-50 space-y-2">
+      {/* On mobile, sit below the ~56px App header so toasts don't cover
+          the nav; span the viewport with a small side gutter. On sm+
+          revert to the original top-right pill. */}
+      <div className="fixed top-16 left-2 right-2 sm:top-4 sm:left-auto sm:right-4 z-50 space-y-2 flex flex-col items-stretch sm:items-end">
         {state.toasts.map(toast => (
           <Toast key={toast.id} {...toast} />
         ))}

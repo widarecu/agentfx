@@ -16,6 +16,12 @@ import Settings from './pages/Settings'
 import PaperRuns from './pages/PaperRuns'
 import ApprovalQueue from './pages/ApprovalQueue'
 import PaperRunDetail from './pages/PaperRunDetail'
+import {
+  MobilePaperChartRoute,
+  MobilePaperDecisionsRoute,
+  MobilePaperRiskRoute,
+  MobilePaperTradesRoute,
+} from './pages/MobilePaperSubRoutes'
 import { ProtectedRoute } from './components/ProtectedRoute'
 import { RequireRole } from './components/RequireRole'
 
@@ -80,6 +86,40 @@ export const router = createBrowserRouter([
         element: (
           <RequireRole allowed={['trader', 'admin']}>
             <PaperRunDetail />
+          </RequireRole>
+        ),
+      },
+      // Mobile drill-down sub-routes — linked from MobilePaperRunDetail's
+      // 2×2 grid at <640px. Reachable on any viewport.
+      {
+        path: 'paper/:runId/chart',
+        element: (
+          <RequireRole allowed={['trader', 'admin']}>
+            <MobilePaperChartRoute />
+          </RequireRole>
+        ),
+      },
+      {
+        path: 'paper/:runId/trades',
+        element: (
+          <RequireRole allowed={['trader', 'admin']}>
+            <MobilePaperTradesRoute />
+          </RequireRole>
+        ),
+      },
+      {
+        path: 'paper/:runId/decisions',
+        element: (
+          <RequireRole allowed={['trader', 'admin']}>
+            <MobilePaperDecisionsRoute />
+          </RequireRole>
+        ),
+      },
+      {
+        path: 'paper/:runId/risk',
+        element: (
+          <RequireRole allowed={['trader', 'admin']}>
+            <MobilePaperRiskRoute />
           </RequireRole>
         ),
       },

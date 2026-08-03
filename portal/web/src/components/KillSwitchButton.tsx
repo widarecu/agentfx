@@ -146,7 +146,7 @@ function ArmedToast({
     <div
       role="alertdialog"
       aria-label="Confirm kill switch"
-      className="fixed top-20 left-1/2 -translate-x-1/2 z-50 bg-rose-700 text-rose-50 rounded-lg shadow-2xl p-4 flex items-center gap-4 min-w-[420px] border border-rose-900"
+      className="fixed top-20 left-1/2 -translate-x-1/2 z-50 bg-rose-700 text-rose-50 rounded-lg shadow-2xl p-4 flex items-center gap-4 w-[calc(100vw-2rem)] max-w-[420px] sm:min-w-[420px] border border-rose-900"
     >
       <div className="text-3xl font-bold font-mono" aria-live="polite">
         {remainingSec}
@@ -182,7 +182,7 @@ function CommittingToast() {
     <div
       role="status"
       aria-label="Halt in progress"
-      className="fixed top-20 left-1/2 -translate-x-1/2 z-50 bg-rose-700 text-rose-50 rounded-lg shadow-2xl p-4 flex items-center gap-3 min-w-[420px] border border-rose-900"
+      className="fixed top-20 left-1/2 -translate-x-1/2 z-50 bg-rose-700 text-rose-50 rounded-lg shadow-2xl p-4 flex items-center gap-3 w-[calc(100vw-2rem)] max-w-[420px] sm:min-w-[420px] border border-rose-900"
     >
       <Loader2 className="w-6 h-6 animate-spin" />
       <div className="flex-1 text-sm font-semibold">

@@ -25,6 +25,8 @@ import {
 } from 'lucide-react';
 
 import { useToast } from '../contexts/ToastContext';
+import { useIsMobile } from '../hooks/useIsMobile';
+import MobilePaperRunDetail from './MobilePaperRunDetail';
 import { KillSwitchButton } from '../components/KillSwitchButton';
 import {
   LivePnLChart,
@@ -83,6 +85,14 @@ const MAX_CHART_BARS = 30_000; // ~20 days of M1 during market hours
 // persisted, no client-side extrapolation.
 
 export default function PaperRunDetail() {
+  // Mobile viewport (<640px) mounts a dedicated glance-view. Only one
+  // of {mobile, desktop} mounts at a time, so polling doesn't double up.
+  const isMobile = useIsMobile();
+  if (isMobile) return <MobilePaperRunDetail />;
+  return <PaperRunDetailDesktop />;
+}
+
+function PaperRunDetailDesktop() {
   const { runId } = useParams<{ runId: string }>();
   const navigate = useNavigate();
   const { showToast } = useToast();

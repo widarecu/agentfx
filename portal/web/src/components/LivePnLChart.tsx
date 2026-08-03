@@ -1083,7 +1083,7 @@ function ChartTooltip({
 
   return (
     <div
-      className={`absolute z-30 pointer-events-none ${nudge} min-w-[240px] rounded-md bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-lg text-xs font-mono tabular-nums`}
+      className={`absolute z-30 pointer-events-none ${nudge} max-w-[calc(100vw-2rem)] min-w-0 sm:min-w-[240px] rounded-md bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-lg text-xs font-mono tabular-nums`}
       style={style}
     >
       <div className="px-3 py-1.5 border-b border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 font-semibold">
@@ -1194,7 +1194,7 @@ function TradeTooltip({ trade, projection }: TradeTooltipProps) {
 
   return (
     <div
-      className={`absolute z-30 pointer-events-none ${nudge} min-w-[260px] rounded-md bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-lg text-xs font-mono tabular-nums`}
+      className={`absolute z-30 pointer-events-none ${nudge} max-w-[calc(100vw-2rem)] min-w-0 sm:min-w-[260px] rounded-md bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-lg text-xs font-mono tabular-nums`}
       style={style}
     >
       <div className="px-3 py-1.5 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">

@@ -61,3 +61,8 @@ dist/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Local docker-compose overrides (LAN-IP overrides for phone access,
+# per-developer resource limits, etc). docker compose auto-loads
+# `docker-compose.override.yml` alongside `docker-compose.yml`.
+docker-compose.override.yml
