@@ -221,6 +221,14 @@ def list_approval_queue(
                 metrics_summary=g.metrics_json,
                 created_at=g.created_at,
                 dsl_exit=dsl_exit,
+                # v0.7.x cross-user sharing: exposes the exporter's
+                # email on genomes whose parent evolution run is a
+                # shadow row from an import. NULL for native genomes.
+                imported_from_email=(
+                    getattr(evorun, "imported_from_email", None)
+                    if evorun is not None
+                    else None
+                ),
             )
         )
     return schemas.ApprovalQueueList(

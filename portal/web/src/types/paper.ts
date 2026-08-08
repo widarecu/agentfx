@@ -121,6 +121,10 @@ export interface ApprovalQueueItem {
   created_at: string | null;
   /** DSL exit block — used by DeployPaperModal to pre-populate SL/TP. */
   dsl_exit: DslExitPublic | null;
+  /** v0.7.x — exporter's email if this genome came in via
+   * `POST /genomes/import`; null for native genomes. UI shows an
+   * `IMPORTED` chip + tooltip. */
+  imported_from_email: string | null;
 }
 
 export interface ClosestGenome {

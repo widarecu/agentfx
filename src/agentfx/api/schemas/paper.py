@@ -206,6 +206,11 @@ class ApprovalQueueItem(BaseSchema):
     metrics_summary: dict | None = None
     created_at: datetime | None = None
     dsl_exit: DslExitPublic | None = None
+    # v0.7.x — cross-user genome sharing. Set on genomes that were
+    # imported (evolution_runs.imported_from_email is not NULL);
+    # NULL for native genomes. Frontend renders an `IMPORTED` chip
+    # + tooltip. Non-authenticated attribution per v1 trust posture.
+    imported_from_email: str | None = None
 
 
 class ClosestGenome(BaseSchema):

@@ -30,6 +30,7 @@ import {
   AlertTriangle,
   Send,
   Shield,
+  Download,
 } from 'lucide-react';
 
 import DslTree from '../components/DslTree';
@@ -40,7 +41,7 @@ import WalkForwardFoldTable from '../components/WalkForwardFoldTable';
 import { ValidatorOverrideModal } from '../components/ValidatorOverrideModal';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
-import { getEvolutionRun, getGenome } from '../services/evolutionApi';
+import { exportGenome, getEvolutionRun, getGenome } from '../services/evolutionApi';
 import {
   archetypeTooltip,
   inferArchetype,
@@ -84,6 +85,36 @@ export default function GenomeDetail() {
   const [error, setError] = useState<string | null>(null);
   const [parentError, setParentError] = useState<string | null>(null);
   const [overrideOpen, setOverrideOpen] = useState(false);
+  const [exporting, setExporting] = useState(false);
+
+  async function handleExport() {
+    if (!runId || !genomeId) return;
+    setExporting(true);
+    try {
+      const payload = await exportGenome(runId, genomeId);
+      // Save as `{genome_id}.agenome.json` — the peer imports this
+      // via the ApprovalQueue's Import button.
+      const blob = new Blob([JSON.stringify(payload, null, 2)], {
+        type: 'application/json',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${genomeId}.agenome.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showToast('Genome exported', 'success');
+    } catch (err) {
+      showToast(
+        `Export failed: ${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+    } finally {
+      setExporting(false);
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -301,6 +332,19 @@ export default function GenomeDetail() {
               <ChevronRight className="w-4 h-4" />
             </Link>
           )}
+          {/* v0.7.x — Export genome to `.agenome.json` for sharing
+              with peers. The peer imports via ApprovalQueue's Import
+              button. See planning/BACKLOG.md v0.7.x for the spec. */}
+          <button
+            type="button"
+            onClick={handleExport}
+            disabled={exporting}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Download this genome as a .agenome.json file that peers can import"
+          >
+            <Download className="w-4 h-4" />
+            {exporting ? 'Exporting…' : 'Export'}
+          </button>
           {/* v0.6.1 (US-027): ADMIN-only validator override — retires the
               raw-SQL demo-unblock workaround Wilson used during the v0.6.0
               smoke-test. Writes an auditable DecisionLog entry. */}

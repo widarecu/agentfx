@@ -157,8 +157,16 @@ export function DeployPaperModal({
         <form onSubmit={handleSubmit}>
           <div className="p-6 border-b border-slate-200 dark:border-slate-700 flex items-start justify-between">
             <div>
-              <div id="deploy-modal-title" className="text-lg font-semibold">
+              <div id="deploy-modal-title" className="text-lg font-semibold flex items-center gap-2">
                 Deploy to paper
+                {item.imported_from_email && (
+                  <span
+                    className="px-1.5 py-0.5 text-[10px] uppercase tracking-wider font-semibold rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300"
+                    title={`Imported from ${item.imported_from_email}. Trust posture: content-hash verified (tamper detection), sender NOT authenticated.`}
+                  >
+                    Imported
+                  </span>
+                )}
               </div>
               <div className="text-xs text-slate-500 dark:text-slate-400 mt-1">
                 {item.instrument} · {item.granularity} · genome{' '}

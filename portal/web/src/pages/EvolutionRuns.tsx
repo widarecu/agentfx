@@ -127,10 +127,15 @@ export default function EvolutionRuns() {
           <Loader2 className="w-8 h-8 text-blue-500 animate-spin" />
         </div>
       ) : (
-        <RunsTable
-          runs={runs}
-          onRowClick={(id) => navigate(`/evolution/${id}`)}
-          onDelete={async (id) => {
+        (() => {
+          // v0.7.x — split native from imported runs. Imported runs
+          // are shadow rows created by `POST /genomes/import`; they
+          // share the list endpoint but shouldn't pollute the
+          // user's evolution-track view. Both sections respect the
+          // same delete handler + click-through.
+          const nativeRuns = runs.filter((r) => !r.imported_from_email);
+          const importedRuns = runs.filter((r) => r.imported_from_email);
+          const onDelete = async (id: string) => {
             if (
               !confirm(
                 `Delete run ${id}?\n\nThis permanently removes all generations, ` +
@@ -145,8 +150,41 @@ export default function EvolutionRuns() {
             } catch (err) {
               alert(err instanceof Error ? err.message : 'Failed to delete run');
             }
-          }}
-        />
+          };
+          return (
+            <>
+              <RunsTable
+                runs={nativeRuns}
+                onRowClick={(id) => navigate(`/evolution/${id}`)}
+                onDelete={onDelete}
+              />
+              {importedRuns.length > 0 && (
+                <div className="mt-8">
+                  <div className="flex items-baseline gap-2 mb-3">
+                    <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
+                      Imported strategies
+                    </h2>
+                    <span className="px-1.5 py-0.5 text-[10px] uppercase tracking-wider font-semibold rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300">
+                      {importedRuns.length}
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mb-3">
+                    Shadow evolution runs created by importing a peer&apos;s
+                    <code className="mx-1 px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800 font-mono text-[11px]">
+                      .agenome.json
+                    </code>
+                    file. Click through to review + approve for paper.
+                  </p>
+                  <RunsTable
+                    runs={importedRuns}
+                    onRowClick={(id) => navigate(`/evolution/${id}`)}
+                    onDelete={onDelete}
+                  />
+                </div>
+              )}
+            </>
+          );
+        })()
       )}
 
       {/* Pagination */}

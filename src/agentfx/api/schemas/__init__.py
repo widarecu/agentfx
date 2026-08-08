@@ -1,5 +1,14 @@
 # Import all schemas here to make them available via the schemas package
 from .base import BaseSchema
+from .genome_share import (
+    SUPPORTED_SCHEMA_VERSIONS,
+    GenomeExportCore,
+    GenomeExportPayload,
+    GenomeExportProvenance,
+    GenomeExportedBy,
+    GenomeImportResponse,
+    ValidationFoldExport,
+)
 from .evolution import (
     DecisionLogList,
     DecisionLogPublic,
@@ -210,6 +219,14 @@ __all__ = [
     "ValidationFoldPublic",
     "DecisionLogPublic",
     "DecisionLogList",
+    # Cross-user genome sharing (v0.7.x)
+    "SUPPORTED_SCHEMA_VERSIONS",
+    "GenomeExportCore",
+    "GenomeExportPayload",
+    "GenomeExportProvenance",
+    "GenomeExportedBy",
+    "GenomeImportResponse",
+    "ValidationFoldExport",
     # User credentials (US-019 / v0.6.0)
     "UserOandaCredentialsPublic",
     "UserOandaCredentialsUpsert",

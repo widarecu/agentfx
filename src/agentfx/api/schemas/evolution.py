@@ -183,6 +183,10 @@ class EvolutionRunPublic(BaseSchema):
     started_at: datetime | None = None
     completed_at: datetime | None = None
     created_at: datetime
+    # v0.7.x cross-user genome sharing — set on shadow evolution
+    # runs created via `POST /genomes/import`; NULL on native runs.
+    imported_from_email: str | None = None
+    imported_from_run_id: str | None = None
 
 
 class EvolutionRunList(BaseModel):

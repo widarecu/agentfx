@@ -152,6 +152,14 @@ class EvolutionRun(Base):
     )
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
 
+    # v0.7.x — cross-user genome sharing (import/export). When set,
+    # this EvolutionRun is a SHADOW row created by an import; the two
+    # fields carry attribution for the UI (imported by <email> from
+    # their run <run_id>). Both NULL on native evolution runs.
+    # Migration: b7f3d1a4c692.
+    imported_from_email = Column(String(200), nullable=True)
+    imported_from_run_id = Column(String(50), nullable=True)
+
     # Relationships
     generations = relationship(
         "Generation",

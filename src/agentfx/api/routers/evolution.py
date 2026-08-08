@@ -26,6 +26,7 @@ from .. import models, schemas
 from ..core import rbac
 from ..core.database import get_db
 from ..services import evolution as evolution_service
+from ..services import genome_share as genome_share_service
 from ..services import user as user_service
 
 router = APIRouter()
@@ -369,6 +370,78 @@ def get_genome_detail(
     # rows. Pydantic's `from_attributes=True` (BaseSchema) lets us serialize
     # the folds directly.
     return schemas.StrategyGenomePublic.model_validate(detail)
+
+
+@router.get(
+    "/evolution-runs/{run_id}/genomes/{genome_id}/export",
+    response_model=schemas.GenomeExportPayload,
+)
+def export_genome(
+    run_id: str,
+    genome_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> schemas.GenomeExportPayload:
+    """v0.7.x — Cross-user genome sharing (export).
+
+    Returns the `.agenome.json` payload for a genome the caller
+    owns. Frontend saves the response body as
+    `{genome_id}.agenome.json`; the peer imports it via
+    `POST /api/v1/genomes/import`.
+
+    Content is hashed (SHA-256 over canonical JSON minus the hash
+    field) so the importer can detect tampering. Not signed —
+    exporter attribution is trust-on-first-file, not authenticated.
+    """
+    try:
+        return genome_share_service.export_genome_payload(
+            db,
+            evolution_run_id=run_id,
+            genome_id=genome_id,
+            user=current_user,
+        )
+    except ValueError as e:
+        # Message differentiates "not found" (404) vs "not owned"
+        # (403) — matches the existing genome-detail endpoint's
+        # convention.
+        msg = str(e)
+        if "not owned" in msg:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail=msg
+            ) from e
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg) from e
+
+
+@router.post(
+    "/genomes/import",
+    response_model=schemas.GenomeImportResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def import_genome(
+    body: schemas.GenomeExportPayload,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> schemas.GenomeImportResponse:
+    """v0.7.x — Cross-user genome sharing (import).
+
+    Creates shadow rows (EvolutionRun + Generation + StrategyGenome
+    + ValidationFolds, all with new IDs) scoped to the importer.
+    The genome then appears in the importer's approval queue and
+    can be deployed like any native genome.
+
+    Rejects with 400 on any validation failure — schema version
+    unsupported, content hash mismatch, DSL grammar drift, etc.
+    """
+    from ..services.genome_share import GenomeImportError
+
+    try:
+        return genome_share_service.import_genome_payload(
+            db, payload=body, importer_user=current_user
+        )
+    except GenomeImportError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+        ) from e
 
 
 @router.get(

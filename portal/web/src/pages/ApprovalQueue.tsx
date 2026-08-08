@@ -7,16 +7,18 @@
  * decision log entry).
  */
 
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { AlertCircle, CheckCircle2, Loader2, PackageOpen, PlayCircle } from 'lucide-react';
+import { AlertCircle, CheckCircle2, Loader2, PackageOpen, PlayCircle, Upload } from 'lucide-react';
 
 import { useToast } from '../contexts/ToastContext';
 import { ApprovalQueueCard } from '../components/ApprovalQueueCard';
 import { DeployPaperModal } from '../components/DeployPaperModal';
 import { RejectGenomeModal } from '../components/RejectGenomeModal';
 import { listApprovalQueue, rejectGenome } from '../services/paperApi';
+import { importGenome } from '../services/evolutionApi';
 import type { ApprovalQueueItem, ApprovalQueueMeta } from '../types/paper';
+import type { GenomeExportPayload } from '../types/evolution';
 
 export default function ApprovalQueue() {
   const [items, setItems] = useState<ApprovalQueueItem[]>([]);
@@ -31,6 +33,45 @@ export default function ApprovalQueue() {
   );
   const { showToast } = useToast();
   const navigate = useNavigate();
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [importing, setImporting] = useState(false);
+
+  // v0.7.x — Import a peer's `.agenome.json`. On success, the
+  // imported genome appears as a shadow row in this user's queue
+  // (backend creates EvolutionRun/Generation/StrategyGenome shadows
+  // scoped to `current_user`). We refresh the queue so the user
+  // sees it immediately.
+  async function handleImportFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    // Reset input so re-selecting the same file re-fires onChange.
+    e.target.value = '';
+    if (!file) return;
+    setImporting(true);
+    try {
+      const text = await file.text();
+      let payload: GenomeExportPayload;
+      try {
+        payload = JSON.parse(text);
+      } catch (parseErr) {
+        throw new Error(
+          `Failed to parse ${file.name} as JSON: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`,
+        );
+      }
+      const response = await importGenome(payload);
+      showToast(
+        `Imported ${response.genome_id.slice(-20)} from ${payload.exported_by.email}`,
+        'success',
+      );
+      await fetchQueue();
+    } catch (err) {
+      showToast(
+        `Import failed: ${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+    } finally {
+      setImporting(false);
+    }
+  }
 
   const fetchQueue = useCallback(async () => {
     try {
@@ -82,16 +123,42 @@ export default function ApprovalQueue() {
             to paper.
           </div>
         </div>
-        <div className="flex gap-1 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-0.5">
-          <Link
-            to="/paper"
-            className="rounded px-3 py-1.5 font-semibold text-slate-500 hover:text-slate-700 dark:hover:text-slate-200"
+        <div className="flex items-center gap-3">
+          {/* v0.7.x — Import a peer's `.agenome.json`. Hidden file
+              input triggered by the visible button. */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/json,.json,.agenome.json"
+            className="hidden"
+            onChange={handleImportFile}
+            aria-hidden
+          />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={importing}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Import a .agenome.json file a peer shared with you"
           >
-            Runs
-          </Link>
-          <span className="bg-emerald-500 text-white rounded px-3 py-1.5 font-semibold">
-            Approvals · {items.length}
-          </span>
+            {importing ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Upload className="w-4 h-4" />
+            )}
+            {importing ? 'Importing…' : 'Import genome'}
+          </button>
+          <div className="flex gap-1 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-0.5">
+            <Link
+              to="/paper"
+              className="rounded px-3 py-1.5 font-semibold text-slate-500 hover:text-slate-700 dark:hover:text-slate-200"
+            >
+              Runs
+            </Link>
+            <span className="bg-emerald-500 text-white rounded px-3 py-1.5 font-semibold">
+              Approvals · {items.length}
+            </span>
+          </div>
         </div>
       </div>
 

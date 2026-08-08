@@ -18,6 +18,8 @@ import type {
   Generation,
   GenerationListResponse,
   GenomeBacktestResult,
+  GenomeExportPayload,
+  GenomeImportResponse,
   StrategyGenome,
   StrategyGenomeSummaryList,
 } from '../types/evolution';
@@ -176,6 +178,39 @@ export async function overrideValidatorVerdict(
       body: JSON.stringify(body),
     },
   );
+  return handleResponse(res);
+}
+
+/**
+ * v0.7.x — Cross-user genome sharing.
+ *
+ * Export: fetches the .agenome.json payload for a genome the caller
+ * owns. Returns the payload as an object; callers save it as a file.
+ */
+export async function exportGenome(
+  runId: string,
+  genomeId: string,
+): Promise<GenomeExportPayload> {
+  const res = await fetch(
+    `${API_BASE_URL}/evolution-runs/${runId}/genomes/${genomeId}/export`,
+    { headers: authHeaders() },
+  );
+  return handleResponse(res);
+}
+
+/**
+ * v0.7.x — Import a peer's .agenome.json payload. Creates shadow
+ * rows scoped to the current user; on success, the imported genome
+ * appears in this user's approval queue.
+ */
+export async function importGenome(
+  payload: GenomeExportPayload,
+): Promise<GenomeImportResponse> {
+  const res = await fetch(`${API_BASE_URL}/genomes/import`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify(payload),
+  });
   return handleResponse(res);
 }
 

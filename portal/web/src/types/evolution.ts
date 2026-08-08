@@ -100,6 +100,11 @@ export interface EvolutionRun {
   started_at: string | null;
   completed_at: string | null;
   created_at: string;
+  /** v0.7.x cross-user genome sharing. Set on shadow evolution runs
+   * created by importing a peer's `.agenome.json`. NULL for native
+   * runs. UI uses these to render the "Imported strategies" section. */
+  imported_from_email: string | null;
+  imported_from_run_id: string | null;
 }
 
 export interface EvolutionRunListResponse {
@@ -419,4 +424,65 @@ export interface DecisionLogListResponse {
   total: number;
   page: number;
   page_size: number;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Cross-user genome sharing (v0.7.x)
+// ─────────────────────────────────────────────────────────────────────
+
+export interface ValidationFoldExport {
+  fold_index: number;
+  fold_start: string;
+  fold_end: string;
+  is_oos: boolean;
+  sharpe: number | null;
+  max_drawdown: number | null;
+  hit_rate: number | null;
+  n_trades: number | null;
+  cagr: number | null;
+  passed_gate_b: boolean | null;
+  regime_direction: string | null;
+  regime_volatility: string | null;
+  regime_trend: string | null;
+}
+
+export interface GenomeExportCore {
+  id: string;
+  dsl_json: DslSpec;
+  origin: string;
+  fitness: number | null;
+  metrics_json: Record<string, unknown> | null;
+  validator_passed: boolean | null;
+  validation_failures: unknown[];
+  llm_reasoning: string | null;
+}
+
+export interface GenomeExportProvenance {
+  source_evolution_run_id: string;
+  source_instrument: string;
+  source_granularity: string;
+  source_data_range_start: string | null;
+  source_data_range_end: string | null;
+}
+
+export interface GenomeExportedBy {
+  email: string;
+  display_name: string | null;
+}
+
+export interface GenomeExportPayload {
+  schema_version: number;
+  exported_at: string;
+  exported_by: GenomeExportedBy;
+  app_version: string;
+  genome: GenomeExportCore;
+  validation_folds: ValidationFoldExport[];
+  provenance: GenomeExportProvenance;
+  content_hash: string;
+}
+
+export interface GenomeImportResponse {
+  genome_id: string;
+  evolution_run_id: string;
+  approval_queue_url: string;
 }

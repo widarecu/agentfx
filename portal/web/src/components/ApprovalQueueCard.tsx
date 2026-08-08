@@ -62,6 +62,14 @@ export function ApprovalQueueCard({
               {item.instrument} {item.granularity}
             </div>
             <GateBSummaryBadge passesAll={passesAll} />
+            {item.imported_from_email && (
+              <span
+                className="px-1.5 py-0.5 text-[10px] uppercase tracking-wider font-semibold rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300"
+                title={`Imported from ${item.imported_from_email}. Trust posture: content-hash verified (tamper detection), sender NOT authenticated.`}
+              >
+                Imported
+              </span>
+            )}
           </div>
           <div className="text-xs text-slate-500 dark:text-slate-400 font-mono mb-3 truncate">
             {item.strategy_genome_id}
