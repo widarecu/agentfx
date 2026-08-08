@@ -166,6 +166,56 @@ class TestContentHash:
         b["app_version"] = "0.7.z"
         assert _compute_content_hash(a) != _compute_content_hash(b)
 
+    def test_hash_stable_across_js_float_int_coercion(self):
+        """Wilson UAT 2026-08-08 regression: the browser silently
+        collapses whole-value floats (`26.0`) to ints (`26`) via
+        JSON.parse + JSON.stringify. Before the js_normalize fix in
+        _canonical_json_for_hash, this made every export-then-import
+        round-trip fail with a content_hash mismatch when the DSL
+        contained integer-valued floats (macd_line args, obv args, etc).
+        """
+        # dsl_json with Python-side floats (as they come out of
+        # StrategySpec.model_dump)
+        py_dsl = {
+            "entry": {
+                "long": {
+                    "lhs": {"ind": "macd_line", "args": [12.0, 26.0]},
+                    "cmp": "crosses_above",
+                    "rhs": {"ind": "macd_signal", "args": [12.0, 26.0, 9.0]},
+                }
+            },
+            "exit": {"stop_pips": 22, "target_pips": 50},
+        }
+        # dsl_json AFTER JS round-trip (float→int on whole-value floats)
+        js_dsl = {
+            "entry": {
+                "long": {
+                    "lhs": {"ind": "macd_line", "args": [12, 26]},
+                    "cmp": "crosses_above",
+                    "rhs": {"ind": "macd_signal", "args": [12, 26, 9]},
+                }
+            },
+            "exit": {"stop_pips": 22, "target_pips": 50},
+        }
+        py = {"schema_version": 1, "genome": {"dsl_json": py_dsl}}
+        js = {"schema_version": 1, "genome": {"dsl_json": js_dsl}}
+        assert _compute_content_hash(py) == _compute_content_hash(js), (
+            "hash must be JS-round-trip stable: Python float 26.0 and JS "
+            "int 26 must produce the same hash so the browser's silent "
+            "float→int coercion doesn't break import validation"
+        )
+
+    def test_hash_preserves_non_integer_floats(self):
+        """Sanity: the JS-normalize only touches WHOLE-value floats.
+        Sub-1 and non-integer floats (like 0.005, 9.884254...) are
+        left alone — JS preserves those bytes on round-trip."""
+        a = {"x": 0.005, "y": 9.884254595826418}
+        b = {"x": 0.005, "y": 9.884254595826418}
+        assert _compute_content_hash(a) == _compute_content_hash(b)
+        # And a different sub-1 float produces a different hash
+        c = {"x": 0.006, "y": 9.884254595826418}
+        assert _compute_content_hash(a) != _compute_content_hash(c)
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Import: happy path (round-trip test happens in the integration

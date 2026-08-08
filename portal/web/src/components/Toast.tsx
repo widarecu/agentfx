@@ -40,9 +40,15 @@ export default function Toast({ message, type, onClose, duration = 5000 }: Toast
   }
 
   return (
-    <div className={`fixed top-4 right-4 z-50 flex items-center gap-3 p-4 rounded-lg border shadow-lg max-w-sm animate-in slide-in-from-right-full ${getStyles()}`}>
-      {getIcon()}
-      <p className="flex-1 text-sm font-medium">{message}</p>
+    // No fixed positioning here — the ToastProvider's wrapper owns
+    // that (mobile-safe on <sm, top-right pill on sm+). Re-positioning
+    // it here broke the mobile wrapper's overrides. Wilson UAT
+    // 2026-08-08: long messages (import-error sha256 hashes) also
+    // overflowed the pill; `break-all` + `min-w-0` on the text
+    // element lets them wrap.
+    <div className={`flex items-start gap-3 p-4 rounded-lg border shadow-lg w-full sm:max-w-md animate-in slide-in-from-right-full ${getStyles()}`}>
+      <span className="flex-shrink-0 mt-0.5">{getIcon()}</span>
+      <p className="flex-1 text-sm font-medium break-all min-w-0">{message}</p>
       <button
         onClick={onClose}
         className="flex-shrink-0 p-1 rounded-md hover:bg-black/10 dark:hover:bg-white/10 transition-colors"

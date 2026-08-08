@@ -61,16 +61,46 @@ gaps. Bump when adding a genome-shape-affecting feature."""
 # ─────────────────────────────────────────────────────────────────────
 
 
+def _js_normalize(obj):
+    """Coerce values to match JavaScript's JSON round-trip semantics.
+
+    Wilson UAT 2026-08-08: content_hash mismatched on a straight
+    export-then-import because the browser silently rewrites
+    `12.0` as `12` when it JSON.parse + JSON.stringify the payload
+    on the way from the export download to the import POST. Python's
+    `json` module preserves the `.0`; JS drops it. Hash of the two
+    dicts differs.
+
+    Fix: apply a JS-equivalent normalization to the hash input on
+    BOTH sides. Whole-value floats become ints; nested dicts + lists
+    are walked recursively. Sub-1 floats (0.005) and non-integer
+    floats (9.884254...) are left alone — JS preserves those bytes.
+
+    NOT a general-purpose normalizer; only used for hashing. The
+    stored `dsl_json` / `metrics_json` on both sides keep their
+    original types."""
+    if isinstance(obj, float) and obj.is_integer():
+        return int(obj)
+    if isinstance(obj, dict):
+        return {k: _js_normalize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_js_normalize(v) for v in obj]
+    return obj
+
+
 def _canonical_json_for_hash(payload_dict: dict) -> bytes:
     """Return the canonical JSON of `payload_dict` with the
     `content_hash` field STRIPPED — this is what gets hashed.
 
     Sorted keys + no whitespace = same output every time regardless
     of dict insertion order. UTF-8 encoded so hash bytes are stable
-    across platforms."""
+    across platforms. `_js_normalize` collapses whole-value floats
+    to ints so JS-side round-tripping doesn't perturb the hash
+    (see the docstring on `_js_normalize` for the exact scenario)."""
     stripped = {k: v for k, v in payload_dict.items() if k != "content_hash"}
+    normalized = _js_normalize(stripped)
     return json.dumps(
-        stripped, sort_keys=True, separators=(",", ":"), default=str
+        normalized, sort_keys=True, separators=(",", ":"), default=str
     ).encode("utf-8")
 
 
