@@ -520,7 +520,10 @@ class TestSignalTick:
         decisions = [r for r in added if type(r).__name__ == "DecisionLog"]
         closed = [d for d in decisions if d.action == "USER_POSITION_CLOSED"]
         assert closed
-        assert "max_hold_bars=5" in closed[0].reasoning_text
+        # v0.7.0: walk() emits "walk-driven exit at bar TS: max_hold" —
+        # the reason substring still identifies the max-hold cause; the
+        # test's intent (max_hold triggered the close) is preserved.
+        assert "max_hold" in closed[0].reasoning_text
 
     def test_runner_close_stamps_broker_close_transaction_id(self):
         """Wilson UAT 2026-07-26: `_close_position_and_persist` must

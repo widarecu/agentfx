@@ -851,161 +851,55 @@ def _signal_tick(
     granularity_seconds: int,
     now_utc: datetime,
 ) -> None:
-    """One granularity-boundary tick: fetch → compile → decide → act.
+    """One granularity-boundary tick: fetch → walk → act.
 
-    Extracted so unit tests can drive one tick in isolation with
-    mocked candles + mocked OandaClient. Errors bubble to
-    `_execute_loop` which logs and continues.
+    v0.7.0 restructure (Wilson UAT 2026-08-06 fidelity fix):
+
+    The tick now delegates all state-machine logic — SL, TP, min_hold,
+    max_hold, opposite_flip, fresh entry — to `paper_walk.walk()`,
+    which is a straight port of backtest's `_apply_exits`. The tick's
+    only job is:
+
+        1. Guards that early-return without processing (kill / stale).
+        2. Fetch candles + derive raw_entries.
+        3. Build the walk's starting state from broker + open trade.
+        4. Call walk() over `bars > bookmark`.
+        5. Reconcile the walk's final state against the broker.
+        6. Advance the bookmark unconditionally.
+        7. Persist an equity snapshot.
+
+    Fixes the previous bug where the runner queued signals during
+    min_hold (bookmark stayed frozen while the shortcut early-returned)
+    and then fired them AFTER min_hold expired — behaviour backtest
+    never exhibits. See `services/paper_walk.py` docstring.
     """
     from agentfx.api.models import RunStatus, Trade
+    from agentfx.services.paper_walk import WalkState, walk
 
     if run.status != RunStatus.RUNNING:
         return
 
     granularity = _seconds_to_granularity(granularity_seconds)
 
-    # Backtest gates ALL exit paths on `bars_held < min_hold_bars` and
-    # expires positions at `bars_held >= max_hold_bars`, where
-    # bars_held is the integer index count within the OHLCV series
-    # (see `_apply_exits` in core/dsl/compiler.py). The paper runner
-    # previously (a) skipped the min_hold gate entirely — Wilson UAT
-    # 2026-07-17: genome _017_019 hit 13 consecutive losses in 22h vs
-    # backtest max of 11 over 510 trades — and (b) measured max_hold
-    # in WALL-CLOCK seconds, which force-closed positions mid-weekend
-    # when no trading bars had ticked. Fix: count actual completed
-    # candles between entry_timestamp and now_utc; gaps (weekends,
-    # ingestion outages) correctly hold the counter.
-    exit_rules_early = getattr(strategy, "spec", None)
-    min_hold_bars_early: int | None = None
-    max_hold_bars_early: int | None = None
-    if exit_rules_early is not None and exit_rules_early.exit is not None:
-        min_hold_bars_early = int(exit_rules_early.exit.min_hold_bars)
-        max_hold_bars_early = int(exit_rules_early.exit.max_hold_bars)
-
-    open_trade_early: Trade | None = None
-    bars_held_early: int = 0
-    if min_hold_bars_early is not None or max_hold_bars_early is not None:
-        open_trade_early = (
-            db.query(Trade)
-            .filter(Trade.run_id == run.id, Trade.exit_timestamp.is_(None))
-            .order_by(Trade.entry_timestamp.asc())
-            .first()
-        )
-        if open_trade_early is not None:
-            entry_ts_early = open_trade_early.entry_timestamp
-            if entry_ts_early.tzinfo is None:
-                entry_ts_early = entry_ts_early.replace(tzinfo=UTC)
-            bars_held_early = _count_bars_since(
-                db=db,
-                instrument=instrument,
-                granularity=granularity,
-                entry_ts=entry_ts_early,
-                now_utc=now_utc,
-            )
+    # Spec + exit rules — needed for both the walk and for the tick's
+    # own diagnostic logging. If the strategy isn't a DSL-compiled
+    # spec (legacy tests may still pass classic strategies), degrade
+    # to a no-op: this restructure only supports DSL specs.
+    spec = getattr(strategy, "spec", None)
+    exit_block = getattr(spec, "exit", None) if spec is not None else None
 
     # Min-hold gate: if the position has held fewer than
     # min_hold_bars completed bars, suppress every exit path this
     # tick — matches backtest exactly. Silent no-op (no decision log
     # spam) since it fires every tick during the hold window. Equity
     # snapshot is still recorded so the LivePnLChart stays continuous.
-    if (
-        open_trade_early is not None
-        and min_hold_bars_early is not None
-        and min_hold_bars_early > 0
-        and bars_held_early < min_hold_bars_early
-    ):
-        try:
-            hold_pos = client.get_position(instrument)
-        except Exception:  # noqa: BLE001 — snapshot is best-effort
-            hold_pos = None
-        _persist_equity_snapshot(db=db, run=run, position=hold_pos, now_utc=now_utc)
-        return
-
-    # Max-hold check — bars, not wall-clock. Runs before the stale-
-    # candle guard so a briefly-lagging ingestion just delays the
-    # force-close by a tick or two; weekend gaps and prolonged
-    # outages correctly hold the counter until real bars resume.
-    if max_hold_bars_early is not None:
-        if open_trade_early is not None:
-            if bars_held_early >= max_hold_bars_early:
-                # Before calling close, check whether OANDA still has a
-                # position. If the broker's SL/TP fired between ticks
-                # while we weren't watching (Wilson UAT 2026-07-15:
-                # stale-guard blocked reconciliation overnight, then
-                # max_hold expired), calling close_all_positions would
-                # spam OANDA with CLOSEOUT_POSITION_DOESNT_EXIST rejects
-                # every tick. Instead, mark the trade as broker-closed
-                # (we can't distinguish stop vs target without recent
-                # candle data — reconciler handles that separately).
-                pos_early = client.get_position(instrument)
-                net_early = int(pos_early.get("long_units", 0) or 0) + int(
-                    pos_early.get("short_units", 0) or 0
-                )
-                if net_early == 0:
-                    open_trade_early.exit_timestamp = now_utc
-                    if open_trade_early.exit_price is None:
-                        open_trade_early.exit_price = float(
-                            open_trade_early.entry_price
-                        )
-                    if open_trade_early.pnl is None:
-                        open_trade_early.pnl = 0.0
-                    open_trade_early.exit_reason = "broker_other"
-                    db.commit()
-                    _write_decision(
-                        db,
-                        run,
-                        action="USER_POSITION_CLOSED",
-                        reason=(
-                            f"max_hold check found OANDA position already 0 — "
-                            f"broker closed trade {open_trade_early.id} while "
-                            f"runner was blocked (stale/restart). Marked as "
-                            f"broker_other; actual fill detail lost to time."
-                        ),
-                        outputs={
-                            "paper_run_id": run.id,
-                            "trade_id": open_trade_early.id,
-                            "exit_reason": "broker_other",
-                            "bars_held": bars_held_early,
-                        },
-                    )
-                    return
-                # Position still exists → normal max_hold force-close.
-                from agentfx.adapters.oanda import OandaOrderRejected
-
-                try:
-                    _close_position_and_persist(
-                        db=db,
-                        run=run,
-                        client=client,
-                        instrument=instrument,
-                        now_utc=now_utc,
-                        reason=(
-                            f"max_hold_bars={max_hold_bars_early} exceeded "
-                            f"(held for {bars_held_early} bars vs limit "
-                            f"{max_hold_bars_early})"
-                        ),
-                        exit_reason="max_hold",
-                    )
-                except OandaOrderRejected as exc:
-                    _write_decision(
-                        db,
-                        run,
-                        action="USER_CLOSE_REJECTED",
-                        reason=(
-                            f"max_hold close rejected by OANDA: {exc.reject_reason} "
-                            f"(txn={exc.transaction_id}) — trade stays open, "
-                            "next tick will retry"
-                        ),
-                        outputs={
-                            "paper_run_id": run.id,
-                            "trade_id": open_trade_early.id,
-                            "reject_reason": exc.reject_reason,
-                            "reject_transaction_id": exc.transaction_id,
-                            "order_type": exc.order_type,
-                            "close_context": "max_hold",
-                        },
-                    )
-                return
+    # v0.7.0 restructure: the min_hold and max_hold gates that used to
+    # early-return here are now applied per-bar INSIDE `walk()`, matching
+    # backtest's `_apply_exits`. The previous approach of early-returning
+    # without advancing the watermark caused signals fired during
+    # min_hold to be queued and re-fired when min_hold expired — a
+    # divergence from backtest never intended by the state machine.
+    # See src/agentfx/services/paper_walk.py.
 
     # Wilson UAT 2026-07-29 Fix A: cumulative indicators (OBV,
     # ad_line) need to see the same window backtest cumulated over.
@@ -1096,88 +990,28 @@ def _signal_tick(
     if len(raw_entries) < 1:
         return
 
-    # Wilson UAT 2026-08-02 Fix D: per-bar watermark evaluation.
-    # Previous code read `raw_entries.iloc[-1]` — only the latest bar.
-    # But signal ticks fire ~every 60s while candle ingestion lags
-    # 0–78s (see cadence report in commit message). If a bar's
-    # complete=True flag lands in the DB AFTER the corresponding
-    # signal tick but BEFORE the next one, the runner would jump
-    # straight from bar T-2 → bar T+1, silently skipping T-1 →
-    # `iloc[-1]` returns raw_entry[T+1], which may be 0 or opposite
-    # even when raw_entry[T-1] fired a cross.
-    #
-    # Wilson audit 2026-08-02 found paper missed the LONG entry at
-    # 14:20 (raw_entry[14:20]=+1, MACD cross fired at bar 14:19)
-    # because bar 14:20 became complete in the DB at 14:22:09 —
-    # AFTER the 14:22 tick fired at ~14:22:00. Next tick (14:23:00)
-    # saw bars up through 14:21 and `iloc[-1]` = raw_entry[14:21] =
-    # -1 (SHORT). Paper entered SHORT; backtest went LONG.
-    #
-    # Fix: track a watermark of the last evaluated bar timestamp on
-    # `run.parameters['last_evaluated_bar_ts']`. On each tick, scan
-    # every bar strictly newer than the watermark for a nonzero
-    # raw_entry, and act on the FIRST (earliest) one. Matches
-    # backtest's sequential bar walk. Update the watermark to the
-    # latest bar in df regardless of whether a signal fired, so
-    # subsequent ticks don't re-fire on bars we already considered.
-    #
-    # Cross events (transient) are the only kind that can be missed
-    # by iloc[-1]; persistent conditions (obv<0) stay true across
-    # bars and get caught anyway. But since a genome mixing both is
-    # common, this fix is required for fidelity in general.
-    params = getattr(run, "parameters", None) or {}
-    last_eval_iso = params.get("last_evaluated_bar_ts")
-    last_eval_ts = datetime.fromisoformat(last_eval_iso) if last_eval_iso else None
-    if last_eval_ts is not None:
-        new_bars = raw_entries[raw_entries.index > last_eval_ts]
-    else:
-        # First tick of the run — take only the latest bar, don't
-        # backfill entries from bars that closed before we started.
-        new_bars = raw_entries.tail(1)
-    # Which bar to act on? Earliest new bar with a nonzero signal
-    # (matches backtest's "first entry wins" semantics — later bars
-    # with opposite signals would flip mid-hold, gated by min_hold).
-    fired = new_bars[new_bars != 0]
-    if len(fired) > 0:
-        raw_entry = int(fired.iloc[0])
-        acted_bar_ts = fired.index[0]
-    else:
-        raw_entry = 0
-        acted_bar_ts = None
-    # Advance watermark to the latest bar we CONSIDERED so subsequent
-    # ticks don't re-scan. Persisted so the watermark survives a
-    # subprocess restart (kill/resume).
-    latest_bar_ts = raw_entries.index[-1]
-    if latest_bar_ts != last_eval_ts:
-        run.parameters = {
-            **params,
-            "last_evaluated_bar_ts": latest_bar_ts.isoformat(),
-        }
-        db.commit()
-
-    signal_direction: Direction = (
-        "long" if raw_entry > 0 else "short" if raw_entry < 0 else "flat"
+    # ── Load state ────────────────────────────────────────────────
+    # Open trade (for entry price + entry timestamp).
+    open_trade = (
+        db.query(Trade)
+        .filter(Trade.run_id == run.id, Trade.exit_timestamp.is_(None))
+        .order_by(Trade.entry_timestamp.asc())
+        .first()
     )
-
+    # Broker position.
     position = client.get_position(instrument)
     long_units = int(position.get("long_units", 0) or 0)
     short_units = int(position.get("short_units", 0) or 0)
-    # OANDA returns short_units as a negative integer; treat the sum as
-    # signed net exposure so `decide_action`'s arithmetic works
-    # consistently regardless of sign convention.
     net_units = long_units + short_units
 
     # Broker-side SL/TP reconciliation. OANDA's SL/TP orders (placed
-    # at entry time) fire on any tick, not at bar close. If they filled
-    # between our previous tick and this one, OANDA position went from
-    # open to 0 without the runner initiating close, and our open Trade
-    # row is stranded with exit_timestamp=None forever. Detect and
-    # reconcile: use the latest bar's close as an approximation of the
-    # fill price (broker doesn't tell us the exact fill without a
-    # transaction-history call — v0.7.0 follow-up), classify as
-    # 'stop' / 'target' / 'broker_other' by comparing to the strategy's
-    # SL/TP pip distances.
-    if net_units == 0:
+    # at entry time) fire on any tick, not at bar close. If they
+    # filled between our previous tick and this one, OANDA position
+    # went from open to 0 without the runner initiating close, and
+    # our open Trade row is stranded with exit_timestamp=None forever.
+    # Detect and reconcile BEFORE the walk so the walk sees the
+    # correct starting state.
+    if net_units == 0 and open_trade is not None:
         _reconcile_broker_side_close(
             db=db,
             run=run,
@@ -1187,102 +1021,141 @@ def _signal_tick(
             latest_low=float(df["low"].iloc[-1]),
             now_utc=now_utc,
         )
+        # Reconciler may have closed the open_trade row — re-query so
+        # the walk starts from the correct state.
+        open_trade = (
+            db.query(Trade)
+            .filter(Trade.run_id == run.id, Trade.exit_timestamp.is_(None))
+            .order_by(Trade.entry_timestamp.asc())
+            .first()
+        )
 
-    # (max_hold check now happens at the top of _signal_tick before
-    # the stale-guard, so it fires on wall-clock regardless of ingest
-    # state — see the early hoist above.)
-
-    # `exit_rules` is needed further down for opposite_signal + DSL
-    # SL/TP fallback; re-bind here so the naming stays local.
-    exit_rules = exit_rules_early
-
-    # No entry event at the latest bar → nothing to do. Silent no-op
-    # (health polls would spam a decision log otherwise); snapshot
-    # equity so LivePnLChart survives reload with a continuous curve.
-    if raw_entry == 0:
-        _persist_equity_snapshot(db=db, run=run, position=position, now_utc=now_utc)
-        return
-
-    # Fresh entry event. Decide against current OANDA position.
-    # (Sizing happens further down in the flat-position branch — it
-    # depends on OANDA balance + strategy risk_pct, not just a cap.)
-    risk_cfg = run.risk_config or {}
-
-    same_direction = (net_units > 0 and signal_direction == "long") or (
-        net_units < 0 and signal_direction == "short"
+    # ── Build walk state ─────────────────────────────────────────
+    params = getattr(run, "parameters", None) or {}
+    last_eval_iso = params.get("last_evaluated_bar_ts")
+    bookmark_ts: datetime | None = (
+        datetime.fromisoformat(last_eval_iso) if last_eval_iso else None
     )
-    opposite_direction = (net_units > 0 and signal_direction == "short") or (
-        net_units < 0 and signal_direction == "long"
-    )
+    if bookmark_ts is not None and bookmark_ts.tzinfo is None:
+        bookmark_ts = bookmark_ts.replace(tzinfo=UTC)
 
-    if same_direction:
-        # We're already in the direction the entry event just fired.
-        # This can happen if a previous same-side cross entered us and
-        # OANDA-side SL/TP hasn't fired yet at this bar. Backtest would
-        # simply hold, no re-entry, so we do too. Silent to keep the
-        # audit log focused on real state changes.
-        _persist_equity_snapshot(db=db, run=run, position=position, now_utc=now_utc)
-        return
-
-    if opposite_direction:
-        # Cross fires in the direction opposite our open position.
-        # Backtest respects `spec.exit.opposite_signal`: when True, exit
-        # + flip (same bar); when False, ignore the cross and keep
-        # holding. Mirror that here.
-        opp_flag = True
-        if exit_rules is not None and exit_rules.exit is not None:
-            opp_flag = bool(exit_rules.exit.opposite_signal)
-        if not opp_flag:
-            _persist_equity_snapshot(db=db, run=run, position=position, now_utc=now_utc)
-            return
-        # opposite_signal=True → close AND open in the same tick.
-        # Backtest's `_apply_exits` (compiler.py:268-277) atomically
-        # sets `in_position`, `entry_close`, `entry_bar` in one bar.
-        # The earlier two-step "close now, reopen next tick" version
-        # dropped the reopen for crossover-style entry rules
-        # (crosses_above / crosses_below fire on ONE bar only) — Wilson
-        # UAT 2026-07-17 audit. Threshold-style entries (obv < 0) stay
-        # true across bars, so those reopened correctly on tick T+1;
-        # crossover entries silently didn't. Now we fall through to
-        # the entry-from-flat block below on successful close.
-        from agentfx.adapters.oanda import OandaOrderRejected
-
-        try:
-            _close_position_and_persist(
+    in_position_start = 1 if net_units > 0 else (-1 if net_units < 0 else 0)
+    entry_close_start: float | None = None
+    bars_held_start = 0
+    if in_position_start != 0:
+        if open_trade is not None:
+            entry_close_start = float(open_trade.entry_price)
+            # Bars held so far uses the DB row-count semantics
+            # `_count_bars_since` provides — matches the pre-refactor
+            # `bars_held_early` computation exactly (weekend gaps
+            # correctly don't advance the counter).
+            entry_ts_ts = open_trade.entry_timestamp
+            if entry_ts_ts.tzinfo is None:
+                entry_ts_ts = entry_ts_ts.replace(tzinfo=UTC)
+            bars_held_start = _count_bars_since(
                 db=db,
-                run=run,
-                client=client,
                 instrument=instrument,
+                granularity=granularity,
+                entry_ts=entry_ts_ts,
                 now_utc=now_utc,
-                reason="direction_change",
-                exit_reason="opposite_flip",
             )
-        except OandaOrderRejected as exc:
-            _write_decision(
-                db,
-                run,
-                action="USER_CLOSE_REJECTED",
-                reason=(
-                    f"opposite-flip close rejected by OANDA: {exc.reject_reason} "
-                    f"(txn={exc.transaction_id}) — position stays open, "
-                    "next tick will re-evaluate"
-                ),
-                outputs={
-                    "paper_run_id": run.id,
-                    "reject_reason": exc.reject_reason,
-                    "reject_transaction_id": exc.transaction_id,
-                    "order_type": exc.order_type,
-                    "close_context": "opposite_flip",
-                },
-            )
-            return
-        # Close succeeded — position at OANDA is now flat. Fall through
-        # to the entry-from-flat block to open the new side in the same
-        # tick. `position` is stale (still reflects the pre-close side)
-        # but downstream only reads `signal_direction` and `sl_pips /
-        # tp_pips` from spec, so it's safe.
+        else:
+            # Broker has position but no open_trade row (data-integrity
+            # edge case; tests exercise it as a broker-view-only setup).
+            # Fall back to latest bar close as the walk's entry_close so
+            # the state machine can still make same/opposite dispatch
+            # decisions. SL/TP evaluated against this synthesized entry
+            # will be approximate but the mismatch only matters until
+            # the next real entry gives us a real entry_close.
+            entry_close_start = float(df["close"].iloc[-1])
+            bars_held_start = 0
 
-    # net_units == 0 AND raw_entry != 0 → fresh entry from flat.
+    start_state = WalkState(
+        in_position=in_position_start,  # type: ignore[arg-type]
+        entry_close=entry_close_start,
+        bars_held=bars_held_start,
+    )
+
+    pip_size = float(getattr(strategy, "pip_size", 0.0001) or 0.0001)
+    close_series = df["close"].astype(float)
+
+    # ── Walk ─────────────────────────────────────────────────────
+    result = walk(
+        raw_entries=raw_entries,
+        close_series=close_series,
+        start_state=start_state,
+        bookmark_ts=bookmark_ts,
+        exit_rules=exit_block,
+        pip_size=pip_size,
+    )
+
+    # ── Advance bookmark UNCONDITIONALLY on any successful tick ──
+    # This is the fix. Previously the min_hold gate returned early
+    # without touching the bookmark, so signals from bars during the
+    # hold accumulated and fired en masse when the gate opened. Now
+    # walk() decides per-bar (respecting min_hold, matching backtest)
+    # and the bookmark advances every tick, so nothing accumulates.
+    if result.last_bar_ts is not None:
+        latest_iso = (
+            result.last_bar_ts.isoformat()
+            if isinstance(result.last_bar_ts, datetime)
+            else str(result.last_bar_ts)
+        )
+        if latest_iso != last_eval_iso:
+            run.parameters = {**params, "last_evaluated_bar_ts": latest_iso}
+            db.commit()
+
+    # ── Execute the walk's decision(s) ───────────────────────────
+    exit_rules_full = spec  # for _open_position_and_persist's sig
+    risk_cfg = run.risk_config or {}
+    _execute_walk_transitions(
+        db=db,
+        run=run,
+        client=client,
+        strategy=strategy,
+        instrument=instrument,
+        df=df,
+        now_utc=now_utc,
+        transitions=result.transitions,
+        broker_net_units=net_units,
+        broker_position=position,
+        exit_rules=exit_rules_full,
+        risk_cfg=risk_cfg,
+    )
+
+
+def _open_position_and_persist(
+    *,
+    db,
+    run,
+    client,
+    strategy,
+    instrument: str,
+    signal_direction: Direction,
+    df,
+    now_utc: datetime,
+    exit_rules,  # spec.exit chain; the caller has already resolved to spec
+    risk_cfg: dict,
+    position_snapshot,
+) -> None:
+    """Size + place a market order + persist the trade + write the
+    decision log. Extracted from `_signal_tick` verbatim so the walk-
+    driven restructure has a single callsite for "open a new
+    position." No behaviour change from the pre-extract inline code.
+
+    - `signal_direction` is "long" or "short" — determines the sign of
+      the order.
+    - `df` is the OHLC dataframe passed to the DSL evaluator; used by
+      `_signal_reason` for the audit-log indicator values.
+    - `exit_rules` is the strategy's `spec` (whole spec, not just the
+      exit block — matches the pre-extract naming).
+    - `position_snapshot` is the broker position dict at the start of
+      the tick; only used for the final equity snapshot.
+
+    Returns None. On sizing failure, broker rejection, or other
+    recoverable errors, writes an appropriate decision log entry and
+    returns silently.
+    """
     # Broker-side SL/TP: the strategy's DSL exit block is the source
     # of truth. The deploy modal pre-populates from these and the user
     # can override in `risk_config`. Runner falls back to the DSL
@@ -1384,7 +1257,9 @@ def _signal_tick(
                 "order_type": exc.order_type,
             },
         )
-        _persist_equity_snapshot(db=db, run=run, position=position, now_utc=now_utc)
+        _persist_equity_snapshot(
+            db=db, run=run, position=position_snapshot, now_utc=now_utc
+        )
         return
     fill_price = float(result.get("fill_price") or 0.0)
     filled_units = int(result.get("units") or signed_units)
@@ -1450,7 +1325,197 @@ def _signal_tick(
             },
         },
     )
-    _persist_equity_snapshot(db=db, run=run, position=position, now_utc=now_utc)
+    _persist_equity_snapshot(
+        db=db, run=run, position=position_snapshot, now_utc=now_utc
+    )
+
+
+def _execute_walk_transitions(
+    *,
+    db,
+    run,
+    client,
+    strategy,
+    instrument: str,
+    df,
+    now_utc: datetime,
+    transitions: list,
+    broker_net_units: int,
+    broker_position,
+    exit_rules,  # StrategySpec (whole spec — passed through to _open_position_and_persist)
+    risk_cfg: dict,
+) -> None:
+    """Execute the walk's final decision against the broker.
+
+    Design (Wilson UAT 2026-08-06):
+    - Zero transitions → walk decided nothing changed; equity snapshot
+      and return.
+    - One transition → execute it (open / close / flip).
+    - Many transitions (multi-bar catch-up after outage) → log the
+      intermediate transitions to the decision log for audit, then
+      execute ONLY the last one. Paper cannot back-execute past bars
+      on OANDA; the intermediate flips didn't touch the broker in
+      real time, so we don't create Trade rows for them. This
+      preserves broker/DB agreement.
+
+    Callers persist the equity snapshot at the end of the tick — this
+    function itself only snapshots when returning without executing
+    anything (the 0-transition path).
+    """
+    if not transitions:
+        _persist_equity_snapshot(
+            db=db, run=run, position=broker_position, now_utc=now_utc
+        )
+        return
+
+    if len(transitions) > 1:
+        # Catch-up mode. Log everything but the last transition as a
+        # notice; the runner cannot back-execute on OANDA.
+        for t in transitions[:-1]:
+            _write_decision(
+                db,
+                run,
+                action="USER_INTERMEDIATE_TRANSITION_SKIPPED",
+                reason=(
+                    f"walk detected {t.kind} at bar {t.bar_ts.isoformat()} "
+                    f"(reason={t.reason}); paper cannot back-execute past "
+                    "bars on OANDA. Executing only the final walk state."
+                ),
+                outputs={
+                    "paper_run_id": run.id,
+                    "skipped_bar_ts": t.bar_ts.isoformat(),
+                    "kind": t.kind,
+                    "reason": t.reason,
+                    "direction": t.direction,
+                    "close_px": t.close_px,
+                },
+            )
+
+    from agentfx.adapters.oanda import OandaOrderRejected
+
+    last_t = transitions[-1]
+
+    if last_t.kind == "close":
+        # Walk decided to exit — SL, TP, or max_hold hit.
+        try:
+            _close_position_and_persist(
+                db=db,
+                run=run,
+                client=client,
+                instrument=instrument,
+                now_utc=now_utc,
+                reason=(
+                    f"walk-driven exit at bar {last_t.bar_ts.isoformat()}: "
+                    f"{last_t.reason}"
+                ),
+                exit_reason=last_t.reason,
+            )
+        except OandaOrderRejected as exc:
+            _write_decision(
+                db,
+                run,
+                action="USER_CLOSE_REJECTED",
+                reason=(
+                    f"walk-driven close rejected by OANDA: "
+                    f"{exc.reject_reason} (txn={exc.transaction_id}) — "
+                    "position stays open, next tick will re-evaluate"
+                ),
+                outputs={
+                    "paper_run_id": run.id,
+                    "reject_reason": exc.reject_reason,
+                    "reject_transaction_id": exc.transaction_id,
+                    "order_type": exc.order_type,
+                    "close_context": last_t.reason,
+                },
+            )
+        _persist_equity_snapshot(
+            db=db, run=run, position=broker_position, now_utc=now_utc
+        )
+        return
+
+    if last_t.kind == "flip":
+        # Close current side, open opposite. Two broker calls (close +
+        # market order) mirroring the pre-refactor opposite_flip
+        # behaviour. If the close leg fails, don't open the new side —
+        # the retry on the next tick will handle it.
+        try:
+            _close_position_and_persist(
+                db=db,
+                run=run,
+                client=client,
+                instrument=instrument,
+                now_utc=now_utc,
+                reason=(
+                    f"walk-driven opposite_flip at bar {last_t.bar_ts.isoformat()}"
+                ),
+                exit_reason="opposite_flip",
+            )
+        except OandaOrderRejected as exc:
+            _write_decision(
+                db,
+                run,
+                action="USER_CLOSE_REJECTED",
+                reason=(
+                    f"opposite-flip close rejected by OANDA: "
+                    f"{exc.reject_reason} (txn={exc.transaction_id}) — "
+                    "position stays open, next tick will re-evaluate"
+                ),
+                outputs={
+                    "paper_run_id": run.id,
+                    "reject_reason": exc.reject_reason,
+                    "reject_transaction_id": exc.transaction_id,
+                    "order_type": exc.order_type,
+                    "close_context": "opposite_flip",
+                },
+            )
+            _persist_equity_snapshot(
+                db=db, run=run, position=broker_position, now_utc=now_utc
+            )
+            return
+        # Close succeeded — open the new side.
+        signal_direction = "long" if last_t.direction > 0 else "short"
+        _open_position_and_persist(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            instrument=instrument,
+            signal_direction=signal_direction,  # type: ignore[arg-type]
+            df=df,
+            now_utc=now_utc,
+            exit_rules=exit_rules,
+            risk_cfg=risk_cfg,
+            position_snapshot=broker_position,
+        )
+        return
+
+    if last_t.kind == "open":
+        # Fresh entry from flat.
+        signal_direction = "long" if last_t.direction > 0 else "short"
+        _open_position_and_persist(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            instrument=instrument,
+            signal_direction=signal_direction,  # type: ignore[arg-type]
+            df=df,
+            now_utc=now_utc,
+            exit_rules=exit_rules,
+            risk_cfg=risk_cfg,
+            position_snapshot=broker_position,
+        )
+        return
+
+    # Unknown kind — defensive. Log and equity-snapshot.
+    _write_decision(
+        db,
+        run,
+        action="USER_SIGNAL_SKIPPED_STALE",
+        reason=f"walk returned unknown transition kind={last_t.kind!r}; ignoring",
+        outputs={"paper_run_id": run.id, "kind": last_t.kind},
+    )
+    _persist_equity_snapshot(db=db, run=run, position=broker_position, now_utc=now_utc)
 
 
 # ─────────────────────────────────────────────────────────────────────
