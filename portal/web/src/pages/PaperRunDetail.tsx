@@ -832,8 +832,13 @@ function StickyHeader({
         <div className="flex items-center gap-2 flex-wrap">
           <StatusPill status={run.status} />
           <div className="text-lg font-semibold truncate">
-            {run.instrument} {run.granularity}
+            {run.name || `${run.instrument} ${run.granularity}`}
           </div>
+          {run.name && (
+            <div className="text-xs text-slate-500 dark:text-slate-400 uppercase tracking-wide">
+              {run.instrument} {run.granularity}
+            </div>
+          )}
         </div>
         <div className="text-xs text-slate-500 dark:text-slate-400 mt-1 font-mono flex flex-wrap items-center gap-x-3 gap-y-1">
           <span className="truncate">{run.id}</span>

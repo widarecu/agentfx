@@ -145,10 +145,22 @@ function RunRow({ run }: { run: PaperRunListItem }) {
         <div className="flex items-center gap-4 min-w-0">
           <StatusPill status={run.status} />
           <div className="min-w-0">
-            <div className="font-semibold truncate">
-              {run.instrument} {run.granularity}
-            </div>
-            <div className="text-xs text-slate-500 dark:text-slate-400 font-mono flex items-center gap-1.5 flex-wrap">
+            {/* Name row (user-set at deploy or LLM-suggested).
+                Falls back to the instrument+granularity line when
+                unnamed so tiles never render nameless. */}
+            {run.name ? (
+              <>
+                <div className="font-semibold truncate">{run.name}</div>
+                <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                  {run.instrument} {run.granularity}
+                </div>
+              </>
+            ) : (
+              <div className="font-semibold truncate">
+                {run.instrument} {run.granularity}
+              </div>
+            )}
+            <div className="text-xs text-slate-500 dark:text-slate-400 font-mono flex items-center gap-1.5 flex-wrap mt-0.5">
               <span className="truncate">{run.id}</span>
               {run.oanda_account_id && (
                 <span className="bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 px-1.5 py-0.5 rounded normal-case">

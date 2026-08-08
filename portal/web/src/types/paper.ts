@@ -45,6 +45,9 @@ export interface PaperRunListItem {
   snapshot_balance: number | null;
   stop_reason: string | null;
   created_at: string | null;
+  /** Human-readable name from the deploy modal (default or
+   *  LLM-suggested). Displayed above the run_id on the tile. */
+  name: string | null;
 }
 
 export interface PaperRunList {
@@ -100,6 +103,8 @@ export interface PaperRunPublic {
     traceback?: string;
     crashed_at?: string;
   } | null;
+  /** Human-readable name from the deploy modal. */
+  name: string | null;
 }
 
 export interface DslExitPublic {

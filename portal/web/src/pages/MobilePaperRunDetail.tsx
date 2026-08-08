@@ -598,8 +598,8 @@ export default function MobilePaperRunDetail(): React.ReactElement {
               {statusLabel(run.status)}
             </span>
             <span className="text-slate-600 text-[11px]">·</span>
-            <span className="text-[11px] font-mono text-slate-300 truncate">
-              {shortRunId(run.id)}
+            <span className="text-[11px] text-slate-300 truncate">
+              {run.name || shortRunId(run.id)}
             </span>
           </div>
           <div className="text-[10px] text-slate-500 font-mono truncate">

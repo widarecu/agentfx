@@ -272,6 +272,96 @@ class TestApprove:
         assert run.oanda_account_id == "101-004-99999-001"
         assert run.strategy_genome_id == alice_validated_genome["genome"].id
 
+    def test_approve_rejects_second_run_on_same_account(
+        self,
+        test_client_with_db,
+        db_session,
+        paper_users,
+        alice_credentials,
+        alice_validated_genome,
+    ):
+        """v0.7.x exclusivity guard (Wilson audit 2026-08-08).
+
+        Two paper runs on the same OANDA account share broker
+        positions, double-count sizing capital, and misfire risk
+        gates against the shared balance delta. The API layer must
+        reject the second deploy with a clear 400.
+        """
+        headers = _auth_headers(
+            test_client_with_db,
+            paper_users["alice"]["email"],
+            paper_users["alice"]["password"],
+        )
+        # First deploy — should succeed.
+        with patch("agentfx.api.workers.paper_runner.schedule_paper_run"):
+            first = test_client_with_db.post(
+                "/api/v1/paper-runs/approve",
+                headers=headers,
+                json=_approve_body(alice_validated_genome["genome"].id),
+            )
+        assert first.status_code == 202
+
+        # Second deploy — same account, same genome — must be rejected.
+        with patch("agentfx.api.workers.paper_runner.schedule_paper_run"):
+            second = test_client_with_db.post(
+                "/api/v1/paper-runs/approve",
+                headers=headers,
+                json=_approve_body(alice_validated_genome["genome"].id),
+            )
+        assert second.status_code == 400, second.text
+        detail = second.json()["detail"].lower()
+        assert "already has an active paper run" in detail
+        # Message must name the offending account so the operator
+        # knows which run to halt or which sub-account to switch to.
+        assert "101-004-99999-001" in second.json()["detail"]
+
+    def test_accounts_endpoint_marks_account_with_active_run(
+        self,
+        test_client_with_db,
+        db_session,
+        paper_users,
+        alice_credentials,
+        alice_validated_genome,
+    ):
+        """v0.7.x defense-in-depth (frontend UX): the accounts
+        endpoint returns `active_paper_run_id` per account so the
+        deploy modal can warn BEFORE the user submits into the
+        backend guard."""
+        headers = _auth_headers(
+            test_client_with_db,
+            paper_users["alice"]["email"],
+            paper_users["alice"]["password"],
+        )
+        # Baseline: no runs → all accounts NULL.
+        resp = test_client_with_db.get(
+            "/api/v1/users/me/credentials/accounts", headers=headers
+        )
+        assert resp.status_code == 200
+        for acct in resp.json()["items"]:
+            assert acct["active_paper_run_id"] is None
+
+        # Deploy a run.
+        with patch("agentfx.api.workers.paper_runner.schedule_paper_run"):
+            deploy = test_client_with_db.post(
+                "/api/v1/paper-runs/approve",
+                headers=headers,
+                json=_approve_body(alice_validated_genome["genome"].id),
+            )
+        assert deploy.status_code == 202
+        run_id = deploy.json()["run_id"]
+
+        # Same-account row now surfaces the active run.
+        resp2 = test_client_with_db.get(
+            "/api/v1/users/me/credentials/accounts", headers=headers
+        )
+        assert resp2.status_code == 200
+        target = next(
+            a
+            for a in resp2.json()["items"]
+            if a["oanda_account_id"] == "101-004-99999-001"
+        )
+        assert target["active_paper_run_id"] == run_id
+
     def test_approve_wrong_owner_genome_returns_400(
         self,
         test_client_with_db,

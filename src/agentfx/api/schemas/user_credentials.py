@@ -58,6 +58,13 @@ class UserOandaAccountPublic(BaseSchema):
     alias: str | None = None
     currency: str
     last_seen_at: datetime
+    # v0.7.x — set to the run_id of the caller's APPROVED or RUNNING
+    # paper run on this account, if one exists; NULL otherwise.
+    # DeployPaperModal shows a warning strip when the picked account
+    # has a non-null value here so the operator sees the collision
+    # before submit. See `find_active_paper_run_on_account` in
+    # services/paper.py for the exact query.
+    active_paper_run_id: str | None = None
 
 
 class UserOandaAccountsList(BaseSchema):

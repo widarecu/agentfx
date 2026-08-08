@@ -155,6 +155,10 @@ class PaperRunPublic(BaseSchema):
     # here so the /paper/:id page can render a diagnostic panel
     # instead of just showing "process_crashed (exit_code=1)".
     crash_detail: dict | None = None
+    # Human-readable name from the deploy modal (either the default
+    # `{instrument} {granularity} — YYYY-MM-DD` or the LLM
+    # suggestion). Stored inside `run.parameters['name']`.
+    name: str | None = None
 
 
 class PaperRunListItem(BaseSchema):
@@ -169,6 +173,13 @@ class PaperRunListItem(BaseSchema):
     snapshot_balance: float | None = None
     stop_reason: str | None = None
     created_at: datetime | None = None
+    # Human-readable name (default `{instrument} {granularity} — YYYY-MM-DD`
+    # or the LLM-suggested string when the operator hit "Suggest" at
+    # deploy time). Stored inside `run.parameters['name']`; surfaced
+    # here so the paper-runs tiles + detail page can render it above
+    # the run_id. Wilson UAT 2026-08-08: named a run via the LLM
+    # suggestion, then couldn't see the name anywhere.
+    name: str | None = None
 
 
 class PaperRunList(BaseSchema):

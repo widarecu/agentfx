@@ -310,6 +310,9 @@ def approve_and_deploy(
     genome = _load_owned_validated_genome(db, body.strategy_genome_id, current_user.id)
     creds = _load_verified_credentials(db, current_user.id)
     _validate_account_choice(creds, body.oanda_account_id)
+    _reject_if_account_has_active_run(
+        db, user_id=current_user.id, oanda_account_id=body.oanda_account_id
+    )
 
     name = body.name or (
         f"{body.instrument} {body.granularity} — {datetime.now(UTC):%Y-%m-%d}"
@@ -718,6 +721,82 @@ def _validate_account_choice(
         raise ValueError(
             f"OANDA account '{oanda_account_id}' is not one of the "
             "user's detected sub-accounts"
+        )
+
+
+def find_active_paper_run_on_account(
+    db: Session,
+    *,
+    user_id: int,
+    oanda_account_id: str,
+) -> models.Run | None:
+    """Return the user's APPROVED or RUNNING paper run on the given
+    OANDA account, if one exists. Used by both the approve-and-deploy
+    guard and the credentials list endpoint (which surfaces this as
+    per-account `active_paper_run_id` so the deploy modal can warn
+    before submit).
+
+    Only paper runs are considered — `environment == PAPER` — so a
+    live-trading rollout (v1.0.0+) doesn't accidentally get blocked
+    by this predicate."""
+    return (
+        db.query(models.Run)
+        .filter(
+            models.Run.user_id == user_id,
+            models.Run.oanda_account_id == oanda_account_id,
+            models.Run.environment == models.RunEnvironment.PAPER,
+            models.Run.status.in_(
+                [models.RunStatus.APPROVED, models.RunStatus.RUNNING]
+            ),
+        )
+        .first()
+    )
+
+
+def _reject_if_account_has_active_run(
+    db: Session,
+    *,
+    user_id: int,
+    oanda_account_id: str,
+) -> None:
+    """v0.7.x exclusivity guard (Wilson 2026-08-08 audit).
+
+    Reject the deploy if the user already has an APPROVED or RUNNING
+    paper run on the same OANDA sub-account. Sharing an account
+    across paper runs is functionally broken:
+
+    - OANDA reports account-level position for `get_position()`; two
+      runs on the same account see each other's units and misattribute
+      quantity.
+    - `close_all_positions(instrument)` flattens the entire account's
+      instrument position; one run's exit closes the other run's trade
+      as a side-effect, triggering the broker-side SL/TP misclassifier.
+    - Balance-derived sizing double-counts capital (each run sizes
+      off the shared balance independently).
+    - Risk gates (`daily_loss_pct`, `kill_switch_dd_pct`) fire on the
+      SHARED balance delta — a profitable run gets halted for the
+      other run's loss.
+
+    Two paper runs must be deployed to DIFFERENT sub-accounts. This
+    guard makes the intent explicit at the API layer; the frontend
+    deploy modal also warns via `UserOandaAccountPublic.active_paper_run_id`
+    so the operator sees the collision before submit."""
+    existing = find_active_paper_run_on_account(
+        db, user_id=user_id, oanda_account_id=oanda_account_id
+    )
+    if existing is not None:
+        status_val = (
+            existing.status.value
+            if hasattr(existing.status, "value")
+            else str(existing.status)
+        )
+        raise ValueError(
+            f"OANDA account '{oanda_account_id}' already has an active "
+            f"paper run ({existing.id}, status={status_val}). Two paper "
+            f"runs on the same account would share broker positions, "
+            f"double-count capital in sizing, and interfere with each "
+            f"other's risk gates. Pick a different sub-account or halt "
+            f"the existing run first."
         )
 
 

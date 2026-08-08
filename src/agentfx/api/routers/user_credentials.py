@@ -63,12 +63,17 @@ def _public_view(
     )
 
 
-def _account_view(row: models.UserOandaAccount) -> schemas.UserOandaAccountPublic:
+def _account_view(
+    row: models.UserOandaAccount,
+    *,
+    active_paper_run_id: str | None = None,
+) -> schemas.UserOandaAccountPublic:
     return schemas.UserOandaAccountPublic(
         oanda_account_id=row.oanda_account_id,
         alias=row.alias,
         currency=row.currency,
         last_seen_at=row.last_seen_at,
+        active_paper_run_id=active_paper_run_id,
     )
 
 
@@ -287,10 +292,31 @@ def list_my_accounts(
     row = _load_credentials(db, current_user.id)
     if row is None:
         return schemas.UserOandaAccountsList(items=[], verified_at=None)
+    # v0.7.x: enrich each row with `active_paper_run_id` so the deploy
+    # modal can warn on account collisions BEFORE submit. Uses the
+    # same query as `approve_and_deploy`'s exclusivity guard.
+
     return schemas.UserOandaAccountsList(
-        items=[_account_view(a) for a in row.accounts],
+        items=[
+            _account_view(
+                a,
+                active_paper_run_id=_active_run_id_for(
+                    db, current_user.id, a.oanda_account_id
+                ),
+            )
+            for a in row.accounts
+        ],
         verified_at=row.verified_at,
     )
+
+
+def _active_run_id_for(db: Session, user_id: int, oanda_account_id: str) -> str | None:
+    from ..services import paper as paper_service
+
+    active = paper_service.find_active_paper_run_on_account(
+        db, user_id=user_id, oanda_account_id=oanda_account_id
+    )
+    return active.id if active is not None else None
 
 
 @router.get("/users/me/credentials/diagnose")

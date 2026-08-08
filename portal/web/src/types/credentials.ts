@@ -22,6 +22,11 @@ export interface UserOandaAccountPublic {
   alias: string | null;
   currency: string;
   last_seen_at: string;
+  /** v0.7.x: set to the caller's APPROVED or RUNNING paper run's id
+   *  on this account, if any; null otherwise. DeployPaperModal shows
+   *  a warning strip when the picked account has a non-null value
+   *  here so the operator sees the collision before submit. */
+  active_paper_run_id: string | null;
 }
 
 export interface UserOandaAccountsList {

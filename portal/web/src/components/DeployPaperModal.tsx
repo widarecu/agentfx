@@ -276,7 +276,7 @@ export function DeployPaperModal({
                           className="accent-emerald-500"
                         />
                         <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2">
+                          <div className="flex items-center gap-2 flex-wrap">
                             <span className="font-mono text-sm truncate">
                               {account.oanda_account_id}
                             </span>
@@ -285,10 +285,27 @@ export function DeployPaperModal({
                                 {account.alias}
                               </span>
                             )}
+                            {account.active_paper_run_id && (
+                              <span
+                                className="text-[10px] uppercase tracking-wider bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 px-1.5 py-0.5 rounded shrink-0"
+                                title={`Already running paper run ${account.active_paper_run_id}. Two runs on the same account share broker positions — pick another sub-account or halt the existing run.`}
+                              >
+                                In use
+                              </span>
+                            )}
                           </div>
                           <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                             {account.currency}
                           </div>
+                          {account.active_paper_run_id && (
+                            <div className="text-[11px] text-amber-700 dark:text-amber-400 mt-1">
+                              This account already has an active paper run
+                              (<span className="font-mono">{account.active_paper_run_id}</span>).
+                              Deploying a second run here will be rejected
+                              — pick another sub-account or halt the
+                              existing run first.
+                            </div>
+                          )}
                         </div>
                       </label>
                     );

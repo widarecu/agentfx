@@ -115,6 +115,7 @@ def _to_public(
         started_at=run.started_at,
         completed_at=run.completed_at,
         user_id=run.user_id,
+        name=(run.parameters or {}).get("name"),
     )
 
 
@@ -127,6 +128,7 @@ def _to_list_item(run: models.Run) -> schemas.PaperRunListItem:
         oanda_account_id=run.oanda_account_id,
         pnl=run.pnl,
         snapshot_balance=run.snapshot_balance,
+        name=(run.parameters or {}).get("name"),
         stop_reason=run.stop_reason,
         created_at=run.created_at,
     )
