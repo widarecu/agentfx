@@ -180,6 +180,17 @@ def find_prior_winners(
         models.EvolutionRun.granularity == granularity,
         models.EvolutionRun.status == "completed",
         models.StrategyGenome.fitness.isnot(None),
+        # v0.7.x cross-user sharing (Wilson 2026-08-08): imported
+        # shadow runs must NEVER seed the importer's future evolutions.
+        # Isolation is intentional — the importer can still deploy
+        # the imported genome directly to paper via the approval queue,
+        # but it doesn't mutate/crossover with their own GA runs and
+        # doesn't inherit as a warm-start. Before this filter the
+        # exclusion happened only because the imported run's
+        # config_json shape didn't match the rubric-match keys — a
+        # brittle accident that a future config-key refactor could
+        # break.
+        models.EvolutionRun.imported_from_email.is_(None),
     ]
     if exclude_run_id is not None:
         base_filters.append(models.Generation.run_id != exclude_run_id)

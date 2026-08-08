@@ -1584,3 +1584,107 @@ class TestFindPriorWinnersConfigMatch:
         assert len(rows) == 2
         assert rows[0]["fitness"] == pytest.approx(1.5)
         assert rows[1]["fitness"] == pytest.approx(0.4)
+
+
+class TestFindPriorWinnersImportIsolation:
+    """v0.7.x cross-user sharing (Wilson 2026-08-08).
+
+    Imported shadow evolution runs must NEVER seed the importer's
+    future evolutions via warm-start. The importer can still deploy
+    the imported genome directly to paper via the approval queue —
+    but a fresh evolution the importer starts should behave as if
+    the import never happened.
+
+    Before the explicit `imported_from_email IS NULL` filter, imports
+    were excluded only because their config_json shape didn't match
+    the rubric-match keys (`data_window_start` etc.) — a brittle
+    accident. These tests lock in the explicit isolation.
+    """
+
+    def _run_with_import_attr(
+        self,
+        db: Session,
+        *,
+        instrument: str = "EUR_USD",
+        granularity: str = "M1",
+        imported_from_email: str | None = None,
+    ) -> models.EvolutionRun:
+        run = evolution_service.create_run(
+            db,
+            schemas.EvolutionRunCreate(instrument=instrument, granularity=granularity),
+        )
+        run.status = models.EvolutionRunStatus.COMPLETED
+        run.imported_from_email = imported_from_email
+        db.commit()
+        return run
+
+    def _seed(
+        self,
+        db: Session,
+        *,
+        run: models.EvolutionRun,
+        fitness: float,
+        idx: int = 0,
+    ) -> models.StrategyGenome:
+        from agentfx.api.models import GenomeOrigin
+
+        gen_id = f"{run.id}_gen_000"
+        if db.get(models.Generation, gen_id) is None:
+            db.add(models.Generation(id=gen_id, run_id=run.id, index=0))
+            db.commit()
+        genome_id = f"genome_{run.id}_000_{idx:03d}"
+        spec = MA_CROSSOVER_SEED.model_dump(mode="json")
+        spec["entry"]["long"]["lhs"]["args"] = [10.0 + idx]
+        spec["entry"]["short"]["lhs"]["args"] = [10.0 + idx]
+        db.add(
+            models.StrategyGenome(
+                id=genome_id,
+                generation_id=gen_id,
+                dsl_json=spec,
+                origin=GenomeOrigin.SEED,
+                fitness=fitness,
+            )
+        )
+        db.commit()
+        return db.get(models.StrategyGenome, genome_id)
+
+    def test_native_run_still_included(self, db: Session) -> None:
+        """Baseline: with no imports, the picker still returns the
+        native run (proves the new filter doesn't accidentally drop
+        legitimate candidates)."""
+        native = self._run_with_import_attr(db)
+        self._seed(db, run=native, fitness=1.5)
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        assert len(rows) == 1
+        assert rows[0]["fitness"] == pytest.approx(1.5)
+
+    def test_imported_run_excluded(self, db: Session) -> None:
+        """Core isolation contract: a shadow run with
+        `imported_from_email` set is NEVER a warm-start candidate,
+        no matter how high its fitness."""
+        imported = self._run_with_import_attr(db, imported_from_email="alice@peer.com")
+        self._seed(db, run=imported, fitness=999.0)  # highest possible
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        assert rows == [], (
+            "imported shadow runs must be excluded from warm-start candidates by design"
+        )
+
+    def test_mixed_native_and_imported_only_native_returned(self, db: Session) -> None:
+        """When native and imported runs coexist for the same pair,
+        the picker returns ONLY the native ones."""
+        native = self._run_with_import_attr(db)
+        imported = self._run_with_import_attr(db, imported_from_email="alice@peer.com")
+        self._seed(db, run=native, fitness=0.5, idx=0)
+        self._seed(db, run=imported, fitness=1.5, idx=1)  # would win otherwise
+        rows = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=3
+        )
+        assert len(rows) == 1
+        assert rows[0]["fitness"] == pytest.approx(0.5), (
+            "picker must skip the higher-fitness imported genome and "
+            "pick only the native one"
+        )
