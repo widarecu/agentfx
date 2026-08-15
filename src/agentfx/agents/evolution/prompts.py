@@ -414,6 +414,19 @@ def build_user_prompt(
         "bleed exceeds any per-trade edge. Set min_hold_bars to a "
         "value that gives the entry signal time to play out — 5-15 on "
         "M1 for mean-reversion, 20-60 for trend-following.\n"
+        "eval_mode picks how SL and TP are checked each bar:\n"
+        '  * "close": only the bar\'s CLOSE triggers exit. Wicks that '
+        "touch the threshold but recover are ignored. Legacy default; "
+        "produces higher-Sharpe backtests but under-reports how often "
+        "broker-side stops would fire in real trading.\n"
+        '  * "wick": bar\'s LOW (long SL / short TP) or HIGH (long '
+        "TP / short SL) triggers exit at exactly the threshold price. "
+        "Realistic model of a broker-side stop-loss / take-profit "
+        "order. Backtest Sharpe is lower but predicts paper P&L "
+        "faithfully.\n"
+        'Prefer "wick" when SL is tight relative to the pair\'s typical '
+        'M1 range (e.g. stop_pips <= 25 on EUR_USD); prefer "close" '
+        "when SL is deliberately wide to ride out noise.\n"
     )
 
     framing_blocks = f"{cost_block}{cagr_block}{exit_note}"

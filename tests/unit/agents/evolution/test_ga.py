@@ -109,6 +109,25 @@ class TestMutateSpec:
             "MA_CROSSOVER_SEED — the new dimension isn't being explored."
         )
 
+    def test_eval_mode_mutation_flips_over_lineage(self) -> None:
+        """Wilson 2026-08-15: `eval_mode` is now a GA-searchable
+        dimension. Over a long lineage at least one mutation must
+        flip the default 'close' → 'wick' (or back), otherwise the
+        dimension is frozen."""
+        rng = Random(999)
+        spec = MA_CROSSOVER_SEED
+        assert spec.exit.eval_mode == "close", "Seed precondition"
+        seen_wick = False
+        for _ in range(80):
+            spec = mutate_spec(spec, rng)
+            if spec.exit.eval_mode == "wick":
+                seen_wick = True
+                break
+        assert seen_wick, (
+            "eval_mode never flipped to 'wick' across 80 mutations — "
+            "the GA isn't exploring the new dimension."
+        )
+
     def test_min_hold_mutation_respects_max_hold_bound(self) -> None:
         """Cross-field validator: min_hold must always stay strictly
         below max_hold. Walk a long lineage and assert the invariant

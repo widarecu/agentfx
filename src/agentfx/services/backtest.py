@@ -524,6 +524,11 @@ def run_backtest_from_db(
     # re-entered" from "stop hit, re-entered" without re-deriving from
     # prices (UAT 2026-06-17 OBV-seed confusion).
     exit_reasons_by_ts: dict = getattr(strat, "exit_reasons_by_ts", {}) or {}
+    # Wilson 2026-08-15: for wick-mode SL/TP exits the trigger price is
+    # the SL/TP threshold, not the bar close. Override map is populated
+    # by DSL strategies with eval_mode="wick"; empty for close-mode and
+    # classic strategies.
+    exit_prices_by_ts: dict = getattr(strat, "exit_prices_by_ts", {}) or {}
 
     # Apply policies
     pconf = PolicyConfig(
@@ -643,7 +648,15 @@ def run_backtest_from_db(
                 ):
                     # Exit (or flip — close current position first)
                     signal_type = "exit_long" if prev_signal > 0 else "exit_short"
-                    exit_price = float(df.loc[timestamp, "close"])
+                    # Wick-mode SL/TP fills at the trigger price; every
+                    # other exit fills at the bar close. `exit_prices_by_ts`
+                    # is populated only for wick-mode SL/TP; falls back
+                    # to close[t] otherwise.
+                    exit_price_override = exit_prices_by_ts.get(timestamp)
+                    if exit_price_override is not None:
+                        exit_price = float(exit_price_override)
+                    else:
+                        exit_price = float(df.loc[timestamp, "close"])
                     # Look up the structural reason the compiler emitted
                     # for this exit so we can annotate both the signal
                     # and trade rows. Missing key (e.g. policy-driven

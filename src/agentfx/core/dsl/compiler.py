@@ -179,46 +179,48 @@ def _eval_condition(
 def _apply_exits(
     raw_pos: np.ndarray,
     close: np.ndarray,
+    high: np.ndarray | None,
+    low: np.ndarray | None,
     exit_rules: ExitRules,
     pip_size: float,
-) -> tuple[np.ndarray, dict[int, str]]:
+) -> tuple[np.ndarray, dict[int, str], dict[int, float]]:
     """Walk bars with state and apply DSL exit rules to a raw position
     series.
 
-    `raw_pos[t]` is the entry-condition direction (+1/-1/0) the spec
-    *wants* to hold during bar t, already 1-bar-shifted for lookahead
-    protection. The walker tracks the actual open position and emits the
-    final per-bar signal:
+    Two evaluation modes (`exit_rules.eval_mode`):
 
-      - Entry: when flat (`in_position == 0`) and `raw_pos[t] != 0`,
-        enter at close[t]. The bar's signal becomes the new direction.
-      - Stop / target: at each subsequent bar, compute the pip move
-        from entry's close to bar `t`'s close. If it crosses the
-        configured threshold (against → stop, for → target), emit 0
-        at that bar (exit fires). `extract_closed_trades` then records
-        exit_price = close[t] which is the stop/target hit price.
-      - max_hold_bars: if `t - entry_bar >= max_hold_bars`, force exit.
-      - opposite_signal: if true and `raw_pos[t]` is the opposite of
-        the open position, exit AND flip in the same bar (signal
-        becomes the new opposite direction). Matches the v1 behaviour
-        when exits were not enforced.
+      * `"close"` (default): SL and TP fire only when the bar's CLOSE
+        breaches the threshold. Legacy behaviour — every genome
+        validated before eval_mode existed uses this. Intra-bar wicks
+        that touch the SL/TP but recover before close do NOT trigger.
 
-    Exits are evaluated in the order: stop → target → max_hold →
-    opposite. Same-bar exit + re-entry in the *same* direction is
-    blocked (the `continue` skips the entry block on the exit bar) —
-    same-bar opposite flip is allowed when `opposite_signal=True`.
+      * `"wick"`: SL and TP fire when the bar's LOW (long SL / short
+        TP) or HIGH (long TP / short SL) touches the threshold. Realistic
+        model of how a broker-side stop / take-profit order fills.
+        Trigger price = exactly the SL/TP price; the returned exit_price
+        override reflects this so the trade P&L matches a real fill.
 
-    Returns (signals, exit_reasons) where exit_reasons maps the bar
-    index at which an exit fired to one of the four reason codes:
-    'stop' / 'target' / 'max_hold' / 'opposite_flip'. The reason
-    map is what the trade-marker UI displays alongside each exit so
-    the user can tell "max_hold expired, re-entered" from "stop hit,
-    re-entered" without re-deriving from prices — UAT 2026-06-17
-    OBV-seed confusion stemmed from the absence of this signal.
+    Order of exits (both modes): stop → target → max_hold → opposite.
+    First match wins. Same-bar exit + re-entry in the same direction
+    is blocked; opposite flip is allowed when `opposite_signal=True`.
+
+    When both stop AND target could trigger in the same wick-mode bar
+    (bar's range spans both), we resolve conservatively: assume stop
+    fires first. Can't tell tick order from OHLC alone; better to
+    under-report profit than over-report it.
+
+    Returns (signals, exit_reasons, exit_prices):
+      * signals: per-bar target position after the walk.
+      * exit_reasons: bar_idx → 'stop'/'target'/'max_hold'/'opposite_flip'.
+      * exit_prices: bar_idx → override exit price. For wick-mode SL/TP
+        this is the trigger price (better fidelity than close). For all
+        other exits (close-mode, max_hold, opposite_flip) the dict has
+        no entry and the caller should fall back to `close[t]`.
     """
     n = len(raw_pos)
     final = np.zeros(n, dtype=np.int8)
     exit_reasons: dict[int, str] = {}
+    exit_prices: dict[int, float] = {}
     in_position = 0
     entry_close = 0.0
     entry_bar = -1
@@ -228,38 +230,77 @@ def _apply_exits(
     max_hold = exit_rules.max_hold_bars
     min_hold = exit_rules.min_hold_bars
     flip_on_opposite = exit_rules.opposite_signal
+    wick = exit_rules.eval_mode == "wick"
+    if wick and (high is None or low is None):
+        raise CompilerError(
+            "eval_mode='wick' requires high and low arrays; caller "
+            "must pass them to _apply_exits."
+        )
+
+    stop_price_dist = stop_pips * pip_size
+    target_price_dist = target_pips * pip_size
 
     for t in range(n):
         if in_position != 0:
-            # Direction-aware pip move from entry close to current close.
-            move_pips = (close[t] - entry_close) / pip_size
-            if in_position == -1:
-                move_pips = -move_pips
-
+            bars_held = t - entry_bar
             # Min-hold gate: while the position is younger than
             # min_hold_bars, no exit path can fire (stop / target /
             # opposite-flip / max-hold are all suppressed). Bars
-            # younger than the gate hold the existing direction. This
-            # forces the GA to discover strategies that don't churn
-            # every M1 bar; over-trading was the dominant failure mode
-            # on the M1 EUR_USD staging runs.
-            bars_held = t - entry_bar
+            # younger than the gate hold the existing direction.
             if bars_held < min_hold:
                 final[t] = in_position
                 continue
 
-            if move_pips <= -stop_pips:
-                # Stop hit: exit at this bar's close. Signal flips to 0
-                # so extract_closed_trades records exit_price = close[t].
+            # ── Evaluate stop + target ──────────────────────────────
+            stop_hit = False
+            target_hit = False
+            trigger_price: float | None = None
+
+            if wick:
+                # Touch-based check against bar extremes.
+                if in_position == 1:  # LONG
+                    long_sl = entry_close - stop_price_dist
+                    long_tp = entry_close + target_price_dist
+                    if low[t] <= long_sl:
+                        stop_hit = True
+                        trigger_price = long_sl
+                    elif high[t] >= long_tp:
+                        target_hit = True
+                        trigger_price = long_tp
+                else:  # SHORT
+                    short_sl = entry_close + stop_price_dist
+                    short_tp = entry_close - target_price_dist
+                    if high[t] >= short_sl:
+                        stop_hit = True
+                        trigger_price = short_sl
+                    elif low[t] <= short_tp:
+                        target_hit = True
+                        trigger_price = short_tp
+            else:
+                # Close-based check (legacy default).
+                move_pips = (close[t] - entry_close) / pip_size
+                if in_position == -1:
+                    move_pips = -move_pips
+                if move_pips <= -stop_pips:
+                    stop_hit = True
+                elif move_pips >= target_pips:
+                    target_hit = True
+
+            if stop_hit:
                 final[t] = 0
                 in_position = 0
                 exit_reasons[t] = "stop"
+                if trigger_price is not None:
+                    exit_prices[t] = float(trigger_price)
                 continue
-            if move_pips >= target_pips:
+            if target_hit:
                 final[t] = 0
                 in_position = 0
                 exit_reasons[t] = "target"
+                if trigger_price is not None:
+                    exit_prices[t] = float(trigger_price)
                 continue
+
             if bars_held >= max_hold:
                 final[t] = 0
                 in_position = 0
@@ -288,7 +329,7 @@ def _apply_exits(
             final[t] = in_position
         # else: stay flat, final[t] is already 0.
 
-    return final, exit_reasons
+    return final, exit_reasons, exit_prices
 
 
 class CompiledDSLStrategy(Strategy):
@@ -315,6 +356,11 @@ class CompiledDSLStrategy(Strategy):
         # each closed trade / exit signal. Per-instance state because
         # we call generate_signals once per backtest invocation.
         self.exit_reasons_by_ts: dict[pd.Timestamp, str] = {}
+        # Wilson 2026-08-15: for eval_mode="wick" exits, the trigger
+        # price is exactly the SL/TP threshold, not the bar's close.
+        # Backtest reads this map to override the default `close[t]`
+        # exit price when present.
+        self.exit_prices_by_ts: dict[pd.Timestamp, float] = {}
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         cache: dict[tuple, pd.Series] = {}
@@ -338,14 +384,21 @@ class CompiledDSLStrategy(Strategy):
             .to_numpy()
         )
         close = df["close"].to_numpy()
-        final, exit_reasons_by_idx = _apply_exits(
-            raw_pos, close, self.spec.exit, self.pip_size
+        # High/low are only needed for eval_mode="wick" but always
+        # available on OHLC DataFrames — pass them unconditionally.
+        high = df["high"].to_numpy() if "high" in df.columns else None
+        low = df["low"].to_numpy() if "low" in df.columns else None
+        final, exit_reasons_by_idx, exit_prices_by_idx = _apply_exits(
+            raw_pos, close, high, low, self.spec.exit, self.pip_size
         )
         # Translate bar-index → timestamp so the backtest engine can
-        # look up the reason by signal timestamp without re-deriving
-        # the bar offset.
+        # look up the reason (and wick-mode trigger price) by signal
+        # timestamp without re-deriving the bar offset.
         self.exit_reasons_by_ts = {
             df.index[i]: reason for i, reason in exit_reasons_by_idx.items()
+        }
+        self.exit_prices_by_ts = {
+            df.index[i]: price for i, price in exit_prices_by_idx.items()
         }
         return pd.Series(final, index=df.index, dtype=int)
 

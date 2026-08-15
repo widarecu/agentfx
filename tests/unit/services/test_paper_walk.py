@@ -601,8 +601,17 @@ class TestPropertyBacktestParity:
         # takes raw_pos already shifted (it's what the compiler passes it).
         # For this parity test we treat raw already-shifted so both sides
         # see identical inputs.
-        applyexit_final, _reasons = _apply_exits(
-            raw.astype(np.int8), close.astype(float), rules, PIP
+        # Wilson 2026-08-15: _apply_exits now takes high/low + returns
+        # exit_prices for eval_mode="wick" support. Under close-mode
+        # (this test's rules) high/low are unused and exit_prices is
+        # empty; parity check against walk() unchanged.
+        applyexit_final, _reasons, _exit_prices = _apply_exits(
+            raw.astype(np.int8),
+            close.astype(float),
+            None,
+            None,
+            rules,
+            PIP,
         )
 
         assert (walk_final == applyexit_final).all(), (
@@ -610,3 +619,205 @@ class TestPropertyBacktestParity:
             f"walk:        {walk_final.tolist()}\n"
             f"apply_exits: {applyexit_final.tolist()}"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Wilson 2026-08-15: eval_mode="wick" — touch-based SL/TP
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _wick_rules(**kwargs) -> ExitRules:
+    """Same defaults as `_rules` but eval_mode='wick'."""
+    return ExitRules(
+        stop_pips=kwargs.get("stop_pips", 20),
+        target_pips=kwargs.get("target_pips", 40),
+        min_hold_bars=kwargs.get("min_hold", 0),
+        max_hold_bars=kwargs.get("max_hold", 100),
+        opposite_signal=kwargs.get("opposite_signal", True),
+        eval_mode="wick",
+    )
+
+
+class TestEvalModeWick:
+    """Every long/short × SL/TP combination, plus the min_hold gate
+    (wick SL/TP is suppressed while under min_hold, same as close-mode).
+    """
+
+    def test_long_sl_fires_on_wick_touch_even_if_close_recovers(self):
+        # Entry 1.15000, SL 20 pips → trigger price 1.14800. Bar wicks
+        # to 1.14795 (below SL) but closes at 1.15010 (above entry).
+        # Close-mode: no exit. Wick-mode: SL fires at exactly 1.14800.
+        idx = _bars(2)
+        raw = _series([0, 0], idx)
+        close = _series([1.15000, 1.15010], idx)
+        high = _series([1.15020, 1.15015], idx)
+        low = _series([1.14990, 1.14795], idx)
+
+        result = walk(
+            raw_entries=raw,
+            close_series=close,
+            start_state=_long_at(1.15000, bars_held=0),
+            bookmark_ts=(BASE_TS - timedelta(minutes=1)),
+            exit_rules=_wick_rules(),
+            pip_size=PIP,
+            high_series=high,
+            low_series=low,
+        )
+        assert len(result.transitions) == 1
+        t = result.transitions[0]
+        assert t.reason == "stop"
+        assert t.close_px == pytest.approx(1.14800, abs=1e-6)
+
+    def test_long_tp_fires_on_wick_touch(self):
+        idx = _bars(2)
+        raw = _series([0, 0], idx)
+        close = _series([1.15000, 1.14990], idx)  # closes below TP
+        high = _series([1.15020, 1.15405], idx)  # wick above TP (1.15400)
+        low = _series([1.14990, 1.14980], idx)
+        result = walk(
+            raw_entries=raw,
+            close_series=close,
+            start_state=_long_at(1.15000, bars_held=0),
+            bookmark_ts=(BASE_TS - timedelta(minutes=1)),
+            exit_rules=_wick_rules(target_pips=40),
+            pip_size=PIP,
+            high_series=high,
+            low_series=low,
+        )
+        assert len(result.transitions) == 1
+        t = result.transitions[0]
+        assert t.reason == "target"
+        assert t.close_px == pytest.approx(1.15400, abs=1e-6)
+
+    def test_short_sl_fires_on_wick_touch(self):
+        idx = _bars(2)
+        raw = _series([0, 0], idx)
+        close = _series([1.15000, 1.14990], idx)  # closes below entry
+        high = _series([1.15020, 1.15205], idx)  # wick above SL (1.15200)
+        low = _series([1.14980, 1.14970], idx)
+        result = walk(
+            raw_entries=raw,
+            close_series=close,
+            start_state=_short_at(1.15000, bars_held=0),
+            bookmark_ts=(BASE_TS - timedelta(minutes=1)),
+            exit_rules=_wick_rules(stop_pips=20),
+            pip_size=PIP,
+            high_series=high,
+            low_series=low,
+        )
+        assert len(result.transitions) == 1
+        t = result.transitions[0]
+        assert t.reason == "stop"
+        assert t.close_px == pytest.approx(1.15200, abs=1e-6)
+
+    def test_short_tp_fires_on_wick_touch(self):
+        idx = _bars(2)
+        raw = _series([0, 0], idx)
+        close = _series([1.15000, 1.15010], idx)  # closes above entry
+        high = _series([1.15020, 1.15015], idx)
+        low = _series([1.14980, 1.14595], idx)  # wick below TP (1.14600)
+        result = walk(
+            raw_entries=raw,
+            close_series=close,
+            start_state=_short_at(1.15000, bars_held=0),
+            bookmark_ts=(BASE_TS - timedelta(minutes=1)),
+            exit_rules=_wick_rules(target_pips=40),
+            pip_size=PIP,
+            high_series=high,
+            low_series=low,
+        )
+        assert len(result.transitions) == 1
+        t = result.transitions[0]
+        assert t.reason == "target"
+        assert t.close_px == pytest.approx(1.14600, abs=1e-6)
+
+    def test_wick_mode_requires_high_and_low_series(self):
+        idx = _bars(1)
+        with pytest.raises(ValueError, match="wick.*requires"):
+            walk(
+                raw_entries=_series([0], idx),
+                close_series=_series([1.15], idx),
+                start_state=_long_at(1.15),
+                bookmark_ts=(BASE_TS - timedelta(minutes=1)),
+                exit_rules=_wick_rules(),
+                pip_size=PIP,
+            )
+
+    def test_wick_sl_priority_when_both_could_trigger(self):
+        """Bar whose range spans BOTH SL and TP: SL wins (conservative
+        assumption — can't tell tick order from OHLC alone)."""
+        idx = _bars(2)
+        raw = _series([0, 0], idx)
+        close = _series([1.15000, 1.15100], idx)
+        high = _series([1.15020, 1.15450], idx)  # touches TP
+        low = _series([1.14990, 1.14700], idx)  # also touches SL
+        result = walk(
+            raw_entries=raw,
+            close_series=close,
+            start_state=_long_at(1.15000, bars_held=0),
+            bookmark_ts=(BASE_TS - timedelta(minutes=1)),
+            exit_rules=_wick_rules(stop_pips=20, target_pips=40),
+            pip_size=PIP,
+            high_series=high,
+            low_series=low,
+        )
+        assert len(result.transitions) == 1
+        t = result.transitions[0]
+        assert t.reason == "stop"
+        assert t.close_px == pytest.approx(1.14800, abs=1e-6)
+
+    def test_wick_mode_min_hold_still_suppresses_exit(self):
+        """Same min_hold semantics apply: no exit fires while
+        bars_held < min_hold, even if wick screams STOP."""
+        idx = _bars(2)
+        raw = _series([0, 0], idx)
+        close = _series([1.15000, 1.15000], idx)
+        high = _series([1.15020, 1.15020], idx)
+        low = _series([1.14990, 1.14700], idx)  # deep wick past SL
+        result = walk(
+            raw_entries=raw,
+            close_series=close,
+            start_state=_long_at(1.15000, bars_held=0),
+            bookmark_ts=(BASE_TS - timedelta(minutes=1)),
+            exit_rules=_wick_rules(stop_pips=20, min_hold=10),
+            pip_size=PIP,
+            high_series=high,
+            low_series=low,
+        )
+        # Held through — no transitions.
+        assert result.transitions == []
+        assert result.final_state.in_position == 1
+        assert result.final_state.bars_held == 2
+
+    def test_apply_exits_matches_walk_in_wick_mode(self):
+        """Parity: same OHLC + rules through _apply_exits (backtest)
+        and walk() (paper) produce the same exit reason + trigger price."""
+        rules = _wick_rules(stop_pips=20, target_pips=40, min_hold=0, max_hold=100)
+        # Bars 0..4 with a wick on bar 2 that trips a LONG SL.
+        raw = np.array([1, 0, 0, 0, 0], dtype=np.int8)  # open LONG on bar 0
+        close = np.array([1.15000, 1.15000, 1.15010, 1.15000, 1.15000])
+        high = np.array([1.15020, 1.15020, 1.15020, 1.15020, 1.15020])
+        low = np.array([1.14990, 1.14990, 1.14795, 1.14990, 1.14990])
+
+        final, reasons, exit_prices = _apply_exits(raw, close, high, low, rules, PIP)
+        # Bar 2 should hold reason=stop with override price 1.14800.
+        assert reasons.get(2) == "stop"
+        assert exit_prices.get(2) == pytest.approx(1.14800, abs=1e-6)
+        assert final[2] == 0  # flat after SL fires
+
+    def test_close_mode_would_have_missed_the_wick(self):
+        """Same OHLC as above; close-mode holds through, wick-mode
+        stops. Locks the divergence Wilson's audit was chasing."""
+        close_rules = _rules(stop_pips=20, target_pips=40, min_hold=0, max_hold=100)
+        wick_rules = _wick_rules(stop_pips=20, target_pips=40, min_hold=0, max_hold=100)
+        raw = np.array([1, 0, 0, 0, 0], dtype=np.int8)
+        close = np.array([1.15000, 1.15000, 1.15010, 1.15000, 1.15000])
+        high = np.array([1.15020, 1.15020, 1.15020, 1.15020, 1.15020])
+        low = np.array([1.14990, 1.14990, 1.14795, 1.14990, 1.14990])
+
+        # Close-mode holds through — no exit.
+        _, close_reasons, _ = _apply_exits(raw, close, high, low, close_rules, PIP)
+        assert close_reasons == {}
+        # Wick-mode fires on bar 2.
+        _, wick_reasons, _ = _apply_exits(raw, close, high, low, wick_rules, PIP)
+        assert wick_reasons.get(2) == "stop"

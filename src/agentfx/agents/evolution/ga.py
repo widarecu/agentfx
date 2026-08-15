@@ -275,6 +275,24 @@ def _mut_perturb_min_hold(spec_dict: dict, rng: Random) -> bool:
     return True
 
 
+def _mut_toggle_eval_mode(spec_dict: dict, rng: Random) -> bool:
+    """Flip `exit.eval_mode` between "close" and "wick".
+
+    Wilson 2026-08-15: added so the GA can search over evaluation
+    semantics. Wick-mode genomes model touch-based SL/TP fills
+    (realistic broker behaviour); close-mode genomes only exit on a
+    full bar close beyond the threshold (backtest-legacy behaviour).
+    Both are legitimate strategies — the GA discovers which one the
+    edge lives in for a given entry rule + SL/TP combo.
+    """
+    exit_node = spec_dict.get("exit")
+    if not isinstance(exit_node, dict):
+        return False
+    current = exit_node.get("eval_mode", "close")
+    exit_node["eval_mode"] = "wick" if current == "close" else "close"
+    return True
+
+
 _MUTATIONS: tuple[Callable[[dict, Random], bool], ...] = (
     _mut_flip_comparator,
     _mut_perturb_threshold,
@@ -283,6 +301,7 @@ _MUTATIONS: tuple[Callable[[dict, Random], bool], ...] = (
     _mut_toggle_opposite_signal,
     _mut_perturb_exit_numeric,
     _mut_perturb_min_hold,
+    _mut_toggle_eval_mode,
 )
 
 

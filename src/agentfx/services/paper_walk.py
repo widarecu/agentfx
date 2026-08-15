@@ -99,6 +99,9 @@ def walk(
     bookmark_ts: datetime | None,
     exit_rules: ExitRules,
     pip_size: float,
+    *,
+    high_series: pd.Series | None = None,
+    low_series: pd.Series | None = None,
 ) -> WalkResult:
     """Walk bars strictly newer than `bookmark_ts` through the strategy
     state machine. Returns the terminal state, all transitions along
@@ -169,6 +172,18 @@ def walk(
     if not raw_entries.index.equals(close_series.index):
         raise ValueError("raw_entries and close_series must share an index")
 
+    # Defensive: tests (and pre-eval_mode ExitRules deserialisers)
+    # may pass a bare SimpleNamespace without the new field. Default
+    # to close-mode, which is the legacy behaviour.
+    wick = getattr(exit_rules, "eval_mode", "close") == "wick"
+    if wick:
+        if high_series is None or low_series is None:
+            raise ValueError("eval_mode='wick' requires high_series and low_series")
+        if not high_series.index.equals(
+            close_series.index
+        ) or not low_series.index.equals(close_series.index):
+            raise ValueError("high_series/low_series must share close_series index")
+
     # Filter to bars strictly greater than bookmark.
     if bookmark_ts is not None:
         # pandas DatetimeIndex comparison works with tz-aware Timestamp.
@@ -176,12 +191,18 @@ def walk(
         mask = raw_entries.index > cutoff
         raw_entries = raw_entries[mask]
         close_series = close_series[mask]
+        if wick:
+            high_series = high_series[mask]
+            low_series = low_series[mask]
     else:
         # No bookmark → this is the first tick after a fresh deploy.
         # Only consider the latest bar; don't backfill history. Matches
         # the pre-refactor `raw_entries.tail(1)` fresh-run behaviour.
         raw_entries = raw_entries.tail(1)
         close_series = close_series.tail(1)
+        if wick:
+            high_series = high_series.tail(1)
+            low_series = low_series.tail(1)
 
     if len(raw_entries) == 0:
         # Bookmark was already at or past the latest bar. No-op tick.
@@ -192,6 +213,8 @@ def walk(
     min_hold_bars = int(exit_rules.min_hold_bars)
     max_hold_bars = int(exit_rules.max_hold_bars)
     flip_on_opposite = bool(exit_rules.opposite_signal)
+    stop_price_dist = stop_pips * pip_size
+    target_price_dist = target_pips * pip_size
 
     state = start_state
     transitions: list[Transition] = []
@@ -202,15 +225,10 @@ def walk(
         close_px = float(close_series.loc[bar_ts_val])
 
         if state.in_position != 0:
-            # Direction-aware pip move from entry close to this bar's
-            # close. Same formula as _apply_exits (compiler.py:234-237).
             if state.entry_close is None:
                 raise ValueError(
                     "walk() invariant broken: in_position != 0 with entry_close None"
                 )
-            move_pips = (close_px - state.entry_close) / pip_size
-            if state.in_position == -1:
-                move_pips = -move_pips
 
             # Advance bars_held for THIS bar before gating. bars_held
             # in _apply_exits is `t - entry_bar` where t is the current
@@ -225,28 +243,67 @@ def walk(
                 state = replace(state, bars_held=new_bars_held)
                 continue
 
+            # ── Stop / target evaluation ────────────────────────────
+            # Two modes (compiler.py _apply_exits mirrors this branch):
+            #   close: check bar close vs threshold.
+            #   wick:  check bar low (long SL / short TP) or high
+            #          (long TP / short SL); fill at exact threshold.
+            stop_hit = False
+            target_hit = False
+            exit_px = close_px  # default fill price (max_hold/flip)
+
+            if wick:
+                bar_high = float(high_series.loc[bar_ts_val])
+                bar_low = float(low_series.loc[bar_ts_val])
+                if state.in_position == 1:
+                    long_sl = state.entry_close - stop_price_dist
+                    long_tp = state.entry_close + target_price_dist
+                    if bar_low <= long_sl:
+                        stop_hit = True
+                        exit_px = long_sl
+                    elif bar_high >= long_tp:
+                        target_hit = True
+                        exit_px = long_tp
+                else:  # SHORT
+                    short_sl = state.entry_close + stop_price_dist
+                    short_tp = state.entry_close - target_price_dist
+                    if bar_high >= short_sl:
+                        stop_hit = True
+                        exit_px = short_sl
+                    elif bar_low <= short_tp:
+                        target_hit = True
+                        exit_px = short_tp
+            else:
+                move_pips = (close_px - state.entry_close) / pip_size
+                if state.in_position == -1:
+                    move_pips = -move_pips
+                if move_pips <= -stop_pips:
+                    stop_hit = True
+                elif move_pips >= target_pips:
+                    target_hit = True
+
             # Exits, in fixed order. First match wins.
-            if move_pips <= -stop_pips:
+            if stop_hit:
                 transitions.append(
                     Transition(
                         bar_ts=bar_ts,
                         kind="close",
                         direction=0,
                         reason="stop",
-                        close_px=close_px,
+                        close_px=exit_px,
                     )
                 )
                 state = WalkState(in_position=0, entry_close=None, bars_held=0)
                 continue
 
-            if move_pips >= target_pips:
+            if target_hit:
                 transitions.append(
                     Transition(
                         bar_ts=bar_ts,
                         kind="close",
                         direction=0,
                         reason="target",
-                        close_px=close_px,
+                        close_px=exit_px,
                     )
                 )
                 state = WalkState(in_position=0, entry_close=None, bars_held=0)

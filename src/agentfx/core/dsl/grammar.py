@@ -290,6 +290,23 @@ class ExitRules(BaseModel):
     # timeframes.
     min_hold_bars: int = Field(default=0, ge=0, le=2880)
     opposite_signal: bool = True
+    # How the walk state machine (and backtest exit machine) evaluate
+    # SL and TP each bar. Wilson 2026-08-15 audit:
+    #
+    #   * "close" (default, legacy): only the bar's CLOSE counts.
+    #     Intra-bar wicks that touch the SL/TP but recover before the
+    #     bar ends do NOT trigger an exit. Matches every DSL genome
+    #     validated before this field existed.
+    #
+    #   * "wick": the bar's LOW (for LONG SL / SHORT TP) and HIGH
+    #     (for LONG TP / SHORT SL) are checked. Any touch triggers
+    #     the exit at exactly the SL/TP price. Realistic model of how
+    #     broker-side stop / take-profit orders fire — recommended for
+    #     genomes that will eventually run under a tight broker SL.
+    #
+    # New genomes' GA searches over this field. Existing genomes
+    # default to "close" so their OOS backtest metrics remain valid.
+    eval_mode: Literal["close", "wick"] = "close"
 
     model_config = {"frozen": True}
 

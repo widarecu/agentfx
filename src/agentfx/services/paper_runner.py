@@ -1121,6 +1121,10 @@ def _signal_tick(
 
     pip_size = float(getattr(strategy, "pip_size", 0.0001) or 0.0001)
     close_series = df["close"].astype(float)
+    # High/low are only used when exit_block.eval_mode == "wick";
+    # pass unconditionally when available so the walk decides.
+    high_series = df["high"].astype(float) if "high" in df.columns else None
+    low_series = df["low"].astype(float) if "low" in df.columns else None
 
     # ── Walk ─────────────────────────────────────────────────────
     result = walk(
@@ -1130,6 +1134,8 @@ def _signal_tick(
         bookmark_ts=bookmark_ts,
         exit_rules=exit_block,
         pip_size=pip_size,
+        high_series=high_series,
+        low_series=low_series,
     )
 
     # ── Advance bookmark UNCONDITIONALLY on any successful tick ──
