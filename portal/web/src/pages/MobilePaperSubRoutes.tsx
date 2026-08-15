@@ -584,11 +584,11 @@ export function MobilePaperRiskRoute(): React.ReactElement {
       value: tpLabel,
     },
     {
-      label: 'Loss cap (cumulative)',
+      label: 'Loss cap (soft halt)',
       value: risk?.loss_cap_pct != null ? `${risk.loss_cap_pct.toFixed(2)}%` : '—',
     },
     {
-      label: 'Kill-switch drawdown',
+      label: 'Loss cap (hard halt)',
       value:
         risk?.kill_switch_dd_pct != null
           ? `${risk.kill_switch_dd_pct.toFixed(2)}%`

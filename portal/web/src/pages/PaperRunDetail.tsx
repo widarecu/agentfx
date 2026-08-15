@@ -1206,12 +1206,12 @@ function RiskConfigPanel({ run }: { run: PaperRunPublic }) {
               : 'dynamic (risk_pct × balance)'}
           </span>
         </Row>
-        <Row label="Loss cap (cumulative)">
+        <Row label="Loss cap (soft halt)">
           <span className="font-mono">
             {cfg ? `${cfg.loss_cap_pct}%` : '—'}
           </span>
         </Row>
-        <Row label="Kill-switch DD">
+        <Row label="Loss cap (hard halt)">
           <span className="font-mono">
             {cfg ? `${cfg.kill_switch_dd_pct}%` : '—'}
           </span>

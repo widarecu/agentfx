@@ -316,17 +316,17 @@ export function DeployPaperModal({
 
             <div className="grid grid-cols-2 gap-4">
               <NumericField
-                label="Loss cap (cumulative)"
-                hint="Auto-halt when total loss since run start exceeds this % of snapshot"
+                label="Loss cap (soft halt)"
+                hint="Halt the run when cumulative loss reaches this % of the starting balance"
                 suffix="% of balance"
                 value={lossCapPct}
                 onChange={setLossCapPct}
                 step="0.1"
               />
               <NumericField
-                label="Kill-switch DD threshold"
-                hint="Halt if drawdown from snapshot exceeds this"
-                suffix="%"
+                label="Loss cap (hard halt)"
+                hint="Safety net: hard halt if losses keep going past the soft cap. Must be higher than the soft halt."
+                suffix="% of balance"
                 value={killDdPct}
                 onChange={setKillDdPct}
                 step="0.1"

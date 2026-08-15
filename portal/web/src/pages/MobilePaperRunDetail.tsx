@@ -863,15 +863,15 @@ export default function MobilePaperRunDetail(): React.ReactElement {
           </button>
         </section>
 
-        {/* 5. LOSS CAP GAUGE (cumulative vs snapshot) */}
+        {/* 5. LOSS CAP GAUGE (soft-halt threshold) */}
         {lossCapPct != null && (
           <section
             className="bg-slate-800 border border-slate-700 rounded-xl p-4"
-            aria-label="P&L versus cumulative loss cap"
+            aria-label="P&L versus soft loss cap"
           >
             <div className="flex items-center justify-between">
               <span className="text-[10px] uppercase tracking-wider text-slate-500">
-                Loss cap (cumulative)
+                Loss cap (soft halt)
               </span>
               <span
                 className={`text-[10px] font-mono uppercase tracking-wider ${capLabelClass}`}
