@@ -37,7 +37,7 @@ At a cadence matching the genome's granularity (M1 = every 60s, M5 = every 5m, H
    - Signal unchanged, position matches → hold
 5. **Pre-order risk checks** via `src/agentfx/core/policy.py`:
    - Reject order if projected position size > `risk_config.max_position_size`
-   - Reject order if cumulative daily loss < `risk_config.daily_loss_threshold` (halts run with `stop_reason=DAILY_LOSS_LIMIT`)
+   - Reject order if cumulative loss vs snapshot < `risk_config.loss_cap_pct` (halts run with `stop_reason=LOSS_CAP_HIT`)
    - Reject order if `runs.kill_requested_at` is set (halt path)
 6. **Persist orders + trades**: on order fill, insert `orders` row and (once closed) `trades` row. Update `runs.current_balance`, `runs.pnl`.
 7. **Poll `runs.kill_requested_at`** — if non-null AND older than the 3-second undo window on the frontend has fired, close all positions and exit with `approval_status=HALTED_MANUAL`, `stop_reason=USER_KILL`.
@@ -52,7 +52,7 @@ At a cadence matching the genome's granularity (M1 = every 60s, M5 = every 5m, H
   - `strategy_genome_id` VARCHAR FK → `strategy_genomes.id` NULLABLE (so legacy rows still work)
   - `oanda_environment` ENUM(`PRACTICE`, `LIVE`) NULLABLE (distinct from `RunEnvironment{DEV, PAPER, LIVE}` — see design note below)
   - `user_id` INT FK → `users.id` NULLABLE
-  - `stop_reason` VARCHAR — union of `USER_KILL`, `DAILY_LOSS_LIMIT`, `BROKER_CIRCUIT`, `CREDENTIALS_REVOKED`, `process_crashed`, `COMPLETED`
+  - `stop_reason` VARCHAR — union of `USER_KILL`, `LOSS_CAP_HIT`, `BROKER_CIRCUIT`, `BROKER_NETWORK`, `OANDA_AUTH_LOST`, `CREDENTIALS_REVOKED`, `process_crashed`, `COMPLETED`
   - `kill_requested_at` TIMESTAMP NULLABLE
   - `approved_at` TIMESTAMP NULLABLE
   - `approved_by_user_id` INT FK → `users.id` NULLABLE

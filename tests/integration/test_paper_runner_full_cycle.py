@@ -176,7 +176,7 @@ def paper_run_with_candles(db_session: Session):
         pnl=0.0,
         risk_config={
             "max_position_size_units": 10_000,
-            "daily_loss_pct": 2.0,
+            "loss_cap_pct": 2.0,
             "kill_switch_dd_pct": 5.0,
         },
         user_id=user.id,

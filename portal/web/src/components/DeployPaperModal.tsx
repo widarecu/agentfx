@@ -54,7 +54,7 @@ export function DeployPaperModal({
   // orders that exceed real capacity. The extra knob confused the UX
   // (users set numbers that under-sized compounding strategies) and
   // added no safety over the broker's own controls.
-  const [dailyLossPct, setDailyLossPct] = useState<string>('2.0');
+  const [lossCapPct, setLossCapPct] = useState<string>('2.0');
   const [killDdPct, setKillDdPct] = useState<string>('5.0');
   // Broker-side SL/TP. Pre-populated from the strategy's DSL exit
   // block so paper trades always ship with the strategy's designed
@@ -115,7 +115,7 @@ export function DeployPaperModal({
     }
 
     const riskConfig = _buildRiskConfig({
-      dailyLossPct,
+      lossCapPct,
       killDdPct,
       stopLossPips,
       takeProfitPips,
@@ -316,11 +316,11 @@ export function DeployPaperModal({
 
             <div className="grid grid-cols-2 gap-4">
               <NumericField
-                label="Daily loss threshold"
-                hint="Auto-halt at this % below snapshot"
+                label="Loss cap (cumulative)"
+                hint="Auto-halt when total loss since run start exceeds this % of snapshot"
                 suffix="% of balance"
-                value={dailyLossPct}
-                onChange={setDailyLossPct}
+                value={lossCapPct}
+                onChange={setLossCapPct}
                 step="0.1"
               />
               <NumericField
@@ -468,13 +468,13 @@ function NumericField({
  * treats them as "no broker-side SL/TP registered".
  */
 export function _buildRiskConfig(inputs: {
-  dailyLossPct: string;
+  lossCapPct: string;
   killDdPct: string;
   stopLossPips: string;
   takeProfitPips: string;
 }): Record<string, number> {
   const cfg: Record<string, number> = {
-    daily_loss_pct: Math.max(0.01, Number(inputs.dailyLossPct) || 2),
+    loss_cap_pct: Math.max(0.01, Number(inputs.lossCapPct) || 2),
     kill_switch_dd_pct: Math.max(0.01, Number(inputs.killDdPct) || 5),
   };
   // v0.6.2 (Wilson UAT 2026-07-19): `max_position_size_units` was

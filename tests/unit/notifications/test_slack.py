@@ -182,18 +182,18 @@ class TestBuildPayload:
         run = _make_run(pnl=42.5, balance=1_234.56, pair="GBP_USD")
         payload = slack._build_slack_payload(
             run=run,
-            reason="DAILY_LOSS_LIMIT",
+            reason="LOSS_CAP_HIT",
             extra=None,
             portal_base_url=None,
         )
         assert "🚨 Paper run halted" in payload["text"]
-        assert "DAILY_LOSS_LIMIT" in payload["text"]
+        assert "LOSS_CAP_HIT" in payload["text"]
         # Header block + section fields block only when no portal URL
         assert payload["blocks"][0]["type"] == "header"
         fields = payload["blocks"][1]["fields"]
         joined = " ".join(f["text"] for f in fields)
         assert "run_test_abc" in joined
-        assert "DAILY_LOSS_LIMIT" in joined
+        assert "LOSS_CAP_HIT" in joined
         assert "HALTED_MANUAL" in joined
         assert "42.50" in joined
         assert "1,234.56" in joined

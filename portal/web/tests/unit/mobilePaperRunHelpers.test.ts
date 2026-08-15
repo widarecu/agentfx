@@ -300,7 +300,7 @@ describe('resolveSlTpPips', () => {
       risk_config: {
         stop_loss_pips: 22,
         take_profit_pips: 40,
-        daily_loss_pct: 2,
+        loss_cap_pct: 2,
         kill_switch_dd_pct: 10,
       },
     });
@@ -314,7 +314,7 @@ describe('resolveSlTpPips', () => {
   it('falls back to genome DSL when risk_config has no SL/TP (Wilson UAT case)', () => {
     const run = makeRun({
       risk_config: {
-        daily_loss_pct: 2,
+        loss_cap_pct: 2,
         kill_switch_dd_pct: 10,
       },
     });
@@ -339,7 +339,7 @@ describe('resolveSlTpPips', () => {
       risk_config: {
         stop_loss_pips: 15,
         take_profit_pips: 30,
-        daily_loss_pct: 2,
+        loss_cap_pct: 2,
         kill_switch_dd_pct: 10,
       },
     });

@@ -28,10 +28,10 @@
 
 ### Risk controls
 
-**GIVEN** a paper run has `risk_config = {max_position_size, daily_loss_threshold, initial_balance}`
+**GIVEN** a paper run has `risk_config = {max_position_size, loss_cap_pct, initial_balance}`
 **WHEN** the paper runner is about to place an order OR is polling P&L
 **THEN**:
-  - If cumulative daily loss (running total of `trades.pnl` since 00:00 UTC today) < `-daily_loss_threshold`: halt run with `stop_reason=DAILY_LOSS_LIMIT`, close all positions
+  - If cumulative loss vs snapshot balance >= `loss_cap_pct`: halt run with `stop_reason=LOSS_CAP_HIT`, close all positions. NOTE: this is a run-lifetime cumulative cap, not a per-day reset. Renamed from `daily_loss_pct` / `DAILY_LOSS_LIMIT` on 2026-08-15 (Wilson) — the old name implied day-scoped behaviour it never had.
   - If projected order units > `max_position_size`: reject the order, log a `RISK_REJECT` decision, do not halt run (single-order guard, not fatal)
   - If OANDA circuit breaker raises `OandaCircuitOpen`: halt run with `stop_reason=BROKER_CIRCUIT`, attempt best-effort position close
 

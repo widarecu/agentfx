@@ -85,6 +85,13 @@ DEFAULT_LOOKBACK_BARS = 500
 # outages. 150s tolerance → M1 threshold 210s = 3.5 bar lengths.
 INGEST_LAG_TOLERANCE_SECONDS = 150
 
+# Consecutive non-auth OANDA failures on the balance refresh before we
+# give up and halt with `BROKER_NETWORK`. Each attempt inside the OANDA
+# adapter already burns 5 retries with backoff (~75s of wall time), so
+# 3 outer attempts = ~3-4 minutes of sustained unavailability before we
+# halt cleanly.
+_BALANCE_RETRY_LIMIT = 3
+
 # Granularity → seconds. Mirrors OANDA's naming; keep in sync with the
 # frontend's `granularityToSeconds` in `portal/web/src/utils/candles.ts`.
 _GRANULARITY_SECONDS: dict[str, int] = {
@@ -531,8 +538,8 @@ def _execute_loop(
     from agentfx.api.models import RunStatus
     from agentfx.services.paper_policy import (
         RiskState,
-        check_daily_loss_cap,
         check_kill_switch_dd,
+        check_loss_cap,
     )
 
     if now_fn is None:  # pragma: no cover — trivial
@@ -565,6 +572,13 @@ def _execute_loop(
     )
 
     _snapshot_balance_if_needed(db=db, run=run, client=client)
+
+    # Consecutive non-auth OANDA failures on the balance refresh. A
+    # single 15s read-timeout no longer crashes the subprocess (Wilson
+    # 2026-08-14): the tick is skipped, the loop retries next iteration,
+    # and only after `_BALANCE_RETRY_LIMIT` failures in a row do we halt
+    # cleanly with `BROKER_NETWORK`. Reset to 0 on any successful call.
+    consecutive_balance_failures = 0
 
     iteration = 0
     while True:
@@ -613,28 +627,57 @@ def _execute_loop(
             _flatten_and_halt(db, run, client, reason="BROKER_CIRCUIT")
             return
         except OandaError as exc:
-            if not _is_auth_error(exc):
-                raise
-            logger.warning(
-                "paper runner: %s got 401 on balance; attempting cred refresh",
-                run.id,
-            )
-            new_client = _recover_from_auth_loss(db, run, exc)
-            if new_client is None:
-                logger.error(
-                    "paper runner: %s auth-refresh failed; halting oanda_auth_lost",
+            if _is_auth_error(exc):
+                logger.warning(
+                    "paper runner: %s got 401 on balance; attempting cred refresh",
                     run.id,
                 )
-                _flatten_and_halt(db, run, client, reason="OANDA_AUTH_LOST")
-                return
-            client = new_client
-            balance = client.get_account_balance()
+                new_client = _recover_from_auth_loss(db, run, exc)
+                if new_client is None:
+                    logger.error(
+                        "paper runner: %s auth-refresh failed; halting oanda_auth_lost",
+                        run.id,
+                    )
+                    _flatten_and_halt(db, run, client, reason="OANDA_AUTH_LOST")
+                    return
+                client = new_client
+                balance = client.get_account_balance()
+            else:
+                # Non-auth OANDA failure — most commonly a read timeout
+                # after the adapter's own 5-retry chain gave up
+                # (`connection_error:` prefix). Wilson 2026-08-14: this
+                # used to `raise` and kill the subprocess; the runner
+                # now skips the tick and retries next iteration. If it
+                # keeps failing we halt cleanly via BROKER_NETWORK
+                # instead of leaving the position stranded on OANDA.
+                consecutive_balance_failures += 1
+                if consecutive_balance_failures >= _BALANCE_RETRY_LIMIT:
+                    logger.error(
+                        "paper runner: %s balance refresh failed %d times "
+                        "in a row (%s); halting broker_network",
+                        run.id,
+                        consecutive_balance_failures,
+                        exc,
+                    )
+                    _flatten_and_halt(db, run, client, reason="BROKER_NETWORK")
+                    return
+                logger.warning(
+                    "paper runner: %s balance refresh failed (%s); "
+                    "skipping tick (%d/%d)",
+                    run.id,
+                    exc,
+                    consecutive_balance_failures,
+                    _BALANCE_RETRY_LIMIT,
+                )
+                sleep_fn(5.0)
+                continue
+        consecutive_balance_failures = 0
         run.current_balance = balance["balance"]
         run.pnl = balance["balance"] - (run.snapshot_balance or 0.0)
         db.commit()
 
         # Evaluate risk gates against the current balance. The health
-        # tick only checks halt-gates (kill_switch, daily_loss);
+        # tick only checks halt-gates (kill_switch, loss cap);
         # position-size gating happens at order-placement time inside
         # `_signal_tick` where the real proposed units are known.
         # v0.6.2 (Wilson UAT 2026-07-19): previously called
@@ -649,10 +692,10 @@ def _execute_loop(
             max_position_size_units=int(
                 risk_cfg.get("max_position_size_units") or 10_000_000
             ),
-            daily_loss_pct=float(risk_cfg.get("daily_loss_pct", 2.0)),
+            loss_cap_pct=float(risk_cfg.get("loss_cap_pct", 2.0)),
             kill_switch_dd_pct=float(risk_cfg.get("kill_switch_dd_pct", 5.0)),
         )
-        for check in (check_kill_switch_dd(state), check_daily_loss_cap(state)):
+        for check in (check_kill_switch_dd(state), check_loss_cap(state)):
             if not check.ok:
                 logger.info(
                     "paper runner: gate refused on %s (%s); halting",

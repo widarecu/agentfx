@@ -128,7 +128,7 @@ def _make_run(user_id: int = 42) -> SimpleNamespace:
         parameters={},
         risk_config={
             "max_position_size_units": 10_000,
-            "daily_loss_pct": 2.0,
+            "loss_cap_pct": 2.0,
             "kill_switch_dd_pct": 5.0,
         },
     )
@@ -1015,7 +1015,7 @@ class TestSignalTick:
         db = _make_db()
         run = _make_run()
         run.risk_config = {
-            "daily_loss_pct": 2.0,
+            "loss_cap_pct": 2.0,
             "kill_switch_dd_pct": 5.0,
             "stop_loss_pips": 20.0,
             "take_profit_pips": 40.0,
@@ -1063,7 +1063,7 @@ class TestExecuteLoopSignalIntegration:
             last_transaction_id=None,
             risk_config={
                 "max_position_size_units": 10_000,
-                "daily_loss_pct": 2.0,
+                "loss_cap_pct": 2.0,
                 "kill_switch_dd_pct": 5.0,
             },
             parameters={},
@@ -1142,7 +1142,7 @@ class TestExecuteLoopSignalIntegration:
             kill_requested_at=None,
             last_transaction_id=None,
             risk_config={
-                "daily_loss_pct": 2.0,
+                "loss_cap_pct": 2.0,
                 "kill_switch_dd_pct": 5.0,
             },
             parameters={},
@@ -1227,7 +1227,7 @@ class TestExecuteLoopSignalIntegration:
             pnl=0.0,
             kill_requested_at=None,
             last_transaction_id=None,
-            risk_config={"daily_loss_pct": 2.0, "kill_switch_dd_pct": 5.0},
+            risk_config={"loss_cap_pct": 2.0, "kill_switch_dd_pct": 5.0},
             parameters={},
             status=RunStatus.RUNNING,
             stop_reason=None,

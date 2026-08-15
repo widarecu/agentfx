@@ -17,7 +17,7 @@ import pytest
 
 from agentfx.services.paper_policy import (
     RiskState,
-    check_daily_loss_cap,
+    check_loss_cap,
     check_kill_switch_dd,
     check_position_size,
     evaluate_all,
@@ -29,33 +29,33 @@ def _state(**overrides) -> RiskState:
         snapshot_balance=10_000.0,
         current_balance=10_000.0,
         max_position_size_units=10_000,
-        daily_loss_pct=2.0,
+        loss_cap_pct=2.0,
         kill_switch_dd_pct=5.0,
     )
     defaults.update(overrides)
     return RiskState(**defaults)
 
 
-class TestDailyLossCap:
+class TestLossCap:
     def test_no_loss_passes(self):
-        assert check_daily_loss_cap(_state()).ok
+        assert check_loss_cap(_state()).ok
 
     def test_small_loss_passes(self):
         # 1% loss on a 2% cap
-        assert check_daily_loss_cap(_state(current_balance=9_900.0)).ok
+        assert check_loss_cap(_state(current_balance=9_900.0)).ok
 
     def test_exactly_at_threshold_halts(self):
         # 2% loss, cap is 2.0% → halt
-        r = check_daily_loss_cap(_state(current_balance=9_800.0))
+        r = check_loss_cap(_state(current_balance=9_800.0))
         assert r.ok is False
-        assert r.reason == "DAILY_LOSS_LIMIT"
+        assert r.reason == "LOSS_CAP_HIT"
 
     def test_past_threshold_halts(self):
-        r = check_daily_loss_cap(_state(current_balance=9_500.0))
+        r = check_loss_cap(_state(current_balance=9_500.0))
         assert r.ok is False
 
     def test_zero_snapshot_fails_closed(self):
-        r = check_daily_loss_cap(_state(snapshot_balance=0.0))
+        r = check_loss_cap(_state(snapshot_balance=0.0))
         assert r.ok is False
 
 
@@ -102,17 +102,17 @@ class TestEvaluateAll:
 
     def test_dd_takes_precedence_over_loss_cap(self):
         # The order in evaluate_all is: kill switch (DD) first, then
-        # daily loss, then position. Even though a 5% loss trips both
+        # loss cap, then position. Even though a 5% loss trips both
         # gates, DD wins because it comes first.
         r = evaluate_all(_state(current_balance=9_500.0), proposed_units=1_000)
         assert r.reason == "BROKER_CIRCUIT"
 
     def test_loss_cap_wins_over_position_size(self):
-        # 3% loss (past 2% cap) with a valid position size — daily
-        # loss reason surfaces, not position size.
+        # 3% loss (past 2% cap) with a valid position size — loss cap
+        # reason surfaces, not position size.
         r = evaluate_all(_state(current_balance=9_700.0), proposed_units=1_000)
         assert r.ok is False
-        assert r.reason == "DAILY_LOSS_LIMIT"
+        assert r.reason == "LOSS_CAP_HIT"
 
     def test_position_size_only_when_healthy(self):
         r = evaluate_all(_state(), proposed_units=15_000)
@@ -130,8 +130,8 @@ class TestEvaluateAll:
     ],
     ids=["1pct_loss", "exact_2pct_halt", "small_account_1pct"],
 )
-def test_daily_loss_regression_matrix(snapshot, current, expected):
-    r = check_daily_loss_cap(_state(snapshot_balance=snapshot, current_balance=current))
+def test_loss_cap_regression_matrix(snapshot, current, expected):
+    r = check_loss_cap(_state(snapshot_balance=snapshot, current_balance=current))
     # The third case has 4900/5000 = -2% → halts, so we adjust
     # expectations to what the math actually says.
     loss_pct = (snapshot - current) / snapshot * 100

@@ -478,13 +478,13 @@ export default function MobilePaperRunDetail(): React.ReactElement {
     [lastPolledAt, nowTick],
   );
 
-  const dailyLossPct = run?.risk_config?.daily_loss_pct ?? null;
-  // Cap gauge: bar range is [-dailyLossPct, +dailyLossPct]; halt tick is
+  const lossCapPct = run?.risk_config?.loss_cap_pct ?? null;
+  // Cap gauge: bar range is [-lossCapPct, +lossCapPct]; halt tick is
   // at 0% (leftmost). Marker sits at the current pnl-pct scaled onto
   // this range. Below 50%-of-cap = SAFE, 50–80% = WARNING, 80%+ = NEAR HALT.
   const capUsage =
-    dailyLossPct != null && pnlPct != null
-      ? Math.max(0, -pnlPct) / dailyLossPct
+    lossCapPct != null && pnlPct != null
+      ? Math.max(0, -pnlPct) / lossCapPct
       : 0;
   const capLabel =
     capUsage >= 0.8 ? 'Near halt' : capUsage >= 0.5 ? 'Warning' : 'Safe';
@@ -863,15 +863,15 @@ export default function MobilePaperRunDetail(): React.ReactElement {
           </button>
         </section>
 
-        {/* 5. DAILY P&L CAP */}
-        {dailyLossPct != null && (
+        {/* 5. LOSS CAP GAUGE (cumulative vs snapshot) */}
+        {lossCapPct != null && (
           <section
             className="bg-slate-800 border border-slate-700 rounded-xl p-4"
-            aria-label="Daily P&L versus halt threshold"
+            aria-label="P&L versus cumulative loss cap"
           >
             <div className="flex items-center justify-between">
               <span className="text-[10px] uppercase tracking-wider text-slate-500">
-                Daily P&L cap
+                Loss cap (cumulative)
               </span>
               <span
                 className={`text-[10px] font-mono uppercase tracking-wider ${capLabelClass}`}
@@ -879,14 +879,14 @@ export default function MobilePaperRunDetail(): React.ReactElement {
                 {capLabel}
               </span>
             </div>
-            <DailyCapBar pnlPct={pnlPct ?? 0} dailyLossPct={dailyLossPct} />
+            <LossCapBar pnlPct={pnlPct ?? 0} lossCapPct={lossCapPct} />
             <div className="flex items-center justify-between mt-2 text-[10px] font-mono text-slate-500">
               <span className="text-rose-400">
-                −{dailyLossPct.toFixed(2)}% halt
+                −{lossCapPct.toFixed(2)}% halt
               </span>
               <span>0</span>
               <span className="text-slate-400">
-                +{dailyLossPct.toFixed(2)}%
+                +{lossCapPct.toFixed(2)}%
               </span>
             </div>
             <div className="mt-2 text-[11px] text-slate-400">
@@ -899,7 +899,7 @@ export default function MobilePaperRunDetail(): React.ReactElement {
                   ? formatUSD(
                       Math.max(
                         0,
-                        run.snapshot_balance * (dailyLossPct / 100) +
+                        run.snapshot_balance * (lossCapPct / 100) +
                           (pnlPct / 100) * run.snapshot_balance,
                       ),
                     )
@@ -1212,15 +1212,15 @@ function CandlePreview({ candles }: { candles: CandleData[] }) {
   );
 }
 
-function DailyCapBar({
+function LossCapBar({
   pnlPct,
-  dailyLossPct,
+  lossCapPct,
 }: {
   pnlPct: number;
-  dailyLossPct: number;
+  lossCapPct: number;
 }) {
-  // Range: [-dailyLossPct, +dailyLossPct]. Marker at pnlPct.
-  const halfRange = dailyLossPct;
+  // Range: [-lossCapPct, +lossCapPct]. Marker at pnlPct.
+  const halfRange = lossCapPct;
   const clamped = Math.max(-halfRange, Math.min(halfRange, pnlPct));
   const markerPct = ((clamped + halfRange) / (halfRange * 2)) * 100;
   const markerColor = pnlPct >= 0 ? '#34d399' : '#fb7185';
@@ -1245,7 +1245,7 @@ function DailyCapBar({
           background: '#fb7185',
           boxShadow: '0 0 0 3px rgba(251,113,133,0.25)',
         }}
-        title={`Auto-halt −${dailyLossPct.toFixed(2)}%`}
+        title={`Auto-halt −${lossCapPct.toFixed(2)}%`}
       />
       <div
         className="absolute"

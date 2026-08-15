@@ -3,7 +3,7 @@
 Kept as pure functions so the runner's loop-body can call them without
 touching the DB, and the unit test suite can exercise every branch
 with plain dataclasses. Each helper returns a `(pass, reason)` pair;
-`pass=False` short-circuits the decision loop and — for the daily-loss
+`pass=False` short-circuits the decision loop and — for the loss-cap
 and kill-switch cases — halts the run.
 
 The runner is responsible for persisting `stop_reason` and updating
@@ -28,7 +28,7 @@ class RiskState:
     snapshot_balance: float
     current_balance: float
     max_position_size_units: int
-    daily_loss_pct: float
+    loss_cap_pct: float
     kill_switch_dd_pct: float
 
 
@@ -38,15 +38,16 @@ class GateResult:
     reason: str = ""
 
 
-def check_daily_loss_cap(state: RiskState) -> GateResult:
+def check_loss_cap(state: RiskState) -> GateResult:
     """Halt the run if cumulative loss vs snapshot exceeds
-    `daily_loss_pct`.
+    `loss_cap_pct`.
 
-    "Daily" is a misnomer preserved from the wireframes — v0.6.0
-    computes the cap against the run-start snapshot, not against a
-    UTC-day open, because that matches how users think about the
-    metric on the mockup. A future v0.6.1 could switch to a rolling
-    24h window if the difference matters in practice.
+    The cap is measured against the run-start snapshot balance, not
+    against a UTC-day open — so this is a **cumulative** loss cap over
+    the life of the run, not a per-day reset. Wilson 2026-08-15
+    renamed from `daily_loss_pct` / `check_daily_loss_cap` /
+    `DAILY_LOSS_LIMIT` after Run B halted with a name that implied
+    daily-scoped behaviour it never had.
 
     Returns ok=False when the loss threshold is met (equality
     counts — a run that lost EXACTLY the cap should halt, not
@@ -56,10 +57,10 @@ def check_daily_loss_cap(state: RiskState) -> GateResult:
         # Defensive — a zero snapshot means the runner never
         # captured a balance; the run shouldn't be trading and this
         # gate refuses fail-closed rather than dividing by zero.
-        return GateResult(False, "DAILY_LOSS_LIMIT")
+        return GateResult(False, "LOSS_CAP_HIT")
     loss_pct = (state.snapshot_balance - state.current_balance) / state.snapshot_balance
-    if loss_pct * 100 >= state.daily_loss_pct:
-        return GateResult(False, "DAILY_LOSS_LIMIT")
+    if loss_pct * 100 >= state.loss_cap_pct:
+        return GateResult(False, "LOSS_CAP_HIT")
     return GateResult(True)
 
 
@@ -67,8 +68,8 @@ def check_kill_switch_dd(state: RiskState) -> GateResult:
     """Halt if the unrealised drawdown from snapshot exceeds
     `kill_switch_dd_pct`.
 
-    Same denominator + fail-closed policy as the daily-loss cap;
-    exists as a separate call so the runner can log which one tripped.
+    Same denominator + fail-closed policy as the loss cap; exists as
+    a separate call so the runner can log which one tripped.
     """
     if state.snapshot_balance <= 0:
         return GateResult(False, "BROKER_CIRCUIT")
@@ -97,11 +98,11 @@ def evaluate_all(state: RiskState, proposed_units: int) -> GateResult:
     refusal.
 
     Order matches the runner's expected behaviour: kill switch and
-    daily-loss cap halt the whole run; position size only rejects the
+    loss cap halt the whole run; position size only rejects the
     single order. The runner treats a refusal at either of the first
     two as "halt", and at the third as "skip this tick".
     """
-    for check in (check_kill_switch_dd(state), check_daily_loss_cap(state)):
+    for check in (check_kill_switch_dd(state), check_loss_cap(state)):
         if not check.ok:
             return check
     return check_position_size(state, proposed_units)
@@ -110,8 +111,8 @@ def evaluate_all(state: RiskState, proposed_units: int) -> GateResult:
 __all__ = [
     "GateResult",
     "RiskState",
-    "check_daily_loss_cap",
     "check_kill_switch_dd",
+    "check_loss_cap",
     "check_position_size",
     "evaluate_all",
 ]

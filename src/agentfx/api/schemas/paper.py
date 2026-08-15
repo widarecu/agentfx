@@ -39,11 +39,17 @@ class RiskConfig(BaseSchema):
             "compatibility with legacy runs."
         ),
     )
-    daily_loss_pct: float = Field(
+    loss_cap_pct: float = Field(
         default=2.0,
         gt=0,
         le=100,
-        description="Auto-halt if cumulative loss vs snapshot exceeds this %.",
+        description=(
+            "Auto-halt when cumulative loss since the run started "
+            "exceeds this % of the snapshot balance. NOTE: this is a "
+            "run-lifetime cap, not a per-day reset. Renamed from "
+            "`daily_loss_pct` on 2026-08-15 (the old name implied "
+            "day-scoped behaviour it never had)."
+        ),
     )
     kill_switch_dd_pct: float = Field(
         default=5.0,

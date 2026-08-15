@@ -127,8 +127,10 @@ class Run(Base):
     # never types an initial balance; it's read from the sub-account).
     snapshot_balance = Column(Float, nullable=True)
     # Human-readable stop reason. Vocabulary: `USER_KILL`,
-    # `DAILY_LOSS_LIMIT`, `BROKER_CIRCUIT`, `process_crashed`,
-    # `crashed_pre_init`, `COMPLETED`.
+    # `LOSS_CAP_HIT`, `BROKER_CIRCUIT`, `BROKER_NETWORK`,
+    # `OANDA_AUTH_LOST`, `process_crashed`, `crashed_pre_init`,
+    # `COMPLETED`. Legacy runs (pre 2026-08-15) may have
+    # `DAILY_LOSS_LIMIT`; the frontend renders unknown values verbatim.
     stop_reason = Column(String(40), nullable=True)
     # Set by `POST /paper-runs/:id/kill`; the runner polls this on
     # every loop tick and halts when it flips from NULL to non-NULL.
@@ -139,7 +141,7 @@ class Run(Base):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
-    # {"max_position_size_units": 10000, "daily_loss_pct": 2.0,
+    # {"max_position_size_units": 10000, "loss_cap_pct": 2.0,
     #  "kill_switch_dd_pct": 5.0}
     risk_config = Column(JSON, nullable=True)
     # PID of the runner subprocess. Set by `schedule_paper_run`.

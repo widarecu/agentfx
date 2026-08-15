@@ -6,7 +6,7 @@ in PR-F's router integration tests. Locks the four terminal
 state transitions the plan calls out:
 
 - USER_KILL — router sets kill flag, runner observes, halts <5s tick
-- DAILY_LOSS_LIMIT — declining balance trips the daily-loss gate
+- LOSS_CAP_HIT — declining balance trips the cumulative loss cap
 - BROKER_CIRCUIT — OandaCircuitOpen raised by the client halts the run
 - Snapshot capture — first-tick balance persists as `snapshot_balance`
 
@@ -70,7 +70,7 @@ def alice_paper_run(db_session: Session, alice_user):
         oanda_account_id="101-004-99999-001",
         risk_config={
             "max_position_size_units": 10_000,
-            "daily_loss_pct": 2.0,
+            "loss_cap_pct": 2.0,
             "kill_switch_dd_pct": 5.0,
         },
         started_at=datetime.now(UTC),
@@ -142,18 +142,18 @@ class TestKillSwitch:
         client.close_all_positions.assert_called_once_with("EUR_USD")
 
 
-class TestDailyLossHalt:
-    def test_declining_balance_trips_daily_loss(self, db_session, alice_paper_run):
-        """A 5% balance drop hits both the DD gate and the daily-loss
+class TestLossCapHalt:
+    def test_declining_balance_trips_loss_cap(self, db_session, alice_paper_run):
+        """A 5% balance drop hits both the DD gate and the loss-cap
         gate. `evaluate_all` orders DD first, so the observed reason
-        is BROKER_CIRCUIT (kill switch). The daily-loss-only scenario
+        is BROKER_CIRCUIT (kill switch). The loss-cap-only scenario
         is a smaller drop that hits ONLY the 2% cap without exceeding
         the 5% DD cap — that's the case this test locks."""
         from src.agentfx.api.models import RunStatus
         from agentfx.services.paper_runner import _execute_loop
 
         # Snapshot at 10_000, balance drops to 9_800 = exactly 2% loss.
-        # DD gate at 5% is fine; daily-loss gate at 2% trips.
+        # DD gate at 5% is fine; loss-cap gate at 2% trips.
         alice_paper_run.snapshot_balance = 10_000.0
         alice_paper_run.current_balance = 10_000.0
         db_session.commit()
@@ -171,14 +171,14 @@ class TestDailyLossHalt:
 
         db_session.refresh(alice_paper_run)
         assert alice_paper_run.status == RunStatus.ERROR
-        assert alice_paper_run.stop_reason == "DAILY_LOSS_LIMIT"
+        assert alice_paper_run.stop_reason == "LOSS_CAP_HIT"
         client.close_all_positions.assert_called_once_with("EUR_USD")
 
 
 class TestBrokerCircuit:
     def test_dd_gate_trips_broker_circuit(self, db_session, alice_paper_run):
         """5% balance drop trips the kill-switch DD gate before the
-        daily-loss gate (per evaluate_all precedence)."""
+        loss-cap gate (per evaluate_all precedence)."""
         from src.agentfx.api.models import RunStatus
         from agentfx.services.paper_runner import _execute_loop
 

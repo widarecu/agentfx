@@ -584,8 +584,8 @@ export function MobilePaperRiskRoute(): React.ReactElement {
       value: tpLabel,
     },
     {
-      label: 'Daily loss cap',
-      value: risk?.daily_loss_pct != null ? `${risk.daily_loss_pct.toFixed(2)}%` : '—',
+      label: 'Loss cap (cumulative)',
+      value: risk?.loss_cap_pct != null ? `${risk.loss_cap_pct.toFixed(2)}%` : '—',
     },
     {
       label: 'Kill-switch drawdown',

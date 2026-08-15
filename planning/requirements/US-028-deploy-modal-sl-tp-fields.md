@@ -14,7 +14,7 @@ The fields belong on the DeployPaperModal because that's the last chance the use
 
 **GIVEN** the user is on `/paper/approvals` and clicks "Approve" on a validated genome
 **WHEN** the `DeployPaperModal` opens
-**THEN** the form shows the existing fields (name, instrument, granularity, initial_balance, max_position_size, daily_loss_pct, kill_switch_dd_pct) plus a collapsed "Advanced risk controls" section containing two new optional NumericFields:
+**THEN** the form shows the existing fields (name, instrument, granularity, initial_balance, max_position_size, loss_cap_pct, kill_switch_dd_pct) plus a collapsed "Advanced risk controls" section containing two new optional NumericFields:
 - **Stop loss (pips)** — decimal, min 1, max 500, no default (empty).
 - **Take profit (pips)** — decimal, min 1, max 1000, no default (empty).
 

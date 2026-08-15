@@ -153,7 +153,7 @@ def _approve_body(genome_id: str) -> dict:
         "oanda_account_id": "101-004-99999-001",
         "risk_config": {
             "max_position_size_units": 5000,
-            "daily_loss_pct": 2.0,
+            "loss_cap_pct": 2.0,
             "kill_switch_dd_pct": 5.0,
         },
     }

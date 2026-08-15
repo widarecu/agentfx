@@ -184,7 +184,7 @@ class TestExecuteLoop:
             kill_requested_at=datetime.now(UTC),
             risk_config={
                 "max_position_size_units": 10_000,
-                "daily_loss_pct": 2.0,
+                "loss_cap_pct": 2.0,
                 "kill_switch_dd_pct": 5.0,
             },
             status=RunStatus.RUNNING,
@@ -223,7 +223,7 @@ class TestExecuteLoop:
             kill_requested_at=None,
             risk_config={
                 "max_position_size_units": 10_000,
-                "daily_loss_pct": 2.0,
+                "loss_cap_pct": 2.0,
                 "kill_switch_dd_pct": 5.0,
             },
             status=RunStatus.RUNNING,
@@ -264,7 +264,7 @@ class TestExecuteLoop:
             kill_requested_at=None,
             risk_config={
                 "max_position_size_units": 10_000,
-                "daily_loss_pct": 2.0,
+                "loss_cap_pct": 2.0,
                 "kill_switch_dd_pct": 5.0,
             },
             status=RunStatus.RUNNING,
@@ -285,6 +285,106 @@ class TestExecuteLoop:
 
         assert run.status == RunStatus.ERROR
         assert run.stop_reason == "BROKER_CIRCUIT"
+
+    def test_transient_balance_failure_skipped_then_recovers(self):
+        """Wilson 2026-08-14: a single OANDA read timeout on the
+        balance refresh must NOT crash the subprocess. The loop skips
+        the tick, retries next iteration, and resumes normally when
+        OANDA recovers within `_BALANCE_RETRY_LIMIT` attempts."""
+        from agentfx.adapters.oanda import OandaError
+        from agentfx.api.models import RunStatus
+
+        run = SimpleNamespace(
+            id="run_test",
+            pair="EUR_USD",
+            snapshot_balance=10_000.0,
+            last_transaction_id=None,
+            current_balance=10_000.0,
+            pnl=0.0,
+            kill_requested_at=None,
+            risk_config={
+                "max_position_size_units": 10_000,
+                "loss_cap_pct": 2.0,
+                "kill_switch_dd_pct": 5.0,
+            },
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+        )
+        client = MagicMock()
+        # Two timeouts, then a successful balance — third iteration
+        # goes through the healthy code path and updates the balance.
+        client.get_account_balance.side_effect = [
+            OandaError("connection_error: Read timed out. (read timeout=15)"),
+            OandaError("connection_error: Read timed out. (read timeout=15)"),
+            {"balance": 10_000.0},
+        ]
+        db = MagicMock()
+
+        _execute_loop(
+            db=db,
+            run=run,
+            client=client,
+            sleep_fn=MagicMock(),
+            max_iterations=3,
+        )
+
+        # Balance was tried 3 times — 2 failures + 1 recovery.
+        assert client.get_account_balance.call_count == 3
+        # Loop hit its iteration cap on a healthy tick — no crash and
+        # no BROKER_NETWORK halt (that requires 3 CONSECUTIVE fails).
+        # Positions were never flattened.
+        assert run.status == RunStatus.RUNNING
+        assert run.stop_reason is None
+        client.close_all_positions.assert_not_called()
+
+    def test_persistent_balance_failure_halts_broker_network(self):
+        """Wilson 2026-08-14: `_BALANCE_RETRY_LIMIT` consecutive
+        non-auth OANDA failures on the balance refresh halt the run
+        cleanly with BROKER_NETWORK (positions flattened) instead of
+        crashing the subprocess and leaving a stranded broker
+        position."""
+        from agentfx.adapters.oanda import OandaError
+        from agentfx.api.models import RunStatus
+        from agentfx.services.paper_runner import _BALANCE_RETRY_LIMIT
+
+        run = SimpleNamespace(
+            id="run_test",
+            pair="EUR_USD",
+            snapshot_balance=10_000.0,
+            last_transaction_id=None,
+            current_balance=10_000.0,
+            pnl=0.0,
+            kill_requested_at=None,
+            risk_config={
+                "max_position_size_units": 10_000,
+                "loss_cap_pct": 2.0,
+                "kill_switch_dd_pct": 5.0,
+            },
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+        )
+        client = MagicMock()
+        client.get_account_balance.side_effect = OandaError(
+            "connection_error: Read timed out. (read timeout=15)"
+        )
+        db = MagicMock()
+
+        _execute_loop(
+            db=db,
+            run=run,
+            client=client,
+            sleep_fn=MagicMock(),
+            max_iterations=_BALANCE_RETRY_LIMIT + 2,
+        )
+
+        assert client.get_account_balance.call_count == _BALANCE_RETRY_LIMIT
+        assert run.status == RunStatus.ERROR
+        assert run.stop_reason == "BROKER_NETWORK"
+        # Flatten was best-effort attempted even though the broker
+        # was down (the try/except in _flatten_and_halt swallows).
+        client.close_all_positions.assert_called_once_with("EUR_USD")
 
 
 # ─────────────────────────────────────────────────────────────────────
