@@ -8,6 +8,7 @@ import pytest
 
 from agentfx.services.paper_sizing import (
     _pip_size_for_pair,
+    compute_failsafe_sl_pips,
     compute_position_units,
 )
 
@@ -121,3 +122,100 @@ class TestComputePositionUnits:
                 safety_cap_units=None,
                 client=client,
             )
+
+
+class TestComputeFailsafeSLPips:
+    """Wilson 2026-08-15 audit: broker order carries only a wide
+    fail-safe SL sized from the hard-halt loss cap. The DSL's own
+    `stop_pips` is enforced walk-side on bar close."""
+
+    def test_scales_with_kill_switch_dd(self):
+        # $10k balance, 10k units EUR_USD (USD account),
+        # kill_switch_dd_pct = 5% → max loss $500 → 500 pips
+        # ($500 / (10_000 × 0.0001) = 500).
+        pips = compute_failsafe_sl_pips(
+            balance=10_000.0,
+            units=10_000,
+            pip_value_account=0.0001,  # pip_size × 1.0 (USD/USD)
+            kill_switch_dd_pct=5.0,
+        )
+        assert pips == 500
+
+    def test_scales_with_position_size(self):
+        # Same balance and DD cap; 25_000 units → tighter fail-safe.
+        # $500 / (25_000 × 0.0001) = 200 pips (well above the 100 floor).
+        pips = compute_failsafe_sl_pips(
+            balance=10_000.0,
+            units=25_000,
+            pip_value_account=0.0001,
+            kill_switch_dd_pct=5.0,
+        )
+        assert pips == 200
+
+    def test_min_pips_floor_prevents_broker_from_beating_walk(self):
+        """If the computed fail-safe would be tighter than the DSL stop
+        (typical for large positions), the floor keeps the broker from
+        firing before the walk's own close-based check gets a chance."""
+        pips = compute_failsafe_sl_pips(
+            balance=10_000.0,
+            units=1_000_000,  # very large → computed ~5 pips
+            pip_value_account=0.0001,
+            kill_switch_dd_pct=5.0,
+        )
+        assert pips == 100  # floored
+
+    def test_aud_account_higher_pip_value_reduces_pips(self):
+        # AUD-denominated account, EUR_USD trade. USD/AUD ≈ 1.50 (AUD is
+        # weaker), so pip_value_account = 0.0001 × 1.50 = 0.00015. Loss
+        # in AUD per pip per unit is higher → fewer pips to hit cap.
+        pips = compute_failsafe_sl_pips(
+            balance=10_000.0,  # AUD
+            units=10_000,
+            pip_value_account=0.00015,
+            kill_switch_dd_pct=5.0,
+        )
+        # $500 / (10_000 × 0.00015) = 333.33 → 333
+        assert pips == 333
+
+    def test_degenerate_units_returns_floor(self):
+        assert (
+            compute_failsafe_sl_pips(
+                balance=10_000.0,
+                units=0,
+                pip_value_account=0.0001,
+                kill_switch_dd_pct=5.0,
+            )
+            == 100
+        )
+
+    def test_degenerate_pip_value_returns_floor(self):
+        assert (
+            compute_failsafe_sl_pips(
+                balance=10_000.0,
+                units=10_000,
+                pip_value_account=0.0,
+                kill_switch_dd_pct=5.0,
+            )
+            == 100
+        )
+
+    def test_zero_dd_cap_returns_floor(self):
+        assert (
+            compute_failsafe_sl_pips(
+                balance=10_000.0,
+                units=10_000,
+                pip_value_account=0.0001,
+                kill_switch_dd_pct=0.0,
+            )
+            == 100
+        )
+
+    def test_custom_min_pips(self):
+        pips = compute_failsafe_sl_pips(
+            balance=10_000.0,
+            units=1_000_000,
+            pip_value_account=0.0001,
+            kill_switch_dd_pct=5.0,
+            min_pips=250,
+        )
+        assert pips == 250

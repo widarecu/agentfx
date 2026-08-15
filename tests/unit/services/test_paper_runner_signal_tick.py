@@ -371,14 +371,15 @@ class TestSignalTick:
             now_utc=datetime(2026, 7, 10, 12, 0, tzinfo=UTC),
         )
 
-        # v0.6.1 raw-entry refactor: DSL's exit block seeds SL/TP when
-        # `risk_config` doesn't override, so tests use the mock's
-        # default stop_pips=20, target_pips=50.
+        # Wilson 2026-08-15: broker order now carries only a wide
+        # fail-safe SL sized from kill_switch_dd_pct (5% default),
+        # and NO broker-side TP. Strategy's own SL/TP is enforced
+        # walk-side on bar close. $10k × 5% / (25k × $0.0001) = 200 pips.
         client.place_market_order.assert_called_once_with(
             "EUR_USD",
             25_000,
-            stop_loss_pips=20,
-            take_profit_pips=50,
+            stop_loss_pips=200,
+            take_profit_pips=None,
         )
         # A Trade row got added.
         added = [c.args[0] for c in db.add.call_args_list]
@@ -991,12 +992,16 @@ class TestSignalTick:
 
         client.close_all_positions.assert_called_once_with("EUR_USD")
 
-    def test_stop_loss_and_take_profit_passed_through(self):
-        # SL/TP from risk_config override → passed through to the
-        # broker call. Sizing under the v0.6.1 dynamic model:
-        # balance $10k × 0.005 risk / (20 pip stop × $0.0001 pip) =
-        # 25,000 units. `max_position_size_units` unset (blank) so
-        # no safety cap kicks in.
+    def test_broker_failsafe_sl_replaces_dsl_sl_tp(self):
+        # Wilson 2026-08-15: legacy `risk_config.stop_loss_pips` /
+        # `take_profit_pips` are no longer forwarded to the broker.
+        # Broker always gets a WIDE fail-safe SL sized from
+        # kill_switch_dd_pct, and NO broker-side TP. The DSL's own
+        # SL/TP is enforced walk-side on bar close.
+        #
+        # Sizing (unchanged): balance $10k × 0.005 / (20pip × $0.0001)
+        # = 25,000 units. Fail-safe SL: $10k × 5% / (25k × $0.0001)
+        # = 200 pips.
         strategy = _make_strategy(signals=[0, 0, 1])
         candles_df = _mk_candles_df(3, datetime(2026, 7, 10, 12, 0, tzinfo=UTC))
         fetch = MagicMock(return_value=candles_df)
@@ -1017,8 +1022,8 @@ class TestSignalTick:
         run.risk_config = {
             "loss_cap_pct": 2.0,
             "kill_switch_dd_pct": 5.0,
-            "stop_loss_pips": 20.0,
-            "take_profit_pips": 40.0,
+            "stop_loss_pips": 20.0,  # legacy override — now IGNORED at broker
+            "take_profit_pips": 40.0,  # legacy override — now IGNORED at broker
         }
 
         _signal_tick(
@@ -1035,8 +1040,8 @@ class TestSignalTick:
         client.place_market_order.assert_called_once_with(
             "EUR_USD",
             25_000,
-            stop_loss_pips=20.0,
-            take_profit_pips=40.0,
+            stop_loss_pips=200,
+            take_profit_pips=None,
         )
 
 

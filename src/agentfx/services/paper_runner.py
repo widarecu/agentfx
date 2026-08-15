@@ -1199,18 +1199,31 @@ def _open_position_and_persist(
     recoverable errors, writes an appropriate decision log entry and
     returns silently.
     """
-    # Broker-side SL/TP: the strategy's DSL exit block is the source
-    # of truth. The deploy modal pre-populates from these and the user
-    # can override in `risk_config`. Runner falls back to the DSL
-    # values if the modal didn't override (or a legacy run row is
-    # missing them) — see US-028.
-    sl_pips = risk_cfg.get("stop_loss_pips")
-    tp_pips = risk_cfg.get("take_profit_pips")
-    if exit_rules is not None and exit_rules.exit is not None:
-        if sl_pips is None:
-            sl_pips = int(exit_rules.exit.stop_pips)
-        if tp_pips is None:
-            tp_pips = int(exit_rules.exit.target_pips)
+    # Wilson 2026-08-15 audit: the strategy's DSL `stop_pips` is
+    # enforced walk-side against bar CLOSE. Registering it as a
+    # broker-side `stopLossOnFill` order turned it into a TOUCH-based
+    # stop — an intra-bar wick fires it, but the walk (and backtest's
+    # `_apply_exits`) only trigger on the bar's close. That silently
+    # changes the strategy's payoff distribution vs its OOS-validated
+    # backtest — every wick that would have recovered becomes a
+    # locked loss.
+    #
+    # The broker order now carries only a WIDE fail-safe SL sized
+    # from `kill_switch_dd_pct` (matches the run's hard-halt loss
+    # cap), and NO broker-side TP. The walk enforces the strategy's
+    # real SL + TP on close each tick; the broker SL only fires if
+    # the runner is dead. See `compute_failsafe_sl_pips` for the
+    # sizing formula.
+    #
+    # `risk_config.stop_loss_pips` / `take_profit_pips` are legacy
+    # deploy-modal overrides — retained in the schema for back-compat
+    # but ignored here.
+    sl_pips_dsl = (
+        int(exit_rules.exit.stop_pips) if exit_rules and exit_rules.exit else None
+    )
+    tp_pips_dsl = (
+        int(exit_rules.exit.target_pips) if exit_rules and exit_rules.exit else None
+    )
 
     # Dynamic position sizing (v0.6.1 UAT 2026-07-15 — Wilson):
     # backtest already sizes each trade off risk_pct × balance
@@ -1221,7 +1234,10 @@ def _open_position_and_persist(
     # sized. Match backtest by computing units from risk_pct + current
     # balance + stop distance + account-currency-aware pip value.
     # `max_position_size_units` becomes a safety cap only.
-    from agentfx.services.paper_sizing import compute_position_units
+    from agentfx.services.paper_sizing import (
+        compute_failsafe_sl_pips,
+        compute_position_units,
+    )
 
     account_summary = client.get_account_balance()
     account_currency = str(account_summary.get("currency") or "USD")
@@ -1243,7 +1259,7 @@ def _open_position_and_persist(
         balance=balance_account,
         account_currency=account_currency,
         risk_pct=risk_pct_dsl,
-        stop_pips=float(sl_pips or 0),
+        stop_pips=float(sl_pips_dsl or 0),
         safety_cap_units=safety_cap,
         client=client,
     )
@@ -1268,14 +1284,26 @@ def _open_position_and_persist(
         sizing.capped_units if signal_direction == "long" else -sizing.capped_units
     )
 
+    # Broker fail-safe SL, sized from the run's hard-halt loss cap
+    # (kill_switch_dd_pct). Wide enough that normal price action never
+    # touches it; only fires if the runner is dead. Walk enforces the
+    # DSL's real SL + TP on bar close each tick.
+    kill_switch_dd_pct = float(risk_cfg.get("kill_switch_dd_pct", 5.0))
+    failsafe_sl_pips = compute_failsafe_sl_pips(
+        balance=sizing.balance,
+        units=sizing.capped_units,
+        pip_value_account=sizing.pip_value_account,
+        kill_switch_dd_pct=kill_switch_dd_pct,
+    )
+
     from agentfx.adapters.oanda import OandaOrderRejected
 
     try:
         result = client.place_market_order(
             instrument,
             signed_units,
-            stop_loss_pips=sl_pips,
-            take_profit_pips=tp_pips,
+            stop_loss_pips=failsafe_sl_pips,
+            take_profit_pips=None,
         )
     except OandaOrderRejected as exc:
         # Broker refused to fill (INSUFFICIENT_MARGIN, MARKET_HALTED,
@@ -1346,7 +1374,9 @@ def _open_position_and_persist(
         action="USER_ORDER_PLACED",
         reason=(
             f"{signal_direction.upper()} {abs(filled_units)} {instrument} "
-            f"@ {fill_price:.5f} ({signal_reason}) | sizing: {sizing_note}"
+            f"@ {fill_price:.5f} ({signal_reason}) | sizing: {sizing_note} | "
+            f"broker failsafe SL: {failsafe_sl_pips} pips "
+            f"({kill_switch_dd_pct}% of balance)"
         ),
         outputs={
             "paper_run_id": run.id,
@@ -1355,6 +1385,9 @@ def _open_position_and_persist(
             "fill_price": fill_price,
             "broker_trade_id": trade_id,
             "signal_reason": signal_reason,
+            "broker_failsafe_sl_pips": failsafe_sl_pips,
+            "dsl_stop_pips": sl_pips_dsl,
+            "dsl_target_pips": tp_pips_dsl,
             "sizing": {
                 "balance": sizing.balance,
                 "account_currency": sizing.account_currency,
