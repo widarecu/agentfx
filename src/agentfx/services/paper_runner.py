@@ -86,11 +86,29 @@ DEFAULT_LOOKBACK_BARS = 500
 INGEST_LAG_TOLERANCE_SECONDS = 150
 
 # Consecutive non-auth OANDA failures on the balance refresh before we
-# give up and halt with `BROKER_NETWORK`. Each attempt inside the OANDA
-# adapter already burns 5 retries with backoff (~75s of wall time), so
-# 3 outer attempts = ~3-4 minutes of sustained unavailability before we
-# halt cleanly.
-_BALANCE_RETRY_LIMIT = 3
+# give up and halt with `BROKER_NETWORK`.
+#
+# Wilson 2026-08-23 audit: the Aug 21 22:12 UTC outage was a ~60-second
+# OANDA hiccup that halted BOTH live paper runs. Under the old 3-strike
+# / 5s-sleep policy the runner tolerated ~1 minute of unavailability;
+# real-world OANDA transient outages routinely run 30s–15min. Widened
+# to 6 outer attempts with exponential backoff between them so we
+# tolerate up to ~15 minutes of continuous unavailability before halting
+# cleanly (still with BROKER_NETWORK). Each adapter call itself burns
+# ~75s of internal retries; 6 outer attempts × ~75s + backoff sleeps
+# (15 + 30 + 60 + 120 + 240 = 465s) ≈ 15.25 min total tolerance.
+_BALANCE_RETRY_LIMIT = 6
+_BALANCE_RETRY_BACKOFF_SECONDS = (15.0, 30.0, 60.0, 120.0, 240.0)
+
+
+def _balance_retry_sleep_seconds(consecutive_failures: int) -> float:
+    """Sleep length after the Nth (1-indexed) consecutive balance
+    failure. Clamped to the last defined backoff so callers can't run
+    off the end of the list. Also caps at 5 minutes for safety.
+    """
+    idx = max(0, min(consecutive_failures - 1, len(_BALANCE_RETRY_BACKOFF_SECONDS) - 1))
+    return min(300.0, _BALANCE_RETRY_BACKOFF_SECONDS[idx])
+
 
 # Granularity → seconds. Mirrors OANDA's naming; keep in sync with the
 # frontend's `granularityToSeconds` in `portal/web/src/utils/candles.ts`.
@@ -661,15 +679,19 @@ def _execute_loop(
                     )
                     _flatten_and_halt(db, run, client, reason="BROKER_NETWORK")
                     return
+                sleep_seconds = _balance_retry_sleep_seconds(
+                    consecutive_balance_failures
+                )
                 logger.warning(
                     "paper runner: %s balance refresh failed (%s); "
-                    "skipping tick (%d/%d)",
+                    "skipping tick (%d/%d), backing off %.0fs",
                     run.id,
                     exc,
                     consecutive_balance_failures,
                     _BALANCE_RETRY_LIMIT,
+                    sleep_seconds,
                 )
-                sleep_fn(5.0)
+                sleep_fn(sleep_seconds)
                 continue
         consecutive_balance_failures = 0
         run.current_balance = balance["balance"]
@@ -2236,20 +2258,56 @@ def _recover_from_auth_loss(db, run, original_exc: Exception):
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _flatten_and_halt(db, run, client, *, reason: str) -> None:
+_FLATTEN_RETRY_LIMIT = 3
+_FLATTEN_RETRY_BACKOFF_SECONDS = (10.0, 30.0, 60.0)
+
+
+def _flatten_and_halt(db, run, client, *, reason: str, sleep_fn=time.sleep) -> None:
     """Close all OANDA positions on the run's instrument and mark the
     run terminal. Best-effort on the OANDA close — the run row is
     always transitioned even if the broker call raises. Also flags
     any open Trade row with a classified `exit_reason` so the chart
-    marker shows the halt cause instead of a stranded open trade."""
+    marker shows the halt cause instead of a stranded open trade.
+
+    Wilson 2026-08-23 audit: the Aug 21 outage halted both runs while
+    OANDA was still down, so `close_all_positions` failed and both live
+    positions stranded on the broker for 37h. Retry the close with
+    exponential backoff before giving up — a common flatten-during-outage
+    scenario is that OANDA recovers within seconds.
+    """
     from agentfx.api.models import RunStatus, Trade
 
-    try:
-        client.close_all_positions(run.pair)
-    except Exception:  # noqa: BLE001
+    close_ok = False
+    for attempt in range(1, _FLATTEN_RETRY_LIMIT + 1):
+        try:
+            client.close_all_positions(run.pair)
+            close_ok = True
+            if attempt > 1:
+                logger.info(
+                    "paper runner: close_all_positions succeeded on %s "
+                    "at attempt %d/%d",
+                    run.id,
+                    attempt,
+                    _FLATTEN_RETRY_LIMIT,
+                )
+            break
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "paper runner: close_all_positions failed on %s "
+                "(attempt %d/%d); will retry",
+                run.id,
+                attempt,
+                _FLATTEN_RETRY_LIMIT,
+            )
+            if attempt < _FLATTEN_RETRY_LIMIT:
+                backoff = _FLATTEN_RETRY_BACKOFF_SECONDS[attempt - 1]
+                sleep_fn(backoff)
+    if not close_ok:
         logger.exception(
-            "paper runner: close_all_positions failed on %s; halting anyway",
+            "paper runner: close_all_positions failed on %s "
+            "after %d attempts; halting anyway (position may be stranded)",
             run.id,
+            _FLATTEN_RETRY_LIMIT,
         )
 
     # Close any stranded open Trade rows so the chart doesn't show a

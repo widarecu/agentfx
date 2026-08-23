@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import logging.handlers
 import sys
@@ -110,7 +111,10 @@ async def lifespan(app: FastAPI):
     # leave paper runs in a zombie RUNNING state with no subprocess or
     # watchdog — kill requests never get serviced and the UI hides
     # Delete because status isn't terminal. Wilson UAT 2026-07-14.
-    from .workers.paper_runner import recover_orphaned_paper_runs
+    from .workers.paper_runner import (
+        auto_restart_supervisor_loop,
+        recover_orphaned_paper_runs,
+    )
 
     try:
         recovered_paper = recover_orphaned_paper_runs()
@@ -119,10 +123,24 @@ async def lifespan(app: FastAPI):
     except Exception:  # noqa: BLE001
         logger.exception("paper-run recovery failed; continuing startup")
 
+    # Start the auto-restart supervisor (Wilson 2026-08-23). Watches
+    # for paper runs that halted with a transient stop reason
+    # (BROKER_NETWORK, process_crashed) and re-schedules them with
+    # backoff. See workers/paper_runner.py auto-restart section.
+    supervisor_task = asyncio.create_task(
+        auto_restart_supervisor_loop(),
+        name="paper-runner-auto-restart-supervisor",
+    )
+
     yield  # App runs here
 
     # Shutdown
     logger.info("Shutting down...")
+    supervisor_task.cancel()
+    try:
+        await supervisor_task
+    except asyncio.CancelledError:
+        pass
     await stop_ingestion_worker()
     logger.info("Candle ingestion worker stopped")
 

@@ -16,6 +16,7 @@ OANDA positions before exiting.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import multiprocessing
 import os
@@ -30,6 +31,45 @@ logger = logging.getLogger(__name__)
 _MP_CONTEXT = multiprocessing.get_context("spawn")
 
 _WATCHDOG_POLL_SECONDS = 5.0
+
+# ─────────────────────────────────────────────────────────────────────
+# Auto-restart supervisor (Wilson 2026-08-23)
+#
+# The watchdog reaps dead subprocesses and marks the run ERROR; it
+# never re-schedules. Before this supervisor, every transient failure
+# (OANDA outage, momentary crash) left the run dead until Wilson
+# manually re-approved via the UI. Aug 19 + Aug 21 events sat dead
+# for 14h and 37h respectively.
+#
+# The supervisor scans for ERROR runs whose stop_reason is in the
+# transient set. It waits a backoff period based on how many times it
+# has already restarted this same run, then flips ERROR → APPROVED
+# and calls `schedule_paper_run`. Attempt count is stored in
+# `run.parameters['auto_restart_attempts']`.
+#
+# Explicitly NOT auto-restarted: OANDA_AUTH_LOST (credential issue,
+# user action), LOSS_CAP_HIT / BROKER_CIRCUIT (risk gate trips,
+# should be reviewed), USER_KILL (operator intent). The gate is
+# strictly the transient stop_reasons defined here.
+# ─────────────────────────────────────────────────────────────────────
+
+_TRANSIENT_STOP_REASONS: frozenset[str] = frozenset({"BROKER_NETWORK"})
+_TRANSIENT_STOP_PREFIXES: tuple[str, ...] = ("process_crashed", "crashed_pre_init")
+
+# Backoff between restart attempts (indexed by attempts_already_made).
+# After the 3rd attempt fails, run is left permanently ERROR + Slack.
+_RESTART_BACKOFF_SECONDS: tuple[float, ...] = (60.0, 300.0, 1800.0)
+_MAX_AUTO_RESTART_ATTEMPTS = len(_RESTART_BACKOFF_SECONDS)
+
+# How often the supervisor tick fires. Small enough that a 60s outage
+# is picked up quickly after the backoff clears; large enough not to
+# hammer the DB.
+_SUPERVISOR_TICK_SECONDS = 120.0
+
+# Reset the attempt counter after the run has been healthy this long.
+# Prevents a run that fails once every 3 weeks from ever exhausting
+# its restart budget.
+_ATTEMPT_RESET_AFTER_SECONDS = 24 * 3600.0
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -327,3 +367,215 @@ def _persist_crash_detail(run_id: str, exc: Exception) -> None:
             db.close()
     except Exception:  # noqa: BLE001
         logger.exception("failed to persist crash_detail for paper run %s", run_id)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Auto-restart supervisor
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _is_transient_stop_reason(stop_reason: str | None) -> bool:
+    """True if a stop_reason is safe to auto-restart from.
+
+    Exact match against `_TRANSIENT_STOP_REASONS`; prefix match against
+    `_TRANSIENT_STOP_PREFIXES` (so `process_crashed (exit_code=1)` is
+    caught). Anything else — LOSS_CAP_HIT, BROKER_CIRCUIT, USER_KILL,
+    OANDA_AUTH_LOST — is deliberately excluded: those need human
+    review.
+    """
+    if not stop_reason:
+        return False
+    if stop_reason in _TRANSIENT_STOP_REASONS:
+        return True
+    return any(stop_reason.startswith(p) for p in _TRANSIENT_STOP_PREFIXES)
+
+
+def _seconds_since(dt: datetime | None, now: datetime) -> float:
+    if dt is None:
+        return float("inf")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return (now - dt).total_seconds()
+
+
+def scan_and_restart_transient_errors(db=None, now: datetime | None = None) -> int:
+    """One supervisor tick — walk the paper runs table, restart each
+    eligible run.
+
+    Extracted from the async loop so tests can call it directly with
+    a controlled `now` and stub `schedule_paper_run`. Returns the
+    number of runs re-scheduled by this tick.
+
+    Eligibility (all must hold):
+      * status == ERROR
+      * environment == PAPER
+      * completed_at is set
+      * _is_transient_stop_reason(stop_reason) True
+      * attempts_so_far < _MAX_AUTO_RESTART_ATTEMPTS
+      * seconds_since(completed_at) >= _RESTART_BACKOFF_SECONDS[attempts_so_far]
+
+    On restart:
+      * status → APPROVED, stop_reason → None, completed_at → None
+      * parameters['auto_restart_attempts'] += 1
+      * parameters['auto_restart_last_at'] = ISO timestamp
+      * calls schedule_paper_run(run.id)
+      * writes a decision-log entry so the operator sees the restart
+        in the run's timeline
+    """
+    from agentfx.api.core.database import SessionLocal
+    from agentfx.api.models import Run, RunEnvironment, RunStatus
+    from sqlalchemy.orm.attributes import flag_modified
+
+    own_session = db is None
+    if own_session:
+        db = SessionLocal()
+    if now is None:
+        now = datetime.now(UTC)
+
+    restarted = 0
+    try:
+        candidates = (
+            db.query(Run)
+            .filter(
+                Run.environment == RunEnvironment.PAPER,
+                Run.status == RunStatus.ERROR,
+                Run.completed_at.isnot(None),
+            )
+            .all()
+        )
+        for run in candidates:
+            if not _is_transient_stop_reason(run.stop_reason):
+                continue
+            params = dict(run.parameters or {})
+            attempts_so_far = int(params.get("auto_restart_attempts", 0))
+
+            # Reset the attempt counter if the run was healthy long
+            # enough before this crash. Approximated by
+            # `completed_at - approved_at` — if the whole run lasted
+            # more than the reset window, we consider prior attempts
+            # stale.
+            approved_at = run.approved_at
+            if approved_at is not None and attempts_so_far > 0:
+                run_lifetime = _seconds_since(approved_at, run.completed_at)
+                if run_lifetime >= _ATTEMPT_RESET_AFTER_SECONDS:
+                    attempts_so_far = 0
+
+            if attempts_so_far >= _MAX_AUTO_RESTART_ATTEMPTS:
+                continue
+
+            backoff = _RESTART_BACKOFF_SECONDS[attempts_so_far]
+            since_halt = _seconds_since(run.completed_at, now)
+            if since_halt < backoff:
+                continue
+
+            # Restart.
+            prior_reason = run.stop_reason
+            run.status = RunStatus.APPROVED
+            run.process_pid = None
+            run.stop_reason = None
+            run.completed_at = None
+            params["auto_restart_attempts"] = attempts_so_far + 1
+            params["auto_restart_last_at"] = now.isoformat()
+            params["auto_restart_prior_reason"] = prior_reason
+            run.parameters = params
+            flag_modified(run, "parameters")
+            db.commit()
+
+            logger.warning(
+                "auto-restart: rescheduling paper run %s "
+                "(attempt %d/%d, prior stop_reason=%s, waited %.0fs)",
+                run.id,
+                attempts_so_far + 1,
+                _MAX_AUTO_RESTART_ATTEMPTS,
+                prior_reason,
+                since_halt,
+            )
+            _write_restart_decision(
+                db, run, attempts_so_far + 1, prior_reason, since_halt
+            )
+            schedule_paper_run(run.id)
+            restarted += 1
+    finally:
+        if own_session:
+            db.close()
+
+    return restarted
+
+
+def _write_restart_decision(
+    db,
+    run,
+    attempt_number: int,
+    prior_reason: str | None,
+    waited_seconds: float,
+) -> None:
+    """Append an auto-restart entry to the run's decision log so the
+    operator sees the recovery attempt inline with trades and health
+    ticks. Best-effort — a decision-log write failure must not block
+    the restart itself."""
+    try:
+        from agentfx.api.models import DecisionLog
+
+        db.add(
+            DecisionLog(
+                run_id=run.id,
+                action="AUTO_RESTART",
+                agent_type="PAPER_RUNNER_SUPERVISOR",
+                reason=(
+                    f"supervisor rescheduled paper run "
+                    f"(attempt {attempt_number}/{_MAX_AUTO_RESTART_ATTEMPTS}) — "
+                    f"prior stop_reason={prior_reason}, "
+                    f"waited {waited_seconds:.0f}s of "
+                    f"{_RESTART_BACKOFF_SECONDS[attempt_number - 1]:.0f}s backoff"
+                ),
+                metadata_json={
+                    "auto_restart_attempt": attempt_number,
+                    "prior_stop_reason": prior_reason,
+                    "waited_seconds": waited_seconds,
+                },
+                timestamp=datetime.now(UTC),
+            )
+        )
+        db.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "auto-restart: failed to write decision-log entry for %s "
+            "(restart itself already happened)",
+            run.id,
+        )
+
+
+async def auto_restart_supervisor_loop(
+    tick_seconds: float = _SUPERVISOR_TICK_SECONDS,
+) -> None:
+    """Background task started from the FastAPI lifespan hook. Runs
+    forever until cancelled at shutdown.
+
+    Each tick calls `scan_and_restart_transient_errors` synchronously
+    inside an executor so blocking DB work doesn't tie up the event
+    loop. Any per-tick exception is logged and swallowed — the loop
+    itself must never die.
+    """
+    logger.info(
+        "auto-restart supervisor started (tick=%.0fs, max_attempts=%d)",
+        tick_seconds,
+        _MAX_AUTO_RESTART_ATTEMPTS,
+    )
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            await asyncio.sleep(tick_seconds)
+            try:
+                restarted = await loop.run_in_executor(
+                    None, scan_and_restart_transient_errors
+                )
+                if restarted > 0:
+                    logger.info(
+                        "auto-restart supervisor: rescheduled %d paper run(s)",
+                        restarted,
+                    )
+            except Exception:  # noqa: BLE001 — never let the loop die
+                logger.exception("auto-restart supervisor: tick failed; continuing")
+        except asyncio.CancelledError:
+            logger.info("auto-restart supervisor: cancelled at shutdown")
+            raise

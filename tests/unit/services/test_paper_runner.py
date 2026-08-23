@@ -386,6 +386,97 @@ class TestExecuteLoop:
         # was down (the try/except in _flatten_and_halt swallows).
         client.close_all_positions.assert_called_once_with("EUR_USD")
 
+    def test_balance_retry_uses_exponential_backoff(self):
+        """Wilson 2026-08-23: sleep between failures should grow
+        (15s → 30s → 60s ...) so a 15-min OANDA outage is absorbed,
+        not a 60-second one."""
+        from agentfx.services.paper_runner import (
+            _BALANCE_RETRY_BACKOFF_SECONDS,
+            _balance_retry_sleep_seconds,
+        )
+
+        # First failure sleeps for the first backoff value; later
+        # failures ramp up; past the end it clamps.
+        assert _balance_retry_sleep_seconds(1) == _BALANCE_RETRY_BACKOFF_SECONDS[0]
+        assert _balance_retry_sleep_seconds(2) == _BALANCE_RETRY_BACKOFF_SECONDS[1]
+        assert _balance_retry_sleep_seconds(3) == _BALANCE_RETRY_BACKOFF_SECONDS[2]
+        # Beyond the defined tuple, clamp to the last value.
+        last = _BALANCE_RETRY_BACKOFF_SECONDS[-1]
+        assert _balance_retry_sleep_seconds(100) == min(300.0, last)
+
+    def test_flatten_retries_close_all_positions_on_failure(self):
+        """Wilson 2026-08-23: `_flatten_and_halt` now retries the broker
+        `close_all_positions` call before giving up, so a 60s OANDA
+        blip during a halt doesn't strand the position at the broker.
+        """
+        from types import SimpleNamespace
+
+        from agentfx.adapters.oanda import OandaError
+        from agentfx.api.models import RunStatus
+        from agentfx.services.paper_runner import (
+            _FLATTEN_RETRY_LIMIT,
+            _flatten_and_halt,
+        )
+
+        run = SimpleNamespace(
+            id="run_flatten",
+            pair="EUR_USD",
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+            parameters={},
+        )
+        client = MagicMock()
+        # First two attempts fail, third succeeds.
+        client.close_all_positions.side_effect = [
+            OandaError("503 Service unavailable"),
+            OandaError("503 Service unavailable"),
+            None,
+        ]
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = []
+
+        _flatten_and_halt(
+            db, run, client, reason="BROKER_NETWORK", sleep_fn=MagicMock()
+        )
+
+        assert client.close_all_positions.call_count == 3
+        assert run.status == RunStatus.ERROR
+        assert run.stop_reason == "BROKER_NETWORK"
+
+    def test_flatten_gives_up_after_max_close_attempts(self):
+        """If every retry fails, the run still transitions to terminal
+        state (position stranded — logged but not blocking)."""
+        from types import SimpleNamespace
+
+        from agentfx.adapters.oanda import OandaError
+        from agentfx.api.models import RunStatus
+        from agentfx.services.paper_runner import (
+            _FLATTEN_RETRY_LIMIT,
+            _flatten_and_halt,
+        )
+
+        run = SimpleNamespace(
+            id="run_flatten_fail",
+            pair="EUR_USD",
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+            parameters={},
+        )
+        client = MagicMock()
+        client.close_all_positions.side_effect = OandaError("503 forever")
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = []
+
+        _flatten_and_halt(
+            db, run, client, reason="BROKER_NETWORK", sleep_fn=MagicMock()
+        )
+
+        assert client.close_all_positions.call_count == _FLATTEN_RETRY_LIMIT
+        assert run.status == RunStatus.ERROR
+        assert run.stop_reason == "BROKER_NETWORK"
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Terminal state
