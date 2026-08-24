@@ -598,6 +598,17 @@ def _execute_loop(
     # cleanly with `BROKER_NETWORK`. Reset to 0 on any successful call.
     consecutive_balance_failures = 0
 
+    # Wilson 2026-08-24: subprocess heartbeat. Persisted to
+    # `run.parameters['last_heartbeat_at']` every ~5 minutes of
+    # healthy iteration (measured in iterations, not wall time, so
+    # tests that inject a pre-baked now_fn iterator don't run out).
+    # The supervisor uses this + `process_pid` to detect zombie
+    # RUNNING rows (subprocess dead but DB status still RUNNING) and
+    # restart them. Also grep-able signature in Railway logs — the
+    # absence of "paper runner heartbeat" lines after N minutes is
+    # proof of silent death. Loop iterates every ~5s so 60 = ~5 min.
+    _HEARTBEAT_INTERVAL_ITERATIONS = 60
+
     iteration = 0
     while True:
         if max_iterations is not None and iteration >= max_iterations:
@@ -697,6 +708,34 @@ def _execute_loop(
         run.current_balance = balance["balance"]
         run.pnl = balance["balance"] - (run.snapshot_balance or 0.0)
         db.commit()
+
+        # Heartbeat: log INFO + persist `last_heartbeat_at` every
+        # ~5 min (60 iterations at 5s cadence) of healthy iteration.
+        # Supervisor uses this to detect zombie RUNNING rows and
+        # restart them. Emitted on iteration 1 too so a fresh
+        # subprocess registers a heartbeat immediately.
+        if iteration == 1 or iteration % _HEARTBEAT_INTERVAL_ITERATIONS == 0:
+            heartbeat_iso = datetime.now(UTC).isoformat()
+            logger.info(
+                "paper runner heartbeat: run=%s iter=%d balance=%.2f pnl=%.2f",
+                run.id,
+                iteration,
+                run.current_balance or 0.0,
+                run.pnl or 0.0,
+            )
+            try:
+                params = dict(run.parameters or {})
+                params["last_heartbeat_at"] = heartbeat_iso
+                run.parameters = params
+                from sqlalchemy.orm.attributes import flag_modified as _flag_hb
+
+                _flag_hb(run, "parameters")
+                db.commit()
+            except Exception:  # noqa: BLE001 — never let heartbeat crash the loop
+                logger.exception(
+                    "paper runner: heartbeat persist failed on %s (loop continues)",
+                    run.id,
+                )
 
         # Evaluate risk gates against the current balance. The health
         # tick only checks halt-gates (kill_switch, loss cap);
@@ -2310,31 +2349,88 @@ def _flatten_and_halt(db, run, client, *, reason: str, sleep_fn=time.sleep) -> N
             _FLATTEN_RETRY_LIMIT,
         )
 
-    # Close any stranded open Trade rows so the chart doesn't show a
-    # trade running past the halt. Map halt `reason` → structured
-    # exit_reason for the chart marker.
-    exit_reason_map = {
-        "USER_KILL": "user_kill",
-        "BROKER_CIRCUIT": "broker_other",
-    }
+    # Wilson 2026-08-24: previously we marked open Trade rows CLOSED
+    # even when `close_all_positions` failed — the DB then lied that
+    # positions were flat while OANDA still held them (Aug 21 event
+    # stranded both live positions for 37h with paper DB showing
+    # `broker_other` exits at pnl=0). Fix: only mark trades closed
+    # when the broker actually confirmed the close. On failure, leave
+    # the DB rows OPEN, persist a `stranded_positions` marker on the
+    # run so the operator / reconciler can find them, and write a
+    # loud decision-log entry per stranded trade.
     now = datetime.now(UTC)
     open_trades = (
         db.query(Trade)
         .filter(Trade.run_id == run.id, Trade.exit_timestamp.is_(None))
         .all()
     )
-    for t in open_trades:
-        t.exit_timestamp = now
-        # Exit price/pnl are best-effort — the broker's exact fill
-        # isn't queried here. Chart marker still renders with the
-        # entry-price fallback so the halt is visible.
-        if t.exit_price is None:
-            t.exit_price = t.entry_price
-        if t.pnl is None:
-            t.pnl = 0.0
-        t.exit_reason = exit_reason_map.get(reason, "broker_other")
-    if open_trades:
+
+    if close_ok:
+        # Broker confirmed close — safe to mark DB rows closed.
+        exit_reason_map = {
+            "USER_KILL": "user_kill",
+            "BROKER_CIRCUIT": "broker_other",
+        }
+        for t in open_trades:
+            t.exit_timestamp = now
+            # Exit price/pnl are best-effort — the broker's exact fill
+            # isn't queried here. Chart marker still renders with the
+            # entry-price fallback so the halt is visible.
+            if t.exit_price is None:
+                t.exit_price = t.entry_price
+            if t.pnl is None:
+                t.pnl = 0.0
+            t.exit_reason = exit_reason_map.get(reason, "broker_other")
+        if open_trades:
+            db.commit()
+    elif open_trades:
+        # Broker close FAILED. Leave trades OPEN in the DB so the
+        # reconciler sees the mismatch and Wilson can act. Persist a
+        # marker on the run for the supervisor + Slack alert.
+        stranded = [
+            {
+                "trade_id": t.id,
+                "side": t.side,
+                "units": t.quantity,
+                "entry_price": t.entry_price,
+                "entry_timestamp": t.entry_timestamp.isoformat()
+                if t.entry_timestamp
+                else None,
+            }
+            for t in open_trades
+        ]
+        params = dict(run.parameters or {})
+        params["stranded_positions"] = {
+            "recorded_at": now.isoformat(),
+            "halt_reason": reason,
+            "trades": stranded,
+        }
+        run.parameters = params
+        from sqlalchemy.orm.attributes import flag_modified as _flag
+
+        _flag(run, "parameters")
         db.commit()
+
+        for t in open_trades:
+            _write_decision(
+                db,
+                run,
+                action="USER_POSITION_STRANDED",
+                reason=(
+                    f"BROKER CLOSE FAILED on halt ({reason}) — "
+                    f"{t.side} {t.quantity} {run.pair} @ {t.entry_price} "
+                    f"is STILL OPEN AT BROKER but DB kept trade open. "
+                    f"Manual close required in the OANDA UI."
+                ),
+                outputs={
+                    "paper_run_id": run.id,
+                    "trade_id": t.id,
+                    "halt_reason": reason,
+                    "side": t.side,
+                    "units": t.quantity,
+                    "entry_price": t.entry_price,
+                },
+            )
 
     terminal_status = (
         RunStatus.HALTED_MANUAL if reason == "USER_KILL" else RunStatus.ERROR

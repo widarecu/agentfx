@@ -14,8 +14,9 @@ multiprocessing.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agentfx.services.paper_runner import (
     TickAction,
@@ -463,6 +464,7 @@ class TestExecuteLoop:
             stop_reason=None,
             completed_at=None,
             parameters={},
+            user_id=42,
         )
         client = MagicMock()
         client.close_all_positions.side_effect = OandaError("503 forever")
@@ -476,6 +478,107 @@ class TestExecuteLoop:
         assert client.close_all_positions.call_count == _FLATTEN_RETRY_LIMIT
         assert run.status == RunStatus.ERROR
         assert run.stop_reason == "BROKER_NETWORK"
+
+    def test_flatten_leaves_trade_rows_open_when_broker_close_fails(self):
+        """Wilson 2026-08-24 fix: when broker close fails, DB Trade
+        rows must stay OPEN (not marked broker_other/pnl=0). The Aug
+        21 bug was that trades were marked closed unconditionally,
+        creating a phantom-flat DB state while OANDA held real
+        positions for 37h.
+        """
+        from types import SimpleNamespace
+
+        from agentfx.adapters.oanda import OandaError
+        from agentfx.api.models import RunStatus
+        from agentfx.services.paper_runner import _flatten_and_halt
+
+        run = SimpleNamespace(
+            id="run_stranded",
+            pair="EUR_USD",
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+            parameters={},
+            user_id=42,
+        )
+        # One OPEN trade in the DB.
+        open_trade = SimpleNamespace(
+            id="tr_1",
+            side="buy",
+            quantity=15_000,
+            entry_price=1.16729,
+            entry_timestamp=datetime(2026, 8, 21, 14, 46, tzinfo=UTC),
+            exit_timestamp=None,
+            exit_price=None,
+            pnl=None,
+            exit_reason=None,
+        )
+        client = MagicMock()
+        client.close_all_positions.side_effect = OandaError("503 down")
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = [open_trade]
+
+        with patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()):
+            _flatten_and_halt(
+                db, run, client, reason="BROKER_NETWORK", sleep_fn=MagicMock()
+            )
+
+        # Trade row STAYS OPEN — the bug was flipping this closed.
+        assert open_trade.exit_timestamp is None
+        assert open_trade.exit_price is None
+        assert open_trade.exit_reason is None
+        assert open_trade.pnl is None
+        # Run marker persisted for the supervisor + reconciler.
+        assert "stranded_positions" in run.parameters
+        stranded = run.parameters["stranded_positions"]
+        assert stranded["halt_reason"] == "BROKER_NETWORK"
+        assert len(stranded["trades"]) == 1
+        assert stranded["trades"][0]["trade_id"] == "tr_1"
+        # Run still transitions to terminal state.
+        assert run.status == RunStatus.ERROR
+        assert run.stop_reason == "BROKER_NETWORK"
+
+    def test_flatten_closes_trade_rows_when_broker_close_succeeds(self):
+        """The happy path: broker close succeeded, so DB rows get the
+        usual closed treatment. Nothing was regressed by the fix
+        above."""
+        from types import SimpleNamespace
+
+        from agentfx.api.models import RunStatus
+        from agentfx.services.paper_runner import _flatten_and_halt
+
+        run = SimpleNamespace(
+            id="run_happy_close",
+            pair="EUR_USD",
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+            parameters={},
+            user_id=42,
+        )
+        open_trade = SimpleNamespace(
+            id="tr_ok",
+            side="buy",
+            quantity=10_000,
+            entry_price=1.17,
+            entry_timestamp=datetime(2026, 8, 24, 10, 0, tzinfo=UTC),
+            exit_timestamp=None,
+            exit_price=None,
+            pnl=None,
+            exit_reason=None,
+        )
+        client = MagicMock()  # close_all_positions succeeds by default
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = [open_trade]
+
+        _flatten_and_halt(db, run, client, reason="USER_KILL", sleep_fn=MagicMock())
+
+        # Trade row IS marked closed.
+        assert open_trade.exit_timestamp is not None
+        assert open_trade.exit_reason == "user_kill"
+        # No stranded-positions marker on the happy path.
+        assert "stranded_positions" not in run.parameters
+        assert run.status == RunStatus.HALTED_MANUAL
 
 
 # ─────────────────────────────────────────────────────────────────────

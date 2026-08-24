@@ -513,3 +513,192 @@ class TestScanAndRestart:
         # Fresh budget → restart happened, counter reset then bumped to 1.
         assert restarted == 1
         assert run.parameters["auto_restart_attempts"] == 1
+
+
+class TestScanZombieRunning:
+    """Wilson 2026-08-24: second supervisor scan catches paper runs
+    that are RUNNING in the DB but whose subprocess is dead."""
+
+    def _stub_run(
+        self,
+        *,
+        process_pid,
+        approved_at,
+        parameters: dict | None = None,
+        run_id: str = "run_zombie_x",
+    ):
+        from agentfx.api.models import RunStatus
+
+        return SimpleNamespace(
+            id=run_id,
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+            approved_at=approved_at,
+            parameters=parameters or {},
+            process_pid=process_pid,
+            pair="EUR_USD",
+            user_id=42,
+        )
+
+    def _fake_db(self, candidates):
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = candidates
+        db.add = MagicMock()
+        db.commit = MagicMock()
+        return db
+
+    def test_null_pid_running_run_gets_restarted(self):
+        """The Aug 23 failure mode: status=RUNNING but process_pid=None.
+        This is a zombie."""
+        from datetime import UTC, datetime, timedelta
+
+        from agentfx.api.models import RunStatus
+        from agentfx.api.workers.paper_runner import (
+            scan_and_restart_zombie_running,
+        )
+
+        now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC)
+        run = self._stub_run(
+            process_pid=None,
+            approved_at=now - timedelta(days=2),
+        )
+        db = self._fake_db([run])
+        scheduled: list[str] = []
+        with (
+            patch(
+                "agentfx.api.workers.paper_runner.schedule_paper_run",
+                side_effect=lambda rid: scheduled.append(rid),
+            ),
+            patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()),
+        ):
+            restarted = scan_and_restart_zombie_running(db=db, now=now)
+
+        assert restarted == 1
+        assert scheduled == [run.id]
+        assert run.status == RunStatus.APPROVED
+        assert run.process_pid is None
+        assert run.parameters["auto_restart_attempts"] == 1
+        assert run.parameters["auto_restart_prior_reason"].startswith("zombie:")
+
+    def test_stale_heartbeat_running_run_gets_restarted(self):
+        """A RUNNING run with a pid but no heartbeat for 20 min is
+        still zombie (the subprocess may be alive but is not doing
+        any work — the loop is stuck or crashed silently)."""
+        from datetime import UTC, datetime, timedelta
+
+        from agentfx.api.models import RunStatus
+        from agentfx.api.workers.paper_runner import (
+            _HEARTBEAT_STALE_SECONDS,
+            scan_and_restart_zombie_running,
+        )
+
+        now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC)
+        stale_hb = (now - timedelta(seconds=_HEARTBEAT_STALE_SECONDS + 60)).isoformat()
+        run = self._stub_run(
+            process_pid=12345,
+            approved_at=now - timedelta(days=2),
+            parameters={"last_heartbeat_at": stale_hb},
+        )
+        db = self._fake_db([run])
+        scheduled: list[str] = []
+        with (
+            patch(
+                "agentfx.api.workers.paper_runner.schedule_paper_run",
+                side_effect=lambda rid: scheduled.append(rid),
+            ),
+            patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()),
+        ):
+            restarted = scan_and_restart_zombie_running(db=db, now=now)
+
+        assert restarted == 1
+        assert scheduled == [run.id]
+        assert run.status == RunStatus.APPROVED
+
+    def test_fresh_heartbeat_running_run_is_not_touched(self):
+        """A healthy RUNNING run with a fresh heartbeat and a live
+        pid must NOT be restarted."""
+        from datetime import UTC, datetime, timedelta
+
+        from agentfx.api.workers.paper_runner import (
+            scan_and_restart_zombie_running,
+        )
+
+        now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC)
+        fresh_hb = (now - timedelta(seconds=60)).isoformat()
+        run = self._stub_run(
+            process_pid=12345,
+            approved_at=now - timedelta(days=2),
+            parameters={"last_heartbeat_at": fresh_hb},
+        )
+        db = self._fake_db([run])
+        scheduled: list[str] = []
+        with (
+            patch(
+                "agentfx.api.workers.paper_runner.schedule_paper_run",
+                side_effect=lambda rid: scheduled.append(rid),
+            ),
+            patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()),
+        ):
+            restarted = scan_and_restart_zombie_running(db=db, now=now)
+
+        assert restarted == 0
+        assert scheduled == []
+
+    def test_freshly_scheduled_run_gets_grace_period(self):
+        """A run approved 60s ago that hasn't emitted a heartbeat yet
+        must not be classified zombie — the subprocess may still be
+        booting."""
+        from datetime import UTC, datetime, timedelta
+
+        from agentfx.api.workers.paper_runner import (
+            scan_and_restart_zombie_running,
+        )
+
+        now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC)
+        run = self._stub_run(
+            process_pid=12345,  # live pid, no heartbeat yet
+            approved_at=now - timedelta(seconds=60),  # 60s ago
+        )
+        db = self._fake_db([run])
+        scheduled: list[str] = []
+        with (
+            patch(
+                "agentfx.api.workers.paper_runner.schedule_paper_run",
+                side_effect=lambda rid: scheduled.append(rid),
+            ),
+            patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()),
+        ):
+            restarted = scan_and_restart_zombie_running(db=db, now=now)
+
+        assert restarted == 0
+
+    def test_zombie_respects_max_attempts(self):
+        """After the max restart budget is exhausted, zombie runs are
+        left alone (Slack + manual intervention)."""
+        from datetime import UTC, datetime, timedelta
+
+        from agentfx.api.workers.paper_runner import (
+            _MAX_AUTO_RESTART_ATTEMPTS,
+            scan_and_restart_zombie_running,
+        )
+
+        now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC)
+        run = self._stub_run(
+            process_pid=None,
+            approved_at=now - timedelta(hours=6),
+            parameters={"auto_restart_attempts": _MAX_AUTO_RESTART_ATTEMPTS},
+        )
+        db = self._fake_db([run])
+        scheduled: list[str] = []
+        with (
+            patch(
+                "agentfx.api.workers.paper_runner.schedule_paper_run",
+                side_effect=lambda rid: scheduled.append(rid),
+            ),
+            patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()),
+        ):
+            restarted = scan_and_restart_zombie_running(db=db, now=now)
+
+        assert restarted == 0
+        assert scheduled == []

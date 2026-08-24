@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -469,3 +469,155 @@ class TestReconcile:
 
         assert result.trades_updated == 0
         assert result.transactions_seen == 3
+
+
+class TestPositionMismatchCheck:
+    """Wilson 2026-08-24: reconciler compares OANDA net position
+    against sum of open DB Trade rows every tick. Detects the Aug 21
+    stranded-broker-position scenario within one health cycle instead
+    of silently drifting for hours."""
+
+    def _run(self, parameters=None):
+        return SimpleNamespace(
+            id="run_mismatch",
+            pair="EUR_USD",
+            last_transaction_id="900",
+            parameters=parameters or {},
+            user_id=42,
+        )
+
+    def _client(self, long_units=0, short_units=0, txn_response=None):
+        c = MagicMock()
+        c.get_position.return_value = {
+            "long_units": long_units,
+            "short_units": short_units,
+        }
+        c.get_transactions_since.return_value = txn_response or {
+            "transactions": [],
+            "lastTransactionID": "900",
+        }
+        return c
+
+    def _db_with_open_trades(self, trades):
+        db = MagicMock()
+        # Two query call sites: the reconciler's own (ORDER_FILL match)
+        # and the mismatch check's (open-trade sum). Both hit .filter(...).all().
+        db.query.return_value.filter.return_value.all.return_value = trades
+        db.query.return_value.filter.return_value.one_or_none.return_value = None
+        return db
+
+    def test_stranded_broker_position_fires_alarm(self):
+        """OANDA has open units but DB thinks flat → alarm."""
+        from agentfx.services.paper_reconciler import (
+            reconcile_broker_transactions,
+        )
+
+        run = self._run()
+        client = self._client(long_units=16_987)
+        db = self._db_with_open_trades([])  # DB says no open trades
+
+        with patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()):
+            result = reconcile_broker_transactions(db=db, run=run, client=client)
+
+        assert any("position_mismatch_alerted" in n for n in result.notes), result.notes
+        assert "position_mismatch_alerted_at" in run.parameters
+        details = run.parameters["position_mismatch_details"]
+        assert details["kind"] == "stranded_broker_position"
+        assert details["oanda_signed_units"] == 16_987
+        assert details["db_signed_units"] == 0
+
+    def test_ghost_db_trade_fires_alarm(self):
+        """DB has open trade but OANDA has 0 units."""
+        from agentfx.services.paper_reconciler import (
+            reconcile_broker_transactions,
+        )
+
+        run = self._run()
+        client = self._client(long_units=0, short_units=0)
+        open_trade = SimpleNamespace(
+            id="tr_ghost",
+            side="buy",
+            quantity=10_000,
+            entry_price=1.17,
+            exit_timestamp=None,
+        )
+        db = self._db_with_open_trades([open_trade])
+
+        with patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()):
+            result = reconcile_broker_transactions(db=db, run=run, client=client)
+
+        assert any("position_mismatch_alerted" in n for n in result.notes)
+        assert run.parameters["position_mismatch_details"]["kind"] == "ghost_db_trade"
+
+    def test_in_sync_no_alarm(self):
+        """Both sides agree — nothing fires."""
+        from agentfx.services.paper_reconciler import (
+            reconcile_broker_transactions,
+        )
+
+        run = self._run()
+        client = self._client(long_units=15_000)
+        open_trade = SimpleNamespace(
+            id="tr_ok",
+            side="buy",
+            quantity=15_000,
+            entry_price=1.17,
+            exit_timestamp=None,
+        )
+        db = self._db_with_open_trades([open_trade])
+
+        result = reconcile_broker_transactions(db=db, run=run, client=client)
+
+        assert not any("position_mismatch" in n for n in result.notes)
+        assert "position_mismatch_alerted_at" not in run.parameters
+
+    def test_already_alerted_stays_silent(self):
+        """Idempotent: mismatch persists across ticks — alarm fires
+        once, then stays silent until it clears."""
+        from agentfx.services.paper_reconciler import (
+            reconcile_broker_transactions,
+        )
+
+        run = self._run(
+            parameters={
+                "position_mismatch_alerted_at": "2026-08-24T10:00:00+00:00",
+                "position_mismatch_details": {
+                    "oanda_signed_units": 16_987,
+                    "db_signed_units": 0,
+                    "kind": "stranded_broker_position",
+                },
+            }
+        )
+        client = self._client(long_units=16_987)
+        db = self._db_with_open_trades([])
+
+        result = reconcile_broker_transactions(db=db, run=run, client=client)
+
+        # No new alert note this tick — already flagged.
+        assert not any("position_mismatch_alerted" in n for n in result.notes)
+
+    def test_resolved_clears_marker(self):
+        """When mismatch is fixed (operator manually closed broker
+        position), the marker is cleared on the next tick."""
+        from agentfx.services.paper_reconciler import (
+            reconcile_broker_transactions,
+        )
+
+        run = self._run(
+            parameters={
+                "position_mismatch_alerted_at": "2026-08-24T10:00:00+00:00",
+                "position_mismatch_details": {
+                    "oanda_signed_units": 16_987,
+                    "db_signed_units": 0,
+                    "kind": "stranded_broker_position",
+                },
+            }
+        )
+        client = self._client(long_units=0)  # broker now flat
+        db = self._db_with_open_trades([])  # DB also flat
+
+        with patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()):
+            result = reconcile_broker_transactions(db=db, run=run, client=client)
+
+        assert any("position_mismatch_resolved" in n for n in result.notes)
+        assert "position_mismatch_alerted_at" not in run.parameters

@@ -280,12 +280,162 @@ def reconcile_broker_transactions(*, db, run, client) -> ReconcileResult:
         run.last_transaction_id = new_last
     db.commit()
 
+    # Wilson 2026-08-24: position-mismatch check. On top of the
+    # transaction-log reconciliation above, compare the CURRENT OANDA
+    # position against the sum of our OPEN Trade rows. This catches:
+    #
+    #   * Stranded broker positions: DB thinks flat, OANDA holds units.
+    #     Symptom of the Aug 21 event where `_flatten_and_halt` marked
+    #     trades closed even though `close_all_positions` failed.
+    #   * Ghost DB open trades: DB has open trade, OANDA holds nothing.
+    #     Can happen if a close txn was missed and we haven't yet
+    #     processed the resulting fill.
+    #   * Direction/size drift: both have positions but they don't
+    #     agree on units.
+    #
+    # Idempotent: uses `run.parameters['position_mismatch_alerted_at']`
+    # so the alarm fires ONCE per mismatch episode, not every 60s.
+    try:
+        mismatch_note = _check_position_mismatch(db=db, run=run, client=client)
+        if mismatch_note:
+            notes.append(mismatch_note)
+    except Exception:  # noqa: BLE001 — never let a check crash the reconciler
+        logger.exception(
+            "reconciler: position-mismatch check failed on %s (continuing)",
+            run.id,
+        )
+
     return ReconcileResult(
         transactions_seen=len(txns),
         trades_updated=updated,
         new_last_transaction_id=new_last,
         notes=notes,
     )
+
+
+def _check_position_mismatch(*, db, run, client) -> str | None:
+    """Compare OANDA net position vs sum of open DB Trade units.
+
+    Returns a short human note if mismatch alarm fired this tick;
+    None if in-sync or if already-alerted state is unchanged.
+    """
+    from agentfx.api.models import Trade
+    from sqlalchemy.orm.attributes import flag_modified
+
+    # OANDA-side: net units for this instrument. `get_position` returns
+    # {"long_units": N, "short_units": M} — subtract to get signed.
+    try:
+        pos = client.get_position(run.pair)
+    except Exception:  # noqa: BLE001
+        # Broker call failed — can't verify. Skip this tick.
+        logger.warning(
+            "reconciler: get_position failed for %s (%s) — skipping mismatch check",
+            run.id,
+            run.pair,
+        )
+        return None
+    long_units = int(pos.get("long_units", 0) or 0)
+    short_units = int(pos.get("short_units", 0) or 0)
+    oanda_signed = long_units - short_units
+
+    # DB-side: sum of open trade units (with side sign).
+    open_trades = (
+        db.query(Trade)
+        .filter(Trade.run_id == run.id, Trade.exit_timestamp.is_(None))
+        .all()
+    )
+    db_signed = 0
+    for t in open_trades:
+        side_sign = 1 if (t.side or "").lower() in ("buy", "long") else -1
+        db_signed += side_sign * int(t.quantity or 0)
+
+    in_sync = oanda_signed == db_signed
+    params = dict(run.parameters or {})
+    alerted_at = params.get("position_mismatch_alerted_at")
+
+    if in_sync:
+        # Clear any prior alert marker.
+        if alerted_at is not None:
+            params.pop("position_mismatch_alerted_at", None)
+            params.pop("position_mismatch_details", None)
+            run.parameters = params
+            flag_modified(run, "parameters")
+            db.commit()
+            logger.info(
+                "reconciler: position-mismatch RESOLVED on %s (OANDA=%d, DB=%d)",
+                run.id,
+                oanda_signed,
+                db_signed,
+            )
+            return f"position_mismatch_resolved OANDA={oanda_signed} DB={db_signed}"
+        return None
+
+    # Mismatch. Idempotent: only alarm once per episode.
+    if alerted_at is not None:
+        return None
+
+    now = datetime.now(UTC)
+    diff = oanda_signed - db_signed
+    kind = (
+        "stranded_broker_position"
+        if not open_trades and oanda_signed != 0
+        else "ghost_db_trade"
+        if oanda_signed == 0 and open_trades
+        else "size_or_direction_drift"
+    )
+    logger.error(
+        "reconciler: POSITION MISMATCH on %s (%s) — "
+        "OANDA=%d, DB=%d, diff=%+d, kind=%s. Requires operator review.",
+        run.id,
+        run.pair,
+        oanda_signed,
+        db_signed,
+        diff,
+        kind,
+    )
+
+    from agentfx.services.paper_runner import _write_decision  # local to avoid cycle
+
+    _write_decision(
+        db,
+        run,
+        action="USER_POSITION_MISMATCH",
+        reason=(
+            f"OANDA position ({oanda_signed} units) does not match DB open "
+            f"trades ({db_signed} units, {len(open_trades)} rows). "
+            f"Diff={diff:+d}. Kind={kind}. "
+            f"Broker-side state may be stranded — manual review required."
+        ),
+        outputs={
+            "paper_run_id": run.id,
+            "instrument": run.pair,
+            "oanda_signed_units": oanda_signed,
+            "db_signed_units": db_signed,
+            "diff_units": diff,
+            "kind": kind,
+            "open_db_trades": [
+                {
+                    "id": t.id,
+                    "side": t.side,
+                    "units": t.quantity,
+                    "entry_price": t.entry_price,
+                }
+                for t in open_trades
+            ],
+        },
+    )
+
+    params["position_mismatch_alerted_at"] = now.isoformat()
+    params["position_mismatch_details"] = {
+        "oanda_signed_units": oanda_signed,
+        "db_signed_units": db_signed,
+        "kind": kind,
+    }
+    run.parameters = params
+    flag_modified(run, "parameters")
+    db.commit()
+
+    return f"position_mismatch_alerted OANDA={oanda_signed} DB={db_signed} kind={kind}"
 
 
 __all__ = [
