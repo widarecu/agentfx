@@ -372,6 +372,23 @@ def _check_position_mismatch(*, db, run, client) -> str | None:
     params = dict(run.parameters or {})
     alerted_at = params.get("position_mismatch_alerted_at")
 
+    # Wilson 2026-08-31: unconditional INFO log so we can prove the
+    # check is running and see what it computes. Previously the check
+    # was silent when in-sync or when already-alerted, making it hard
+    # to tell whether the mismatch alarm was skipped vs never called.
+    logger.info(
+        "reconciler mismatch tick: run=%s OANDA(long=%d, short=%d, signed=%d) "
+        "DB(open_trades=%d, signed=%d) in_sync=%s already_alerted=%s",
+        run.id,
+        long_units,
+        short_units,
+        oanda_signed,
+        len(open_trades),
+        db_signed,
+        in_sync,
+        alerted_at is not None,
+    )
+
     if in_sync:
         # Clear any prior alert marker.
         if alerted_at is not None:
