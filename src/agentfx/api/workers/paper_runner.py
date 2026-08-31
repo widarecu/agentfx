@@ -521,26 +521,35 @@ def _write_restart_decision(
     ticks. Best-effort — a decision-log write failure must not block
     the restart itself."""
     try:
+        import uuid as _uuid
+
         from agentfx.api.models import DecisionLog
 
+        # Wilson 2026-08-31: prior version used field names that don't
+        # exist on the DecisionLog model (`reason`, `metadata_json`,
+        # `timestamp`, `run_id=paper_run_id`), so every restart's audit
+        # entry silently exploded. DecisionLog.run_id FKs to
+        # evolution_runs; paper run id is stashed in outputs_json.
         db.add(
             DecisionLog(
-                run_id=run.id,
-                action="AUTO_RESTART",
+                id=_uuid.uuid4().hex,
+                run_id=None,
                 agent_type="PAPER_RUNNER_SUPERVISOR",
-                reason=(
+                action="AUTO_RESTART",
+                outputs_json={
+                    "paper_run_id": run.id,
+                    "auto_restart_attempt": attempt_number,
+                    "prior_stop_reason": prior_reason,
+                    "waited_seconds": waited_seconds,
+                },
+                reasoning_text=(
                     f"supervisor rescheduled paper run "
                     f"(attempt {attempt_number}/{_MAX_AUTO_RESTART_ATTEMPTS}) — "
                     f"prior stop_reason={prior_reason}, "
                     f"waited {waited_seconds:.0f}s of "
                     f"{_RESTART_BACKOFF_SECONDS[attempt_number - 1]:.0f}s backoff"
                 ),
-                metadata_json={
-                    "auto_restart_attempt": attempt_number,
-                    "prior_stop_reason": prior_reason,
-                    "waited_seconds": waited_seconds,
-                },
-                timestamp=datetime.now(UTC),
+                user_id=getattr(run, "user_id", None),
             )
         )
         db.commit()

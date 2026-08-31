@@ -621,3 +621,161 @@ class TestPositionMismatchCheck:
 
         assert any("position_mismatch_resolved" in n for n in result.notes)
         assert "position_mismatch_alerted_at" not in run.parameters
+
+
+class TestPositionMismatchWilsonAug31:
+    """Wilson 2026-08-31: three specific bugs found in the mismatch
+    check + reconciler flow, all covered here."""
+
+    def _run(self, parameters=None, last_txn_id="900"):
+        return SimpleNamespace(
+            id="run_test",
+            pair="EUR_USD",
+            last_transaction_id=last_txn_id,
+            parameters=parameters or {},
+            user_id=42,
+        )
+
+    def _client_with_short(self, short_units=-16741):
+        """OANDA reports short units as NEGATIVE per convention."""
+        c = MagicMock()
+        c.get_position.return_value = {
+            "long_units": 0,
+            "short_units": short_units,
+            "long": {"units": "0"},
+            "short": {
+                "units": str(short_units),
+                "averagePrice": "1.16158",
+                "tradeIDs": ["552"],
+            },
+        }
+        c.get_transactions_since.return_value = {
+            "transactions": [],
+            "lastTransactionID": "900",
+        }
+        return c
+
+    def test_short_position_mismatch_uses_correct_signed_math(self):
+        """Bug 2 fix: `oanda_signed = long + short` (short is
+        already negative), not `long - short`. Under the old code, a
+        real SHORT position at broker (short=-16741) produced
+        oanda_signed=+16741 and could look like a size-drift mismatch
+        rather than a stranded position."""
+        from agentfx.services.paper_reconciler import (
+            reconcile_broker_transactions,
+        )
+
+        run = self._run()
+        client = self._client_with_short(-16_741)
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = []
+        db.query.return_value.filter.return_value.one_or_none.return_value = None
+
+        with patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()):
+            result = reconcile_broker_transactions(db=db, run=run, client=client)
+
+        assert "position_mismatch_alerted_at" in run.parameters
+        details = run.parameters["position_mismatch_details"]
+        # Correct signed value = 0 + (-16741) = -16741
+        assert details["oanda_signed_units"] == -16_741
+        assert details["kind"] == "stranded_broker_position"
+
+    def test_mismatch_check_runs_when_last_transaction_id_is_None(self):
+        """Bug 1 fix: previously the reconciler early-returned when
+        last_transaction_id was None, skipping the mismatch check
+        entirely. Aug 28-31 event had this state throughout, so
+        alarm never fired."""
+        from agentfx.services.paper_reconciler import (
+            reconcile_broker_transactions,
+        )
+
+        # last_transaction_id=None simulates a fresh restart cycle.
+        run = self._run(last_txn_id=None)
+        client = self._client_with_short(-16_741)
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = []
+        db.query.return_value.filter.return_value.one_or_none.return_value = None
+
+        with patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()):
+            result = reconcile_broker_transactions(db=db, run=run, client=client)
+
+        # Even with no transactions to process, the mismatch check
+        # runs and detects the stranded broker position.
+        assert any("position_mismatch_alerted" in n for n in result.notes), result.notes
+        assert "position_mismatch_alerted_at" in run.parameters
+        # And the client's get_transactions_since was NOT called (still
+        # early-returned) but get_position WAS called.
+        client.get_transactions_since.assert_not_called()
+        client.get_position.assert_called()
+
+    def test_stranded_position_gets_adopted_as_new_trade_row(self):
+        """Bug 4 fix: on stranded_broker_position mismatch, adopt the
+        OANDA position into a new DB Trade row so the operator sees it
+        in the UI + the runner has an open_trade reference."""
+        from agentfx.services.paper_reconciler import (
+            reconcile_broker_transactions,
+        )
+
+        run = self._run(last_txn_id=None)
+        client = self._client_with_short(-16_741)
+        db = MagicMock()
+        # first .all() call = mismatch check (0 open trades); rest are
+        # simple MagicMock defaults.
+        db.query.return_value.filter.return_value.all.return_value = []
+        db.query.return_value.filter.return_value.one_or_none.return_value = None
+        added_rows: list = []
+        db.add = MagicMock(side_effect=lambda row: added_rows.append(row))
+
+        with patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()):
+            reconcile_broker_transactions(db=db, run=run, client=client)
+
+        # Exactly one Trade row got added — the adopted position.
+        # (Decision-log entry from mismatch alarm also goes through
+        # db.add so filter for the Trade rows.)
+        from agentfx.api.models import Trade
+
+        trade_rows = [r for r in added_rows if isinstance(r, Trade)]
+        assert len(trade_rows) == 1
+        adopted = trade_rows[0]
+        assert adopted.side == "sell"
+        assert adopted.quantity == 16_741
+        assert adopted.entry_price == 1.16158
+        assert adopted.broker_trade_id == "552"
+        assert adopted.origin == "adopted_from_broker"
+        assert adopted.exit_timestamp is None
+
+    def test_adoption_reopens_phantom_closed_trade(self):
+        """If the reconciler previously marked a trade closed
+        (broker_other/pnl=0) but the broker still holds it, adoption
+        REOPENS the DB row rather than creating a duplicate."""
+        from datetime import UTC, datetime
+
+        from agentfx.services.paper_reconciler import (
+            reconcile_broker_transactions,
+        )
+
+        run = self._run(last_txn_id=None)
+        client = self._client_with_short(-16_741)
+
+        # Existing DB row for broker_trade_id 552, phantom-closed.
+        phantom = SimpleNamespace(
+            id="tr_phantom",
+            broker_trade_id="552",
+            exit_timestamp=datetime(2026, 8, 28, 23, 54, tzinfo=UTC),
+            exit_price=1.16158,
+            pnl=0.0,
+            pnl_pct=0.0,
+            exit_reason="broker_other",
+        )
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = []
+        db.query.return_value.filter.return_value.one_or_none.return_value = phantom
+
+        with patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()):
+            reconcile_broker_transactions(db=db, run=run, client=client)
+
+        # Phantom row got REOPENED, no new Trade added.
+        assert phantom.exit_timestamp is None
+        assert phantom.exit_price is None
+        assert phantom.pnl is None
+        assert phantom.exit_reason is None

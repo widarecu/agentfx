@@ -137,11 +137,27 @@ def reconcile_broker_transactions(*, db, run, client) -> ReconcileResult:
     if run.last_transaction_id is None:
         # Not yet initialized — nothing to reconcile against. The
         # runner sets this on first successful signal-tick.
+        #
+        # Wilson 2026-08-31: still run the position-mismatch check
+        # even when the transaction log is uninitialised. That check
+        # is standalone (needs only get_position + DB open trades) and
+        # is the only detector for the phantom-flat state after a
+        # restart cycle where last_transaction_id got reset.
+        notes: list[str] = ["last_transaction_id not initialised"]
+        try:
+            mismatch_note = _check_position_mismatch(db=db, run=run, client=client)
+            if mismatch_note:
+                notes.append(mismatch_note)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "reconciler: position-mismatch check failed on %s (continuing)",
+                run.id,
+            )
         return ReconcileResult(
             transactions_seen=0,
             trades_updated=0,
             new_last_transaction_id=None,
-            notes=["last_transaction_id not initialised"],
+            notes=notes,
         )
 
     resp = client.get_transactions_since(run.last_transaction_id)
@@ -323,7 +339,10 @@ def _check_position_mismatch(*, db, run, client) -> str | None:
     from sqlalchemy.orm.attributes import flag_modified
 
     # OANDA-side: net units for this instrument. `get_position` returns
-    # {"long_units": N, "short_units": M} — subtract to get signed.
+    # {"long_units": N, "short_units": M} where M is ALREADY NEGATIVE
+    # per OANDA convention, so signed net is `long + short`.
+    # Wilson 2026-08-31: previously computed `long - short` which
+    # double-negated shorts, producing positive when broker held short.
     try:
         pos = client.get_position(run.pair)
     except Exception:  # noqa: BLE001
@@ -336,7 +355,7 @@ def _check_position_mismatch(*, db, run, client) -> str | None:
         return None
     long_units = int(pos.get("long_units", 0) or 0)
     short_units = int(pos.get("short_units", 0) or 0)
-    oanda_signed = long_units - short_units
+    oanda_signed = long_units + short_units
 
     # DB-side: sum of open trade units (with side sign).
     open_trades = (
@@ -435,7 +454,114 @@ def _check_position_mismatch(*, db, run, client) -> str | None:
     flag_modified(run, "parameters")
     db.commit()
 
+    # Wilson 2026-08-31: for the stranded-broker-position kind
+    # specifically, ADOPT the OANDA-side position into a fresh DB
+    # Trade row. Without this, the runner keeps holding through what
+    # it thinks is an existing position but the operator has no
+    # visibility in the UI (no open Trade row → nothing to see or
+    # kill). Adoption creates a Trade row derived from OANDA's
+    # authoritative state.
+    if kind == "stranded_broker_position":
+        try:
+            _adopt_stranded_position(db=db, run=run, pos=pos, now=now)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "reconciler: adoption of stranded position failed for %s "
+                "(alarm already fired)",
+                run.id,
+            )
+
     return f"position_mismatch_alerted OANDA={oanda_signed} DB={db_signed} kind={kind}"
+
+
+def _adopt_stranded_position(*, db, run, pos: dict, now: datetime) -> None:
+    """Create a DB Trade row that mirrors OANDA's currently-open
+    position for this run. Fires from `_check_position_mismatch` when
+    we've confirmed the broker holds units the DB doesn't know about.
+
+    Uses the OANDA-reported entry (averagePrice, opening time from
+    the trade block) so the runner + UI see the position matching
+    what the operator sees at the broker.
+    """
+    import uuid as _uuid
+
+    from agentfx.api.models import Trade
+
+    long_side = pos.get("long") or {}
+    short_side = pos.get("short") or {}
+    long_units = int(pos.get("long_units", 0) or 0)
+    short_units = int(pos.get("short_units", 0) or 0)
+
+    if long_units > 0:
+        units = long_units
+        side = "buy"
+        entry_price = float(long_side.get("averagePrice") or 0.0)
+        trade_ids = long_side.get("tradeIDs") or []
+    elif short_units < 0:
+        units = abs(short_units)
+        side = "sell"
+        entry_price = float(short_side.get("averagePrice") or 0.0)
+        trade_ids = short_side.get("tradeIDs") or []
+    else:
+        return  # nothing to adopt
+
+    broker_trade_id = str(trade_ids[0]) if trade_ids else None
+
+    # Idempotent: if we've already adopted this broker_trade_id, don't
+    # add another row.
+    if broker_trade_id:
+        existing = (
+            db.query(Trade)
+            .filter(
+                Trade.run_id == run.id,
+                Trade.broker_trade_id == broker_trade_id,
+            )
+            .one_or_none()
+        )
+        if existing is not None:
+            if existing.exit_timestamp is not None:
+                # The prior phantom-close bug marked this trade closed
+                # with pnl=0. Reopen it so the runner + UI see live state.
+                existing.exit_timestamp = None
+                existing.exit_price = None
+                existing.pnl = None
+                existing.pnl_pct = None
+                existing.exit_reason = None
+                db.commit()
+                logger.warning(
+                    "reconciler: REOPENED trade %s (broker_trade_id=%s) — was "
+                    "phantom-closed but broker still holds it",
+                    existing.id,
+                    broker_trade_id,
+                )
+            return
+
+    trade = Trade(
+        id=f"tr_adopted_{_uuid.uuid4().hex[:12]}",
+        run_id=run.id,
+        side=side,
+        quantity=float(units),
+        entry_price=entry_price,
+        entry_timestamp=now,
+        origin="adopted_from_broker",
+        signal_reason=(
+            f"AUTO-ADOPTED from OANDA — broker held {side} {units} "
+            f"@ {entry_price} that DB had no record of. Reconciler "
+            f"created this row so the runner + UI reflect real state."
+        ),
+        broker_trade_id=broker_trade_id,
+    )
+    db.add(trade)
+    db.commit()
+    logger.warning(
+        "reconciler: ADOPTED broker position as new Trade row %s "
+        "(side=%s units=%d entry=%.5f broker_trade_id=%s)",
+        trade.id,
+        side,
+        units,
+        entry_price,
+        broker_trade_id,
+    )
 
 
 __all__ = [
