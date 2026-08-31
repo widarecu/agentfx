@@ -2317,9 +2317,10 @@ def _flatten_and_halt(db, run, client, *, reason: str, sleep_fn=time.sleep) -> N
     from agentfx.api.models import RunStatus, Trade
 
     close_ok = False
+    close_result: dict | None = None
     for attempt in range(1, _FLATTEN_RETRY_LIMIT + 1):
         try:
-            client.close_all_positions(run.pair)
+            close_result = client.close_all_positions(run.pair)
             close_ok = True
             if attempt > 1:
                 logger.info(
@@ -2348,6 +2349,55 @@ def _flatten_and_halt(db, run, client, *, reason: str, sleep_fn=time.sleep) -> N
             run.id,
             _FLATTEN_RETRY_LIMIT,
         )
+
+    # Wilson 2026-08-31: `close_all_positions` returns a "success"
+    # dict without actually closing anything in two cases:
+    #   * `get_position` returned 0/0 units → short-circuit no-op
+    #   * OANDA rejected with CLOSEOUT_POSITION_DOESNT_EXIST → benign
+    # During an OANDA maintenance window (like Aug 28 23:35 UTC), the
+    # position endpoint can return stale 0/0 even when the position is
+    # still open. Under the old code, my `if close_ok:` branch marked
+    # DB trades closed → phantom-flat state.
+    #
+    # Cross-check: if close_ok but the OANDA response says ZERO units
+    # were actually closed AND we had open DB trades, VERIFY with a
+    # fresh get_position before trusting the close. If OANDA still
+    # holds units, the API was lying — flip to stranded semantics.
+    close_actually_did_something = True
+    if close_ok and close_result is not None:
+        units_reported_closed = abs(
+            int(close_result.get("long_units_closed", 0) or 0)
+        ) + abs(int(close_result.get("short_units_closed", 0) or 0))
+        if units_reported_closed == 0:
+            # No fill returned. Verify OANDA state before trusting.
+            try:
+                verify_pos = client.get_position(run.pair)
+                verify_long = int(verify_pos.get("long_units", 0) or 0)
+                verify_short = int(verify_pos.get("short_units", 0) or 0)
+                if verify_long != 0 or verify_short != 0:
+                    logger.error(
+                        "paper runner: %s close_all_positions returned "
+                        "success but 0 units closed; get_position "
+                        "verified position STILL OPEN "
+                        "(long=%d short=%d). Treating as stranded — DB "
+                        "trades stay OPEN for reconciler to reconcile.",
+                        run.id,
+                        verify_long,
+                        verify_short,
+                    )
+                    close_ok = False
+                    close_actually_did_something = False
+            except Exception:  # noqa: BLE001
+                # Verification call failed too — be conservative and
+                # treat as stranded rather than mark closed on
+                # unverified state.
+                logger.warning(
+                    "paper runner: %s close_all_positions verification "
+                    "get_position failed; treating as stranded to be safe",
+                    run.id,
+                )
+                close_ok = False
+                close_actually_did_something = False
 
     # Wilson 2026-08-24: previously we marked open Trade rows CLOSED
     # even when `close_all_positions` failed — the DB then lied that

@@ -538,6 +538,68 @@ class TestExecuteLoop:
         assert run.status == RunStatus.ERROR
         assert run.stop_reason == "BROKER_NETWORK"
 
+    def test_flatten_verifies_when_close_returns_zero_units(self):
+        """Wilson 2026-08-31: `close_all_positions` can return a
+        success dict (`long_units_closed=0, short_units_closed=0`)
+        without actually closing anything — happens when OANDA's
+        `get_position` returned 0/0 during maintenance and the close
+        short-circuited. Under the old code, my `if close_ok:` branch
+        marked DB trades closed → phantom-flat.
+
+        Fix 5: when close reports 0 units closed AND we had open
+        trades, re-verify with a fresh get_position. If OANDA still
+        shows units, treat as stranded (do NOT mark closed)."""
+        from types import SimpleNamespace
+
+        from agentfx.api.models import RunStatus
+        from agentfx.services.paper_runner import _flatten_and_halt
+
+        run = SimpleNamespace(
+            id="run_phantom_close",
+            pair="EUR_USD",
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+            parameters={},
+            user_id=42,
+        )
+        open_trade = SimpleNamespace(
+            id="tr_stranded",
+            side="sell",
+            quantity=16741,
+            entry_price=1.16158,
+            entry_timestamp=datetime(2026, 8, 28, 14, 8, tzinfo=UTC),
+            exit_timestamp=None,
+            exit_price=None,
+            pnl=None,
+            exit_reason=None,
+        )
+        client = MagicMock()
+        # Close returns "0 units closed" — the OANDA short-circuit path.
+        client.close_all_positions.return_value = {
+            "long_units_closed": 0,
+            "short_units_closed": 0,
+        }
+        # Verification get_position shows OANDA STILL holds the short.
+        client.get_position.return_value = {
+            "long_units": 0,
+            "short_units": -16741,
+        }
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = [open_trade]
+
+        with patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()):
+            _flatten_and_halt(
+                db, run, client, reason="BROKER_NETWORK", sleep_fn=MagicMock()
+            )
+
+        # Trade row must NOT be marked closed — phantom-close prevented.
+        assert open_trade.exit_timestamp is None
+        assert open_trade.pnl is None
+        assert open_trade.exit_reason is None
+        # Stranded marker recorded so operator + reconciler see it.
+        assert "stranded_positions" in run.parameters
+
     def test_flatten_closes_trade_rows_when_broker_close_succeeds(self):
         """The happy path: broker close succeeded, so DB rows get the
         usual closed treatment. Nothing was regressed by the fix
