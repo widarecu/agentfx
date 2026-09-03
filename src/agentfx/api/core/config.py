@@ -334,29 +334,72 @@ class Settings(BaseSettings):
         description="Maximum gaps to process per instrument/granularity per health check cycle",
     )
 
-    # Notifications (v0.6.2 — Wilson UAT 2026-07-19)
-    # Slack incoming webhook for paper-run terminal / crash alerts.
-    # Empty (default) → notifications short-circuit at every call
-    # site; the runner keeps working unchanged. Set in Railway
-    # dashboard for staging; set in `.env.uat` for local UAT.
-    SLACK_WEBHOOK_URL: str = Field(
-        default="",
-        env="SLACK_WEBHOOK_URL",
-        description=(
-            "Slack incoming webhook URL. Empty = notifications disabled. "
-            "Used by `agentfx.notifications.slack` for paper-run halt / "
-            "crash alerts."
-        ),
-    )
-
+    # Notifications — email (Wilson 2026-08-31)
+    # Replaced the earlier Slack webhook path — Slack push notifications
+    # weren't reliably reaching Wilson's phone. Email via SMTP is the
+    # interim channel until a proper mobile app ships. SMTP config is
+    # deployment-set (Railway env vars); empty SMTP_HOST short-circuits
+    # every call site so tests + unconfigured envs never leak.
     NOTIFICATIONS_ENABLED: bool = Field(
         default=True,
         env="NOTIFICATIONS_ENABLED",
         description=(
             "Master on/off for outbound notifications. Set to False in the "
             "test environment (conftest overrides this) so unit tests can't "
-            "leak real HTTP to Slack. In production, keep True and control "
-            "delivery via SLACK_WEBHOOK_URL presence."
+            "leak real emails. In production, keep True and control "
+            "delivery via SMTP_HOST presence."
+        ),
+    )
+    SMTP_HOST: str = Field(
+        default="",
+        env="SMTP_HOST",
+        description=(
+            "SMTP server hostname (e.g. smtp.sendgrid.net, smtp.gmail.com, "
+            "smtp-mail.outlook.com). Empty = email notifications disabled."
+        ),
+    )
+    SMTP_PORT: int = Field(
+        default=587,
+        env="SMTP_PORT",
+        description="SMTP submission port. Default 587 (STARTTLS).",
+    )
+    SMTP_USER: str = Field(
+        default="",
+        env="SMTP_USER",
+        description=(
+            "SMTP auth username. For SendGrid this is literally 'apikey'; "
+            "for Gmail/Outlook it's the sender address."
+        ),
+    )
+    SMTP_PASSWORD: str = Field(
+        default="",
+        env="SMTP_PASSWORD",
+        description=("SMTP auth password / API key / app password. Never logged."),
+    )
+    EMAIL_FROM: str = Field(
+        default="",
+        env="EMAIL_FROM",
+        description=(
+            "Envelope 'From' address for outbound alerts. Must be authorised "
+            "by the SMTP provider (e.g. a SendGrid-verified sender)."
+        ),
+    )
+    EMAIL_TO: str = Field(
+        default="",
+        env="EMAIL_TO",
+        description=(
+            "Recipient address(es) for paper-run alerts. Comma-separated "
+            "for multiple. Empty = no recipient, notifications short-circuit."
+        ),
+    )
+    # Legacy Slack config — kept for one release so old deployments don't
+    # break on rollback. New code MUST NOT read it. Delete after v0.7.x.
+    SLACK_WEBHOOK_URL: str = Field(
+        default="",
+        env="SLACK_WEBHOOK_URL",
+        description=(
+            "DEPRECATED: replaced by SMTP_* + EMAIL_* email notifications. "
+            "Kept temporarily so rollbacks don't fail-fast on missing var."
         ),
     )
 

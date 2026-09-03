@@ -672,10 +672,13 @@ class TestMarkTerminal:
 
     def test_invokes_notification_hook_once_per_unique_reason(self, monkeypatch):
         """Wilson UAT 2026-07-19 — every terminal event should fire
-        exactly one Slack alert. Re-entrant halt paths must not spam
-        the channel (see `_should_send` dedup)."""
+        exactly one email alert. Re-entrant halt paths must not spam
+        the inbox (see `_should_send` dedup).
+
+        Wilson 2026-08-31: notifications channel migrated from Slack to
+        email; dedup semantics + hook wiring assertions are unchanged."""
         from agentfx.api.models import RunStatus
-        from agentfx.notifications import slack as slack_module
+        from agentfx.notifications import email as email_module
 
         calls: list[tuple[str, str]] = []
 
@@ -683,7 +686,7 @@ class TestMarkTerminal:
             calls.append((kwargs["run"].id, kwargs["reason"]))
             # Also mutate parameters like the real helper does, so
             # dedup semantics are exercised end-to-end.
-            slack_module._mark_notified(kwargs["run"], kwargs["reason"])
+            email_module._mark_notified(kwargs["run"], kwargs["reason"])
 
         monkeypatch.setattr("agentfx.notifications.post_paper_run_alert", spy_post)
 
@@ -707,9 +710,8 @@ class TestMarkTerminal:
         # The spy IS called again because our monkeypatch bypasses
         # the real dedup — but the actual `post_paper_run_alert` DOES
         # dedup via `run.parameters['notified']`, verified in
-        # tests/unit/notifications/test_slack.py::
-        # test_second_call_same_reason_does_not_post_again. Here we
-        # just assert the hook wiring itself works.
+        # tests/unit/notifications/test_email.py — dedup lives there.
+        # Here we just assert the hook wiring itself works.
         assert len(calls) == 2  # hook fires; dedup lives inside the hook
 
     def test_hook_exception_does_not_break_terminal_write(self, monkeypatch):
