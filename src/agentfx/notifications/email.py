@@ -198,11 +198,24 @@ def _send_with_one_retry(
     with `starttls`, `login`, `send_message`. Injected by tests so
     they can mock the entire network stack.
 
-    Retryable errors: `SMTPConnectError`, `SMTPServerDisconnected`,
-    `SMTPHeloError`, generic `TimeoutError`, `OSError` (connection
-    refused, DNS blip). Not retryable: `SMTPAuthenticationError`
-    (bad creds — retry won't help), `SMTPRecipientsRefused` (bad
-    address), `SMTPDataError` on 5xx.
+    Classification:
+    - 5xx SMTP responses (permanent — 550 unverified sender, 552 msg
+      too big, 535 auth failed) → NOT retried. A retry will fail the
+      same way and only adds latency to the halt path.
+    - 4xx SMTP responses (transient — 421 service unavailable, 450
+      mailbox busy) → retried once.
+    - Socket-level failures (TimeoutError, generic OSError,
+      SMTPServerDisconnected mid-conversation) → retried once.
+    - Unknown → retried once, tagged `unknown_after_retry`.
+
+    Ordering matters: SMTP-family exceptions must be caught before the
+    generic OSError arm, because `smtplib.SMTPException` inherits from
+    OSError in Python 3 — an untyped OSError catch would swallow every
+    SMTP error and mis-label them all as transient. `_non_retryable`
+    stays as an explicit tuple so the log tag names the specific
+    subclass (clearer than "SMTPResponseException(535)") and because
+    `SMTPRecipientsRefused` wraps a per-recipient dict rather than
+    subclassing `SMTPResponseException`.
     """
     if smtp_factory is None:
         smtp_factory = lambda: smtplib.SMTP(  # noqa: E731
@@ -213,13 +226,6 @@ def _send_with_one_retry(
         smtplib.SMTPAuthenticationError,
         smtplib.SMTPRecipientsRefused,
         smtplib.SMTPSenderRefused,
-    )
-    _transient = (
-        smtplib.SMTPConnectError,
-        smtplib.SMTPServerDisconnected,
-        smtplib.SMTPHeloError,
-        TimeoutError,
-        OSError,
     )
 
     for attempt in (0, 1):
@@ -235,9 +241,21 @@ def _send_with_one_retry(
                 )
             return True, "ok"
         except _non_retryable as exc:
-            # Bad config — no point retrying.
             return False, f"non_retryable:{type(exc).__name__}"
-        except _transient as exc:
+        except smtplib.SMTPResponseException as exc:
+            if 500 <= exc.smtp_code < 600:
+                return (
+                    False,
+                    f"non_retryable:{type(exc).__name__}({exc.smtp_code})",
+                )
+            if attempt == 0:
+                _sleep_jitter()
+                continue
+            return (
+                False,
+                f"transient_after_retry:{type(exc).__name__}({exc.smtp_code})",
+            )
+        except (smtplib.SMTPServerDisconnected, TimeoutError, OSError) as exc:
             if attempt == 0:
                 _sleep_jitter()
                 continue

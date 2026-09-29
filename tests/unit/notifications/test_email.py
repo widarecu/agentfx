@@ -20,6 +20,8 @@ import pytest
 from smtplib import (
     SMTPAuthenticationError,
     SMTPConnectError,
+    SMTPDataError,
+    SMTPResponseException,
     SMTPServerDisconnected,
 )
 
@@ -328,6 +330,67 @@ class TestSendWithOneRetry:
         assert "SMTPAuthenticationError" in detail
         # Exactly one attempt — no retry after auth failure.
         assert factory.call_count == 1
+
+    def test_5xx_data_error_is_not_retried(self, monkeypatch):
+        """A 550 unverified-sender (the exact class of failure we hit
+        in UAT smoke-testing) will fail identically on retry. Must be
+        classified non-retryable so we don't waste latency in the halt
+        path and so logs distinguish real transient network errors
+        from permanent config errors."""
+        monkeypatch.setattr(email_module, "_sleep_jitter", lambda: None)
+        smtp = MagicMock()
+        smtp.__enter__ = MagicMock(return_value=smtp)
+        smtp.__exit__ = MagicMock(return_value=False)
+        smtp.send_message.side_effect = SMTPDataError(
+            550, b"The from address does not match a verified Sender Identity"
+        )
+
+        factory = MagicMock(return_value=smtp)
+        ok, detail = email_module._send_with_one_retry(
+            smtp_host="smtp.example.com",
+            smtp_port=587,
+            smtp_user="apikey",
+            smtp_password="s3cret",
+            email_from="unverified@x.com",
+            email_to="wilson@x.com",
+            msg=self._msg(),
+            smtp_factory=factory,
+        )
+        assert ok is False
+        assert "non_retryable" in detail
+        assert "SMTPDataError" in detail
+        assert "550" in detail
+        # Exactly one attempt — no wasted retry after a permanent 5xx.
+        assert factory.call_count == 1
+
+    def test_4xx_response_error_is_retried(self, monkeypatch):
+        """A 4xx is genuinely transient — server asked us to come
+        back later. Must be retried once, and if the retry also fails,
+        tagged as `transient_after_retry` with the code."""
+        monkeypatch.setattr(email_module, "_sleep_jitter", lambda: None)
+        smtp = MagicMock()
+        smtp.__enter__ = MagicMock(return_value=smtp)
+        smtp.__exit__ = MagicMock(return_value=False)
+        smtp.send_message.side_effect = SMTPResponseException(
+            421, b"service unavailable"
+        )
+
+        factory = MagicMock(return_value=smtp)
+        ok, detail = email_module._send_with_one_retry(
+            smtp_host="smtp.example.com",
+            smtp_port=587,
+            smtp_user="apikey",
+            smtp_password="s3cret",
+            email_from="alerts@x.com",
+            email_to="wilson@x.com",
+            msg=self._msg(),
+            smtp_factory=factory,
+        )
+        assert ok is False
+        assert "transient_after_retry" in detail
+        assert "421" in detail
+        # Two attempts — initial + one retry.
+        assert factory.call_count == 2
 
     def test_login_skipped_when_no_credentials(self):
         """Some providers accept anonymous submission when the sender
