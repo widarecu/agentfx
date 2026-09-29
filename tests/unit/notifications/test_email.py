@@ -149,7 +149,49 @@ class TestBuildMessage:
         )
         assert "LOSS_CAP_HIT" in msg["Subject"]
         assert "run_abc" in msg["Subject"]
+        # No environment passed → plain [AgentFX] prefix, no tag.
         assert "[AgentFX]" in msg["Subject"]
+        assert "[AgentFX " not in msg["Subject"]
+
+    def test_subject_carries_environment_tag(self):
+        """The env tag is what triages a mobile push preview — a UAT
+        smoke email must look instantly different from a PROD halt."""
+        for env, tag in [
+            ("uat", "UAT"),
+            ("staging", "STAGING"),
+            ("production", "PROD"),
+            ("development", "DEV"),
+        ]:
+            msg = email_module._build_message(
+                run=self._run(),
+                reason="USER_KILL",
+                extra=None,
+                portal_base_url=None,
+                email_from="alerts@agentfx.com",
+                email_to="wilson@x.com",
+                environment=env,
+            )
+            assert f"[AgentFX {tag}]" in msg["Subject"], (
+                f"expected [AgentFX {tag}] prefix for env={env}, got {msg['Subject']}"
+            )
+            body = msg.get_content()
+            assert f"Environment: {tag}" in body
+
+    def test_unknown_environment_drops_tag_silently(self):
+        """A garbage env value must not surface in the subject — better
+        no tag than misleading text."""
+        msg = email_module._build_message(
+            run=self._run(),
+            reason="USER_KILL",
+            extra=None,
+            portal_base_url=None,
+            email_from="alerts@agentfx.com",
+            email_to="wilson@x.com",
+            environment="nonsense",
+        )
+        assert msg["Subject"].startswith("[AgentFX]")
+        assert "nonsense" not in msg["Subject"]
+        assert "Environment:" not in msg.get_content()
 
     def test_body_contains_core_facts(self):
         msg = email_module._build_message(
@@ -436,6 +478,7 @@ class TestPostPaperRunAlert:
         enabled: bool = True,
         smtp_host: str = "smtp.example.com",
         email_to: str = "wilson@x.com",
+        environment: str = "test",
     ):
         return SimpleNamespace(
             NOTIFICATIONS_ENABLED=enabled,
@@ -445,6 +488,7 @@ class TestPostPaperRunAlert:
             SMTP_PASSWORD="s3cret",
             EMAIL_FROM="alerts@agentfx.com",
             EMAIL_TO=email_to,
+            ENVIRONMENT=environment,
         )
 
     def test_short_circuits_when_smtp_not_configured(self):

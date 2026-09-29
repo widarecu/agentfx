@@ -118,6 +118,15 @@ def _fmt_num(x: Any, prefix: str = "") -> str:
         return str(x)
 
 
+_ENV_TAG = {
+    "development": "DEV",
+    "test": "TEST",
+    "uat": "UAT",
+    "staging": "STAGING",
+    "production": "PROD",
+}
+
+
 def _build_message(
     *,
     run: Any,
@@ -126,12 +135,19 @@ def _build_message(
     portal_base_url: str | None,
     email_from: str,
     email_to: str,
+    environment: str | None = None,
 ) -> EmailMessage:
     """Build the outgoing email. Pure — no I/O.
 
     Fields pulled from the Run row are all optional so a stub-run
     (SimpleNamespace) in tests and a partially-populated row in
     production both serialise cleanly.
+
+    `environment` (optional) — one of the ENVIRONMENT literal values
+    (`development`, `test`, `uat`, `staging`, `production`). Tagged
+    into the subject prefix so a UAT smoke alert reads instantly
+    different from a real production halt in a mobile push preview.
+    Unknown values are dropped (no tag) rather than surfacing garbage.
     """
     run_id = str(getattr(run, "id", "unknown"))
     status = getattr(run, "status", None)
@@ -140,13 +156,14 @@ def _build_message(
     instrument = getattr(run, "pair", None)
     run_name = getattr(run, "name", None)
 
-    subject = f"[AgentFX] Paper run halted — {reason} ({run_id[:24]}…)"
+    env_tag = _ENV_TAG.get((environment or "").lower())
+    subject_prefix = f"[AgentFX {env_tag}]" if env_tag else "[AgentFX]"
+    subject = f"{subject_prefix} Paper run halted — {reason} ({run_id[:24]}…)"
 
-    body_lines = [
-        "AgentFX paper run halted.",
-        "",
-        f"Run:        {run_id}",
-    ]
+    body_lines = ["AgentFX paper run halted.", ""]
+    if env_tag:
+        body_lines.append(f"Environment: {env_tag}")
+    body_lines.append(f"Run:        {run_id}")
     if run_name:
         body_lines.append(f"Name:       {run_name}")
     body_lines.extend(
@@ -349,6 +366,7 @@ def post_paper_run_alert(
             portal_base_url=_infer_portal_base_url(),
             email_from=settings.EMAIL_FROM or settings.SMTP_USER,
             email_to=settings.EMAIL_TO,
+            environment=settings.ENVIRONMENT,
         )
         ok, detail = _send_with_one_retry(
             smtp_host=settings.SMTP_HOST,
