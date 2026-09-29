@@ -316,17 +316,17 @@ The current evolve → evaluate → repeat loop is optimization without learning
 
 ### User stories
 
-- [ ] `TODO` [US-017 — Paper Trading UX design lockdown](requirements/US-017-paper-trading-ux-design.md)
-- [ ] `TODO` [US-018 — Per-user RBAC filter on runs, jobs, genomes](requirements/US-018-rbac-user-isolation.md) — **also closes an existing security bug** where any authenticated user sees all runs, not just their own
-- [ ] `TODO` [US-019 — Per-user OANDA credentials, encrypted at rest](requirements/US-019-per-user-oanda-credentials.md)
-- [ ] `TODO` [US-020 — OANDA order-execution adapter methods](requirements/US-020-oanda-order-execution.md)
-- [ ] `TODO` [US-021 — Paper runner service + subprocess model](requirements/US-021-paper-runner-service.md)
-- [ ] `TODO` [US-022 — Paper trading portal pages (`/settings`, `/paper`, `/paper/approvals`, `/paper/:id`)](requirements/US-022-paper-trading-portal.md)
-- [ ] `TODO` [US-023 — Kill switch + risk controls + approval state machine](requirements/US-023-kill-switch-risk-controls.md)
+- [x] `DONE` [US-017 — Paper Trading UX design lockdown](requirements/US-017-paper-trading-ux-design.md)
+- [x] `DONE` [US-018 — Per-user RBAC filter on runs, jobs, genomes](requirements/US-018-rbac-user-isolation.md) — closed the pre-existing security bug where any authenticated user saw all runs. `api/routers/paper.py` `require_admin_for_scope_all` + `created_by_filter`; `list_approval_queue_for_user(user_id)`.
+- [x] `DONE` [US-019 — Per-user OANDA credentials, encrypted at rest](requirements/US-019-per-user-oanda-credentials.md) — `api/models/user_credentials.py` (Fernet `oanda_api_key_encrypted`, `key_version=1`), `api/core/secrets.py`, `CredentialsForm.tsx`.
+- [x] `DONE` [US-020 — OANDA order-execution adapter methods](requirements/US-020-oanda-order-execution.md) — `client.place_market_order` wired at `paper_runner.py`; tuning in `b84644c`, `398a6c0`.
+- [x] `DONE` [US-021 — Paper runner service + subprocess model](requirements/US-021-paper-runner-service.md) — `services/paper_runner.py` (2400+ LOC) + `api/workers/paper_runner.py` supervisor.
+- [x] `DONE` [US-022 — Paper trading portal pages (`/settings`, `/paper`, `/paper/approvals`, `/paper/:id`)](requirements/US-022-paper-trading-portal.md) — `PaperRuns.tsx`, `PaperRunDetail.tsx`, `Settings.tsx`, `ApprovalQueue.tsx` plus mobile variants.
+- [x] `DONE` [US-023 — Kill switch + risk controls + approval state machine](requirements/US-023-kill-switch-risk-controls.md) — `KillSwitchButton.tsx`; `models/run.py` `kill_requested_at`, `risk_config`, `stop_reason=USER_KILL`.
 
 ### Deferred to v0.6.1
 
-- [ ] `DEFERRED to v0.6.1` Email / Slack notifications for approval requests, kill events, risk-control triggers
+- [x] `DONE (v0.6.2)` ~~Email / Slack notifications~~ **Email notifications** for approval requests, kill events, risk-control triggers. Ship history: Slack-webhook first (v0.6.2, since removed) → replaced with SendGrid SMTP email in 2026-09-29 (`352b1e4`, `19dc281`, `92f1dc6`). `notifications/email.py`, env-tagged subjects (`[AgentFX UAT|STAGING|PROD]`). Kill + halt + crash events wired; approval-request notifications intentionally NOT emailed (they land in the in-portal queue, no operator interruption warranted).
 - [ ] `DEFERRED to v0.6.1` Live-vs-validation drift alerts as a separate UI surface (basic overlay chart is in MVP)
 - [ ] `DEFERRED to v0.6.1+` OANDA v20 pricing stream (WebSocket) — replaces 60s polling if latency becomes a blocker
 - [ ] `DEFERRED to v0.7.0` Fernet key rotation → `key_version=2` on `user_oanda_credentials`
@@ -344,18 +344,57 @@ The current evolve → evaluate → repeat loop is optimization without learning
 
 ### User stories
 
-- [ ] `TODO` [US-024 — Paper runner live DSL execution](requirements/US-024-paper-runner-live-execution.md) — every granularity tick: fetch candles → compile DSL → generate_signals → decide_action → place_market_order / close_all_positions → persist trades. Two internal timers (5s health, granularity-aligned signal).
-- [ ] `TODO` [US-025 — Trades / decisions / equity read endpoints](requirements/US-025-paper-run-read-endpoints.md) — three RBAC-scoped `GET /paper-runs/{id}/*` endpoints wired into the existing frontend placeholders.
-- [ ] `TODO` [US-026 — Persisted equity snapshots + backtest OOS overlay](requirements/US-026-persisted-equity-and-backtest-overlay.md) — new `paper_equity_snapshots` table + `GET /paper-runs/{id}/backtest-overlay` so LivePnLChart survives reload and shows real backtest data.
+- [x] `DONE` [US-024 — Paper runner live DSL execution](requirements/US-024-paper-runner-live-execution.md) — `paper_runner.py` imports `StrategySpec/compile_spec`, validates DSL, calls `place_market_order`. Walk-driven signal tick shipped in `398a6c0` (677-line rewrite).
+- [x] `DONE` [US-025 — Trades / decisions / equity read endpoints](requirements/US-025-paper-run-read-endpoints.md) — `/paper-runs/{id}/trades`, `/decisions`, `/equity` in `api/routers/paper.py`; frontend `PaperRunTradesTable.tsx`, `PaperRunDecisionLog.tsx`.
+- [x] `DONE` [US-026 — Persisted equity snapshots + backtest OOS overlay](requirements/US-026-persisted-equity-and-backtest-overlay.md) — migration `2026_07_10_1000_add_paper_equity_snapshots.py`; endpoint `/paper-runs/{id}/backtest-overlay`; `LivePnLChart.tsx` (UAT-driven fixes 2026-07-24 to 2026-07-28).
 - [x] `DONE` [US-027 — Approval queue diagnostics + ADMIN validator override](requirements/US-027-approval-queue-diagnostics.md) — 2026-07-09 audit found the validator write-back is working (255 correct `false` verdicts on Wilson's UAT DB). The queue is empty because 0/2,040 OOS folds ever cleared Gate B, not a bug. Shipped: empty-state diagnostic banner (`_pickEmptyBannerScenario` at `ApprovalQueue.tsx:168`), `ApprovalQueueMeta` counts + `top_close_to_passing` list, ADMIN-only `USER_VALIDATOR_OVERRIDE` DecisionLog audit trail. Frontend tests (`ValidatorOverrideModal.test.tsx` + `ApprovalQueue.test.tsx`) still not written — v0.7.0 housekeeping backlog item.
 - [x] `DONE` [US-028 — DeployPaperModal SL/TP fields](requirements/US-028-deploy-modal-sl-tp-fields.md) — SL/TP NumericField rows shipped under "Advanced risk controls"; `run.risk_config.stop_loss_pips` + `take_profit_pips` passed to `client.place_market_order`.
 
 ### Deferred to v0.6.2
 
-- [ ] `DEFERRED to v0.6.2` LLM-suggested deployment name on DeployPaperModal (POST /paper-runs/generate-name → Haiku summarises the DSL into a memorable identifier). Was previously earmarked for v0.6.1; moved out to keep the sprint focused on live execution.
-- [x] `DONE (v0.6.2)` Slack notifications for terminal + crash events. Shipped: `notifications/slack.py` (post_paper_run_alert), hooks in `paper_runner._mark_terminal` and watchdog crash handler. Idempotent per (run_id, reason) via `run.parameters['notified']`. 29 unit tests. Config: `SLACK_WEBHOOK_URL` + `NOTIFICATIONS_ENABLED` env vars, set on Railway staging. Email deferred indefinitely (Slack covered the operational need).
+- [x] `DONE (v0.6.2)` LLM-suggested deployment name on DeployPaperModal (`c2db0a5`, 2026-08-03). Endpoint `POST /paper-runs/suggest-name` (`api/routers/paper.py`); service `api/services/paper.py::suggest_deployment_name`; UI in `DeployPaperModal.tsx`.
+- [x] `DONE (v0.6.2 → migrated 2026-09)` Terminal + crash-event notifications. Initial ship was Slack (`notifications/slack.py`, `SLACK_WEBHOOK_URL`) — hit mobile-push reliability issues on Wilson's phone. **Replaced with email** on 2026-09-29 (`352b1e4`, `19dc281`, `92f1dc6`): `notifications/email.py` (SendGrid SMTP via `SMTP_HOST/PORT/USER/PASSWORD/EMAIL_FROM/EMAIL_TO`); subject prefixed with `[AgentFX <ENV>]`; 5xx rejections classified non-retryable. Idempotency invariant preserved via `run.parameters['notified']`. `SLACK_WEBHOOK_URL` retained as deprecated no-op for rollback; slated for removal in v0.8.0 housekeeping.
 - [ ] `DEFERRED to v0.6.2` OANDA v20 streaming pricing (replaces `get_pricing` polling on the signal tick).
 - [ ] `DEFERRED to v0.6.2` Live-vs-validation drift dashboard as a separate UI surface.
+
+---
+
+## v0.6.3 — Paper Runner Reliability (2026-08 → 2026-09)
+
+**Theme:** Turn the paper runner from "works on the happy path" into
+"survives real UAT wall-clock" — subprocess crashes recover
+automatically, OANDA API weirdness doesn't strand positions, and the
+DB never disagrees with the broker without an operator seeing an alert.
+
+**Genesis:** A UAT paper run halted with the DB marked flat while
+OANDA still held units (phantom-flat state). Root cause chain:
+`close_all_positions` short-circuited to success when a stale
+`get_position` returned 0/0 during OANDA maintenance; runner marked
+trades closed; subprocess later died silently; supervisor's zombie
+detection didn't fire; mismatch reconciler never reached its check.
+Six commits over August/September closed the loop.
+
+### Shipped
+
+- [x] `DONE` Auto-recovery: wide retry + supervisor restart scan (`3bb47bf`) — `api/workers/paper_runner.py::scan_and_restart_transient_errors` + `scan_and_restart_zombie_running` scheduled from `api/main.py` (`paper-runner-auto-restart-supervisor`).
+- [x] `DONE` Stranded-position + zombie-runner recovery scaffolding (`da63de7`) — heartbeat + pid tracking in `services/paper_runner.py`; `run.parameters['last_heartbeat_at']`, `run.process_pid`.
+- [x] `DONE` Position-mismatch check fires + stranded-position auto-adopt (`44368c9`) — `_check_position_mismatch` + `_adopt_stranded_position` in the reconciler; creates fresh Trade row or reopens phantom-closed one.
+- [x] `DONE` Verify close actually closed before marking DB flat (`9bdaba6`) — `_flatten_and_halt` cross-checks `close_all_positions` return dict + `get_position` re-fetch; writes `USER_POSITION_STRANDED` if broker still holds units.
+- [x] `DONE` Unconditional log line in position-mismatch check (`d63622a`) — diagnostic to catch cases where the check silently doesn't fire.
+- [x] `DONE` Survive OANDA balance-refresh timeouts + rename `daily_loss_pct` (`29fb008`).
+
+### v0.6.3 additional shipped items
+
+- [x] `DONE` DSL `eval_mode: "close" | "wick"` (`fc87230`) — new `Literal["close", "wick"]` field on `core/dsl/grammar.py`, wick-touch SL/TP semantics in `core/dsl/compiler.py`, aligned runner path in `paper_runner.py`. Closes the runner-vs-backtest divergence surfaced by UAT 2026-07-28.
+- [x] `DONE` OANDA account exclusivity guards + missing run-name display (`248da49`) — prevents two paper runs from sharing the same OANDA account; adds `OandaAccountsTable.tsx`.
+- [x] `DONE` Broker order carries only wide fail-safe SL, no TP (`b84644c`) — broker touch-SL vs backtest close-SL divergence fix.
+- [x] `DONE` Walk-driven signal tick — restores backtest fidelity during `min_hold` (`398a6c0`).
+- [x] `DONE` Relabel loss-cap fields as soft/hard halt tiers (`3135d06`) — frontend copy across four pages.
+
+### Open
+
+- [ ] `TODO` Post-mortem the phantom-flat DB incident properly in `planning/runbooks/` — cause, detection, fix, and what to look for if it recurs. Currently only lives in commit messages + this session's transcript.
+- [ ] `TODO` Alert on stranded-position adoption events specifically (not just the generic halt reason). Wilson should know the moment the runner had to reopen a phantom-closed trade — currently rolls into the generic email.
 - [x] `DONE (v0.6.2)` Remove `max_position_size_units` editable input from DeployPaperModal (Wilson UAT 2026-07-19). Dynamic sizing (`balance × risk_pct ÷ stop_pips`) is the only ceiling the runner respects; OANDA's own margin/leverage checks reject over-sized orders. Field removed; legacy `risk_config` JSON blobs may still carry the key and the runner tolerates that.
 
 <!-- Historical raw scope notes from 2026-07-08 / 2026-07-09 preserved for archaeology; the executable list above is what future readers act on.
@@ -435,6 +474,8 @@ run. This section covers guardrails for FUTURE genomes.
 ---
 
 ## v0.7.x — Cross-user genome sharing (import/export)
+
+**Shipped:** commits `ce50e22` (backend + frontend + migration), `ab4a812` (warm-start isolation), `f35f8c5` (JS-compatible content hash + Toast wrap). Verified during 2026-08 UAT sessions.
 
 **Theme:** Enable users to exchange validated strategies. Users A
 and B are on separate OANDA accounts and independent evolution
@@ -534,30 +575,28 @@ evaluate + deploy WITHOUT the exporter's evolution run rows:
 
 ### Compatibility checkpoints (verify each)
 
-- [ ] Approval queue query (`list_approval_queue_for_user`) — the
+- [x] Approval queue query (`list_approval_queue_for_user`) — the
   `evolution_run.created_by == user_id` filter already scopes to
   the importer; verified naturally by using shadow rows.
-- [ ] Deploy flow (`approve_and_deploy`) — reads
+- [x] Deploy flow (`approve_and_deploy`) — reads
   `genome.validation_folds` for `fold_length_days`. Folds ARE
-  duplicated on import → works.
-- [ ] Fold-anchored paper runner (Fix A) — reads
+  duplicated on import; `api/services/paper.py` computes
+  `fold_length_days` from imported folds.
+- [x] Fold-anchored paper runner (Fix A) — reads
   `run.parameters['fold_length_days']` set at deploy time. Works.
-- [ ] Backtest re-run endpoint
-  (`/evolution-runs/{id}/genomes/{gid}/backtest`) — takes
-  `run_id` + `genome_id` from URL. Both are shadow rows, both
-  belong to importer, both point at the same DSL. Works BUT the
-  backtest window (`training` / `oos` / `full`) is derived from
-  `EvolutionRun.data_range_start/end`. Import must carry these
-  fields on the source `EvolutionRun` snapshot so window
-  selectors show sensible dates. Verify.
-- [ ] Lineage tree (`GenomeLineageTree.tsx`) — shadow genome has
-  empty `parent_ids`; renders as single-node tree. Verify no
-  crash on the empty-parents case.
-- [ ] Slack notifications (v0.6.2) — same as native genomes; no
-  change needed.
+- [x] Backtest re-run endpoint
+  (`/evolution-runs/{id}/genomes/{gid}/backtest`) — shadow rows
+  carry `data_range_start/end` verbatim from the source snapshot.
+- [x] Lineage tree (`GenomeLineageTree.tsx`) — shadow genome has
+  empty `parent_ids`; single-node render confirmed, no crash.
+- [x] Notifications (v0.6.2 email) — same as native genomes; no
+  change needed. (Line originally said "Slack" — Slack was
+  replaced with email in 2026-09; behaviour is identical.)
 - [ ] Validator warnings (v0.7.0 items above) — re-run on import
   so the importer sees the same amber chip if the DSL uses
-  start-point-sensitive indicators.
+  start-point-sensitive indicators. **Blocked on v0.7.0 not
+  started** (the cumulative-indicator warning itself doesn't
+  exist yet).
 
 ### Attribution + trust posture
 

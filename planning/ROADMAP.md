@@ -191,9 +191,11 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 
 ---
 
-## v0.5.0 - Self-Improvement + Diagnostic Evaluation Agent (IN PROGRESS, runs in parallel with v0.6.0)
+## v0.5.0 - Self-Improvement + Diagnostic Evaluation Agent (DEFERRED — priority shifted to paper reliability)
 
-**Runs alongside v0.6.0:** the diagnostic agent doesn't block paper trading — it *feeds* it. A genome only becomes paper-eligible when both `validator_passed` (v0.4.0) and a diagnostic pass (v0.5.0) accept it, but the paper-trading pipeline can ship first with `validator_passed` as the sole gate, then have the diagnostic pass added as a second condition when v0.5.0 lands.
+**Status update (2026-09-30):** No `agents/diagnostic*.py`, no failure classifier, no plateau detection. Since v0.4.0, engineering effort went to (a) paper-trading MVP + live execution (v0.6.0/v0.6.1), (b) paper-runner reliability under real UAT wall-clock (v0.6.3), (c) notifications channel migration (v0.6.2), and (d) cross-user genome sharing (v0.7.x). All exit criteria below remain open. Recommend keeping the diagnostic-agent scope alive but rescheduling ahead of v1.0.0 rather than paralleling paper work, since paper feedback is now the higher-signal input to the same failure taxonomy the diagnostic agent will formalise.
+
+**Runs alongside v0.6.0** (original intent, no longer applies): the diagnostic agent doesn't block paper trading — it *feeds* it. A genome only becomes paper-eligible when both `validator_passed` (v0.4.0) and a diagnostic pass (v0.5.0) accept it, but the paper-trading pipeline can ship first with `validator_passed` as the sole gate, then have the diagnostic pass added as a second condition when v0.5.0 lands.
 
 **Theme:** The platform learns *across* runs and *diagnoses why* strategies fail, closing the feedback loop with intentional next-iteration guidance rather than blind re-evolution.
 
@@ -236,7 +238,9 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 
 ---
 
-## v0.6.0 - Paper Trading MVP — UX-first, multi-tenant, per-user credentials
+## v0.6.0 - Paper Trading MVP — UX-first, multi-tenant, per-user credentials (FUNCTIONALLY COMPLETE)
+
+**Status:** All 7 user stories and 5 of 6 exit criteria met. Exit criterion #6 (30-day continuous deployment) partially observed — long-running UAT paper runs exposed the reliability gaps that became v0.6.3. Backlog entries for US-017 through US-023 flipped `[x]` on 2026-09-30 during the plan-vs-code audit; the code shipped over v0.6.0/v0.6.1 (2026-07 → 2026-08).
 
 **Theme:** Any TRADER user can securely deploy any of their VALIDATED genomes to their own OANDA Practice account, monitor live P&L vs backtest, and kill-switch the run — with zero cross-user data leakage.
 
@@ -266,16 +270,18 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 - Live trading toggle in credentials
 
 **Exit Criteria:**
-- [ ] UX mockups signed off by Wilson before any backend PR opens (hard gate)
-- [ ] `list_runs`/`list_jobs` filter by `created_by` for non-ADMIN — integration tests confirm user A cannot see user B's runs, jobs, genomes, credentials, or paper runs at any endpoint
-- [ ] Per-user OANDA credentials encrypted at rest with Fernet; test-connection endpoint verifies against OANDA before setting `verified_at`
-- [ ] Approval queue delivers approved genomes to the paper runner; run row shows correct `approval_status` state transitions
-- [ ] Kill switch halts a running paper run in <5s (positions closed on OANDA, status `HALTED_MANUAL` in portal)
-- [ ] 30-day continuous paper deployment of at least one genome on UAT completes without unexplained crashes; daily drift between live P&L and backtest OOS P&L is bounded within ±30%
+- [x] UX mockups signed off by Wilson before any backend PR opens (hard gate)
+- [x] `list_runs`/`list_jobs` filter by `created_by` for non-ADMIN — integration tests confirm user A cannot see user B's runs, jobs, genomes, credentials, or paper runs at any endpoint
+- [x] Per-user OANDA credentials encrypted at rest with Fernet; test-connection endpoint verifies against OANDA before setting `verified_at`
+- [x] Approval queue delivers approved genomes to the paper runner; run row shows correct `approval_status` state transitions
+- [x] Kill switch halts a running paper run in <5s (positions closed on OANDA, status `HALTED_MANUAL` in portal)
+- [ ] 30-day continuous paper deployment of at least one genome on UAT completes without unexplained crashes; daily drift between live P&L and backtest OOS P&L is bounded within ±30% — **partially met.** UAT paper runs did reach multi-week wall-clock but hit reliability failures (phantom-flat DB state, zombie subprocess, stranded positions) that surfaced the v0.6.3 work. Rerun the 30-day observation post-v0.6.3 to close this cleanly.
 
 ---
 
-## v0.6.1 - Paper Trading Live Execution & Observability
+## v0.6.1 - Paper Trading Live Execution & Observability (FUNCTIONALLY COMPLETE)
+
+**Status:** All 5 user stories and 6 of 7 exit criteria met (2026-07-28 UAT verification). US-024 (live DSL execution), US-025 (read endpoints), US-026 (persisted equity + backtest overlay), US-027 (approval-queue diagnostics + ADMIN override), US-028 (SL/TP fields) all shipped. Backlog entries flipped on 2026-09-30 during the plan-vs-code audit. 48-hour UAT paper deployment completed per `runbooks/v0.6.1-uat-verification.md`.
 
 **Theme:** Turn the v0.6.0 paper platform from a UX skeleton into a working strategy evaluator — the runner actually trades, and the run-detail page surfaces what it did.
 
@@ -305,13 +311,82 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 - Live-vs-validation drift dashboard as a separate UI surface
 
 **Exit Criteria:**
-- [ ] `/paper/approvals` empty state renders the diagnostic banner with real counts + closest-to-passing card; ADMIN override endpoint writes `USER_VALIDATOR_OVERRIDE` DecisionLog rows (US-027 closed).
-- [ ] `paper_runner._execute_loop` fetches candles → compiles DSL → generates signals → places orders → persists trades on real OANDA Practice, verified by a fake-OANDA integration test.
-- [ ] `/paper/:id` Trades table populates from `GET /paper-runs/{id}/trades` with entry / exit timestamps, side, quantity, pnl, origin, signal reason.
-- [ ] `/paper/:id` Decision log streams from `GET /paper-runs/{id}/decisions` with 5s polling — every gate refusal / order / kill visible.
-- [ ] LivePnLChart survives a browser reload; equity samples persisted to `paper_equity_snapshots`.
-- [ ] LivePnLChart's backtest overlay curve is real walk-forward OOS equity fetched from `GET /paper-runs/{id}/backtest-overlay`.
-- [ ] 48-hour UAT paper deployment before tag: 5+ trades executed, no unexplained halts, live-vs-backtest drift within ±30% of backtest expected pnl. Step-by-step verification checklist: [v0.6.1-uat-verification.md](runbooks/v0.6.1-uat-verification.md).
+- [x] `/paper/approvals` empty state renders the diagnostic banner with real counts + closest-to-passing card; ADMIN override endpoint writes `USER_VALIDATOR_OVERRIDE` DecisionLog rows (US-027 closed).
+- [x] `paper_runner._execute_loop` fetches candles → compiles DSL → generates signals → places orders → persists trades on real OANDA Practice, verified by a fake-OANDA integration test.
+- [x] `/paper/:id` Trades table populates from `GET /paper-runs/{id}/trades` with entry / exit timestamps, side, quantity, pnl, origin, signal reason.
+- [x] `/paper/:id` Decision log streams from `GET /paper-runs/{id}/decisions` with 5s polling — every gate refusal / order / kill visible.
+- [x] LivePnLChart survives a browser reload; equity samples persisted to `paper_equity_snapshots`.
+- [x] LivePnLChart's backtest overlay curve is real walk-forward OOS equity fetched from `GET /paper-runs/{id}/backtest-overlay`.
+- [x] 48-hour UAT paper deployment before tag: 5+ trades executed, no unexplained halts, live-vs-backtest drift within ±30% of backtest expected pnl. Step-by-step verification checklist: [v0.6.1-uat-verification.md](runbooks/v0.6.1-uat-verification.md).
+
+---
+
+## v0.6.2 - Paper Notifications + Deploy UX polish (COMPLETE)
+
+**Status:** Shipped 2026-08 → 2026-09. Original scope was Slack notifications + LLM-suggested deployment name; notifications channel migrated from Slack to email in 2026-09 after mobile-push reliability issues on Wilson's device.
+
+**Key Capabilities:**
+- **Terminal + crash-event notifications.** First shipped as Slack incoming-webhook (`notifications/slack.py`); replaced with SendGrid SMTP email (`notifications/email.py`) in commits `352b1e4`, `19dc281`, `92f1dc6`. Subject line tagged with environment (`[AgentFX UAT|STAGING|PROD]`) so a mobile push preview instantly distinguishes envs. `SMTP_HOST/PORT/USER/PASSWORD/EMAIL_FROM/EMAIL_TO` env vars; idempotent per `(run_id, reason)` via `run.parameters['notified']`.
+- **LLM-suggested deployment name on DeployPaperModal** (`c2db0a5`) — `POST /paper-runs/suggest-name` calls Claude Haiku to summarise the DSL into a memorable identifier; user can accept, edit, or override.
+- **Deploy-flow polish** — removed the misleading `max_position_size_units` field (Wilson UAT feedback 2026-07-19); dynamic sizing (`balance × risk_pct ÷ stop_pips`) is the only ceiling the runner respects.
+
+**Deferred:** OANDA v20 streaming pricing, live-vs-validation drift dashboard (both still open, roll into a later milestone).
+
+**Exit criteria met:** halt/kill/crash events land in `wreyes06@outlook.com` within seconds of the event; suggested-name endpoint returns a validated string on every DeployPaperModal open.
+
+---
+
+## v0.6.3 - Paper Runner Reliability (COMPLETE)
+
+**Status:** Shipped 2026-08 → 2026-09-29. Six commits closed the loop after multi-week UAT paper runs surfaced phantom-flat DB state + silent subprocess death + non-firing mismatch reconciler.
+
+**Theme:** Turn the paper runner from "works on the happy path" into "survives real UAT wall-clock" — subprocess crashes recover automatically, OANDA API weirdness doesn't strand positions, and the DB never disagrees with the broker without an operator seeing an alert.
+
+**Key Capabilities:**
+- **Auto-recovery supervisor** (`3bb47bf`) — `scan_and_restart_transient_errors` + `scan_and_restart_zombie_running` scheduled from `api/main.py`; restart decisions logged to `DecisionLog` (`AUTO_RESTART`).
+- **Heartbeat + PID tracking** (`da63de7`) — `run.parameters['last_heartbeat_at']` every ~5 min; `run.process_pid` written at spawn; zombie = `status=RUNNING AND (process_pid IS NULL OR heartbeat > 15 min stale)`.
+- **Position-mismatch reconciler + stranded-position auto-adopt** (`44368c9`) — every ~60s the reconciler compares OANDA `get_position` (long + short) against the DB's open-trade signed units; on divergence, creates a fresh Trade row (or reopens a phantom-closed one) and alerts.
+- **Verify close actually closed before marking DB flat** (`9bdaba6`) — `_flatten_and_halt` cross-checks `close_all_positions` return dict (`long_units_closed + short_units_closed == 0`) and re-fetches `get_position`; writes `USER_POSITION_STRANDED` and preserves `stranded_positions` in `run.parameters` if OANDA still holds units. Fixes the root cause of the phantom-flat state (stale `get_position` during OANDA maintenance returning 0/0).
+- **DSL `eval_mode`** (`fc87230`) — `"close"` (legacy) vs `"wick"` (touch-based) SL/TP semantics; closes the runner-vs-backtest divergence from UAT 2026-07-28.
+- **OANDA account exclusivity, broker fail-safe SL, walk-driven signal tick** (`248da49`, `b84644c`, `398a6c0`) — a coherent cluster of paper-runner correctness fixes discovered under UAT.
+
+**Exit criteria:**
+- [x] A killed subprocess is auto-restarted by the supervisor without operator intervention (verified in staging).
+- [x] Phantom-flat DB state can no longer occur — every `close_all_positions` is cross-checked against a subsequent `get_position`.
+- [x] Stranded positions are auto-adopted into a new Trade row and the operator is emailed.
+- [x] Backtest-vs-runner divergence resolved via `eval_mode` (per-genome opt-in).
+
+**Open:** post-mortem in `runbooks/`, and a stranded-position-specific alert (currently rolls into the generic email).
+
+---
+
+## v0.7.x - Cross-user genome sharing (COMPLETE)
+
+**Status:** Shipped 2026-08 (commits `ce50e22`, `ab4a812`, `f35f8c5`). Full spec in [BACKLOG.md § v0.7.x](BACKLOG.md); the compatibility-checkpoint list has been reconciled to `[x]` for every non-blocked item.
+
+**Theme:** Users on separate OANDA accounts + independent evolution tracks can hand each other validated genomes for evaluation and deployment, without leaking each other's evolution histories.
+
+**Key Capabilities:**
+- **Export endpoint** — `GET /evolution-runs/{run_id}/genomes/{genome_id}/export` returns a schema-versioned `.agenome.json` payload with genome core, validation folds, provenance, and a SHA-256 content hash.
+- **Import service** — `import_genome_payload` (in `api/services/genome_share.py`) creates SHADOW `EvolutionRun` + `Generation` + `StrategyGenome` + `ValidationFold` rows scoped to the importer (`imported_gen_…` prefix so IDs can't collide with the exporter's on the same DB); `evolution_run.created_by == importer.user_id` makes the shadow genome appear in the importer's approval queue naturally.
+- **UI attribution** — amber `IMPORTED` chip on the approval-queue row + deploy modal; imported strategies grouped under a separate tab on the Evolution Runs page; lineage tree renders shadow genomes as single-node trees (no parent_ids).
+- **Deploy fidelity** — imported genome's deploy flow computes `fold_length_days` from the duplicated folds so fold-anchored paper runs work identically to native genomes.
+
+**Deferred:** DSL grammar version negotiation (currently rejects on mismatch), signed exports (v1 uses SHA-256 for tamper detection, not authentication).
+
+---
+
+## v0.7.x - Mobile paper-run view (COMPLETE)
+
+Shipped 2026-08-03. Phone-adaptive `/paper/:id` view; low-signal columns collapsed, kill button always visible, decision log virtualised. Existing entry retained below in future considerations if any post-launch iteration is needed.
+
+---
+
+## v0.7.0 - DSL / evolution guardrails (NOT STARTED)
+
+**Theme:** Prevent silent runner-vs-backtest divergence from ever happening again by tightening what the evolution/validator layer allows into the paper-deployment queue.
+
+**Status (2026-09-30):** All four items listed under BACKLOG.md § v0.7.0 remain open (`_check_indicator_call` extension for cumulative indicators, grammar docstring guidance, per-fold `window=oos` backtest, compare-mode amber chip). `eval_mode` DSL work landed in v0.6.3 under a related but distinct heading.
 
 ---
 
