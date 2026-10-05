@@ -242,11 +242,11 @@ This backlog is organized by version milestone. Each item links to executable us
 
 ---
 
-## v0.5.0 - Self-Improvement (IN PROGRESS, runs in parallel with v0.6.0)
+## v0.5.0 - Self-Improvement (CANCELLED 2026-10-05 — subsumed by v0.8.x Agent Fleet)
 
-**Runs alongside v0.6.0.** The diagnostic agent doesn't block paper trading — it *augments* it. A genome only needs `validator_passed` to enter the v0.6.0 paper approval queue. Once the diagnostic agent lands, it becomes a second condition (diagnosis must be `ok` or `regime_mismatch → route to conditional-edge portfolio`). Paper trading ships first with `validator_passed` as the sole gate.
+**Status (2026-10-05):** CANCELLED as a standalone milestone. The scope (diagnostic failure classification, plateau detection, cross-run distillation, drift detection) is reimplemented as the multi-agent **Agent Fleet** at v0.8.x — Quant Analyst Agent + Research Agent + Portfolio Manager + Platform Engineer, orchestrated via Claude Agent SDK with Managed Agents workspaces for autonomous code iteration. See `## v0.8.0 - Agent Fleet` below. Items in the "Recently shipped" subsection remain valid.
 
-**Theme:** The platform learns across runs, not just within runs.
+**Theme (historical):** The platform learns across runs, not just within runs.
 
 ### Recently shipped (May-June 2026)
 
@@ -415,9 +415,11 @@ Six commits over August/September closed the loop.
 
 ---
 
-## v0.7.0 — DSL / evolution guardrails (post UAT 2026-07-28)
+## v0.7.0 — DSL / evolution guardrails (ABSORBED 2026-10-05 into v0.8.x PE workload)
 
-**Theme:** Prevent silent runner-vs-backtest divergence from ever
+**Status (2026-10-05):** v0.7.0 is no longer a standalone milestone. The four open items below become Platform Engineer Agent (v0.8.1) tasks picked up on-demand when the Quant Analyst identifies DSL-level failure modes in paper divergence reports. If PE opens PRs covering all four, this milestone retires inside the v0.8.x window; otherwise the remainder rolls into v1.0.0's hardening tail.
+
+**Theme (historical):** Prevent silent runner-vs-backtest divergence from ever
 happening again by tightening what the evolution/validator layer
 allows into the paper-deployment queue.
 
@@ -738,6 +740,112 @@ information a mobile user would need while monitoring a run."
   - Trades table doesn't overflow
 - Existing desktop Playwright tests continue to pass (breakpoint
   gates on >640px).
+
+---
+
+## v0.8.0 — Agent Fleet: read-only pilot
+
+**Theme:** Introduce the first two Claude agents (Portfolio Manager + Quant Analyst) in **read-only mode** — they observe platform state, produce morning briefs + divergence reports, but take no actions. Earns Wilson's trust in the agents' judgement before any authority is granted.
+
+**Plan document:** `~/.claude/plans/i-think-we-need-functional-pony.md` — approved 2026-10-05.
+
+**Branch strategy:** All work on `feat/agent-fleet`. Staging keeps deploying from `main`. Wilson gates the final `feat/agent-fleet` → `main` merge.
+
+**Cost envelope:** $20-30/month total (LLM + Managed Agents compute).
+
+### User stories
+
+- [ ] `TODO` [US-029 — Agent orchestration layer (Claude Agent SDK + lifespan hook)](requirements/US-029-agent-orchestration-layer.md) — `services/agent_orchestrator.py`, FastAPI lifespan integration, per-agent budget enforcement, `AGENT_FLEET_ENABLED` feature flag.
+- [ ] `TODO` [US-030 — Portfolio Manager Agent (read-only daily brief)](requirements/US-030-pm-agent-readonly.md) — Haiku 4.5, 09:00 UTC cron, reads 7-day platform state, emails Wilson a morning brief, writes to `agent_decisions` + `agent_memory/scoreboard.md`.
+- [ ] `TODO` [US-031 — Quant Analyst Agent (event-triggered divergence reports)](requirements/US-031-qa-agent-divergence.md) — Sonnet 5, fires on paper-run day-close + stop_reason events. Classifies deltas (cost-model / execution / indicator / regime / validator-weakness / novel). First expected win: diagnoses current staging paper runs' cost-model gap unprompted.
+- [ ] `TODO` [US-032 — Shared memory layer](requirements/US-032-agent-memory-layer.md) — `agent_decisions` DB table + migration, `agent_memory/` markdown directory structure, read/write helpers.
+- [ ] `TODO` [US-033 — Agent email channel](requirements/US-033-agent-email-subject-prefix.md) — `[AgentFX AGENT <ROLE>]` subject prefix support in `notifications/email.py` so Wilson's inbox stays sortable.
+
+### Exit criteria
+
+- [ ] PM Agent sent ≥14 morning briefs with no manual intervention.
+- [ ] QA Agent produced ≥5 divergence reports; ≥1 correctly characterised the current staging paper runs' cost-model gap unprompted.
+- [ ] `agent_decisions` DB table has >100 rows; `agent_memory/` has ≥3 topic files.
+- [ ] Total LLM spend < $15 (buffer below $30 cap).
+- [ ] **Profitability checkpoint:** QA identified ≥3 concrete evolution-vs-paper divergences and quantified impact on expected post-cost sharpe.
+
+---
+
+## v0.8.1 — Agent Fleet: autonomous scheduling + code authorship
+
+**Theme:** PM gets its first action tool (schedule evolution runs). Platform Engineer Agent lands in a Managed Agents workspace and ships its first autonomous PRs.
+
+**Approval model** (per Wilson 2026-10-05 decision): `agent/*` sub-branches auto-merge to `feat/agent-fleet` on tests-pass + PE review-agent approval. PRs from `feat/agent-fleet` to `main` require Wilson's manual approval.
+
+### User stories
+
+- [ ] `TODO` [US-034 — PM scheduling tool](requirements/US-034-pm-scheduling-tool.md) — PM calls `/evolution-runs` POST with chosen `(instrument, gran, config)`. Rate-limited (max 2 runs/week initially). First autonomous use: schedules the H1 EUR_USD experiment per Agent 3 SOTA research + Plan agent recommendation.
+- [ ] `TODO` [US-035 — Platform Engineer Agent in Managed Agents workspace](requirements/US-035-pe-agent-managed-agents.md) — Opus 4.7, on-task from QA/PM. Reads task spec, explores code, writes reproducing test, writes fix, runs `make test-unit`, opens PR to `agent/<task-id>` sub-branch. Auto-merges to `feat/agent-fleet` on tests + review agent approval.
+- [ ] `TODO` [US-036 — First PE task: cost-model calibration from paper fills](requirements/US-036-pe-first-cost-model-task.md) — take QA's cost-model divergence report, update `instruments.typical_spread_pips` for EUR_USD M1 from realized paper fills, open PR with reproducing test.
+- [ ] `TODO` [US-037 — OANDA account pool](requirements/US-037-oanda-account-pool.md) — new `oanda_account_pool` table + ADMIN endpoint for Wilson to register practice accounts, PM allocation logic with `cooling_down` state + lease TTL + 10-concurrent soft cap.
+- [ ] `TODO` [US-038 — CI for agent-fleet branches](requirements/US-038-agent-fleet-ci.md) — `.github/workflows/agent-fleet-ci.yml` running test-unit + lint on `agent/*` and `feat/agent-fleet` branches, with auto-merge logic for the three-tier gate.
+
+### Exit criteria
+
+- [ ] PM scheduled ≥2 evolution runs autonomously.
+- [ ] PE merged ≥3 PRs to `feat/agent-fleet`, all with passing tests.
+- [ ] Reproducing test for Run B cost-model issue exists in the codebase.
+- [ ] Account pool has ≥3 accounts; PM allocated runs across ≥2.
+- [ ] **Profitability checkpoint:** ≥1 PE PR directly moves honest post-cost expected sharpe higher.
+
+---
+
+## v0.8.2 — Agent Fleet: autonomous paper lifecycle
+
+**Theme:** PM gets paper-approval authority (unbounded on paper per Wilson "paper is aggressive sandbox" directive). QA + PE close the loop autonomously. Platform becomes self-improving.
+
+### User stories
+
+- [ ] `TODO` [US-039 — PM paper-approval authority](requirements/US-039-pm-paper-approval.md) — PM reads approval queue, decides deployments, posts to `/paper-runs/approve`. No allocation caps on paper. Multiple parallel runs across pairs/timeframes.
+- [ ] `TODO` [US-040 — Paper-deploy gate hardening (first QA→PE pipeline task)](requirements/US-040-paper-deploy-gate.md) — fix `paper.py:677` hole where `validator_passed=TRUE` was accepted even with non-empty `validation_failures` or zero `validation_folds`. Prerequisite for PM auto-approval.
+- [ ] `TODO` [US-041 — Research Agent (weekly literature digest)](requirements/US-041-research-agent.md) — Sonnet 5 + WebSearch, weekly on Monday 03:00 UTC. Reads arXiv/SSRN quant-finance + LLM-trading literature, proposes 1-3 concrete additions to PM.
+- [ ] `TODO` [US-042 — CUSUM live drift detection](requirements/US-042-cusum-drift.md) — PE workload gated by QA. One-sided CUSUM (k=0.5σ, h=4σ) on daily realised-vs-backtest P&L residuals, calibrated per-genome. Fires halt + email on breach.
+- [ ] `TODO` [US-043 — Reflexion loop](requirements/US-043-reflexion-loop.md) — PM writes expected outcome at decision time; later re-reads vs actual; "lessons learned" entries flow into QA's prompt context.
+
+### Exit criteria
+
+- [ ] PM approved ≥3 paper deployments autonomously.
+- [ ] QA caught + reported ≥1 PE-introduced regression (Reflexion loop demonstrated).
+- [ ] Live-vs-backtest divergence on ≥1 paper run under 1σ for ≥7 continuous days.
+- [ ] CUSUM shipped and firing on ≥1 paper run.
+- [ ] Monthly cost within envelope.
+- [ ] **Profitability checkpoint:** ≥1 strategy sustained positive paper P&L for 14 continuous days with divergence under 1σ.
+
+---
+
+## v0.8.3 — Agent Fleet: production merge
+
+**Theme:** `feat/agent-fleet` → `main`.
+
+### Exit criteria
+
+- [ ] 1-2 weeks soak on UAT + dev with no Wilson intervention needed.
+- [ ] Wilson approves the single `feat/agent-fleet` → `main` PR.
+- [ ] 2 continuous weeks of fleet on `main` without Wilson intervention.
+- [ ] Monthly cost at steady state within $20-30.
+- [ ] ≥1 paper run that the fleet fully owned (designed → deployed → monitored → halted/kept).
+
+---
+
+## v0.9.0 — Live-nomination pipeline
+
+**Theme:** Fleet produces first paper-strategy nomination with full evidence package. Wilson reviews. If approved, strategy queues for v1.0.0 live deployment. **This is where the fleet's experimentation output converges on the ultimate goal.**
+
+### User stories
+
+- [ ] `TODO` [US-044 — Strategy nomination schema + composer](requirements/US-044-strategy-nomination.md) — formal `strategy_nomination` record with 30-day paper P&L, divergence report, lineage, cost-model notes, Research Agent corroboration, PM reasoning, sanity-check output.
+- [ ] `TODO` [US-045 — Wilson's review interface](requirements/US-045-nomination-review.md) — approval endpoint + email with full nomination package. Approve / reject-with-reasoning / request-more-paper-time. Rejection reasoning flows into agent memory.
+
+### Exit criteria
+
+- [ ] ≥1 strategy reached nominated state with full evidence package.
+- [ ] Wilson reviewed ≥1 nomination end-to-end.
+- [ ] Approval path to v1.0.0 live trading is clear (mechanism works regardless of first-nomination outcome).
 
 ---
 

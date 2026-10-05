@@ -191,9 +191,16 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 
 ---
 
-## v0.5.0 - Self-Improvement + Diagnostic Evaluation Agent (DEFERRED — priority shifted to paper reliability)
+## v0.5.0 - Self-Improvement + Diagnostic Evaluation Agent (CANCELLED — subsumed by v0.8.x Agent Fleet)
 
-**Status update (2026-09-30):** No `agents/diagnostic*.py`, no failure classifier, no plateau detection. Since v0.4.0, engineering effort went to (a) paper-trading MVP + live execution (v0.6.0/v0.6.1), (b) paper-runner reliability under real UAT wall-clock (v0.6.3), (c) notifications channel migration (v0.6.2), and (d) cross-user genome sharing (v0.7.x). All exit criteria below remain open. Recommend keeping the diagnostic-agent scope alive but rescheduling ahead of v1.0.0 rather than paralleling paper work, since paper feedback is now the higher-signal input to the same failure taxonomy the diagnostic agent will formalise.
+**Status update (2026-10-05):** The diagnostic agent concept is CANCELLED as a standalone milestone and **replaced by the v0.8.x Agent Fleet**. The original v0.5.0 scope (failure classifier, plateau detection, cross-run distillation, drift detection) is covered by the Agent Fleet's Quant Analyst + Research agents, implemented as a true multi-agent system (Claude Agent SDK + Managed Agents workspaces) rather than a single in-process module. See `v0.8.0 - Agent Fleet: read-only pilot` below.
+
+The exit criteria originally listed under v0.5.0 are reframed in v0.8.x terms:
+- Diagnostic failure classification → Quant Analyst Agent (v0.8.0 Phase B).
+- Plateau detection / stuck-run halting → Portfolio Manager Agent with kill clocks (v0.8.1).
+- Cross-run hypothesis distillation → shared `agent_memory/` + Reflexion loop (v0.8.2 Phase C).
+- Drift detection → CUSUM, ships as PE Agent workload under v0.8.2 Phase B.
+- Measurable OOS improvement across evolution runs → the v0.9.0 live-nomination milestone IS this measurement.
 
 **Runs alongside v0.6.0** (original intent, no longer applies): the diagnostic agent doesn't block paper trading — it *feeds* it. A genome only becomes paper-eligible when both `validator_passed` (v0.4.0) and a diagnostic pass (v0.5.0) accept it, but the paper-trading pipeline can ship first with `validator_passed` as the sole gate, then have the diagnostic pass added as a second condition when v0.5.0 lands.
 
@@ -382,11 +389,106 @@ Shipped 2026-08-03. Phone-adaptive `/paper/:id` view; low-signal columns collaps
 
 ---
 
-## v0.7.0 - DSL / evolution guardrails (NOT STARTED)
+## v0.7.0 - DSL / evolution guardrails (ABSORBED into v0.8.x PE workload)
 
-**Theme:** Prevent silent runner-vs-backtest divergence from ever happening again by tightening what the evolution/validator layer allows into the paper-deployment queue.
+**Status update (2026-10-05):** v0.7.0 is no longer a standalone milestone. The four items (`_check_indicator_call` extension, grammar docstring guidance, per-fold `window=oos` backtest, compare-mode amber chip) become work items the **Platform Engineer Agent (v0.8.1)** picks up on-task from the Quant Analyst when it identifies DSL-level failure modes in paper divergence reports. If PE opens PRs covering all four, this milestone retires inside the v0.8.x window; otherwise the remaining items roll into v1.0.0's "final hardening" tail.
 
-**Status (2026-09-30):** All four items listed under BACKLOG.md § v0.7.0 remain open (`_check_indicator_call` extension for cumulative indicators, grammar docstring guidance, per-fold `window=oos` backtest, compare-mode amber chip). `eval_mode` DSL work landed in v0.6.3 under a related but distinct heading.
+---
+
+## v0.8.0 - Agent Fleet: read-only pilot
+
+**Theme:** Introduce the first two Claude agents (Portfolio Manager + Quant Analyst) in **read-only mode** — they observe platform state, produce morning briefs + divergence reports, but take no actions. Earns Wilson's trust in the agents' judgement before any authority is granted.
+
+**Why this shape.** Wilson's platform is fully manual: he starts every evolution, approves every paper deployment, kills every losing run. The vision is a fleet of specialist agents doing that work autonomously — but handing them authority before validating their judgement would amplify platform mistakes. v0.8.0 ships the observe-and-report shell so Wilson can calibrate the fleet before progressively expanding its mandate.
+
+**Branch strategy:** All v0.8.x work lives on `feat/agent-fleet` (cut from `main` at `1c42fc6`). Staging continues to deploy from `main`. Wilson gates the final `feat/agent-fleet` → `main` merge.
+
+**Cost envelope:** $20-30/month total (LLM + Managed Agents compute). Enforced per-agent daily token budgets.
+
+**Key Capabilities (v0.8.0):**
+- **Portfolio Manager Agent** (Haiku 4.5, daily cron) — reads last 7 days of evolution + paper P&L, writes a morning brief to Wilson's inbox + agent memory. Read-only.
+- **Quant Analyst Agent** (Sonnet 5, event-triggered) — fires on paper-run day-close or stop_reason events. Produces divergence reports: *"is the live behaviour an exact reflection of the backtest? If not, why?"* Classifies deltas (cost-model, execution-timing, indicator handling, regime shift, validator weakness).
+- **Shared memory layer** — `agent_decisions` DB table + `agent_memory/` markdown directory. Reflexion dataset.
+- **Orchestration via Claude Agent SDK** — single `services/agent_orchestrator.py` wired into FastAPI lifespan behind `AGENT_FLEET_ENABLED` flag.
+- **Profitability scoreboard** — `agent_memory/scoreboard.md` updated by PM morning brief; Wilson's at-a-glance view of advancement along the profit chain.
+
+**Exit Criteria:**
+- [ ] PM Agent has sent ≥14 morning briefs with no manual intervention.
+- [ ] QA Agent has produced ≥5 divergence reports; at least one correctly characterises the current staging paper runs' cost-model gap without hard-coded hints.
+- [ ] `agent_decisions` DB table has >100 rows; `agent_memory/` has ≥3 topic files.
+- [ ] Total LLM spend < $15 (buffer below $30 cap).
+- [ ] **Profitability checkpoint:** QA has identified ≥3 concrete evolution-vs-paper divergences and quantified their impact on expected post-cost sharpe.
+
+---
+
+## v0.8.1 - Agent Fleet: autonomous scheduling + code authorship
+
+**Theme:** PM gets its first action tool (schedule evolution runs). The Platform Engineer Agent lands in a Managed Agents workspace and ships its first autonomous PRs.
+
+**Branch strategy:** PE Agent operates on `agent/<task-id>` sub-branches off `feat/agent-fleet`. Three-tier CI gate: `agent/*` auto-merges to `feat/agent-fleet` on tests-pass + PE review; `feat/agent-fleet` → `main` requires Wilson's manual approval.
+
+**Key Capabilities (v0.8.1):**
+- **PM scheduling tool** — PM can call `/evolution-runs` POST with its chosen (instrument, gran, config). Rate-limited to 2 evolution runs/week initially. First autonomous use: schedules the H1 EUR_USD experiment (lower noise than M1 — SOTA literature + Phase 1 Plan agent recommendation).
+- **Platform Engineer Agent** (Opus 4.7, Managed Agents workspace, on-task from QA/PM) — reads task spec, forms hypothesis, writes reproducing test, writes fix, runs `make test-unit`, opens PR to `agent/*` sub-branch. Auto-merges to `feat/agent-fleet` on tests-pass + review agent approval.
+- **First PE workload:** take QA's cost-model divergence report, update `instruments.typical_spread_pips` for EUR_USD M1 from realized paper fills, open PR with reproducing test.
+- **OANDA account pool** — new `oanda_account_pool` table + ADMIN endpoint for Wilson to add practice accounts. PM allocates slots across the pool for parallel experiments. Initial seed ~5 accounts, expandable.
+
+**Exit Criteria:**
+- [ ] PM has scheduled ≥2 evolution runs autonomously.
+- [ ] PE has merged ≥3 PRs to `feat/agent-fleet`, all with passing tests.
+- [ ] Reproducing test for Run B cost-model issue exists in the codebase.
+- [ ] Account pool has ≥3 accounts registered; PM has allocated runs across ≥2 of them.
+- [ ] **Profitability checkpoint:** at least one PE PR directly moves the honest post-cost expected sharpe higher.
+
+---
+
+## v0.8.2 - Agent Fleet: autonomous paper lifecycle
+
+**Theme:** PM gets paper-approval authority. QA + PE close the loop on live-vs-backtest divergence autonomously. The platform becomes self-improving.
+
+**Key Capabilities (v0.8.2):**
+- **PM paper-approval authority (unbounded on paper)** — reflecting the "paper is the aggressive sandbox" directive. No allocation caps; multiple parallel runs across pairs/timeframes/parameterisations. PM reads approval queue, decides what to deploy, posts to `/paper-runs/approve`.
+- **Paper-deploy gate hardening** (PE's first "QA → PE pipeline" task) — fix the `paper.py:677` hole where `validator_passed=TRUE` was accepted even with non-empty `validation_failures` or zero `validation_folds`.
+- **QA → PE loop closure** — QA identifies defect → PE opens PR → tests pass → merges to `feat/agent-fleet` → PM reviews impact → cycle continues.
+- **CUSUM live drift detection** (Agent 3 R4) — ships as PE workload when QA identifies its need. One-sided CUSUM on daily realised-vs-backtest P&L residuals.
+- **Reflexion loop** — PM writes expected outcome at decision time; later re-reads and compares to actual. Memory layer gets "lessons learned" entries. QA uses these as prompt context.
+
+**Exit Criteria:**
+- [ ] PM has approved ≥3 paper deployments autonomously.
+- [ ] QA has caught + reported ≥1 regression PE introduced (demonstrates Reflexion loop).
+- [ ] Live-vs-backtest divergence on at least one paper run under 1σ for ≥7 continuous days.
+- [ ] CUSUM shipped and firing correctly on at least one paper run.
+- [ ] Monthly cost still within envelope.
+- [ ] **Profitability checkpoint (Week 10):** ≥1 strategy sustains positive paper P&L for 14 continuous days with divergence under 1σ.
+
+---
+
+## v0.8.3 - Agent Fleet: production merge
+
+**Theme:** Merge `feat/agent-fleet` → `main`. Staging + Railway run the full fleet.
+
+**Exit Criteria:**
+- [ ] 1-2 weeks soak on `feat/agent-fleet` running on UAT + dev with no Wilson intervention required.
+- [ ] Wilson approves the single PR from `feat/agent-fleet` → `main`.
+- [ ] 2 continuous weeks of agent-fleet on `main` without Wilson intervention.
+- [ ] Monthly agent cost at steady state within $20-30 envelope.
+- [ ] At least one paper run that the fleet designed, deployed, monitored, and halted/kept — Wilson only in the loop for merge-to-main.
+
+---
+
+## v0.9.0 - Live-nomination pipeline
+
+**Theme:** The fleet produces its first paper-strategy nomination with the full evidence package. Wilson reviews. If approved, the strategy queues for v1.0.0 live deployment. This is where the agent fleet's experimentation output converges on the ultimate goal — profitable, live-ready strategies.
+
+**Scope:**
+- **Nomination schema** — a formal `strategy_nomination` record with: 30-day paper P&L, divergence report, lineage, cost-model notes, Research Agent corroboration against SOTA literature, PM reasoning, sanity-check output ("would we still deploy if first 7 days had been losses?").
+- **PM composes nominations** — once a paper run clears the 30-day-profitable-with-divergence-under-threshold bar.
+- **Wilson's review interface** — simple approval endpoint + email with the full nomination package. Wilson approves, rejects (with reasoning that goes into agent memory), or requests more paper time.
+
+**Exit Criteria:**
+- [ ] At least 1 strategy has reached the nominated state with the full evidence package.
+- [ ] Wilson has reviewed ≥1 nomination end-to-end.
+- [ ] Approval path to v1.0.0 live-trading is clear (even if first nomination is rejected — the mechanism works).
 
 ---
 
