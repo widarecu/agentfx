@@ -407,7 +407,12 @@ def post_paper_run_alert(
         )
 
 
-__all__ = ["post_paper_run_alert", "send_agent_message"]
+__all__ = [
+    "post_paper_run_alert",
+    "send_agent_message",
+    "render_pm_brief_html",
+    "render_qa_divergence_html",
+]
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -420,6 +425,7 @@ def send_agent_message(
     agent_role: str,
     subject: str,
     body: str,
+    html_body: str | None = None,
 ) -> None:
     """Send a tagged email from a fleet agent.
 
@@ -428,12 +434,15 @@ def send_agent_message(
     staging vs production vs UAT at a glance even inside the fleet
     channel.
 
+    `body` is plain text (always sent). `html_body` is optional; when
+    provided, the message goes as `multipart/alternative` so modern
+    mail clients render HTML while plain-text fallback stays
+    available for stripped forwards and copy-paste.
+
     Never raises. SMTP failures are logged; the orchestrator keeps
     running.
 
     `agent_role` is a short tag (`"PM"`, `"QA"`, `"PE"`, `"RA"`).
-    `body` is plain text; HTML + attachments can come later if the
-    agents' output grows richer.
     """
     try:
         from agentfx.api.core.config import settings
@@ -469,6 +478,10 @@ def send_agent_message(
         msg["From"] = settings.EMAIL_FROM or settings.SMTP_USER
         msg["To"] = settings.EMAIL_TO
         msg.set_content(body)
+        if html_body:
+            # multipart/alternative — mail clients pick HTML; plain
+            # text stays as fallback for forwards, archive, copy.
+            msg.add_alternative(html_body, subtype="html")
 
         ok, detail = _send_with_one_retry(
             smtp_host=settings.SMTP_HOST,
@@ -491,4 +504,231 @@ def send_agent_message(
             "send_agent_message: unexpected failure role=%s subject=%r",
             agent_role,
             subject,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# HTML templates (Wilson 2026-10-05: fleet emails need polish)
+# ─────────────────────────────────────────────────────────────────────
+
+
+# Inline CSS only — many email clients strip <style> blocks. Max
+# width 600px for mobile safety; no external images (deliverability
+# + privacy); monospace for code / IDs.
+_EMAIL_SHELL = """<!doctype html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#f7f7f8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#1f2937;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f7f7f8;">
+  <tr><td align="center" style="padding:24px 12px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;background:#ffffff;border-radius:8px;border:1px solid #e5e7eb;overflow:hidden;">
+      <tr><td style="padding:16px 20px;background:#111827;color:#f9fafb;font-weight:600;letter-spacing:0.5px;">{env_pill} AgentFX &middot; {role_label}</td></tr>
+      <tr><td style="padding:20px;">{inner}</td></tr>
+      <tr><td style="padding:12px 20px;background:#f9fafb;color:#6b7280;font-size:12px;border-top:1px solid #e5e7eb;">v0.8.0 Phase B &middot; feat/agent-fleet &middot; <a href="https://github.com/widarecu/agentfx" style="color:#4b5563;">repo</a></td></tr>
+    </table>
+  </td></tr>
+</table>
+</body></html>"""
+
+
+def _env_pill_html() -> str:
+    try:
+        from agentfx.api.core.config import settings
+
+        env = (settings.ENVIRONMENT or "").upper()
+    except Exception:
+        env = ""
+    if not env:
+        return ""
+    color_map = {
+        "PRODUCTION": "#dc2626",
+        "STAGING": "#d97706",
+        "UAT": "#2563eb",
+        "DEVELOPMENT": "#6b7280",
+        "TEST": "#6b7280",
+    }
+    bg = color_map.get(env, "#6b7280")
+    return (
+        f'<span style="background:{bg};color:#fff;padding:2px 8px;'
+        f'border-radius:12px;font-size:11px;margin-right:8px;">{env}</span>'
+    )
+
+
+def _escape(text: str) -> str:
+    """Minimal HTML escape — enough for prose content from the LLM."""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def render_pm_brief_html(brief: Any, plaintext_body: str) -> str:
+    """Render a `PMBrief` as styled HTML for the fleet email.
+
+    Takes `Any` on the type signature to avoid an import cycle —
+    the caller is `agents.fleet.portfolio_manager` and the model
+    class lives there. The function only reads duck-typed
+    attributes (`headline`, `summary`, `recommendations`,
+    `concerns`).
+
+    `plaintext_body` is accepted but unused — kept in the signature
+    so the caller can pass both forms symmetrically if we ever
+    want to render minor callouts into the HTML pulled from the
+    plaintext render.
+    """
+    try:
+        headline = _escape(getattr(brief, "headline", "") or "")
+        summary = _escape(getattr(brief, "summary", "") or "")
+        recs = getattr(brief, "recommendations", []) or []
+        concerns = getattr(brief, "concerns", []) or []
+
+        rec_html_parts: list[str] = []
+        for r in recs:
+            prio = _escape(getattr(r, "priority", "") or "")
+            head = _escape(getattr(r, "headline", "") or "")
+            why = _escape(getattr(r, "rationale", "") or "")
+            prio_color = {
+                "now": "#dc2626",
+                "this_week": "#d97706",
+                "watch": "#6b7280",
+            }.get(prio, "#6b7280")
+            rec_html_parts.append(
+                f'<li style="margin:0 0 10px 0;">'
+                f'<span style="background:{prio_color};color:#fff;'
+                f"padding:1px 7px;border-radius:10px;font-size:11px;"
+                f'margin-right:6px;">{prio}</span>'
+                f"<strong>{head}</strong>"
+                f'<div style="color:#6b7280;font-size:13px;margin-top:2px;">{why}</div>'
+                f"</li>"
+            )
+        rec_html = (
+            '<h3 style="margin:20px 0 10px 0;font-size:14px;color:#374151;">'
+            "Recommendations</h3>"
+            f'<ul style="margin:0;padding-left:18px;">{"".join(rec_html_parts)}</ul>'
+            if rec_html_parts
+            else ""
+        )
+
+        concern_html_parts: list[str] = []
+        for c in concerns:
+            sev = _escape(getattr(c, "severity", "") or "")
+            desc = _escape(getattr(c, "description", "") or "")
+            sev_color = {
+                "blocker": "#dc2626",
+                "degraded": "#d97706",
+                "noted": "#6b7280",
+            }.get(sev, "#6b7280")
+            concern_html_parts.append(
+                f'<li style="margin:0 0 8px 0;">'
+                f'<span style="background:{sev_color};color:#fff;'
+                f"padding:1px 7px;border-radius:10px;font-size:11px;"
+                f'margin-right:6px;">{sev}</span>'
+                f"{desc}</li>"
+            )
+        concern_html = (
+            '<h3 style="margin:20px 0 10px 0;font-size:14px;color:#374151;">'
+            "Concerns</h3>"
+            f'<ul style="margin:0;padding-left:18px;">{"".join(concern_html_parts)}</ul>'
+            if concern_html_parts
+            else ""
+        )
+
+        inner = (
+            f'<h2 style="margin:0 0 8px 0;font-size:20px;color:#111827;">{headline}</h2>'
+            f'<p style="margin:0 0 16px 0;line-height:1.5;color:#374151;">{summary}</p>'
+            f"{rec_html}"
+            f"{concern_html}"
+        )
+
+        return _EMAIL_SHELL.format(
+            env_pill=_env_pill_html(),
+            role_label="Portfolio Manager",
+            inner=inner,
+        )
+    except Exception:
+        # Rendering must not break the send — fall back to a plain
+        # <pre> dump of the plaintext body wrapped in the shell.
+        safe = _escape(plaintext_body)
+        return _EMAIL_SHELL.format(
+            env_pill=_env_pill_html(),
+            role_label="Portfolio Manager",
+            inner=f'<pre style="white-space:pre-wrap;margin:0;">{safe}</pre>',
+        )
+
+
+def render_qa_divergence_html(report: Any, plaintext_body: str) -> str:
+    """Render a QA divergence report as styled HTML.
+
+    Mirrors `render_pm_brief_html`'s shape so future refactoring
+    can collapse them if we grow more agents. Duck-typed on
+    `headline`, `summary`, `classifications`, `work_orders`.
+    """
+    try:
+        headline = _escape(getattr(report, "headline", "") or "")
+        summary = _escape(getattr(report, "summary", "") or "")
+        classifications = getattr(report, "classifications", []) or []
+        work_orders = getattr(report, "work_orders", []) or []
+
+        class_html_parts: list[str] = []
+        for c in classifications:
+            cat = _escape(getattr(c, "category", "") or "")
+            conf = getattr(c, "confidence", 0.0) or 0.0
+            desc = _escape(getattr(c, "description", "") or "")
+            class_html_parts.append(
+                f'<li style="margin:0 0 8px 0;">'
+                f'<span style="background:#4f46e5;color:#fff;padding:1px 7px;'
+                f'border-radius:10px;font-size:11px;margin-right:6px;">{cat}</span>'
+                f"<strong>confidence {conf:.0%}</strong><br/>"
+                f'<span style="color:#374151;font-size:13px;">{desc}</span>'
+                f"</li>"
+            )
+        class_html = (
+            '<h3 style="margin:20px 0 10px 0;font-size:14px;color:#374151;">'
+            "Divergence classifications</h3>"
+            f'<ul style="margin:0;padding-left:18px;">{"".join(class_html_parts)}</ul>'
+            if class_html_parts
+            else ""
+        )
+
+        wo_html_parts: list[str] = []
+        for w in work_orders:
+            title = _escape(getattr(w, "title", "") or "")
+            file_target = _escape(getattr(w, "target_file", "") or "")
+            spec = _escape(getattr(w, "spec", "") or "")
+            wo_html_parts.append(
+                f'<li style="margin:0 0 10px 0;">'
+                f"<strong>{title}</strong>"
+                f'<div style="color:#6b7280;font-size:12px;">target: '
+                f'<code style="background:#f3f4f6;padding:1px 4px;">{file_target}</code></div>'
+                f'<div style="color:#374151;font-size:13px;margin-top:2px;">{spec}</div>'
+                f"</li>"
+            )
+        wo_html = (
+            '<h3 style="margin:20px 0 10px 0;font-size:14px;color:#374151;">'
+            "Work orders for Platform Engineer</h3>"
+            f'<ul style="margin:0;padding-left:18px;">{"".join(wo_html_parts)}</ul>'
+            if wo_html_parts
+            else ""
+        )
+
+        inner = (
+            f'<h2 style="margin:0 0 8px 0;font-size:20px;color:#111827;">{headline}</h2>'
+            f'<p style="margin:0 0 16px 0;line-height:1.5;color:#374151;">{summary}</p>'
+            f"{class_html}"
+            f"{wo_html}"
+        )
+
+        return _EMAIL_SHELL.format(
+            env_pill=_env_pill_html(),
+            role_label="Quant Analyst",
+            inner=inner,
+        )
+    except Exception:
+        safe = _escape(plaintext_body)
+        return _EMAIL_SHELL.format(
+            env_pill=_env_pill_html(),
+            role_label="Quant Analyst",
+            inner=f'<pre style="white-space:pre-wrap;margin:0;">{safe}</pre>',
         )

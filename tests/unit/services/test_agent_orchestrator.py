@@ -130,12 +130,11 @@ class TestLifespanGating:
             tasks = agent_orchestrator.register_lifespan_tasks()
         assert tasks == []
 
-    async def test_enabled_flag_starts_pm_task(self):
-        """`create_task` requires a running loop — the pytest-asyncio
+    async def test_enabled_flag_starts_all_fleet_tasks(self):
+        """`create_task` requires a running loop — pytest-asyncio
         `auto` mode (see conftest) provides one when the test itself
-        is async. We then cleanly shutdown the task before leaving
-        the test so leftover pending tasks don't pollute other
-        tests."""
+        is async. We patch BOTH loops to no-ops and cleanly shutdown
+        so leftover pending tasks don't pollute other tests."""
 
         async def _noop():
             return None
@@ -145,7 +144,12 @@ class TestLifespanGating:
                 "agentfx.services.agent_orchestrator._pm_daily_loop",
                 _noop,
             ):
-                tasks = agent_orchestrator.register_lifespan_tasks()
-                assert len(tasks) == 1
-                assert tasks[0].get_name() == "fleet_pm_daily"
-                await agent_orchestrator.shutdown_lifespan_tasks()
+                with patch(
+                    "agentfx.services.agent_orchestrator._qa_scan_loop",
+                    _noop,
+                ):
+                    tasks = agent_orchestrator.register_lifespan_tasks()
+                    assert len(tasks) == 2
+                    names = {t.get_name() for t in tasks}
+                    assert names == {"fleet_pm_daily", "fleet_qa_scan"}
+                    await agent_orchestrator.shutdown_lifespan_tasks()

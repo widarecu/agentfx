@@ -152,6 +152,49 @@ async def _pm_daily_loop() -> None:
         await asyncio.sleep(60 * 60)
 
 
+# QA scan cadence. 30 min balances two concerns:
+# - A new fill on paper should be analysed in roughly the same hour
+#   it happens; 30 min keeps the signal fresh.
+# - Each scan is cheap (DB-only count queries) until it finds a
+#   candidate; too-frequent scans still cost near-nothing.
+_QA_SCAN_SECONDS = 60 * 30
+
+
+async def _qa_scan_loop() -> None:
+    """Scan paper runs for QA divergence reports every 30 minutes.
+
+    QA runs event-triggered — the scan finds paper runs with
+    meaningful new activity since their last report (or any
+    terminal stop_reason within the day) and dispatches a Sonnet 5
+    call per run. Idempotent by (`run_id`, UTC date) `decision_key`.
+    """
+    from agentfx.agents.fleet.quant_analyst import scan_and_run_reports
+
+    logger.info(
+        "agent_orchestrator: QA scan loop armed (cadence=%ds)", _QA_SCAN_SECONDS
+    )
+    while True:
+        try:
+            with SessionLocal() as db:
+                if not is_within_daily_budget(db):
+                    logger.warning(
+                        "agent_orchestrator: QA scan skipped — daily budget "
+                        "exceeded for %s",
+                        datetime.now(UTC).date(),
+                    )
+                else:
+                    produced = scan_and_run_reports(db=db)
+                    if produced:
+                        logger.info(
+                            "agent_orchestrator: QA produced %d report(s)",
+                            produced,
+                        )
+        except Exception:
+            logger.exception("agent_orchestrator: QA scan iteration failed")
+
+        await asyncio.sleep(_QA_SCAN_SECONDS)
+
+
 # Set from `register_lifespan_tasks`; retained so tests can inspect
 # or cancel the running tasks explicitly.
 _active_tasks: list[asyncio.Task[Any]] = []
@@ -172,11 +215,15 @@ def register_lifespan_tasks() -> list[asyncio.Task[Any]]:
         return []
 
     logger.info(
-        "agent_orchestrator: starting fleet (PM=%s, daily_cap=$%.2f)",
+        "agent_orchestrator: starting fleet (PM=%s, QA=%s, daily_cap=$%.2f)",
         settings.AGENT_PM_MODEL,
+        settings.AGENT_QA_MODEL,
         settings.AGENT_FLEET_DAILY_USD_CAP,
     )
-    _active_tasks = [asyncio.create_task(_pm_daily_loop(), name="fleet_pm_daily")]
+    _active_tasks = [
+        asyncio.create_task(_pm_daily_loop(), name="fleet_pm_daily"),
+        asyncio.create_task(_qa_scan_loop(), name="fleet_qa_scan"),
+    ]
     return _active_tasks
 
 
