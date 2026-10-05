@@ -407,4 +407,88 @@ def post_paper_run_alert(
         )
 
 
-__all__ = ["post_paper_run_alert"]
+__all__ = ["post_paper_run_alert", "send_agent_message"]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Agent Fleet channel (v0.8.x) — tagged email for PM/QA/PE/RA output
+# ─────────────────────────────────────────────────────────────────────
+
+
+def send_agent_message(
+    *,
+    agent_role: str,
+    subject: str,
+    body: str,
+) -> None:
+    """Send a tagged email from a fleet agent.
+
+    Subject format: `[AgentFX AGENT <ROLE>] <ENV> — <subject>`. The
+    ENV tag matches `post_paper_run_alert` so Wilson can filter
+    staging vs production vs UAT at a glance even inside the fleet
+    channel.
+
+    Never raises. SMTP failures are logged; the orchestrator keeps
+    running.
+
+    `agent_role` is a short tag (`"PM"`, `"QA"`, `"PE"`, `"RA"`).
+    `body` is plain text; HTML + attachments can come later if the
+    agents' output grows richer.
+    """
+    try:
+        from agentfx.api.core.config import settings
+
+        if not settings.AGENT_FLEET_ENABLED:
+            # Belt + braces: even if a caller invokes this with the
+            # flag off, we don't want to leak email.
+            return
+
+        env_tag = _ENV_TAG.get((settings.ENVIRONMENT or "").lower())
+        tag = f"[AgentFX AGENT {agent_role}"
+        tag += f" {env_tag}" if env_tag else ""
+        tag += "]"
+        full_subject = f"{tag} {subject}"
+
+        ok_to_send, why = _should_send(
+            smtp_host=settings.SMTP_HOST,
+            email_to=settings.EMAIL_TO,
+            enabled=settings.NOTIFICATIONS_ENABLED,
+            # No dedup for agent messages — they're expected to
+            # be unique per decision_key already. Pass a fresh
+            # stub so `_should_send`'s notified-set check is a
+            # no-op.
+            run=type("Stub", (), {"id": "agent-stub", "parameters": None})(),
+            reason=full_subject,
+        )
+        if not ok_to_send:
+            logger.debug("send_agent_message: skipped (%s)", why)
+            return
+
+        msg = EmailMessage()
+        msg["Subject"] = full_subject
+        msg["From"] = settings.EMAIL_FROM or settings.SMTP_USER
+        msg["To"] = settings.EMAIL_TO
+        msg.set_content(body)
+
+        ok, detail = _send_with_one_retry(
+            smtp_host=settings.SMTP_HOST,
+            smtp_port=settings.SMTP_PORT,
+            smtp_user=settings.SMTP_USER,
+            smtp_password=settings.SMTP_PASSWORD,
+            email_from=settings.EMAIL_FROM or settings.SMTP_USER,
+            email_to=settings.EMAIL_TO,
+            msg=msg,
+        )
+        if not ok:
+            logger.warning(
+                "send_agent_message: failed role=%s subject=%r detail=%s",
+                agent_role,
+                subject,
+                detail,
+            )
+    except Exception:  # noqa: BLE001 — never let email break the fleet
+        logger.exception(
+            "send_agent_message: unexpected failure role=%s subject=%r",
+            agent_role,
+            subject,
+        )

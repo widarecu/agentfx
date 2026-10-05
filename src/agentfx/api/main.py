@@ -132,6 +132,18 @@ async def lifespan(app: FastAPI):
         name="paper-runner-auto-restart-supervisor",
     )
 
+    # Agent Fleet orchestrator (v0.8.0). No-op when AGENT_FLEET_ENABLED
+    # is False (default on staging/prod); on dev + uat the PM morning
+    # brief loop starts here. See services/agent_orchestrator.py.
+    from agentfx.services.agent_orchestrator import (
+        register_lifespan_tasks as register_agent_fleet,
+        shutdown_lifespan_tasks as shutdown_agent_fleet,
+    )
+
+    fleet_tasks = register_agent_fleet()
+    if fleet_tasks:
+        logger.info(f"Agent fleet started with {len(fleet_tasks)} task(s)")
+
     yield  # App runs here
 
     # Shutdown
@@ -141,6 +153,7 @@ async def lifespan(app: FastAPI):
         await supervisor_task
     except asyncio.CancelledError:
         pass
+    await shutdown_agent_fleet()
     await stop_ingestion_worker()
     logger.info("Candle ingestion worker stopped")
 

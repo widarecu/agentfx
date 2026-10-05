@@ -35,6 +35,7 @@ from .user_credentials import (
     UserOandaAccount,
     UserOandaCredentials,
 )
+from .agent_decision import AgentDecision, AgentRole
 from .verified_gap import VerifiedEmptyGap
 
 # Make models available at the package level
@@ -73,4 +74,7 @@ __all__ = [
     "UserOandaCredentials",
     "UserOandaAccount",
     "OandaEnvironment",
+    # Agent Fleet (v0.8.0)
+    "AgentDecision",
+    "AgentRole",
 ]
