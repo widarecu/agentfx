@@ -761,6 +761,10 @@ information a mobile user would need while monitoring a run."
 - [ ] `TODO` [US-032 — Shared memory layer](requirements/US-032-agent-memory-layer.md) — `agent_decisions` DB table + migration, `agent_memory/` markdown directory structure, read/write helpers.
 - [ ] `TODO` [US-033 — Agent email channel](requirements/US-033-agent-email-subject-prefix.md) — `[AgentFX AGENT <ROLE>]` subject prefix support in `notifications/email.py` so Wilson's inbox stays sortable.
 
+### Phase A follow-ups
+
+- [ ] `TODO` **Email formatting polish** (Wilson 2026-10-05, deferred). Current brief body is a plain-text template — "quite plain and unformatted" per Wilson. Rework once Phase B lands the Haiku-driven PM brief: HTML multipart body, scoreboard rendered as a table, highlighted call-outs for actionable recommendations, mobile-safe layout. Doing it before Phase B is throwaway work since the brief content shape itself changes.
+
 ### Exit criteria
 
 - [ ] PM Agent sent ≥14 morning briefs with no manual intervention.
