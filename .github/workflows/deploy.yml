@@ -204,7 +204,8 @@ jobs:
       # `vercel pull` step below materialises that from the same env
       # vars we already provide, then `vercel deploy` can proceed as
       # before. See https://vercel.link/cannot-load-project-settings.
-      # Added 2026-10-06 after CLI regression broke deploys.
+      # Added 2026-10-06 after CLI regression broke deploys. Also
+      # paired with a refreshed VERCEL_TOKEN secret the same day.
       - name: Pull Vercel project settings
         run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
         working-directory: .
