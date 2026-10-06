@@ -147,10 +147,33 @@ export default function FitnessBreakdown({
           {/* Weighted sum subtotal */}
           <div className={`flex justify-between pt-1.5 border-t border-slate-200 dark:border-slate-700 text-xs font-mono ${dim}`}>
             <span>Weighted sum</span>
-            <span className={termColor(data.terms.reduce((s, t) => s + t.contribution, 0))}>
-              {fmtSigned(data.terms.reduce((s, t) => s + t.contribution, 0), 4)}
+            <span className={termColor(data.weightedSum ?? 0)}>
+              {fmtSigned(data.weightedSum ?? 0, 4)}
             </span>
           </div>
+
+          {/* Fold-consistency penalty: the missing step between weighted
+              sum and raw fitness. Explicit so the arithmetic is visible. */}
+          {data.foldConsistencyPenalty != null &&
+            data.foldConsistencyStd != null && (
+              <div className="flex items-start gap-3 pt-1.5">
+                <div className="min-w-0 flex-1">
+                  <div className="text-xs font-medium text-slate-700 dark:text-slate-300">
+                    Fold-consistency penalty
+                  </div>
+                  <div className={`text-xs ${dim} mt-0.5`}>
+                    −0.5 × std(fold Sharpe) — punishes strategies whose
+                    per-fold Sharpes vary widely (regime-fragile). Here
+                    std = {data.foldConsistencyStd.toFixed(3)}.
+                  </div>
+                </div>
+                <div className="shrink-0 text-right font-mono text-xs">
+                  <span className="text-rose-700 dark:text-rose-400">
+                    {fmtSigned(data.foldConsistencyPenalty, 4)}
+                  </span>
+                </div>
+              </div>
+            )}
         </div>
       )}
 

@@ -55,6 +55,24 @@ export interface FitnessBreakdownData {
   /** Five weighted proximity terms (present when gate_b_proximity_terms exists) */
   terms: ProximityTerm[] | null;
   /**
+   * Sum of the five weighted term contributions BEFORE the fold-consistency
+   * penalty is applied. Null when `terms` is null (legacy rows without
+   * gate_b_proximity_terms — we can't reconstruct the pre-penalty sum from
+   * a legacy raw_fitness alone).
+   */
+  weightedSum: number | null;
+  /**
+   * Fold-consistency penalty = weighted_sum − raw_fitness = 0.5 × std(fold
+   * Sharpe). Punishes strategies whose per-fold Sharpes vary widely
+   * (regime-fragile). Always negative or zero; null when we can't compute it.
+   */
+  foldConsistencyPenalty: number | null;
+  /**
+   * The std(fold Sharpe) value the penalty was derived from (= penalty / 0.5).
+   * Null when penalty is null.
+   */
+  foldConsistencyStd: number | null;
+  /**
    * Raw Gate-B-proximity composite.
    * v0.6.0+: from metrics_json.raw_fitness (dedicated field).
    * Fallback for legacy rows: from penalty_breakdown.raw_fitness.
@@ -219,8 +237,22 @@ export function buildFitnessBreakdownData(params: {
       ? metricsJson.raw_fitness
       : penaltyBreakdown.raw_fitness;
 
+  // Fold-consistency penalty is the gap between the weighted sum and raw
+  // fitness. It's `−0.5 × std(fold Sharpe)` — hardcoded coefficient in
+  // fitness.py's _gate_b_proximity_score. Only reconstructable when the
+  // proximity terms are present (i.e. v0.6.0+ rows).
+  const weightedSum =
+    terms != null ? terms.reduce((s, t) => s + t.contribution, 0) : null;
+  const foldConsistencyPenalty =
+    weightedSum != null ? rawFitness - weightedSum : null;
+  const foldConsistencyStd =
+    foldConsistencyPenalty != null ? Math.abs(foldConsistencyPenalty) / 0.5 : null;
+
   return {
     terms,
+    weightedSum,
+    foldConsistencyPenalty,
+    foldConsistencyStd,
     rawFitness,
     zeroTradePenaltyActive: penaltyBreakdown.zero_trade_penalty !== 0,
     diversityPenaltyActive: penaltyBreakdown.diversity_penalty_factor !== 1.0,
