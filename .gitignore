@@ -66,3 +66,4 @@ yarn-error.log*
 # per-developer resource limits, etc). docker compose auto-loads
 # `docker-compose.override.yml` alongside `docker-compose.yml`.
 docker-compose.override.yml
+docker-compose.override.yml.disabled

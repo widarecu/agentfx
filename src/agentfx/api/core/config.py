@@ -403,6 +403,75 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ─────────────────────────────────────────────────────────────────
+    # Agent Fleet (v0.8.x) — see planning/ROADMAP.md
+    # ─────────────────────────────────────────────────────────────────
+    # Master toggle. Default FALSE on staging + production so the fleet
+    # only runs where it's been explicitly enabled. UAT + dev default
+    # to TRUE via .env.uat / .env.development so Wilson sees fleet
+    # behaviour locally without touching staging config.
+    AGENT_FLEET_ENABLED: bool = Field(
+        default=False,
+        env="AGENT_FLEET_ENABLED",
+        description=(
+            "v0.8.x master switch. When False, the orchestrator "
+            "lifespan hook is a no-op; no agent ever fires. "
+            "Keep False in staging/prod until Wilson approves the "
+            "feat/agent-fleet → main merge (v0.8.3)."
+        ),
+    )
+
+    # Per-agent model routing. Defaults are the cost-tuned mix in the
+    # approved plan (Haiku for cheap PM daily brief, Sonnet for QA
+    # analysis + Research digest, Opus for PE's code work). Env
+    # overrides let Wilson re-pin without a code change if a model is
+    # retired or priced differently.
+    AGENT_PM_MODEL: str = Field(
+        default="claude-haiku-4-5",
+        env="AGENT_PM_MODEL",
+        description="Portfolio Manager Agent model (daily brief).",
+    )
+    AGENT_QA_MODEL: str = Field(
+        default="claude-sonnet-5",
+        env="AGENT_QA_MODEL",
+        description="Quant Analyst Agent model (divergence reports).",
+    )
+    AGENT_PE_MODEL: str = Field(
+        default="claude-opus-5",
+        env="AGENT_PE_MODEL",
+        description="Platform Engineer Agent model (code work, via Managed Agents).",
+    )
+    AGENT_RA_MODEL: str = Field(
+        default="claude-sonnet-5",
+        env="AGENT_RA_MODEL",
+        description="Research Agent model (weekly literature digest).",
+    )
+
+    # Budget caps. Enforced by the orchestrator at call time — if the
+    # per-day USD estimate for an agent exceeds its daily cap, the
+    # orchestrator skips that run and emails Wilson. The monthly cap is
+    # a soft tripwire that triggers an email alert; it does NOT halt
+    # agents by itself (hard caps live on the daily knob).
+    AGENT_FLEET_DAILY_USD_CAP: float = Field(
+        default=2.00,
+        env="AGENT_FLEET_DAILY_USD_CAP",
+        description=(
+            "Hard daily per-fleet USD cap. ~$2/day = ~$60/mo ceiling, "
+            "leaving headroom for Wilson's $20-30/mo target with "
+            "typical day-to-day underspend. Exceeding this skips the "
+            "next scheduled run and sends an email."
+        ),
+    )
+    AGENT_FLEET_MONTHLY_USD_ALERT: float = Field(
+        default=20.00,
+        env="AGENT_FLEET_MONTHLY_USD_ALERT",
+        description=(
+            "Soft monthly spend trip-wire. On crossing this value "
+            "Wilson gets a one-shot email alert; the fleet keeps "
+            "running until the hard daily cap kicks in."
+        ),
+    )
+
     @property
     def instruments_list(self) -> list[str]:
         """Parse CANDLE_INSTRUMENTS into a list."""
