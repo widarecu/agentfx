@@ -37,10 +37,11 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from agentfx.agents.fleet.log_buffer import get_global_buffer
+from agentfx.agents.fleet.memory import agent_memory_root, write_memory_file
 from agentfx.api.core.config import settings
 from agentfx.api.core.database import SessionLocal
 from agentfx.api.models.agent_decision import AgentDecision, AgentRole
-from agentfx.agents.fleet.memory import agent_memory_root, write_memory_file
 
 logger = logging.getLogger(__name__)
 
@@ -161,14 +162,21 @@ _QA_SCAN_SECONDS = 60 * 30
 
 
 async def _qa_scan_loop() -> None:
-    """Scan paper runs for QA divergence reports every 30 minutes.
+    """Scan paper runs for QA divergence reports every 30 minutes,
+    AND fire the daily technical-health scan once per day.
 
     QA runs event-triggered — the scan finds paper runs with
     meaningful new activity since their last report (or any
     terminal stop_reason within the day) and dispatches a Sonnet 5
-    call per run. Idempotent by (`run_id`, UTC date) `decision_key`.
+    call per run. The tech-health scan is independent of paper
+    activity (the two feed different Reflexion grades) and fires
+    at most once per calendar day; it analyses the backend's
+    WARNING+ log buffer for anomalies the UI doesn't surface.
     """
-    from agentfx.agents.fleet.quant_analyst import scan_and_run_reports
+    from agentfx.agents.fleet.quant_analyst import (
+        scan_and_run_reports,
+        scan_for_technical_anomalies,
+    )
 
     logger.info(
         "agent_orchestrator: QA scan loop armed (cadence=%ds)", _QA_SCAN_SECONDS
@@ -186,8 +194,14 @@ async def _qa_scan_loop() -> None:
                     produced = scan_and_run_reports(db=db)
                     if produced:
                         logger.info(
-                            "agent_orchestrator: QA produced %d report(s)",
+                            "agent_orchestrator: QA produced %d divergence report(s)",
                             produced,
+                        )
+                    # Tech-health scan is idempotent per day; this
+                    # call is a no-op once the day's report exists.
+                    if scan_for_technical_anomalies(db=db):
+                        logger.info(
+                            "agent_orchestrator: QA produced tech-health report"
                         )
         except Exception:
             logger.exception("agent_orchestrator: QA scan iteration failed")
@@ -220,6 +234,13 @@ def register_lifespan_tasks() -> list[asyncio.Task[Any]]:
         settings.AGENT_QA_MODEL,
         settings.AGENT_FLEET_DAILY_USD_CAP,
     )
+
+    # Attach the process-wide log buffer BEFORE the agent loops start
+    # so QA sees anything the loops themselves emit on their first
+    # iteration. Idempotent — safe to call across lifespan restarts.
+    get_global_buffer().attach_global_handler()
+    logger.info("agent_orchestrator: log capture buffer attached")
+
     _active_tasks = [
         asyncio.create_task(_pm_daily_loop(), name="fleet_pm_daily"),
         asyncio.create_task(_qa_scan_loop(), name="fleet_qa_scan"),

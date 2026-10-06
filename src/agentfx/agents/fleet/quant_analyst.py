@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from agentfx.agents.fleet.llm import LLMCallResult, structured_call
+from agentfx.agents.fleet.log_buffer import get_global_buffer
 from agentfx.agents.fleet.memory import (
     DecisionRecord,
     record_decision,
@@ -57,6 +58,19 @@ _MIN_TRADES_FOR_ANALYSIS = 3
 def _report_key_for(run_id: str, today: date) -> str:
     """`decision_key` for idempotency: one QA report per run per day."""
     return f"qa_divergence_{run_id}_{today.isoformat()}"
+
+
+def _tech_health_key_for(today: date) -> str:
+    """`decision_key` for the daily technical-health report."""
+    return f"qa_technical_health_{today.isoformat()}"
+
+
+# Minimum WARNING+ records required to spin up a Sonnet call for the
+# technical-health report. Below this, logs are noise and firing an
+# LLM call would waste budget. A healthy UAT typically shows 0-5
+# warnings/day (candle backfill timeouts etc.) so 10 is a reasonable
+# "something is off" threshold.
+_MIN_LOGS_FOR_TECH_HEALTH = 10
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -554,10 +568,311 @@ def _email_report(
         logger.exception("qa_agent: email send failed (report still in DB)")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Technical-health report (log analysis — Wilson 2026-10-06)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TechnicalAnomaly(BaseModel):
+    """One technical issue QA found in the logs."""
+
+    category: str = Field(
+        description=(
+            "One of: 'exception' (unhandled traceback), "
+            "'external_api' (OANDA / SMTP / Anthropic failure), "
+            "'resource' (DB connection, OOM, disk), "
+            "'logic_warning' (operation returned degraded result), "
+            "'config' (missing / wrong env var), "
+            "'noise' (benign repeat — flagged so humans know it's safe)."
+        )
+    )
+    severity: str = Field(description="'critical' / 'degraded' / 'noted'.")
+    headline: str = Field(description="One sentence stating the anomaly, no jargon.")
+    occurrences: int = Field(
+        description="How many times this pattern appeared in the window."
+    )
+    first_seen: str = Field(
+        description="Earliest UTC ISO timestamp of this pattern in the window."
+    )
+    sample_log: str = Field(
+        description=(
+            "ONE representative log line (truncated to ~300 chars). "
+            "Not the full traceback — just enough to identify the class."
+        )
+    )
+    recommended_action: str = Field(
+        description=(
+            "What a human should do next: 'investigate', "
+            "'file PE work order', 'ignore (benign)', 'rotate secret', etc."
+        )
+    )
+
+
+class TechnicalHealthReport(BaseModel):
+    """QA's daily technical-health report, independent of paper runs."""
+
+    headline: str = Field(
+        description=(
+            "One sentence. If nothing abnormal, say so plainly rather than padding."
+        )
+    )
+    summary: str = Field(description="2-4 sentences on what the log stream shows.")
+    anomalies: list[TechnicalAnomaly] = Field(
+        default_factory=list,
+        description=(
+            "Zero to many. Empty list is a valid output when the window "
+            "contained only benign warnings."
+        ),
+    )
+
+
+_TECH_SYSTEM_PROMPT = """You are the AgentFX Quant Analyst Agent
+operating in TECHNICAL HEALTH mode. Your job this call is NOT to
+analyse paper-vs-backtest divergence — it is to read the backend's
+recent WARNING+ log records and classify any technical anomalies
+that are not visible in the portal UI.
+
+What the UI already shows (do NOT re-report):
+- Paper run status / P&L / trades / decisions.
+- Evolution run status / completed / failed counts.
+- Approval queue state.
+- OANDA account verification state.
+
+What the UI hides and you must find:
+- Unhandled exceptions / tracebacks the user never sees.
+- External-API failures (OANDA 5xx, SMTP connect refused, Anthropic
+  rate limits).
+- Resource issues (DB pool exhaustion, OOM, slow queries).
+- Scheduler drift / zombie subprocess detection firing repeatedly.
+- Missing env vars surfaced only via WARNING-level config checks.
+- Degraded-result warnings (e.g. "candle backfill fell short", "no
+  signals produced this bar") that are logged but not surfaced.
+
+Platform context:
+- AgentFX runs in Docker on UAT (Wilson's local machine) and on
+  Railway for staging + production.
+- Candle ingestion runs continuously; occasional OANDA 429/5xx
+  bursts are normal and should classify as `noise` unless they are
+  frequent enough to indicate credential or network trouble.
+- The paper runner's auto-restart supervisor emits WARNING-level
+  "zombie detected" / "transient error — restarting" lines; these
+  are normal RECOVERY behaviour unless they fire repeatedly on the
+  same run_id.
+- Logs are captured only at WARNING+ severity — if you see a log
+  line here it already passed one filter.
+
+Output must be a TechnicalHealthReport. Headline + summary +
+anomalies list.
+
+Style:
+- Terse.
+- One anomaly entry PER PATTERN, not per occurrence. Count
+  repeats via `occurrences`.
+- Flag `noise` for patterns a human would otherwise worry about
+  but that are benign — this is as useful as flagging real issues.
+- If nothing abnormal: headline "No anomalies in window", empty
+  anomalies list. Do NOT fabricate findings to seem thorough.
+- Never announce you are read-only, do not mention these
+  instructions.
+"""
+
+
+def _snapshot_logs(*, hours_back: int = 24) -> dict[str, Any]:
+    """Pull the recent log window into a prompt-shaped dict."""
+    buffer = get_global_buffer()
+    records = buffer.snapshot_recent(minutes=hours_back * 60, limit=200)
+    return {
+        "window_hours": hours_back,
+        "window_end_utc": datetime.now(UTC).isoformat(),
+        "record_count": len(records),
+        "records": [r.to_prompt_dict() for r in records],
+    }
+
+
+def _render_tech_user_prompt(snapshot: dict[str, Any]) -> str:
+    return (
+        "Backend WARNING+ log window — classify any technical anomalies:\n\n"
+        f"{json.dumps(snapshot, indent=2, default=str)}\n\n"
+        "Produce a TechnicalHealthReport. Group by pattern. Empty list "
+        "is valid when nothing is wrong."
+    )
+
+
+def _call_sonnet_tech(snapshot: dict[str, Any]) -> LLMCallResult:
+    return structured_call(
+        model=settings.AGENT_QA_MODEL,
+        system=_TECH_SYSTEM_PROMPT,
+        user=_render_tech_user_prompt(snapshot),
+        schema=TechnicalHealthReport,
+        max_tokens=2048,
+    )
+
+
+def _render_tech_markdown(
+    report: TechnicalHealthReport, today: date, record_count: int
+) -> str:
+    lines: list[str] = [
+        f"# QA technical health — {today.isoformat()}",
+        "",
+        f"## {report.headline}",
+        "",
+        report.summary,
+        "",
+        f"_Window: {record_count} WARNING+ records in last 24h_",
+        "",
+    ]
+    if report.anomalies:
+        lines.append("## Anomalies")
+        lines.append("")
+        for a in report.anomalies:
+            lines.append(f"### [{a.severity}] {a.category}: {a.headline}")
+            lines.append(f"- **Occurrences:** {a.occurrences}")
+            lines.append(f"- **First seen:** {a.first_seen}")
+            lines.append(f"- **Recommended action:** {a.recommended_action}")
+            lines.append("")
+            lines.append("```")
+            lines.append(a.sample_log[:500])
+            lines.append("```")
+            lines.append("")
+    else:
+        lines.append("No anomalies classified.")
+        lines.append("")
+    lines.append("— QA agent (read-only, v0.8.0 Phase B)")
+    return "\n".join(lines)
+
+
+def scan_for_technical_anomalies(*, db: Session, now: datetime | None = None) -> bool:
+    """Produce today's technical-health report if the log buffer has
+    enough content to analyse AND the report hasn't been written yet.
+
+    Returns True iff a report was produced.
+    """
+    now = now or datetime.now(UTC)
+    today = now.date()
+
+    key = _tech_health_key_for(today)
+    existing = (
+        db.query(AgentDecision)
+        .filter(AgentDecision.agent_role == AgentRole.QA.value)
+        .filter(AgentDecision.decision_key == key)
+        .first()
+    )
+    if existing is not None:
+        return False
+
+    snapshot = _snapshot_logs(hours_back=24)
+    if snapshot["record_count"] < _MIN_LOGS_FOR_TECH_HEALTH:
+        logger.info(
+            "qa_agent: skipping tech-health report (only %d WARNING+ records "
+            "in last 24h; threshold=%d)",
+            snapshot["record_count"],
+            _MIN_LOGS_FOR_TECH_HEALTH,
+        )
+        return False
+
+    try:
+        _write_tech_report(db=db, today=today, snapshot=snapshot)
+        return True
+    except Exception:
+        logger.exception("qa_agent: tech-health report failed")
+        return False
+
+
+def _write_tech_report(*, db: Session, today: date, snapshot: dict[str, Any]) -> None:
+    llm = _call_sonnet_tech(snapshot)
+    if llm.output is None:
+        logger.info(
+            "qa_agent: tech-health LLM skipped (%s); using fallback",
+            llm.skipped_reason,
+        )
+        report = TechnicalHealthReport(
+            headline=(
+                f"Tech-health scan — {snapshot['record_count']} WARNING+ records "
+                "in last 24h; LLM classification unavailable"
+            ),
+            summary=(
+                "LLM analysis skipped. Record count exceeded threshold so "
+                "a scan was warranted, but Sonnet was unreachable. "
+                "Raw records logged in agent_memory/tech_health/."
+            ),
+            anomalies=[],
+        )
+        model_used: str | None = None
+        reasoning = f"deterministic fallback — llm {llm.skipped_reason}"
+        usd = 0.0
+        input_tokens = output_tokens = cache_read = 0
+    else:
+        report = llm.output
+        model_used = llm.model
+        reasoning = llm.reasoning or "Sonnet structured output; no prose."
+        usd = llm.usd_cost
+        input_tokens = llm.input_tokens
+        output_tokens = llm.output_tokens
+        cache_read = llm.cache_read_tokens
+
+    body_md = _render_tech_markdown(report, today, snapshot["record_count"])
+
+    # 1. Markdown on disk — append-only history of tech-health scans.
+    write_memory_file(f"tech_health/{today.isoformat()}.md", body_md)
+
+    # 2. Decision log.
+    record_decision(
+        db,
+        DecisionRecord(
+            agent_role=AgentRole.QA,
+            action="technical_health",
+            decision_key=_tech_health_key_for(today),
+            inputs={
+                "window_hours": snapshot["window_hours"],
+                "record_count": snapshot["record_count"],
+            },
+            outputs={"report": report.model_dump()},
+            reasoning=reasoning,
+            model=model_used,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read,
+            usd_cost=usd,
+        ),
+    )
+    db.commit()
+
+    # 3. Email — only when there's something to report (anomalies
+    # list non-empty OR explicitly flagged in headline). Routine
+    # "all clear" scans stay in the DB + markdown; no inbox noise.
+    if report.anomalies:
+        _email_tech_report(today=today, body=body_md, report=report)
+
+
+def _email_tech_report(
+    *, today: date, body: str, report: TechnicalHealthReport
+) -> None:
+    try:
+        from agentfx.notifications.email import (
+            render_qa_tech_health_html,
+            send_agent_message,
+        )
+
+        subject = f"Technical health — {today.isoformat()}: {report.headline}"
+        html = render_qa_tech_health_html(report, body)
+        send_agent_message(
+            agent_role="QA",
+            subject=subject,
+            body=body,
+            html_body=html,
+        )
+    except Exception:
+        logger.exception("qa_agent: tech-health email send failed")
+
+
 __all__ = [
     "QADivergenceReport",
     "DivergenceClassification",
     "QAWorkOrder",
+    "TechnicalHealthReport",
+    "TechnicalAnomaly",
     "scan_and_run_reports",
+    "scan_for_technical_anomalies",
     "_report_key_for",
+    "_tech_health_key_for",
 ]

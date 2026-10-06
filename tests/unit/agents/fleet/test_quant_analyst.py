@@ -69,6 +69,124 @@ class TestFallbackReport:
         assert report.work_orders == []
 
 
+class TestTechHealthKeys:
+    def test_key_is_date_stamped(self):
+        from datetime import date
+
+        assert (
+            qa._tech_health_key_for(date(2026, 10, 6))
+            == "qa_technical_health_2026-10-06"
+        )
+
+
+class TestTechHealthScan:
+    """The scan should skip the LLM call when the log buffer is
+    quiet (below the threshold), and also skip when today's report
+    has already been written (idempotency)."""
+
+    def test_skips_when_log_count_below_threshold(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_MEMORY_ROOT", str(tmp_path))
+        db = MagicMock()
+        # No existing report row.
+        db.query.return_value.filter.return_value.filter.return_value.first.return_value = None  # noqa: E501
+        # Buffer returns 2 records (below the 10-record threshold).
+        from agentfx.agents.fleet.log_buffer import CapturedLog, LogBuffer
+        from datetime import UTC, datetime
+
+        buf = LogBuffer()
+        for i in range(2):
+            buf.append(
+                CapturedLog(
+                    timestamp=datetime.now(UTC),
+                    level="WARNING",
+                    logger_name="l",
+                    message=f"warn-{i}",
+                )
+            )
+        with patch(
+            "agentfx.agents.fleet.quant_analyst.get_global_buffer",
+            return_value=buf,
+        ):
+            with patch(
+                "agentfx.agents.fleet.quant_analyst._write_tech_report"
+            ) as writer:
+                produced = qa.scan_for_technical_anomalies(db=db)
+        assert produced is False
+        writer.assert_not_called()
+
+    def test_skips_when_todays_report_exists(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_MEMORY_ROOT", str(tmp_path))
+        db = MagicMock()
+        # Simulate an existing report row.
+        db.query.return_value.filter.return_value.filter.return_value.first.return_value = MagicMock()  # noqa: E501
+        with patch("agentfx.agents.fleet.quant_analyst._write_tech_report") as writer:
+            produced = qa.scan_for_technical_anomalies(db=db)
+        assert produced is False
+        writer.assert_not_called()
+
+    def test_fires_when_threshold_crossed_and_no_prior_report(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("AGENT_MEMORY_ROOT", str(tmp_path))
+        db = MagicMock()
+        db.query.return_value.filter.return_value.filter.return_value.first.return_value = None  # noqa: E501
+
+        from agentfx.agents.fleet.log_buffer import CapturedLog, LogBuffer
+        from datetime import UTC, datetime
+
+        buf = LogBuffer()
+        # 15 records = above the 10 threshold.
+        for i in range(15):
+            buf.append(
+                CapturedLog(
+                    timestamp=datetime.now(UTC),
+                    level="WARNING",
+                    logger_name="l",
+                    message=f"warn-{i}",
+                )
+            )
+        with patch(
+            "agentfx.agents.fleet.quant_analyst.get_global_buffer",
+            return_value=buf,
+        ):
+            with patch(
+                "agentfx.agents.fleet.quant_analyst._write_tech_report"
+            ) as writer:
+                produced = qa.scan_for_technical_anomalies(db=db)
+        assert produced is True
+        writer.assert_called_once()
+
+    def test_never_raises_on_internal_failure(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_MEMORY_ROOT", str(tmp_path))
+        db = MagicMock()
+        db.query.return_value.filter.return_value.filter.return_value.first.return_value = None  # noqa: E501
+
+        from agentfx.agents.fleet.log_buffer import CapturedLog, LogBuffer
+        from datetime import UTC, datetime
+
+        buf = LogBuffer()
+        for i in range(15):
+            buf.append(
+                CapturedLog(
+                    timestamp=datetime.now(UTC),
+                    level="WARNING",
+                    logger_name="l",
+                    message=f"m-{i}",
+                )
+            )
+        with patch(
+            "agentfx.agents.fleet.quant_analyst.get_global_buffer",
+            return_value=buf,
+        ):
+            with patch(
+                "agentfx.agents.fleet.quant_analyst._write_tech_report",
+                side_effect=RuntimeError("something broke"),
+            ):
+                # Must not raise — orchestrator loop depends on this.
+                produced = qa.scan_for_technical_anomalies(db=db)
+        assert produced is False
+
+
 class TestMarkdownRender:
     def test_renders_sections_present_in_report(self):
         report = qa.QADivergenceReport(

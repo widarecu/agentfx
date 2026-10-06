@@ -412,6 +412,7 @@ __all__ = [
     "send_agent_message",
     "render_pm_brief_html",
     "render_qa_divergence_html",
+    "render_qa_tech_health_html",
 ]
 
 
@@ -730,5 +731,85 @@ def render_qa_divergence_html(report: Any, plaintext_body: str) -> str:
         return _EMAIL_SHELL.format(
             env_pill=_env_pill_html(),
             role_label="Quant Analyst",
+            inner=f'<pre style="white-space:pre-wrap;margin:0;">{safe}</pre>',
+        )
+
+
+def render_qa_tech_health_html(report: Any, plaintext_body: str) -> str:
+    """Render a QA technical-health report as styled HTML.
+
+    Mirrors the divergence template's shape. Duck-typed on
+    `headline`, `summary`, `anomalies` with per-anomaly fields
+    `category`, `severity`, `headline`, `occurrences`, `first_seen`,
+    `sample_log`, `recommended_action`.
+
+    One extra tile vs the divergence template: a `<pre>` sample log
+    line per anomaly so Wilson sees the raw signal without having
+    to open the markdown file.
+    """
+    try:
+        headline = _escape(getattr(report, "headline", "") or "")
+        summary = _escape(getattr(report, "summary", "") or "")
+        anomalies = getattr(report, "anomalies", []) or []
+
+        anomaly_html_parts: list[str] = []
+        for a in anomalies:
+            sev = _escape(getattr(a, "severity", "") or "")
+            cat = _escape(getattr(a, "category", "") or "")
+            head = _escape(getattr(a, "headline", "") or "")
+            occ = getattr(a, "occurrences", 0) or 0
+            first = _escape(getattr(a, "first_seen", "") or "")
+            sample = _escape((getattr(a, "sample_log", "") or "")[:400])
+            action = _escape(getattr(a, "recommended_action", "") or "")
+            sev_color = {
+                "critical": "#dc2626",
+                "degraded": "#d97706",
+                "noted": "#6b7280",
+            }.get(sev, "#6b7280")
+            anomaly_html_parts.append(
+                f'<li style="margin:0 0 14px 0;list-style:none;'
+                f'padding:10px 12px;background:#f9fafb;border-left:3px solid {sev_color};">'
+                f'<div><span style="background:{sev_color};color:#fff;'
+                f"padding:1px 7px;border-radius:10px;font-size:11px;"
+                f'margin-right:6px;">{sev}</span>'
+                f'<span style="background:#4f46e5;color:#fff;padding:1px 7px;'
+                f'border-radius:10px;font-size:11px;margin-right:6px;">{cat}</span>'
+                f"<strong>{head}</strong></div>"
+                f'<div style="color:#6b7280;font-size:12px;margin-top:4px;">'
+                f"{occ}× &middot; first seen {first} &middot; action: {action}</div>"
+                f'<pre style="margin:6px 0 0 0;padding:8px 10px;'
+                f"background:#111827;color:#f9fafb;font-size:11px;"
+                f'overflow-x:auto;border-radius:4px;white-space:pre-wrap;">'
+                f"{sample}</pre>"
+                f"</li>"
+            )
+        anomaly_html = (
+            '<h3 style="margin:20px 0 10px 0;font-size:14px;color:#374151;">'
+            "Anomalies</h3>"
+            f'<ul style="margin:0;padding:0;list-style:none;">'
+            f"{''.join(anomaly_html_parts)}</ul>"
+            if anomaly_html_parts
+            else (
+                '<p style="color:#059669;margin:16px 0 0 0;">'
+                "No anomalies classified in this window.</p>"
+            )
+        )
+
+        inner = (
+            f'<h2 style="margin:0 0 8px 0;font-size:20px;color:#111827;">{headline}</h2>'
+            f'<p style="margin:0 0 16px 0;line-height:1.5;color:#374151;">{summary}</p>'
+            f"{anomaly_html}"
+        )
+
+        return _EMAIL_SHELL.format(
+            env_pill=_env_pill_html(),
+            role_label="Quant Analyst &middot; Technical Health",
+            inner=inner,
+        )
+    except Exception:
+        safe = _escape(plaintext_body)
+        return _EMAIL_SHELL.format(
+            env_pill=_env_pill_html(),
+            role_label="Quant Analyst &middot; Technical Health",
             inner=f'<pre style="white-space:pre-wrap;margin:0;">{safe}</pre>',
         )
