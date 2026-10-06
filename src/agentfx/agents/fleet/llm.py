@@ -240,6 +240,12 @@ def _extract_parsed(resp: Any, schema: type[T]) -> T | None:
     - Fallback: parse the JSON text content ourselves (the SDK
       serialises the structured output into a text block's `.text`
       field as JSON).
+
+    Logs the schema-validation error on failure (as WARNING, so the
+    QA tech-health scan sees it later) instead of silently swallowing
+    it. A silent swallow burned us on 2026-10-06 when Sonnet 5's
+    output for QADivergenceReport returned 200 OK but failed Pydantic
+    validation; the caller just got None and fell back to the stub.
     """
     # Preferred: top-level attributes.
     for attr in ("parsed_output", "output_parsed", "parsed"):
@@ -249,14 +255,19 @@ def _extract_parsed(resp: Any, schema: type[T]) -> T | None:
         if isinstance(direct, dict):
             try:
                 return schema.model_validate(direct)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "fleet.llm: schema validation failed at resp.%s for %s: %s",
+                    attr,
+                    schema.__name__,
+                    exc,
+                )
 
     # Fallback: inspect content blocks.
     import json as _json
 
     content = getattr(resp, "content", None) or []
-    for block in content:
+    for i, block in enumerate(content):
         for attr in ("parsed", "input"):
             parsed = getattr(block, attr, None)
             if isinstance(parsed, schema):
@@ -264,7 +275,15 @@ def _extract_parsed(resp: Any, schema: type[T]) -> T | None:
             if isinstance(parsed, dict):
                 try:
                     return schema.model_validate(parsed)
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "fleet.llm: schema validation failed at content[%d].%s "
+                        "for %s: %s",
+                        i,
+                        attr,
+                        schema.__name__,
+                        exc,
+                    )
                     continue
         # Last resort: the SDK serialises structured output into the
         # text block as a JSON string.
@@ -272,8 +291,23 @@ def _extract_parsed(resp: Any, schema: type[T]) -> T | None:
         if isinstance(text, str) and text.strip().startswith(("{", "[")):
             try:
                 return schema.model_validate(_json.loads(text))
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "fleet.llm: schema validation failed at content[%d].text "
+                    "(JSON parse) for %s: %s — raw text head: %r",
+                    i,
+                    schema.__name__,
+                    exc,
+                    text[:200],
+                )
                 continue
+    logger.warning(
+        "fleet.llm: could not extract %s from response — no known location "
+        "returned a valid instance (resp attrs=%s, content blocks=%d)",
+        schema.__name__,
+        [a for a in ("parsed_output", "output_parsed", "parsed") if hasattr(resp, a)],
+        len(content),
+    )
     return None
 
 

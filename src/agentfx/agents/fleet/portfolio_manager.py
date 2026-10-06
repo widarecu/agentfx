@@ -176,24 +176,44 @@ def _snapshot_platform_state(db: Session) -> dict[str, Any]:
         EvolutionRunStatus,
         StrategyGenome,
     )
-    from agentfx.api.models.run import Run, RunEnvironment, RunStatus
+    from agentfx.api.models.run import Run, RunEnvironment
+    from sqlalchemy import func as sa_func
 
     now = datetime.now(UTC)
     week_ago = now - timedelta(days=7)
     month_ago = now - timedelta(days=30)
 
-    paper_running = (
-        db.query(Run)
+    # Paper-run status breakdown — surfaces "effectively active"
+    # runs (anything the user deployed and hasn't manually killed /
+    # completed), not just the narrow `status == RUNNING` set. On
+    # staging 2026-10-06 both paper runs were in ERROR state while
+    # the auto-restart supervisor cycled them, and the old PM query
+    # reported "zero active" when Wilson absolutely saw them as
+    # active.
+    status_counts_rows = (
+        db.query(Run.status, sa_func.count(Run.id))
         .filter(Run.environment == RunEnvironment.PAPER)
-        .filter(Run.status == RunStatus.RUNNING)
-        .count()
-    )
-    paper_recently_halted = (
-        db.query(Run)
-        .filter(Run.environment == RunEnvironment.PAPER)
-        .filter(Run.status != RunStatus.RUNNING)
         .filter(Run.updated_at >= week_ago)
-        .count()
+        .group_by(Run.status)
+        .all()
+    )
+    status_counts: dict[str, int] = {
+        (s.value if hasattr(s, "value") else str(s)): int(n)
+        for s, n in status_counts_rows
+    }
+    paper_running = status_counts.get("RUNNING", 0)
+    # Effective "needs-attention" set: paper runs touched this week
+    # that are not COMPLETED or user-killed. Captures stuck ERROR +
+    # auto-restarting runs that look dead to a narrow `== RUNNING`
+    # check but are really the current frontier of experimentation.
+    _attention_statuses = {
+        s for s in status_counts if s not in {"RUNNING", "COMPLETED", "HALTED_MANUAL"}
+    }
+    paper_effective_active = paper_running + sum(
+        status_counts.get(s, 0) for s in _attention_statuses
+    )
+    paper_recently_halted = sum(
+        status_counts.get(s, 0) for s in {"HALTED_MANUAL", "COMPLETED"}
     )
     evo_last_7d_completed = (
         db.query(EvolutionRun)
@@ -230,7 +250,14 @@ def _snapshot_platform_state(db: Session) -> dict[str, Any]:
         "as_of_utc": now.isoformat(),
         "paper_runs": {
             "running": paper_running,
+            "effective_active": paper_effective_active,
             "halted_in_last_7_days": paper_recently_halted,
+            "status_counts_last_7_days": status_counts,
+            # Diagnostic hint for the LLM: if effective_active >
+            # running, there are paper runs the user deployed that
+            # aren't currently in RUNNING state. Likely stuck /
+            # auto-restarting; surface as a concern.
+            "needs_attention_count": paper_effective_active - paper_running,
         },
         "evolution_runs_last_7_days": {
             "completed": evo_last_7d_completed,
@@ -294,6 +321,20 @@ Platform context Wilson wants you to remember:
   lineage through on at least two staging runs (bug tracked for
   Phase 0.8.1 PE Agent); the backtest cost model systematically
   under-models M1 spread.
+
+How to read the paper-run snapshot:
+- `paper_runs.running` — strict `status == RUNNING` count.
+- `paper_runs.effective_active` — runs the user deployed and
+  hasn't manually killed / completed. Includes stuck ERROR +
+  auto-restarting runs.
+- `paper_runs.needs_attention_count` — the gap between the two
+  above. If > 0, surface it as a `blocker` concern: these are
+  paper deployments the user believes are "running" but aren't
+  currently in RUNNING state. Likely stuck / cycling, and
+  almost certainly bleeding P&L.
+- `paper_runs.status_counts_last_7_days` — the full breakdown
+  by RunStatus enum value. Useful to diagnose "where did they
+  all go?" when `running` is low.
 
 Your output must be a PMBrief with these fields:
 - headline (one sentence)
@@ -359,10 +400,13 @@ def _deterministic_fallback(state: dict[str, Any], today: date) -> PMBrief:
     Wilson still sees a scoreboard update + email, just without the
     LLM-generated recommendations.
     """
-    running = state["paper_runs"]["running"]
-    halted = state["paper_runs"]["halted_in_last_7_days"]
+    pr = state["paper_runs"]
+    running = pr["running"]
+    needs_attn = pr.get("needs_attention_count", 0)
+    halted = pr["halted_in_last_7_days"]
     summary = (
-        f"Paper runs: {running} RUNNING, {halted} halted in last 7 days. "
+        f"Paper runs: {running} RUNNING + {needs_attn} needing attention "
+        f"(stuck / auto-restarting), {halted} halted/completed in last 7 days. "
         f"Evolution: {state['evolution_runs_last_7_days']['completed']} completed, "
         f"{state['evolution_runs_last_7_days']['failed']} failed. "
         f"LLM brief unavailable; this is a deterministic fallback."
@@ -405,10 +449,19 @@ def _render_markdown(brief: PMBrief, today: date, state: dict[str, Any]) -> str:
         lines.append("")
     lines.append("## Snapshot")
     lines.append("")
-    lines.append(
-        f"- Paper runs: {state['paper_runs']['running']} RUNNING, "
-        f"{state['paper_runs']['halted_in_last_7_days']} halted in last 7 days"
+    pr = state["paper_runs"]
+    status_counts = pr.get("status_counts_last_7_days", {})
+    status_summary = (
+        ", ".join(f"{k}={v}" for k, v in sorted(status_counts.items()))
+        if status_counts
+        else "no activity in last 7 days"
     )
+    lines.append(f"- Paper runs by status (last 7 days): {status_summary}")
+    if pr.get("needs_attention_count", 0) > 0:
+        lines.append(
+            f"- **{pr['needs_attention_count']} paper run(s) in non-terminal "
+            f"non-RUNNING state** — likely stuck / auto-restarting"
+        )
     lines.append(
         f"- Evolution runs last 7 days: "
         f"{state['evolution_runs_last_7_days']['completed']} completed, "

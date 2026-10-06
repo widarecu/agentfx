@@ -116,3 +116,118 @@ class TestBriefKey:
         from datetime import date
 
         assert _brief_key_for(date(2026, 10, 5)) != _brief_key_for(date(2026, 10, 6))
+
+
+class TestDeterministicFallback:
+    """Phase-B PM fallback body must surface the needs-attention
+    paper runs — the staging 2026-10-06 incident where PM reported
+    "zero running" while QA correctly found stuck ERROR runs is
+    exactly the state this branch exists to describe."""
+
+    def test_fallback_mentions_needs_attention_count(self):
+        from datetime import date
+        from agentfx.agents.fleet.portfolio_manager import _deterministic_fallback
+
+        state = {
+            "paper_runs": {
+                "running": 0,
+                "effective_active": 2,
+                "needs_attention_count": 2,
+                "halted_in_last_7_days": 0,
+                "status_counts_last_7_days": {"ERROR": 2},
+            },
+            "evolution_runs_last_7_days": {"completed": 0, "failed": 1},
+        }
+        brief = _deterministic_fallback(state, date(2026, 10, 6))
+        assert "0 RUNNING" in brief.summary
+        assert "2 needing attention" in brief.summary
+        assert brief.recommendations == []
+        assert brief.concerns == []
+
+    def test_fallback_handles_zero_activity(self):
+        from datetime import date
+        from agentfx.agents.fleet.portfolio_manager import _deterministic_fallback
+
+        state = {
+            "paper_runs": {
+                "running": 0,
+                "effective_active": 0,
+                "needs_attention_count": 0,
+                "halted_in_last_7_days": 0,
+                "status_counts_last_7_days": {},
+            },
+            "evolution_runs_last_7_days": {"completed": 0, "failed": 0},
+        }
+        brief = _deterministic_fallback(state, date(2026, 10, 6))
+        assert brief.headline
+        assert "2026-10-06" in brief.headline
+
+
+class TestMarkdownRendering:
+    """The markdown body is what Wilson sees in email + scoreboard.
+    The new snapshot shape surfaces the status breakdown + the
+    needs-attention line — those must render cleanly for both
+    the "stuck runs" case and the "all clear" case."""
+
+    def test_renders_status_breakdown_with_needs_attention(self):
+        from datetime import date
+        from agentfx.agents.fleet.portfolio_manager import (
+            PMBrief,
+            PMConcern,
+            _render_markdown,
+        )
+
+        brief = PMBrief(
+            headline="Stuck ERROR runs",
+            summary="Two paper runs sitting in ERROR; auto-restart is cycling them.",
+            recommendations=[],
+            concerns=[
+                PMConcern(
+                    severity="blocker",
+                    description="2 paper runs stuck in ERROR, no new trades.",
+                )
+            ],
+        )
+        state = {
+            "paper_runs": {
+                "running": 0,
+                "effective_active": 2,
+                "needs_attention_count": 2,
+                "halted_in_last_7_days": 0,
+                "status_counts_last_7_days": {"ERROR": 2},
+            },
+            "evolution_runs_last_7_days": {"completed": 0, "failed": 0},
+            "top_validated_genomes_last_30_days": [],
+        }
+        md = _render_markdown(brief, date(2026, 10, 6), state)
+        assert "ERROR=2" in md
+        assert "2 paper run(s) in non-terminal non-RUNNING state" in md
+        assert "## Concerns" in md
+
+    def test_renders_cleanly_when_no_paper_activity(self):
+        from datetime import date
+        from agentfx.agents.fleet.portfolio_manager import (
+            PMBrief,
+            _render_markdown,
+        )
+
+        brief = PMBrief(
+            headline="All clear",
+            summary="Nothing moving but the floor isn't on fire either.",
+        )
+        state = {
+            "paper_runs": {
+                "running": 0,
+                "effective_active": 0,
+                "needs_attention_count": 0,
+                "halted_in_last_7_days": 0,
+                "status_counts_last_7_days": {},
+            },
+            "evolution_runs_last_7_days": {"completed": 0, "failed": 0},
+            "top_validated_genomes_last_30_days": [],
+        }
+        md = _render_markdown(brief, date(2026, 10, 6), state)
+        # No-activity case renders explanation rather than empty line.
+        assert "no activity in last 7 days" in md
+        # Should NOT render the needs-attention warning when count is 0.
+        assert "non-terminal non-RUNNING" not in md
