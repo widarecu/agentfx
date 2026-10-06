@@ -225,7 +225,7 @@ def _run_has_meaningful_activity(db: Session, *, run: Any) -> bool:
 
     Three cases qualify:
     1. A terminal stop_reason has been set — always worth a post-mortem.
-    2. Any trade has entered a closed state (exit_time or close_reason set).
+    2. Any trade has entered a closed state (exit_timestamp set).
     3. ≥N trades exist for the run (RUNNING case).
     """
     from agentfx.api.models.run import RunStatus, Trade
@@ -236,7 +236,7 @@ def _run_has_meaningful_activity(db: Session, *, run: Any) -> bool:
     closed_count = (
         db.query(Trade)
         .filter(Trade.run_id == run.id)
-        .filter(Trade.exit_time.isnot(None))
+        .filter(Trade.exit_timestamp.isnot(None))
         .count()
     )
     return closed_count >= _MIN_TRADES_FOR_ANALYSIS
@@ -265,20 +265,19 @@ def _snapshot_run(db: Session, *, run_id: str) -> dict[str, Any]:
     trades = (
         db.query(Trade)
         .filter(Trade.run_id == run_id)
-        .order_by(Trade.entry_time.desc())
+        .order_by(Trade.entry_timestamp.desc())
         .limit(30)
         .all()
     )
     trade_payload = [
         {
-            "entry_time": t.entry_time.isoformat() if t.entry_time else None,
-            "exit_time": t.exit_time.isoformat() if t.exit_time else None,
+            "entry_time": t.entry_timestamp.isoformat() if t.entry_timestamp else None,
+            "exit_time": t.exit_timestamp.isoformat() if t.exit_timestamp else None,
             "side": getattr(t, "side", None),
             "entry_price": float(t.entry_price) if t.entry_price is not None else None,
             "exit_price": float(t.exit_price) if t.exit_price is not None else None,
             "pnl": float(t.pnl) if t.pnl is not None else None,
-            "close_reason": getattr(t, "close_reason", None)
-            or getattr(t, "exit_reason", None),
+            "exit_reason": getattr(t, "exit_reason", None),
         }
         for t in trades
     ]
@@ -286,14 +285,17 @@ def _snapshot_run(db: Session, *, run_id: str) -> dict[str, Any]:
     equity = (
         db.query(PaperEquitySnapshot)
         .filter(PaperEquitySnapshot.run_id == run_id)
-        .order_by(PaperEquitySnapshot.taken_at.desc())
+        .order_by(PaperEquitySnapshot.timestamp.desc())
         .limit(50)
         .all()
     )
     equity_payload = [
         {
-            "taken_at": e.taken_at.isoformat() if e.taken_at else None,
-            "equity": float(e.equity) if e.equity is not None else None,
+            "timestamp": e.timestamp.isoformat() if e.timestamp else None,
+            "balance": float(e.balance) if e.balance is not None else None,
+            "unrealized_pnl": float(e.unrealized_pnl)
+            if e.unrealized_pnl is not None
+            else None,
         }
         for e in equity
     ]

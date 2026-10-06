@@ -185,7 +185,7 @@ def structured_call(
                 }
             ],
             messages=[{"role": "user", "content": user}],
-            response_format=schema,
+            output_format=schema,
         )
     except Exception as exc:  # noqa: BLE001 — logged + wrapped
         logger.warning(
@@ -230,24 +230,48 @@ def _skipped_result(model: str, reason: str) -> LLMCallResult:
 def _extract_parsed(resp: Any, schema: type[T]) -> T | None:
     """Pull the parsed Pydantic object out of a `messages.parse` response.
 
-    The SDK typically exposes the parsed instance at
-    `response.content[0].parsed`, but across SDK minor versions the
-    shape has moved (sometimes top-level `.parsed`, sometimes
-    `.output_parsed`). Try the known locations and give up quietly
-    if nothing matches.
+    Known locations across SDK versions:
+    - `response.parsed_output` — Anthropic SDK ≥0.90 (current).
+    - `response.output_parsed` — alternate attribute name used in
+      some docs; checked for forward-compatibility.
+    - `response.parsed` — legacy direct name.
+    - `response.content[i].parsed` / `.input` — some codepaths put
+      the parsed object on the content block itself.
+    - Fallback: parse the JSON text content ourselves (the SDK
+      serialises the structured output into a text block's `.text`
+      field as JSON).
     """
-    direct = getattr(resp, "output_parsed", None) or getattr(resp, "parsed", None)
-    if isinstance(direct, schema):
-        return direct
+    # Preferred: top-level attributes.
+    for attr in ("parsed_output", "output_parsed", "parsed"):
+        direct = getattr(resp, attr, None)
+        if isinstance(direct, schema):
+            return direct
+        if isinstance(direct, dict):
+            try:
+                return schema.model_validate(direct)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # Fallback: inspect content blocks.
+    import json as _json
 
     content = getattr(resp, "content", None) or []
     for block in content:
-        parsed = getattr(block, "parsed", None) or getattr(block, "input", None)
-        if isinstance(parsed, schema):
-            return parsed
-        if isinstance(parsed, dict):
+        for attr in ("parsed", "input"):
+            parsed = getattr(block, attr, None)
+            if isinstance(parsed, schema):
+                return parsed
+            if isinstance(parsed, dict):
+                try:
+                    return schema.model_validate(parsed)
+                except Exception:  # noqa: BLE001
+                    continue
+        # Last resort: the SDK serialises structured output into the
+        # text block as a JSON string.
+        text = getattr(block, "text", None)
+        if isinstance(text, str) and text.strip().startswith(("{", "[")):
             try:
-                return schema.model_validate(parsed)
+                return schema.model_validate(_json.loads(text))
             except Exception:  # noqa: BLE001
                 continue
     return None

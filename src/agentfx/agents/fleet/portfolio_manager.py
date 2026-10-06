@@ -197,13 +197,13 @@ def _snapshot_platform_state(db: Session) -> dict[str, Any]:
     )
     evo_last_7d_completed = (
         db.query(EvolutionRun)
-        .filter(EvolutionRun.updated_at >= week_ago)
+        .filter(EvolutionRun.created_at >= week_ago)
         .filter(EvolutionRun.status == EvolutionRunStatus.COMPLETED)
         .count()
     )
     evo_last_7d_failed = (
         db.query(EvolutionRun)
-        .filter(EvolutionRun.updated_at >= week_ago)
+        .filter(EvolutionRun.created_at >= week_ago)
         .filter(EvolutionRun.status == EvolutionRunStatus.FAILED)
         .count()
     )
@@ -211,7 +211,7 @@ def _snapshot_platform_state(db: Session) -> dict[str, Any]:
     top_genomes_last_30d = (
         db.query(StrategyGenome)
         .filter(StrategyGenome.validator_passed.is_(True))
-        .filter(StrategyGenome.updated_at >= month_ago)
+        .filter(StrategyGenome.created_at >= month_ago)
         .order_by(StrategyGenome.fitness.desc())
         .limit(5)
         .all()
