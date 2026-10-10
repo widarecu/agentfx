@@ -79,9 +79,15 @@ _MIN_LOGS_FOR_TECH_HEALTH = 10
 
 
 class DivergenceClassification(BaseModel):
-    """One category of live-vs-backtest divergence."""
+    """One category of live-vs-backtest divergence.
+
+    Fields default to sensible values so Sonnet 5's structured
+    output can omit any field without tripping Pydantic strict
+    validation.
+    """
 
     category: str = Field(
+        default="unknown",
         description=(
             "One of: 'cost_model' (spread/slippage mismatch), "
             "'execution_timing' (fill clock drift), "
@@ -90,19 +96,21 @@ class DivergenceClassification(BaseModel):
             "'validator_weakness' (overfit lineage got through), "
             "'novel_finding' (something the plan didn't anticipate), "
             "'no_divergence' (live matches backtest)."
-        )
+        ),
     )
     confidence: float = Field(
+        default=0.5,
         description=(
             "QA's confidence this classification applies — 0.0 to 1.0. "
             "Below 0.6 means 'might apply but needs more data.'"
-        )
+        ),
     )
     description: str = Field(
+        default="",
         description=(
             "Plain-prose explanation grounded in the trades + "
             "backtest-overlay data QA was shown."
-        )
+        ),
     )
 
 
@@ -113,21 +121,24 @@ class QAWorkOrder(BaseModel):
     lands in v0.8.1 and starts actioning them.
     """
 
-    title: str = Field(description="Short imperative, max ~12 words.")
+    title: str = Field(default="", description="Short imperative, max ~12 words.")
     target_file: str = Field(
-        description="Repo-relative file path the fix most likely touches."
+        default="",
+        description="Repo-relative file path the fix most likely touches.",
     )
     spec: str = Field(
+        default="",
         description=(
             "What needs to change and why. Must cite the specific "
             "trades / data points that motivated the request."
-        )
+        ),
     )
     expected_profit_impact: str = Field(
+        default="",
         description=(
             "Explicit note on how this change moves the profit chain "
             "forward (per Wilson's 'profit over activity' directive)."
-        )
+        ),
     )
 
 
@@ -135,16 +146,18 @@ class QADivergenceReport(BaseModel):
     """Structured divergence report."""
 
     headline: str = Field(
+        default="",
         description=(
             "One sentence Wilson should read even if ignoring the rest. "
             "States the primary finding, not 'analysis complete'."
-        )
+        ),
     )
     summary: str = Field(
+        default="",
         description=(
             "2-5 sentence overview of what happened vs what backtest "
             "predicted, grounded in trade data."
-        )
+        ),
     )
     classifications: list[DivergenceClassification] = Field(
         default_factory=list,
@@ -433,7 +446,7 @@ def _call_sonnet(snapshot: dict[str, Any]) -> LLMCallResult:
         system=_SYSTEM_PROMPT,
         user=_render_user_prompt(snapshot),
         schema=QADivergenceReport,
-        max_tokens=2048,
+        max_tokens=8192,
     )
 
 
@@ -574,9 +587,15 @@ def _email_report(
 
 
 class TechnicalAnomaly(BaseModel):
-    """One technical issue QA found in the logs."""
+    """One technical issue QA found in the logs.
+
+    Fields default to sensible values so Sonnet 5's structured
+    output can omit any field without tripping Pydantic strict
+    validation. Rendering code tolerates empty strings / None.
+    """
 
     category: str = Field(
+        default="unknown",
         description=(
             "One of: 'exception' (unhandled traceback), "
             "'external_api' (OANDA / SMTP / Anthropic failure), "
@@ -584,27 +603,35 @@ class TechnicalAnomaly(BaseModel):
             "'logic_warning' (operation returned degraded result), "
             "'config' (missing / wrong env var), "
             "'noise' (benign repeat — flagged so humans know it's safe)."
-        )
+        ),
     )
-    severity: str = Field(description="'critical' / 'degraded' / 'noted'.")
-    headline: str = Field(description="One sentence stating the anomaly, no jargon.")
+    severity: str = Field(
+        default="noted", description="'critical' / 'degraded' / 'noted'."
+    )
+    headline: str = Field(
+        default="", description="One sentence stating the anomaly, no jargon."
+    )
     occurrences: int = Field(
-        description="How many times this pattern appeared in the window."
+        default=1,
+        description="How many times this pattern appeared in the window.",
     )
-    first_seen: str = Field(
-        description="Earliest UTC ISO timestamp of this pattern in the window."
+    first_seen: str | None = Field(
+        default=None,
+        description="Earliest UTC ISO timestamp of this pattern in the window.",
     )
     sample_log: str = Field(
+        default="",
         description=(
             "ONE representative log line (truncated to ~300 chars). "
             "Not the full traceback — just enough to identify the class."
-        )
+        ),
     )
     recommended_action: str = Field(
+        default="investigate",
         description=(
             "What a human should do next: 'investigate', "
             "'file PE work order', 'ignore (benign)', 'rotate secret', etc."
-        )
+        ),
     )
 
 
@@ -612,11 +639,15 @@ class TechnicalHealthReport(BaseModel):
     """QA's daily technical-health report, independent of paper runs."""
 
     headline: str = Field(
+        default="",
         description=(
             "One sentence. If nothing abnormal, say so plainly rather than padding."
-        )
+        ),
     )
-    summary: str = Field(description="2-4 sentences on what the log stream shows.")
+    summary: str = Field(
+        default="",
+        description="2-4 sentences on what the log stream shows.",
+    )
     anomalies: list[TechnicalAnomaly] = Field(
         default_factory=list,
         description=(
@@ -704,7 +735,7 @@ def _call_sonnet_tech(snapshot: dict[str, Any]) -> LLMCallResult:
         system=_TECH_SYSTEM_PROMPT,
         user=_render_tech_user_prompt(snapshot),
         schema=TechnicalHealthReport,
-        max_tokens=2048,
+        max_tokens=8192,
     )
 
 

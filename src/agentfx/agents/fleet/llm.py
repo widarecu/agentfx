@@ -188,15 +188,54 @@ def structured_call(
             output_format=schema,
         )
     except Exception as exc:  # noqa: BLE001 — logged + wrapped
+        # Pydantic ValidationError includes the specific field + value
+        # that failed. The default `str(exc)` cuts it off at
+        # "1 validation error for X" — use repr() + str(exc) together
+        # so we see the detailed field path. Previously (2026-10-07)
+        # this was silently costing us Sonnet 5 calls for a schema
+        # field mismatch we couldn't diagnose.
         logger.warning(
-            "fleet.llm: structured call failed model=%s err=%s",
+            "fleet.llm: structured call failed model=%s err_type=%s err=%s",
             model,
+            type(exc).__name__,
             exc,
         )
         return _skipped_result(model, "api_failure")
 
     output = _extract_parsed(resp, schema)
     reasoning = _extract_reasoning(resp)
+
+    # When extraction returned None despite a successful API call,
+    # dump the response shape so the next investigation has evidence.
+    # This fires only on the failing path — healthy calls incur zero
+    # extra logging.
+    if output is None:
+        stop_reason = getattr(resp, "stop_reason", None)
+        content = getattr(resp, "content", None) or []
+        content_summary: list[dict[str, Any]] = []
+        for i, block in enumerate(content[:3]):
+            block_text = getattr(block, "text", None)
+            content_summary.append(
+                {
+                    "idx": i,
+                    "type": getattr(block, "type", type(block).__name__),
+                    "text_head": (block_text[:500] + "…")
+                    if isinstance(block_text, str) and len(block_text) > 500
+                    else block_text,
+                    "has_parsed_attr": hasattr(block, "parsed"),
+                    "has_input_attr": hasattr(block, "input"),
+                }
+            )
+        logger.warning(
+            "fleet.llm: extraction returned None for %s — stop_reason=%s "
+            "parsed_output_is=%r content_blocks=%d first_blocks=%s",
+            schema.__name__,
+            stop_reason,
+            getattr(resp, "parsed_output", "<missing>"),
+            len(content),
+            content_summary,
+        )
+
     usage = getattr(resp, "usage", None)
     input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
     output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
