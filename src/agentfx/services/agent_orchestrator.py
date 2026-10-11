@@ -153,6 +153,44 @@ async def _pm_daily_loop() -> None:
         await asyncio.sleep(60 * 60)
 
 
+# PE scan cadence — daily is enough since Opus 5 is the pricey model
+# and QA work orders don't accumulate faster than once per day in
+# practice. One PE scan per day with a hard 3-proposal cap keeps
+# Opus 5 spend bounded (~$0.75/day worst case).
+_PE_SCAN_SECONDS = 60 * 60 * 24
+
+
+async def _pe_scan_loop() -> None:
+    """Daily scan: find unprocessed QA work orders → generate PE
+    fix proposals via Opus 5. Never raises."""
+    from agentfx.agents.fleet.platform_engineer import scan_and_propose
+
+    logger.info(
+        "agent_orchestrator: PE scan loop armed (cadence=%ds)",
+        _PE_SCAN_SECONDS,
+    )
+    while True:
+        try:
+            with SessionLocal() as db:
+                if not is_within_daily_budget(db):
+                    logger.warning(
+                        "agent_orchestrator: PE scan skipped — daily "
+                        "budget exceeded for %s",
+                        datetime.now(UTC).date(),
+                    )
+                else:
+                    produced = scan_and_propose(db=db)
+                    if produced:
+                        logger.info(
+                            "agent_orchestrator: PE produced %d proposal(s)",
+                            produced,
+                        )
+        except Exception:
+            logger.exception("agent_orchestrator: PE scan iteration failed")
+
+        await asyncio.sleep(_PE_SCAN_SECONDS)
+
+
 # QA scan cadence. 30 min balances two concerns:
 # - A new fill on paper should be analysed in roughly the same hour
 #   it happens; 30 min keeps the signal fresh.
@@ -229,9 +267,10 @@ def register_lifespan_tasks() -> list[asyncio.Task[Any]]:
         return []
 
     logger.info(
-        "agent_orchestrator: starting fleet (PM=%s, QA=%s, daily_cap=$%.2f)",
+        "agent_orchestrator: starting fleet (PM=%s, QA=%s, PE=%s, daily_cap=$%.2f)",
         settings.AGENT_PM_MODEL,
         settings.AGENT_QA_MODEL,
+        settings.AGENT_PE_MODEL,
         settings.AGENT_FLEET_DAILY_USD_CAP,
     )
 
@@ -244,6 +283,7 @@ def register_lifespan_tasks() -> list[asyncio.Task[Any]]:
     _active_tasks = [
         asyncio.create_task(_pm_daily_loop(), name="fleet_pm_daily"),
         asyncio.create_task(_qa_scan_loop(), name="fleet_qa_scan"),
+        asyncio.create_task(_pe_scan_loop(), name="fleet_pe_scan"),
     ]
     return _active_tasks
 

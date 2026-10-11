@@ -413,6 +413,7 @@ __all__ = [
     "render_pm_brief_html",
     "render_qa_divergence_html",
     "render_qa_tech_health_html",
+    "render_pe_proposal_html",
 ]
 
 
@@ -873,5 +874,128 @@ def render_qa_tech_health_html(report: Any, plaintext_body: str) -> str:
         return _EMAIL_SHELL.format(
             env_pill=_env_pill_html(),
             role_label="Quant Analyst &middot; Technical Health",
+            inner=f'<pre style="white-space:pre-wrap;margin:0;">{safe}</pre>',
+        )
+
+
+def render_pe_proposal_html(
+    proposal: Any,
+    work_order: dict[str, Any],
+    plaintext_body: str,
+) -> str:
+    """Render a PE fix proposal as styled HTML.
+
+    Duck-typed on `investigation_summary`, `proposed_changes`,
+    `new_tests`, `risk_assessment`, `estimated_profit_impact`,
+    `confidence`.
+
+    Shape mirrors the PM/QA templates: shell + title + sections.
+    Diffs render in a dark <pre> block so a glance tells Wilson
+    whether the change is tractable without opening the markdown
+    on disk.
+    """
+    try:
+        confidence = _escape(getattr(proposal, "confidence", "") or "")
+        confidence_color = {
+            "high": "#059669",
+            "medium": "#d97706",
+            "low": "#6b7280",
+        }.get(confidence, "#6b7280")
+        wo_title = _escape(work_order.get("title") or "(untitled)")
+        wo_target = _escape(work_order.get("target_file") or "(unspecified)")
+        investigation = _escape(getattr(proposal, "investigation_summary", "") or "")
+        proposed_changes = getattr(proposal, "proposed_changes", []) or []
+        new_tests = getattr(proposal, "new_tests", []) or []
+        risk = _escape(getattr(proposal, "risk_assessment", "") or "")
+        impact = _escape(getattr(proposal, "estimated_profit_impact", "") or "")
+
+        changes_html_parts: list[str] = []
+        for ch in proposed_changes:
+            ch_type = _escape(getattr(ch, "change_type", "") or "")
+            ch_path = _escape(getattr(ch, "file_path", "") or "")
+            ch_why = _escape(getattr(ch, "rationale", "") or "")
+            ch_diff = _escape((getattr(ch, "diff", "") or "")[:2000])
+            type_color = {
+                "add": "#059669",
+                "modify": "#2563eb",
+                "delete": "#dc2626",
+            }.get(ch_type, "#6b7280")
+            changes_html_parts.append(
+                f'<li style="margin:0 0 14px 0;list-style:none;">'
+                f'<div><span style="background:{type_color};color:#fff;'
+                f"padding:1px 7px;border-radius:10px;font-size:11px;"
+                f'margin-right:6px;">{ch_type}</span>'
+                f'<code style="background:#f3f4f6;padding:1px 6px;">'
+                f"{ch_path}</code></div>"
+                f'<div style="color:#6b7280;font-size:13px;margin-top:4px;">'
+                f"<em>Why:</em> {ch_why}</div>"
+                f'<pre style="margin:6px 0 0 0;padding:8px 10px;'
+                f"background:#111827;color:#f9fafb;font-size:11px;"
+                f'overflow-x:auto;border-radius:4px;white-space:pre-wrap;">'
+                f"{ch_diff}</pre>"
+                f"</li>"
+            )
+        changes_html = (
+            '<h3 style="margin:20px 0 10px 0;font-size:14px;color:#374151;">'
+            "Proposed changes</h3>"
+            f'<ul style="margin:0;padding:0;list-style:none;">'
+            f"{''.join(changes_html_parts)}</ul>"
+            if changes_html_parts
+            else (
+                '<p style="color:#6b7280;margin:16px 0 0 0;">'
+                "No code changes — see investigation summary.</p>"
+            )
+        )
+
+        tests_html_parts: list[str] = []
+        for t in new_tests:
+            tests_html_parts.append(
+                f'<li style="margin:0 0 8px 0;">'
+                f"<strong>{_escape(getattr(t, 'name', '') or '')}</strong> "
+                f'in <code style="background:#f3f4f6;padding:1px 4px;">'
+                f"{_escape(getattr(t, 'file_path', '') or '')}</code>"
+                f'<div style="color:#6b7280;font-size:13px;">'
+                f"{_escape(getattr(t, 'purpose', '') or '')}</div>"
+                f"</li>"
+            )
+        tests_html = (
+            '<h3 style="margin:20px 0 10px 0;font-size:14px;color:#374151;">'
+            "New tests</h3>"
+            f'<ul style="margin:0;padding-left:18px;">'
+            f"{''.join(tests_html_parts)}</ul>"
+            if tests_html_parts
+            else ""
+        )
+
+        inner = (
+            f'<h2 style="margin:0 0 8px 0;font-size:20px;color:#111827;">{wo_title}</h2>'
+            f'<div style="margin:0 0 16px 0;color:#6b7280;font-size:13px;">'
+            f'<span style="background:{confidence_color};color:#fff;'
+            f"padding:1px 7px;border-radius:10px;font-size:11px;"
+            f'margin-right:6px;">confidence: {confidence}</span>'
+            f'Target: <code style="background:#f3f4f6;padding:1px 4px;">{wo_target}</code>'
+            f"</div>"
+            f'<h3 style="margin:20px 0 10px 0;font-size:14px;color:#374151;">'
+            f"Investigation</h3>"
+            f'<p style="margin:0 0 16px 0;line-height:1.5;color:#374151;">'
+            f"{investigation}</p>"
+            f"{changes_html}"
+            f"{tests_html}"
+            f'<h3 style="margin:20px 0 10px 0;font-size:14px;color:#374151;">Risk</h3>'
+            f'<p style="margin:0 0 16px 0;color:#374151;">{risk}</p>'
+            f'<h3 style="margin:20px 0 10px 0;font-size:14px;color:#374151;">'
+            f"Expected profit impact</h3>"
+            f'<p style="margin:0 0 16px 0;color:#374151;">{impact}</p>'
+        )
+        return _EMAIL_SHELL.format(
+            env_pill=_env_pill_html(),
+            role_label="Platform Engineer",
+            inner=inner,
+        )
+    except Exception:
+        safe = _escape(plaintext_body)
+        return _EMAIL_SHELL.format(
+            env_pill=_env_pill_html(),
+            role_label="Platform Engineer",
             inner=f'<pre style="white-space:pre-wrap;margin:0;">{safe}</pre>',
         )
