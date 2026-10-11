@@ -163,6 +163,100 @@ class TestDeterministicFallback:
         assert "2026-10-06" in brief.headline
 
 
+class TestEvolutionActionExecution:
+    """`_execute_evolution_actions` iterates the brief's actions and
+    returns a per-action summary. Must never raise, even if the
+    scheduler itself raises mid-iteration."""
+
+    def test_iterates_actions_and_summarises(self):
+        from unittest.mock import MagicMock, patch
+        from agentfx.agents.fleet.portfolio_manager import (
+            PMBrief,
+            _execute_evolution_actions,
+        )
+        from agentfx.agents.fleet.pm_scheduler import (
+            PMEvolutionAction,
+            ScheduledEvolutionResult,
+        )
+
+        brief = PMBrief(
+            headline="x",
+            summary="y",
+            evolution_actions=[
+                PMEvolutionAction(
+                    pair="EUR_USD",
+                    granularity="H1",
+                    rationale="r1",
+                    expected_profit_impact="i1",
+                    priority="now",
+                ),
+                PMEvolutionAction(
+                    pair="USD_JPY",
+                    granularity="M1",
+                    rationale="r2",
+                    expected_profit_impact="i2",
+                    priority="watch",
+                ),
+            ],
+        )
+        db = MagicMock()
+
+        with patch(
+            "agentfx.agents.fleet.portfolio_manager.schedule_evolution_from_pm_action",
+            side_effect=[
+                ScheduledEvolutionResult(
+                    accepted=True, evo_run_id="evorun_a", reason=""
+                ),
+                ScheduledEvolutionResult(
+                    accepted=False, evo_run_id=None, reason="wrong_priority:watch"
+                ),
+            ],
+        ):
+            results = _execute_evolution_actions(
+                db=db, brief=brief, pm_decision_key="pm_test"
+            )
+
+        assert len(results) == 2
+        assert results[0]["accepted"] is True
+        assert results[0]["evo_run_id"] == "evorun_a"
+        assert results[1]["accepted"] is False
+        assert results[1]["reason"] == "wrong_priority:watch"
+
+    def test_scheduler_exception_does_not_crash_iteration(self):
+        from unittest.mock import MagicMock, patch
+        from agentfx.agents.fleet.portfolio_manager import (
+            PMBrief,
+            _execute_evolution_actions,
+        )
+        from agentfx.agents.fleet.pm_scheduler import PMEvolutionAction
+
+        brief = PMBrief(
+            headline="x",
+            summary="y",
+            evolution_actions=[
+                PMEvolutionAction(
+                    pair="EUR_USD",
+                    granularity="H1",
+                    rationale="r",
+                    expected_profit_impact="i",
+                    priority="now",
+                )
+            ],
+        )
+        db = MagicMock()
+        with patch(
+            "agentfx.agents.fleet.portfolio_manager.schedule_evolution_from_pm_action",
+            side_effect=RuntimeError("completely broken"),
+        ):
+            # Must not raise.
+            results = _execute_evolution_actions(
+                db=db, brief=brief, pm_decision_key="pm_test"
+            )
+        assert len(results) == 1
+        assert results[0]["accepted"] is False
+        assert results[0]["reason"] == "orchestrator_exception"
+
+
 class TestMarkdownRendering:
     """The markdown body is what Wilson sees in email + scoreboard.
     The new snapshot shape surfaces the status breakdown + the

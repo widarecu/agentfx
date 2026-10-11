@@ -565,7 +565,11 @@ def _escape(text: str) -> str:
     )
 
 
-def render_pm_brief_html(brief: Any, plaintext_body: str) -> str:
+def render_pm_brief_html(
+    brief: Any,
+    plaintext_body: str,
+    scheduling_results: list[dict[str, Any]] | None = None,
+) -> str:
     """Render a `PMBrief` as styled HTML for the fleet email.
 
     Takes `Any` on the type signature to avoid an import cycle —
@@ -574,10 +578,15 @@ def render_pm_brief_html(brief: Any, plaintext_body: str) -> str:
     attributes (`headline`, `summary`, `recommendations`,
     `concerns`).
 
-    `plaintext_body` is accepted but unused — kept in the signature
-    so the caller can pass both forms symmetrically if we ever
-    want to render minor callouts into the HTML pulled from the
-    plaintext render.
+    `scheduling_results` (v0.8.1): the per-action outcomes from
+    PM's evolution-scheduling tool invocations this tick. When
+    non-empty, rendered as a dedicated section with accept/reject
+    badges and the launched `evo_run_id` so Wilson can trace back
+    to the actual evolution.
+
+    `plaintext_body` is accepted but unused in the main render
+    path — only shown as fallback if an exception breaks the
+    structured render.
     """
     try:
         headline = _escape(getattr(brief, "headline", "") or "")
@@ -636,11 +645,14 @@ def render_pm_brief_html(brief: Any, plaintext_body: str) -> str:
             else ""
         )
 
+        scheduling_html = _render_scheduling_results_html(scheduling_results)
+
         inner = (
             f'<h2 style="margin:0 0 8px 0;font-size:20px;color:#111827;">{headline}</h2>'
             f'<p style="margin:0 0 16px 0;line-height:1.5;color:#374151;">{summary}</p>'
             f"{rec_html}"
             f"{concern_html}"
+            f"{scheduling_html}"
         )
 
         return _EMAIL_SHELL.format(
@@ -657,6 +669,56 @@ def render_pm_brief_html(brief: Any, plaintext_body: str) -> str:
             role_label="Portfolio Manager",
             inner=f'<pre style="white-space:pre-wrap;margin:0;">{safe}</pre>',
         )
+
+
+def _render_scheduling_results_html(
+    results: list[dict[str, Any]] | None,
+) -> str:
+    """Render the "evolution actions executed this tick" section.
+
+    Returns an empty string when PM scheduled nothing — the
+    section only appears when it actually has content.
+    """
+    if not results:
+        return ""
+    parts: list[str] = []
+    for r in results:
+        pair = _escape(r.get("pair") or "")
+        gran = _escape(r.get("granularity") or "")
+        priority = _escape(r.get("priority") or "")
+        rationale = _escape(r.get("rationale") or "")
+        impact = _escape(r.get("expected_profit_impact") or "")
+        if r.get("accepted"):
+            evo_id = _escape(r.get("evo_run_id") or "")
+            parts.append(
+                f'<li style="margin:0 0 10px 0;">'
+                f'<span style="background:#059669;color:#fff;padding:1px 7px;'
+                f'border-radius:10px;font-size:11px;margin-right:6px;">started</span>'
+                f"<strong>{pair}/{gran}</strong> "
+                f'<code style="background:#f3f4f6;padding:1px 4px;font-size:11px;">'
+                f"{evo_id}</code>"
+                f'<div style="color:#6b7280;font-size:13px;margin-top:4px;">'
+                f"<em>Why:</em> {rationale}</div>"
+                f'<div style="color:#6b7280;font-size:13px;">'
+                f"<em>Expected:</em> {impact}</div>"
+                f"</li>"
+            )
+        else:
+            reason = _escape(r.get("reason") or "")
+            parts.append(
+                f'<li style="margin:0 0 10px 0;">'
+                f'<span style="background:#6b7280;color:#fff;padding:1px 7px;'
+                f'border-radius:10px;font-size:11px;margin-right:6px;">skipped</span>'
+                f"<strong>{pair}/{gran}</strong> "
+                f'<span style="color:#6b7280;">(priority={priority}, '
+                f"reason: <code>{reason}</code>)</span>"
+                f"</li>"
+            )
+    return (
+        '<h3 style="margin:20px 0 10px 0;font-size:14px;color:#374151;">'
+        "Evolution actions executed this tick</h3>"
+        f'<ul style="margin:0;padding-left:18px;">{"".join(parts)}</ul>'
+    )
 
 
 def render_qa_divergence_html(report: Any, plaintext_body: str) -> str:

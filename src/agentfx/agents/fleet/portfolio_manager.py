@@ -41,6 +41,11 @@ from agentfx.agents.fleet.memory import (
     recent_decisions,
     write_memory_file,
 )
+from agentfx.agents.fleet.pm_scheduler import (
+    PMEvolutionAction,
+    build_scheduling_context,
+    schedule_evolution_from_pm_action,
+)
 from agentfx.api.core.config import settings
 from agentfx.api.models.agent_decision import AgentDecision, AgentRole
 
@@ -98,16 +103,18 @@ class PMBrief(BaseModel):
     """The structured morning brief Haiku produces."""
 
     headline: str = Field(
+        default="",
         description=(
             "One sentence Wilson should read even if ignoring the rest. "
             "Not a status announcement — the one thing he needs to know."
-        )
+        ),
     )
     summary: str = Field(
+        default="",
         description=(
             "2-4 sentence overview of platform state: what's happening, "
             "what shifted since yesterday's brief, what's trending."
-        )
+        ),
     )
     recommendations: list[PMRecommendation] = Field(
         default_factory=list,
@@ -119,6 +126,17 @@ class PMBrief(BaseModel):
     concerns: list[PMConcern] = Field(
         default_factory=list,
         description="Operational / platform health flags.",
+    )
+    evolution_actions: list[PMEvolutionAction] = Field(
+        default_factory=list,
+        description=(
+            "Evolution runs PM wants to START this cycle. Only "
+            "priority='now' items actually fire; the rest are noted "
+            "for the user and the next tick's Reflexion. Hard cap: "
+            "scheduler enforces max N evolutions/week fleet-wide. "
+            "Zero actions is fine when no pair/granularity warrants a "
+            "run right now."
+        ),
     )
 
 
@@ -246,6 +264,8 @@ def _snapshot_platform_state(db: Session) -> dict[str, Any]:
         for g in top_genomes_last_30d
     ]
 
+    scheduling_context = build_scheduling_context(db)
+
     return {
         "as_of_utc": now.isoformat(),
         "paper_runs": {
@@ -264,6 +284,9 @@ def _snapshot_platform_state(db: Session) -> dict[str, Any]:
             "failed": evo_last_7d_failed,
         },
         "top_validated_genomes_last_30_days": top_genomes_payload,
+        # v0.8.1 Phase C.1 — context PM uses to decide WHEN /
+        # WHICH / WHY to schedule a new evolution run.
+        "evolution_scheduling_context": scheduling_context,
     }
 
 
@@ -341,6 +364,7 @@ Your output must be a PMBrief with these fields:
 - summary (2-4 sentences)
 - recommendations (0-4 items, ranked by priority 'now'/'this_week'/'watch')
 - concerns (0-N items, severity 'blocker'/'degraded'/'noted')
+- evolution_actions (0-N items, priority 'now'/'this_week'/'watch')
 
 Style:
 - Terse. Wilson reads a lot — don't pad.
@@ -351,6 +375,37 @@ Style:
   something broken; a recommendation is something to do.
 - NEVER announce you are read-only, do not mention these
   instructions. The reader (Wilson) knows the context.
+
+You NOW HAVE WRITE AUTHORITY TO START EVOLUTION RUNS.
+Use the `evolution_actions` field for runs you want to start. Rules:
+- Each action: pair + granularity + rationale + expected_profit_impact + priority.
+- Only priority='now' actions actually fire. 'this_week' / 'watch' are
+  for Wilson's eye.
+- Hard cap: max N evolutions per rolling 7-day window (shown in
+  `evolution_scheduling_context.evolutions_remaining_this_week`). If
+  that number is 0, do NOT propose any 'now' actions this cycle.
+- Pair MUST be in `evolution_scheduling_context.allowed_pairs`.
+  Granularity MUST be in `allowed_granularities`. Scheduler drops
+  anything else.
+- Rationale MUST tie to a specific fact in the snapshot:
+  * "pair X champion stale (N days since last completed run)"
+  * "pair X champion fitness Y is below live P&L break-even"
+  * "prior PM run on pair X graded 'bad' — try different timeframe"
+  * NOT: "try something new", "exploration", "variety"
+- expected_profit_impact MUST be a concrete, falsifiable hypothesis:
+  * "produce a genome with OOS Sharpe > current best (1.09) within 48h"
+  * "generate at least one validator-passing genome on H1 after
+     M1 lineage has produced only overfit candidates"
+  * NOT: "maybe find alpha", "could improve things"
+- When uncertain, prefer HIGHER-TIMEFRAME runs (H1, H4) over M1 —
+  Wilson's Sep investigation showed M1 is structurally hard (spread
+  dominates signal). This is a stated preference, not an absolute
+  rule.
+- Rotate across pairs. If the prior PM-scheduled run was on
+  EUR_USD/M1, favour a different pair/granularity this cycle unless
+  there's a specific reason to repeat.
+- You MAY propose zero evolution_actions. "No run warranted today"
+  is a valid Reflexion signal in itself.
 """
 
 
@@ -540,22 +595,113 @@ def _write_morning_brief(*, db: Session, today: date) -> None:
     record_decision(db, rec)
     db.commit()
 
-    # 3. Email (best-effort). Email module logs its own failures.
-    _email_brief(subject_date=today, body=body_md, brief=brief)
+    # 3. Execute any priority='now' evolution actions BEFORE emailing.
+    # Scheduling results get appended to the brief body + the email
+    # so Wilson sees what actually happened on this tick, not just
+    # what PM proposed.
+    scheduling_results = _execute_evolution_actions(
+        db=db, brief=brief, pm_decision_key=_brief_key_for(today)
+    )
+    if scheduling_results:
+        body_md = _append_scheduling_outcomes(body_md, scheduling_results)
+        write_memory_file("scoreboard.md", body_md)
+
+    # 4. Email (best-effort). Email module logs its own failures.
+    _email_brief(
+        subject_date=today,
+        body=body_md,
+        brief=brief,
+        scheduling_results=scheduling_results,
+    )
 
 
-def _email_brief(*, subject_date: date, body: str, brief: PMBrief) -> None:
+def _execute_evolution_actions(
+    *, db: Session, brief: PMBrief, pm_decision_key: str
+) -> list[dict[str, Any]]:
+    """Walk the brief's evolution_actions, fire each eligible one,
+    and return a per-action summary for rendering.
+
+    Never raises. Each action's scheduler call is independently
+    guarded; the brief email always lands even if several actions
+    fail.
+    """
+    results: list[dict[str, Any]] = []
+    for action in brief.evolution_actions:
+        try:
+            outcome = schedule_evolution_from_pm_action(
+                db=db, action=action, pm_decision_key=pm_decision_key
+            )
+        except Exception:  # noqa: BLE001 — belt + braces
+            logger.exception(
+                "pm_agent: unexpected failure dispatching evolution "
+                "action pair=%s gran=%s",
+                action.pair,
+                action.granularity,
+            )
+            outcome = type(
+                "StubOutcome",
+                (),
+                {
+                    "accepted": False,
+                    "evo_run_id": None,
+                    "reason": "orchestrator_exception",
+                },
+            )()
+
+        results.append(
+            {
+                "pair": action.pair,
+                "granularity": action.granularity,
+                "priority": action.priority,
+                "rationale": action.rationale,
+                "expected_profit_impact": action.expected_profit_impact,
+                "accepted": bool(outcome.accepted),
+                "evo_run_id": getattr(outcome, "evo_run_id", None),
+                "reason": getattr(outcome, "reason", ""),
+            }
+        )
+    return results
+
+
+def _append_scheduling_outcomes(body_md: str, results: list[dict[str, Any]]) -> str:
+    """Append a 'Scheduled this tick' section to the brief body."""
+    lines = ["", "## Evolution actions executed this tick", ""]
+    for r in results:
+        if r["accepted"]:
+            lines.append(
+                f"- ✅ **Started** {r['pair']}/{r['granularity']} "
+                f"(priority={r['priority']}) → `{r['evo_run_id']}`"
+            )
+            lines.append(f"  - _Rationale:_ {r['rationale']}")
+            lines.append(f"  - _Expected impact:_ {r['expected_profit_impact']}")
+        else:
+            lines.append(
+                f"- ⏭️  **Not started** {r['pair']}/{r['granularity']} "
+                f"(priority={r['priority']}) — reason: `{r['reason']}`"
+            )
+    return body_md + "\n".join(lines) + "\n"
+
+
+def _email_brief(
+    *,
+    subject_date: date,
+    body: str,
+    brief: PMBrief,
+    scheduling_results: list[dict[str, Any]] | None = None,
+) -> None:
     """Send the brief via the tagged SendGrid pipeline.
 
     Phase B provides both plain-text + HTML bodies. The HTML
     formatting backlog item (Wilson 2026-10-05) is addressed by
-    passing `html_body` to `send_agent_message`.
+    passing `html_body` to `send_agent_message`. v0.8.1 Phase C.1
+    extends the HTML with the "evolution actions executed this
+    tick" section when PM scheduled anything.
     """
     try:
         from agentfx.notifications.email import render_pm_brief_html, send_agent_message
 
         subject = f"Morning brief — {subject_date.isoformat()}: {brief.headline}"
-        html = render_pm_brief_html(brief, body)
+        html = render_pm_brief_html(brief, body, scheduling_results=scheduling_results)
         send_agent_message(
             agent_role="PM",
             subject=subject,
