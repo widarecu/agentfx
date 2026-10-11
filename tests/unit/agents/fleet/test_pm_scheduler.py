@@ -34,7 +34,7 @@ def _action(**overrides):
     return pm_scheduler.PMEvolutionAction(**defaults)
 
 
-def _db_with_week_count(count: int) -> MagicMock:
+def _db_with_today_count(count: int) -> MagicMock:
     """DB stub whose rate-limit count query returns `count`."""
     db = MagicMock()
     db.query.return_value.filter.return_value.filter.return_value.filter.return_value.count.return_value = count  # noqa: E501
@@ -43,20 +43,20 @@ def _db_with_week_count(count: int) -> MagicMock:
 
 class TestRateLimit:
     def test_zero_prior_runs_leaves_full_quota(self):
-        db = _db_with_week_count(0)
-        assert pm_scheduler.evolutions_remaining_this_week(db) == 2
+        db = _db_with_today_count(0)
+        assert pm_scheduler.evolutions_remaining_today(db) == 10
 
-    def test_one_prior_leaves_one(self):
-        db = _db_with_week_count(1)
-        assert pm_scheduler.evolutions_remaining_this_week(db) == 1
+    def test_partial_use_subtracts_from_cap(self):
+        db = _db_with_today_count(3)
+        assert pm_scheduler.evolutions_remaining_today(db) == 7
 
     def test_cap_reached_leaves_zero(self):
-        db = _db_with_week_count(2)
-        assert pm_scheduler.evolutions_remaining_this_week(db) == 0
+        db = _db_with_today_count(10)
+        assert pm_scheduler.evolutions_remaining_today(db) == 0
 
     def test_cap_exceeded_still_zero_not_negative(self):
-        db = _db_with_week_count(5)
-        assert pm_scheduler.evolutions_remaining_this_week(db) == 0
+        db = _db_with_today_count(50)
+        assert pm_scheduler.evolutions_remaining_today(db) == 0
 
 
 class TestPreDispatchValidation:
@@ -66,7 +66,7 @@ class TestPreDispatchValidation:
     def test_wrong_priority_rejected(self, monkeypatch):
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_INSTRUMENTS", "EUR_USD")
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_GRANULARITIES", "M1")
-        db = _db_with_week_count(0)
+        db = _db_with_today_count(0)
         action = _action(priority="watch")
 
         out = pm_scheduler.schedule_evolution_from_pm_action(
@@ -78,7 +78,7 @@ class TestPreDispatchValidation:
     def test_missing_rationale_rejected(self, monkeypatch):
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_INSTRUMENTS", "EUR_USD")
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_GRANULARITIES", "M1")
-        db = _db_with_week_count(0)
+        db = _db_with_today_count(0)
         action = _action(rationale="   ")  # whitespace-only
 
         out = pm_scheduler.schedule_evolution_from_pm_action(
@@ -90,7 +90,7 @@ class TestPreDispatchValidation:
     def test_missing_expected_impact_rejected(self, monkeypatch):
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_INSTRUMENTS", "EUR_USD")
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_GRANULARITIES", "M1")
-        db = _db_with_week_count(0)
+        db = _db_with_today_count(0)
         action = _action(expected_profit_impact="")
 
         out = pm_scheduler.schedule_evolution_from_pm_action(
@@ -104,7 +104,7 @@ class TestPreDispatchValidation:
             pm_scheduler.settings, "CANDLE_INSTRUMENTS", "EUR_USD,USD_JPY"
         )
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_GRANULARITIES", "M1")
-        db = _db_with_week_count(0)
+        db = _db_with_today_count(0)
         action = _action(pair="XAU_USD")
 
         out = pm_scheduler.schedule_evolution_from_pm_action(
@@ -116,7 +116,7 @@ class TestPreDispatchValidation:
     def test_granularity_not_in_allowlist_rejected(self, monkeypatch):
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_INSTRUMENTS", "EUR_USD")
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_GRANULARITIES", "M1,H1")
-        db = _db_with_week_count(0)
+        db = _db_with_today_count(0)
         action = _action(granularity="M5")
 
         out = pm_scheduler.schedule_evolution_from_pm_action(
@@ -128,7 +128,7 @@ class TestPreDispatchValidation:
     def test_rate_limited_rejected_before_db_write(self, monkeypatch):
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_INSTRUMENTS", "EUR_USD")
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_GRANULARITIES", "M1")
-        db = _db_with_week_count(2)  # at cap
+        db = _db_with_today_count(10)  # at cap
         action = _action()
 
         out = pm_scheduler.schedule_evolution_from_pm_action(
@@ -146,7 +146,7 @@ class TestDispatchSuccess:
     def test_happy_path_schedules_and_records_decision(self, monkeypatch):
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_INSTRUMENTS", "EUR_USD")
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_GRANULARITIES", "M1")
-        db = _db_with_week_count(0)
+        db = _db_with_today_count(0)
         action = _action()
 
         fake_run = MagicMock(id="evorun_test_123")
@@ -204,8 +204,8 @@ class TestSchedulingContext:
 
         assert ctx["allowed_pairs"] == ["EUR_USD", "USD_JPY"]
         assert ctx["allowed_granularities"] == ["M1", "H1"]
-        assert ctx["max_per_week"] == 2
-        assert ctx["evolutions_remaining_this_week"] == 2
+        assert ctx["max_per_day"] == 10
+        assert ctx["evolutions_remaining_today"] == 10
         # 2 pairs × 2 grans = 4 coverage entries.
         assert len(ctx["per_pair_coverage"]) == 4
         pairs_grans = {(p["pair"], p["granularity"]) for p in ctx["per_pair_coverage"]}
@@ -229,7 +229,7 @@ class TestNeverRaises:
     def test_create_run_exception_returns_rejected_result(self, monkeypatch):
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_INSTRUMENTS", "EUR_USD")
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_GRANULARITIES", "M1")
-        db = _db_with_week_count(0)
+        db = _db_with_today_count(0)
         action = _action()
 
         with patch(

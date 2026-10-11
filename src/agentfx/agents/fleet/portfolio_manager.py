@@ -381,9 +381,10 @@ Use the `evolution_actions` field for runs you want to start. Rules:
 - Each action: pair + granularity + rationale + expected_profit_impact + priority.
 - Only priority='now' actions actually fire. 'this_week' / 'watch' are
   for Wilson's eye.
-- Hard cap: max N evolutions per rolling 7-day window (shown in
-  `evolution_scheduling_context.evolutions_remaining_this_week`). If
-  that number is 0, do NOT propose any 'now' actions this cycle.
+- Hard cap: max N evolutions per calendar day UTC (shown in
+  `evolution_scheduling_context.evolutions_remaining_today` /
+  `max_per_day`). If `evolutions_remaining_today` is 0, do NOT
+  propose any 'now' actions this cycle.
 - Pair MUST be in `evolution_scheduling_context.allowed_pairs`.
   Granularity MUST be in `allowed_granularities`. Scheduler drops
   anything else.

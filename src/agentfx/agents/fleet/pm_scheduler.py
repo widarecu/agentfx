@@ -9,7 +9,7 @@ Design intent:
   only LLM $ budget (the backtest + validation subprocess cost), not
   capital. OANDA practice accounts are unaffected until a resulting
   genome gets approved to paper — that's v0.8.2 PM authority.
-- Hard rate limit: `_MAX_EVOLUTIONS_PER_WEEK` runs/week across the
+- Hard rate limit: `_MAX_EVOLUTIONS_PER_DAY` runs/day across the
   entire fleet. Prevents runaway LLM spend if PM gets a bad run of
   rationales.
 - Pair/granularity restricted to the pre-approved
@@ -43,12 +43,17 @@ from agentfx.agents.fleet.memory import DecisionRecord, record_decision
 logger = logging.getLogger(__name__)
 
 
-# Hard cap: this many PM-scheduled evolution runs per rolling 7-day
-# window. Can be raised later via a settings-exposed knob; for
-# v0.8.1 Phase C.1 the goal is "unblock the 10-day silence", not
-# "churn LLM budget". 2 runs/week keeps fleet LLM spend bounded even
-# in the pathological case where PM wants to run everything every day.
-_MAX_EVOLUTIONS_PER_WEEK = 2
+# Hard cap: this many PM-scheduled evolution runs per calendar day
+# (UTC). Raised from 2/week on 2026-10-11 per Wilson — he wants PM
+# to have real scheduling agency, not ultra-conservative throttling.
+#
+# IMPORTANT: this cap only limits how many evolutions PM may KICK
+# OFF per day. Each evolution has its OWN internal LLM budget
+# (set via `llm_budget_usd` at creation), which is counted against
+# per-run budgets, NOT the fleet daily cap. 10 evolutions/day could
+# realistically spend $50-200/day in evolution LLM subprocess costs
+# if PM runs them to depth. Monitor via Railway cost dashboards.
+_MAX_EVOLUTIONS_PER_DAY = 10
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -112,27 +117,30 @@ class PMEvolutionAction(BaseModel):
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _evolutions_started_this_week(db: Session) -> int:
-    """Count PM-initiated evolution runs in the last 7 days.
+def _evolutions_started_today(db: Session) -> int:
+    """Count PM-initiated evolution runs in the current UTC calendar
+    day. Window is the current UTC date — a run started at 23:59 UTC
+    doesn't count against tomorrow's budget.
 
     Reads the decision log — the DB is the authority on rate limits,
     not any in-memory counter (which would reset across restarts).
     """
-    week_ago = datetime.now(UTC) - timedelta(days=7)
+    now = datetime.now(UTC)
+    today_start = datetime.combine(now.date(), datetime.min.time(), tzinfo=UTC)
     return (
         db.query(AgentDecision)
         .filter(AgentDecision.agent_role == AgentRole.PM.value)
         .filter(AgentDecision.action == "started_evolution_run")
-        .filter(AgentDecision.created_at >= week_ago)
+        .filter(AgentDecision.created_at >= today_start)
         .count()
     )
 
 
-def evolutions_remaining_this_week(db: Session) -> int:
+def evolutions_remaining_today(db: Session) -> int:
     """Public helper for the PM snapshot — tells Haiku how many more
-    evolutions it can propose before the hard cap kicks in."""
-    used = _evolutions_started_this_week(db)
-    return max(0, _MAX_EVOLUTIONS_PER_WEEK - used)
+    evolutions it can propose before today's cap kicks in."""
+    used = _evolutions_started_today(db)
+    return max(0, _MAX_EVOLUTIONS_PER_DAY - used)
 
 
 def _is_allowed_pair(pair: str) -> bool:
@@ -173,7 +181,7 @@ def schedule_evolution_from_pm_action(
     - "wrong_priority": priority != 'now'
     - "no_rationale" / "no_expected_impact": required text missing
     - "pair_not_allowed" / "granularity_not_allowed": not in config
-    - "rate_limited": would exceed _MAX_EVOLUTIONS_PER_WEEK
+    - "rate_limited": would exceed _MAX_EVOLUTIONS_PER_DAY
     - "scheduler_error": uncaught exception (logged)
 
     On success, writes an `AgentDecision` row with
@@ -208,7 +216,7 @@ def schedule_evolution_from_pm_action(
 
         # Rate limit — strictest check last so the easier rejections
         # happen first (cheaper + log more informative).
-        if _evolutions_started_this_week(db) >= _MAX_EVOLUTIONS_PER_WEEK:
+        if _evolutions_started_today(db) >= _MAX_EVOLUTIONS_PER_DAY:
             return ScheduledEvolutionResult(accepted=False, reason="rate_limited")
 
         # OK — fire the run via the existing service layer. Lazy
@@ -291,7 +299,7 @@ def build_scheduling_context(db: Session) -> dict[str, Any]:
     - available pairs + granularities
     - per-pair: days since last COMPLETED evolution, current best
       genome's fitness
-    - evolutions_remaining_this_week (rate-limit headroom)
+    - evolutions_remaining_today (rate-limit headroom)
     - prior PM scheduling decisions in the last 30 days + their
       current outcomes (Reflexion signal)
     """
@@ -391,8 +399,8 @@ def build_scheduling_context(db: Session) -> dict[str, Any]:
         "allowed_pairs": allowed_pairs,
         "allowed_granularities": allowed_grans,
         "per_pair_coverage": per_pair,
-        "evolutions_remaining_this_week": evolutions_remaining_this_week(db),
-        "max_per_week": _MAX_EVOLUTIONS_PER_WEEK,
+        "evolutions_remaining_today": evolutions_remaining_today(db),
+        "max_per_day": _MAX_EVOLUTIONS_PER_DAY,
         "prior_pm_evolution_decisions": prior_payload,
     }
 
@@ -401,6 +409,6 @@ __all__ = [
     "PMEvolutionAction",
     "ScheduledEvolutionResult",
     "build_scheduling_context",
-    "evolutions_remaining_this_week",
+    "evolutions_remaining_today",
     "schedule_evolution_from_pm_action",
 ]
