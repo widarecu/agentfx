@@ -449,13 +449,18 @@ class TestOandaIntermittent401Recovery:
     def oanda_client(self, mock_session):
         from agentfx.adapters.oanda import OandaClient
 
+        # Patch via the clean `agentfx.*` import path (no `src.` prefix):
+        # locally PYTHONPATH=src makes both paths importable, but in CI
+        # only `agentfx.*` is reachable, so the `src.*` patch resolved
+        # to a different module instance and never intercepted the real
+        # `oanda_api_key()` call inside OandaClient.__init__.
         with (
             patch(
-                "src.agentfx.adapters.oanda.oanda_api_key",
+                "agentfx.adapters.oanda.oanda_api_key",
                 return_value="test-key",
             ),
             patch(
-                "src.agentfx.adapters.oanda.oanda_api_host",
+                "agentfx.adapters.oanda.oanda_api_host",
                 return_value="api-fxpractice.oanda.com",
             ),
             patch("requests.Session", return_value=mock_session),
