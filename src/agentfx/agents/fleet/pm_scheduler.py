@@ -153,6 +153,45 @@ def _is_allowed_granularity(gran: str) -> bool:
     return gran in allowed
 
 
+def _resolve_owner_user_id(db: Session) -> int | None:
+    """Look up `settings.AGENT_FLEET_OWNER_EMAIL` → User.id.
+
+    Returns None when:
+    - the setting is empty (fleet-scoped mode — PM runs land with
+      `created_by=NULL`), or
+    - the email doesn't match any active user (misconfiguration).
+
+    The not-found path logs as WARNING so Wilson sees the
+    misconfiguration surface in the next QA tech-health scan.
+    """
+    email = (settings.AGENT_FLEET_OWNER_EMAIL or "").strip().lower()
+    if not email:
+        return None
+    try:
+        from agentfx.api.models.user import User
+
+        row = (
+            db.query(User)
+            .filter(User.email == email)
+            .filter(User.is_active.is_(True))
+            .first()
+        )
+        if row is None:
+            logger.warning(
+                "pm_scheduler: AGENT_FLEET_OWNER_EMAIL=%s does not match any "
+                "active user — PM-authored runs will land with created_by=NULL "
+                "and stay invisible in the operator's scoped UI",
+                email,
+            )
+            return None
+        return int(row.id)
+    except Exception:
+        logger.exception(
+            "pm_scheduler: owner-user resolution failed for email=%s", email
+        )
+        return None
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Scheduler (the write action)
 # ─────────────────────────────────────────────────────────────────────
@@ -229,10 +268,14 @@ def schedule_evolution_from_pm_action(
             instrument=action.pair,
             granularity=action.granularity,
         )
-        # created_by=None — PM-authored, not tied to a user.
-        # Scoped reads (US-018) treat `created_by IS NULL` as fleet-
-        # scoped; ADMIN sees them in `scope=all` listings.
-        evo_run = evolution_service.create_run(db, create, created_by=None)
+        # Attribute to the fleet operator so the run shows up in
+        # their RBAC-scoped UI listing. Falls back to NULL (fleet-
+        # scoped, ADMIN-only visible) if `AGENT_FLEET_OWNER_EMAIL`
+        # is unset or doesn't match an active user. Wilson needed
+        # this on 2026-10-15 — PM runs were landing with
+        # created_by=NULL and he couldn't see them in /evolution-runs.
+        owner_user_id = _resolve_owner_user_id(db)
+        evo_run = evolution_service.create_run(db, create, created_by=owner_user_id)
 
         # Schedule the worker subprocess. Must happen OUTSIDE this
         # function's commit boundary — use a background task if the
@@ -258,6 +301,7 @@ def schedule_evolution_from_pm_action(
                 outputs={
                     "evo_run_id": evo_run.id,
                     "expected_profit_impact": action.expected_profit_impact,
+                    "attributed_user_id": owner_user_id,
                 },
                 reasoning=action.rationale,
             ),

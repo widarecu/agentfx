@@ -146,6 +146,7 @@ class TestDispatchSuccess:
     def test_happy_path_schedules_and_records_decision(self, monkeypatch):
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_INSTRUMENTS", "EUR_USD")
         monkeypatch.setattr(pm_scheduler.settings, "CANDLE_GRANULARITIES", "M1")
+        monkeypatch.setattr(pm_scheduler.settings, "AGENT_FLEET_OWNER_EMAIL", "")
         db = _db_with_today_count(0)
         action = _action()
 
@@ -168,6 +169,8 @@ class TestDispatchSuccess:
         assert out.accepted is True
         assert out.evo_run_id == "evorun_test_123"
         create.assert_called_once()
+        # No owner email set → NULL attribution, fleet-scoped visibility.
+        assert create.call_args.kwargs["created_by"] is None
         sched.assert_called_once_with("evorun_test_123")
         rec.assert_called_once()
         # The decision record must capture everything Reflexion needs
@@ -177,7 +180,79 @@ class TestDispatchSuccess:
         assert decision.action == "started_evolution_run"
         assert decision.decision_key == "pm_evo_evorun_test_123"
         assert decision.outputs["evo_run_id"] == "evorun_test_123"
+        assert decision.outputs["attributed_user_id"] is None
         assert decision.reasoning == action.rationale
+
+    def test_attributes_run_to_configured_owner_email(self, monkeypatch):
+        """Wilson 2026-10-15: when AGENT_FLEET_OWNER_EMAIL is set,
+        PM-authored runs land with `created_by=<that user's id>` so
+        they appear in the operator's RBAC-scoped UI listing."""
+        monkeypatch.setattr(pm_scheduler.settings, "CANDLE_INSTRUMENTS", "EUR_USD")
+        monkeypatch.setattr(pm_scheduler.settings, "CANDLE_GRANULARITIES", "M1")
+        monkeypatch.setattr(
+            pm_scheduler.settings,
+            "AGENT_FLEET_OWNER_EMAIL",
+            "wreyes06@outlook.com",
+        )
+        db = _db_with_today_count(0)
+        # The owner-user lookup query goes through filter/filter/first.
+        owner_row = MagicMock(id=42)
+        db.query.return_value.filter.return_value.filter.return_value.first.return_value = owner_row  # noqa: E501
+        action = _action()
+
+        fake_run = MagicMock(id="evorun_owned_1")
+        with (
+            patch(
+                "agentfx.api.services.evolution.create_run", return_value=fake_run
+            ) as create,
+            patch("agentfx.api.workers.evolution_runner.schedule_run"),
+            patch("agentfx.agents.fleet.pm_scheduler.record_decision") as rec,
+        ):
+            out = pm_scheduler.schedule_evolution_from_pm_action(
+                db=db, action=action, pm_decision_key="pm_test"
+            )
+        assert out.accepted is True
+        assert create.call_args.kwargs["created_by"] == 42
+        decision = rec.call_args[0][1]
+        assert decision.outputs["attributed_user_id"] == 42
+
+    def test_missing_owner_email_logs_warning_not_crash(self, monkeypatch, caplog):
+        """Misconfiguration: owner email set but no matching active
+        user. Scheduler must still create the run (falls back to NULL
+        attribution) and log a WARNING so QA tech-health picks it up."""
+        import logging
+
+        monkeypatch.setattr(pm_scheduler.settings, "CANDLE_INSTRUMENTS", "EUR_USD")
+        monkeypatch.setattr(pm_scheduler.settings, "CANDLE_GRANULARITIES", "M1")
+        monkeypatch.setattr(
+            pm_scheduler.settings,
+            "AGENT_FLEET_OWNER_EMAIL",
+            "unknown@example.com",
+        )
+        db = _db_with_today_count(0)
+        # Owner lookup returns None (no matching active user).
+        db.query.return_value.filter.return_value.filter.return_value.first.return_value = None  # noqa: E501
+        action = _action()
+
+        fake_run = MagicMock(id="evorun_unattributed_1")
+        with (
+            caplog.at_level(
+                logging.WARNING, logger="agentfx.agents.fleet.pm_scheduler"
+            ),
+            patch(
+                "agentfx.api.services.evolution.create_run", return_value=fake_run
+            ) as create,
+            patch("agentfx.api.workers.evolution_runner.schedule_run"),
+            patch("agentfx.agents.fleet.pm_scheduler.record_decision"),
+        ):
+            out = pm_scheduler.schedule_evolution_from_pm_action(
+                db=db, action=action, pm_decision_key="pm_test"
+            )
+        assert out.accepted is True
+        assert create.call_args.kwargs["created_by"] is None
+        assert any(
+            "does not match any active user" in r.message for r in caplog.records
+        )
         db.commit.assert_called_once()
 
 

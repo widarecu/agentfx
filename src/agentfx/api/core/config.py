@@ -472,6 +472,23 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Fleet attribution — which user owns PM-authored artefacts
+    # (evolution runs, future paper deployments). Without this, PM
+    # creates runs with `created_by=NULL` and the owning user never
+    # sees them in the RBAC-scoped UI listing. Set on Railway staging
+    # and in `.env.uat` to the operator's platform email.
+    AGENT_FLEET_OWNER_EMAIL: str = Field(
+        default="",
+        env="AGENT_FLEET_OWNER_EMAIL",
+        description=(
+            "Platform email of the fleet operator (Wilson). PM-authored "
+            "evolution runs are attributed to this user so they appear "
+            "in the operator's RBAC-scoped listing. Empty string means "
+            "PM runs stay fleet-scoped (`created_by=NULL`), visible only "
+            "to ADMINs via `scope=all`."
+        ),
+    )
+
     @property
     def instruments_list(self) -> list[str]:
         """Parse CANDLE_INSTRUMENTS into a list."""
