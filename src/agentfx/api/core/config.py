@@ -489,6 +489,49 @@ class Settings(BaseSettings):
         ),
     )
 
+    # PE Managed Agents workspace (v0.8.1 C.2 Phase 2) — False by default
+    # until the Anthropic SDK integration is wired and verified. With the
+    # flag off, PE keeps emailing proposals; with it on, HIGH-confidence
+    # proposals dispatch to a workspace that opens a PR on
+    # `feat/agent-fleet`.
+    AGENT_PE_WORKSPACE_ENABLED: bool = Field(
+        default=False,
+        env="AGENT_PE_WORKSPACE_ENABLED",
+        description=(
+            "If true, PE routes HIGH-confidence proposals to the "
+            "Managed Agents workspace adapter (PR on `feat/agent-fleet`). "
+            "If false (default), every proposal stays on the email path."
+        ),
+    )
+    AGENT_PE_WORKSPACE_MAX_PER_DAY: int = Field(
+        default=2,
+        env="AGENT_PE_WORKSPACE_MAX_PER_DAY",
+        description=(
+            "Hard cap on PE workspace dispatches per UTC day. Counts "
+            "every attempt (success / failure / stub) so a looping "
+            "proposal can't chew the daily budget."
+        ),
+    )
+    AGENT_PE_WORKSPACE_DAILY_USD_CAP: float = Field(
+        default=3.00,
+        env="AGENT_PE_WORKSPACE_DAILY_USD_CAP",
+        description=(
+            "Daily USD cap on container-time + LLM cost across all PE "
+            "workspace dispatches. New dispatches refuse when the "
+            "cumulative cost for the UTC day would exceed this."
+        ),
+    )
+    GITHUB_TOKEN: str = Field(
+        default="",
+        env="GITHUB_TOKEN",
+        description=(
+            "GitHub Personal Access Token used by the PE Managed Agents "
+            "workspace to push the agent sub-branch and open the PR "
+            "against `feat/agent-fleet`. Empty string disables the "
+            "real adapter (stub falls through)."
+        ),
+    )
+
     @property
     def instruments_list(self) -> list[str]:
         """Parse CANDLE_INSTRUMENTS into a list."""

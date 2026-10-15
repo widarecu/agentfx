@@ -36,6 +36,7 @@ from .user_credentials import (
     UserOandaCredentials,
 )
 from .agent_decision import AgentDecision, AgentRole
+from .agent_workspace_run import AgentWorkspaceRun, AgentWorkspaceRunStatus
 from .oanda_account_pool import (
     OandaAccountPool,
     OandaAccountPoolEnvironment,
@@ -82,6 +83,9 @@ __all__ = [
     # Agent Fleet (v0.8.0)
     "AgentDecision",
     "AgentRole",
+    # PE Managed Agents workspace dispatches (v0.8.1 C.2 Phase 2)
+    "AgentWorkspaceRun",
+    "AgentWorkspaceRunStatus",
     # OANDA account pool (v0.8.1 C.3)
     "OandaAccountPool",
     "OandaAccountPoolStatus",

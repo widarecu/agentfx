@@ -240,6 +240,242 @@ def scan_and_propose(*, db: Session, now: datetime | None = None) -> int:
     return produced
 
 
+# ─────────────────────────────────────────────────────────────────────
+# C.2 Phase 2 — dispatch to Managed Agents workspace
+# ─────────────────────────────────────────────────────────────────────
+
+
+def scan_and_dispatch(*, db: Session, now: datetime | None = None) -> tuple[int, int]:
+    """Phase-2 entry point used by the orchestrator when the
+    workspace flag is on.
+
+    Does Phase 1's work first — produces proposals via Opus 5 — then
+    for each HIGH-confidence proposal attempts a workspace dispatch
+    through the resolved adapter. MEDIUM / LOW proposals stay on the
+    email path (Phase 1 already emailed them during `_generate_proposal`).
+
+    Returns `(proposals_produced, dispatches_attempted)` for logging.
+    Never raises — individual dispatch failures are swallowed and
+    logged; the orchestrator loop continues.
+    """
+    now = now or datetime.now(UTC)
+
+    # Phase 1 — produce proposals (also records them in agent_decisions).
+    proposals_produced = scan_and_propose(db=db, now=now)
+
+    # Phase 2 — find HIGH-confidence proposals created today that
+    # don't yet have a workspace dispatch, and hand them to the adapter.
+    try:
+        candidates = _collect_undispatched_high_confidence_proposals(db, now=now)
+    except Exception:
+        logger.exception("pe_agent: dispatch candidate scan failed")
+        return proposals_produced, 0
+
+    if not candidates:
+        return proposals_produced, 0
+
+    # Lazy imports — Phase 2 modules shouldn't be imported unless the
+    # dispatcher runs (keeps Phase-1-only installs light).
+    from agentfx.agents.fleet.pe_workspace import (
+        build_task_slug,
+        resolve_adapter,
+        sweep_stuck_runs,
+    )
+
+    sweep_stuck_runs(db, now=now)
+
+    adapter = resolve_adapter()
+    attempted = 0
+    for decision_id, decision_key, proposal_dict, work_order in candidates:
+        try:
+            spec = _build_task_spec(
+                decision_key=decision_key,
+                proposal_dict=proposal_dict,
+                work_order=work_order,
+                slug_fn=build_task_slug,
+                now=now,
+            )
+            result = adapter.dispatch(db, spec=spec, now=now)
+            attempted += 1
+            if not result.accepted:
+                logger.info(
+                    "pe_agent: workspace adapter refused proposal=%s — %s",
+                    decision_key,
+                    result.reason,
+                )
+            else:
+                logger.info(
+                    "pe_agent: dispatched proposal=%s to workspace "
+                    "(run_id=%s, branch=%s, reason=%s)",
+                    decision_key,
+                    result.workspace_run_id,
+                    result.agent_branch,
+                    result.reason or "ok",
+                )
+        except Exception:
+            logger.exception(
+                "pe_agent: workspace dispatch failed for proposal=%s",
+                decision_key,
+            )
+    return proposals_produced, attempted
+
+
+def _collect_undispatched_high_confidence_proposals(
+    db: Session, *, now: datetime
+) -> list[tuple[str, str, dict[str, Any], dict[str, Any]]]:
+    """Find today's HIGH-confidence PE proposals that don't yet have
+    an `agent_workspace_runs` row.
+
+    Returns `(decision_id, decision_key, proposal_dict, work_order_dict)`.
+    """
+    from agentfx.api.models.agent_workspace_run import AgentWorkspaceRun
+
+    today_start = datetime.combine(now.date(), datetime.min.time(), tzinfo=UTC)
+    rows = (
+        db.query(AgentDecision)
+        .filter(AgentDecision.agent_role == AgentRole.PE.value)
+        .filter(AgentDecision.action == "proposed_fix")
+        .filter(AgentDecision.created_at >= today_start)
+        .order_by(AgentDecision.created_at.asc())
+        .all()
+    )
+
+    already_dispatched_keys = {
+        r.pe_proposal_decision_key
+        for r in db.query(AgentWorkspaceRun)
+        .filter(AgentWorkspaceRun.created_at >= today_start)
+        .all()
+    }
+
+    out: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
+    for row in rows:
+        if row.decision_key in already_dispatched_keys:
+            continue
+        outputs = row.outputs_json or {}
+        proposal = outputs.get("proposal") or {}
+        if (proposal.get("confidence") or "").lower() != "high":
+            continue
+        inputs = row.inputs_json or {}
+        # Reconstruct the minimum work-order view PE needs; the full
+        # QA work order lives on the QA row but all we need here is
+        # title + target_file + estimated profit impact.
+        work_order = {
+            "title": inputs.get("work_order_title") or "(untitled)",
+            "target_file": inputs.get("target_file") or "",
+        }
+        out.append((row.id, row.decision_key, proposal, work_order))
+    return out
+
+
+def _build_task_spec(
+    *,
+    decision_key: str,
+    proposal_dict: dict[str, Any],
+    work_order: dict[str, Any],
+    slug_fn: Any,
+    now: datetime,
+) -> Any:
+    """Turn a persisted PEProposal (dict) + its work order into the
+    adapter's `WorkspaceTaskSpec`."""
+    from agentfx.agents.fleet.pe_workspace import WorkspaceTaskSpec
+
+    title = work_order.get("title") or "pe-task"
+    target_files = [
+        c.get("file_path", "")
+        for c in proposal_dict.get("proposed_changes", [])
+        if c.get("file_path")
+    ]
+    new_test_paths = [
+        t.get("file_path", "")
+        for t in proposal_dict.get("new_tests", [])
+        if t.get("file_path")
+    ]
+    narrative = _render_dispatch_narrative(
+        proposal_dict=proposal_dict, work_order=work_order
+    )
+    return WorkspaceTaskSpec(
+        task_slug=slug_fn(title, now=now),
+        pe_proposal_decision_key=decision_key,
+        title=title,
+        narrative=narrative,
+        target_files=target_files,
+        new_test_paths=new_test_paths,
+        estimated_profit_impact=proposal_dict.get("estimated_profit_impact") or "",
+    )
+
+
+def _render_dispatch_narrative(
+    *,
+    proposal_dict: dict[str, Any],
+    work_order: dict[str, Any],
+) -> str:
+    """Workspace-ready prompt — explains the task, the files to
+    touch, the required test, and the three-tier branch gate so the
+    workspace agent never pushes to main.
+    """
+    lines: list[str] = []
+    title = work_order.get("title") or "(untitled task)"
+    lines.append(f"# Task: {title}")
+    lines.append("")
+    lines.append(
+        "You are the Platform Engineer workspace. Apply this proposal, "
+        "add a reproducing test, make `make test-unit` pass, and open a "
+        "PR against the `feat/agent-fleet` branch from an "
+        "`agent/<task-slug>` sub-branch. **NEVER push to `main`.**"
+    )
+    lines.append("")
+    summary = proposal_dict.get("investigation_summary") or ""
+    if summary:
+        lines.append("## Investigation summary")
+        lines.append(summary)
+        lines.append("")
+    changes = proposal_dict.get("proposed_changes") or []
+    if changes:
+        lines.append("## Proposed changes")
+        for c in changes:
+            lines.append(
+                f"- **{c.get('file_path', '?')}** ({c.get('change_type', 'modify')}): {c.get('rationale', '')}"
+            )
+            diff = c.get("diff") or ""
+            if diff:
+                lines.append("")
+                lines.append("```diff")
+                lines.append(diff.strip())
+                lines.append("```")
+                lines.append("")
+    new_tests = proposal_dict.get("new_tests") or []
+    if new_tests:
+        lines.append("## Required new tests")
+        for t in new_tests:
+            lines.append(
+                f"- `{t.get('file_path', '?')}::{t.get('name', '?')}` — "
+                f"{t.get('purpose', '')}"
+            )
+        lines.append("")
+    risk = proposal_dict.get("risk_assessment") or ""
+    if risk:
+        lines.append("## Risk assessment")
+        lines.append(risk)
+        lines.append("")
+    impact = proposal_dict.get("estimated_profit_impact") or ""
+    if impact:
+        lines.append("## Expected profit impact")
+        lines.append(impact)
+        lines.append("")
+    lines.append("## Workflow")
+    lines.append("")
+    lines.append("1. Create a new branch `agent/<task-slug>` off `feat/agent-fleet`.")
+    lines.append("2. Add the required tests FIRST (they should fail initially).")
+    lines.append("3. Apply the proposed changes.")
+    lines.append("4. Run `make test-unit` — iterate until green.")
+    lines.append("5. Commit with a message referencing this task title.")
+    lines.append("6. Push the branch and open a PR to `feat/agent-fleet`.")
+    lines.append(
+        "7. If after 3 iterations tests still fail, STOP and report the failing output."
+    )
+    return "\n".join(lines)
+
+
 def _collect_candidate_work_orders(
     db: Session,
 ) -> list[tuple[str, dict[str, Any]]]:
@@ -602,4 +838,5 @@ __all__ = [
     "PEProposedChange",
     "PENewTest",
     "scan_and_propose",
+    "scan_and_dispatch",
 ]

@@ -162,12 +162,18 @@ _PE_SCAN_SECONDS = 60 * 60 * 24
 
 async def _pe_scan_loop() -> None:
     """Daily scan: find unprocessed QA work orders → generate PE
-    fix proposals via Opus 5. Never raises."""
-    from agentfx.agents.fleet.platform_engineer import scan_and_propose
+    fix proposals via Opus 5. When the workspace flag is on, also
+    hand HIGH-confidence proposals to the Managed Agents adapter
+    for autonomous PR creation. Never raises."""
+    from agentfx.agents.fleet.platform_engineer import (
+        scan_and_dispatch,
+        scan_and_propose,
+    )
 
     logger.info(
-        "agent_orchestrator: PE scan loop armed (cadence=%ds)",
+        "agent_orchestrator: PE scan loop armed (cadence=%ds, workspace=%s)",
         _PE_SCAN_SECONDS,
+        bool(getattr(settings, "AGENT_PE_WORKSPACE_ENABLED", False)),
     )
     while True:
         try:
@@ -178,6 +184,15 @@ async def _pe_scan_loop() -> None:
                         "budget exceeded for %s",
                         datetime.now(UTC).date(),
                     )
+                elif getattr(settings, "AGENT_PE_WORKSPACE_ENABLED", False):
+                    produced, attempted = scan_and_dispatch(db=db)
+                    if produced or attempted:
+                        logger.info(
+                            "agent_orchestrator: PE produced %d proposal(s), "
+                            "attempted %d workspace dispatch(es)",
+                            produced,
+                            attempted,
+                        )
                 else:
                     produced = scan_and_propose(db=db)
                     if produced:
