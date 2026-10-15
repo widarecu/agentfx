@@ -142,6 +142,19 @@ class OandaCircuitBreaker:
         return len(self._failures) >= self.threshold
 
 
+def _auth_backoff_delay_seconds(attempt: int) -> float:
+    """Longer backoff tailored to intermittent OANDA 401s.
+
+    `attempt` starts at 0 for the first retry: 30s, 60s, 120s. These
+    match the observed OANDA edge-recovery window — Wilson 2026-10-15
+    noted 401 bursts clear within a few minutes without any token
+    change. Jitter is ±15% so parallel clients don't retry in lockstep.
+    """
+    base = {0: 30.0, 1: 60.0, 2: 120.0}.get(attempt, 120.0)
+    jitter = random.uniform(-0.15, 0.15) * base
+    return max(0.0, base + jitter)
+
+
 def _backoff_delay_seconds(
     attempt: int,
     *,
@@ -247,13 +260,40 @@ class OandaClient:
         # doesn't trip another user's client. 5 failures / 60s window
         # matches the paper runner's tolerance in US-023.
         self.circuit_breaker = OandaCircuitBreaker(threshold=5, window_seconds=60.0)
-        self.session = requests.Session()
-        self.session.headers.update(
+        self.session = self._build_session()
+
+    def _build_session(self) -> requests.Session:
+        """Create a fresh `requests.Session` with headers set.
+
+        Factored out so `_reset_session()` can call it on 401
+        recovery — see Wilson 2026-10-15 incident analysis. Keep-
+        alive connection pools can get into a bad state against
+        OANDA's edge where the socket returns 401 despite valid
+        credentials. A fresh session drops the pool and forces a
+        new TCP+TLS handshake, which the "restart cures it" symptom
+        was effectively doing accidentally.
+        """
+        s = requests.Session()
+        s.headers.update(
             {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             }
         )
+        return s
+
+    def _reset_session(self) -> None:
+        """Drop the current `requests.Session` and build a fresh one.
+
+        Called on 401 retry to escape the stale-connection-pool
+        failure mode. Safe to call multiple times; the old session's
+        pool is closed so sockets are released.
+        """
+        try:
+            self.session.close()
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
+        self.session = self._build_session()
 
     # ─────────────────────────────────────────────────────────────
     # v0.6.0 (US-019) — account discovery for the credentials flow.
@@ -315,9 +355,21 @@ class OandaClient:
 
         Retryable failures (network errors, HTTP 429, HTTP 5xx) burn
         an attempt and sleep for an exponentially-growing delay with
-        jitter. Non-retryable failures (HTTP 4xx other than 429) fail
-        immediately — a 401 won't get better by trying again, and the
-        paper runner needs a fast signal so the user can fix creds.
+        jitter.
+
+        **401 handling (Wilson 2026-10-15):** 401 is treated as
+        retryable with a session reset between attempts. The pattern
+        Wilson has been seeing weekly — intermittent 401s that go
+        away on process restart — points at a stale
+        `requests.Session` keep-alive connection pool rather than
+        bad credentials. We rebuild the session on each 401 retry
+        to drop any poisoned sockets. Bounded at 3 retries over
+        ~5 minutes; if 401 persists past that it probably IS a real
+        credential issue and we fail hard so the paper runner halts
+        and the user can rotate the token.
+
+        Other 4xx failures (400, 403, 404, 422, ...) still fail
+        immediately — those genuinely won't get better.
 
         The circuit breaker is checked BEFORE each attempt. Any
         failure that reaches the retry cap records to the breaker;
@@ -382,6 +434,41 @@ class OandaClient:
                 last_error = OandaError(f"{resp.status_code} {resp.text[:200]}")
                 if attempt < 4:
                     time.sleep(_backoff_delay_seconds(attempt))
+                    continue
+                self.circuit_breaker.record_failure()
+                raise last_error
+
+            # 401 — treated as potentially-recoverable from stale
+            # keep-alive sockets. Reset the session, back off longer
+            # than the 429/5xx path (OANDA edge recoveries take
+            # minutes, not seconds), retry. Bounded at 3 retries so
+            # a genuinely bad credential surfaces inside ~5 minutes
+            # instead of being treated as transient forever.
+            if resp.status_code == 401:
+                _log_call_result(
+                    method,
+                    path,
+                    status=resp.status_code,
+                    elapsed_ms=elapsed_ms,
+                    attempt=attempt,
+                )
+                last_error = OandaError(
+                    f"401 {resp.text[:200]} (attempt {attempt + 1}/4)"
+                )
+                if attempt < 3:
+                    _oanda_log.warning(
+                        "OANDA 401 on attempt %d — resetting session + "
+                        "backing off (treating as transient edge issue; "
+                        "will fail hard after 3 retries)",
+                        attempt,
+                    )
+                    self._reset_session()
+                    # Dedicated 401 backoff: ~30s, 60s, 120s. OANDA
+                    # edge-recovery is minutes, not the seconds the
+                    # standard _backoff_delay_seconds targets. Total
+                    # worst-case: ~3.5 minutes before a genuinely-bad
+                    # credential surfaces.
+                    time.sleep(_auth_backoff_delay_seconds(attempt))
                     continue
                 self.circuit_breaker.record_failure()
                 raise last_error

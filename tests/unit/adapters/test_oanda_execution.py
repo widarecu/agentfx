@@ -182,17 +182,26 @@ class TestRequestBehaviour:
         assert mock_session.request.call_count == 3
 
     def test_4xx_fails_immediately_no_retry(self, client, mock_session):
-        # 401 must NOT retry — the token isn't going to change.
-        mock_session.request.side_effect = [_http_error(401, "unauthorized")]
+        # 400 (and other 4xx except 401) must NOT retry — these are
+        # genuine client errors that won't resolve themselves.
+        # NOTE: 401 handling changed 2026-10-15 — see
+        # TestOandaIntermittent401Recovery in test_oanda.py. 401 is
+        # now treated as potentially recoverable from a stale
+        # requests.Session keep-alive pool and retries up to 3 times
+        # with a session reset between attempts.
+        mock_session.request.side_effect = [_http_error(400, "bad request")]
         with patch("time.sleep"):
-            with pytest.raises(OandaError, match="401"):
+            with pytest.raises(OandaError, match="400"):
                 client._request("GET", "/test")
         assert mock_session.request.call_count == 1
 
     def test_circuit_opens_after_five_terminal_failures(self, client, mock_session):
-        # Each 401 records one failure. After 5, the next call raises
-        # OandaCircuitOpen without touching the session.
-        mock_session.request.side_effect = [_http_error(401) for _ in range(5)]
+        # Each 400 records exactly one failure (no retries). After 5
+        # of them, the circuit trips and the next call short-circuits.
+        # Using 400 rather than 401 since the 2026-10-15 change — 401
+        # now burns 4 request calls (1 initial + 3 retries) before
+        # recording a single circuit-breaker failure.
+        mock_session.request.side_effect = [_http_error(400) for _ in range(5)]
         with patch("time.sleep"):
             for _ in range(5):
                 with pytest.raises(OandaError):

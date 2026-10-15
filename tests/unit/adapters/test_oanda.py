@@ -431,3 +431,125 @@ class TestOandaAdapter:
 
         assert result == {"data": "success"}
         assert oanda_client.session.request.call_count == 3
+
+
+class TestOandaIntermittent401Recovery:
+    """Wilson 2026-10-15: intermittent OANDA 401s have been curing on
+    process restart. Hypothesis is a stale `requests.Session`
+    keep-alive socket. The 401 path now retries with a session reset
+    before failing hard."""
+
+    @pytest.fixture
+    def mock_session(self):
+        session = MagicMock(spec=requests.Session)
+        session.headers = {}
+        return session
+
+    @pytest.fixture
+    def oanda_client(self, mock_session):
+        from agentfx.adapters.oanda import OandaClient
+
+        with (
+            patch(
+                "src.agentfx.adapters.oanda.oanda_api_key",
+                return_value="test-key",
+            ),
+            patch(
+                "src.agentfx.adapters.oanda.oanda_api_host",
+                return_value="api-fxpractice.oanda.com",
+            ),
+            patch("requests.Session", return_value=mock_session),
+        ):
+            return OandaClient()
+
+    def test_401_recovers_after_session_reset(self, oanda_client):
+        """A 401 followed by a 200 on retry must succeed, AND the
+        session must have been reset between attempts (otherwise
+        the keep-alive pool stays stale)."""
+        from agentfx.adapters import oanda as oanda_mod
+
+        resp_401 = MagicMock(
+            status_code=401, text="Insufficient Authorization", content=b"..."
+        )
+        resp_200 = MagicMock(
+            status_code=200,
+            text="",
+            content=b"{}",
+            json=MagicMock(return_value={}),
+        )
+        oanda_client.session.request = MagicMock(side_effect=[resp_401, resp_200])
+
+        # Patch the slow 401 backoff + session rebuild so the test runs instantly.
+        with (
+            patch.object(oanda_mod, "_auth_backoff_delay_seconds", return_value=0.0),
+            patch.object(
+                oanda_client, "_build_session", return_value=oanda_client.session
+            ) as rebuild,
+        ):
+            result = oanda_client._request("GET", "/test", {})
+
+        assert result == {}
+        assert oanda_client.session.request.call_count == 2
+        rebuild.assert_called_once()  # session reset between the two attempts
+
+    def test_401_persistent_fails_hard_after_bounded_retries(self, oanda_client):
+        """If every single attempt returns 401, we eventually give up
+        with a hard error — a genuinely bad credential shouldn't loop
+        forever."""
+        from agentfx.adapters import oanda as oanda_mod
+        from agentfx.adapters.oanda import OandaError
+
+        resp_401 = MagicMock(
+            status_code=401, text="Insufficient Authorization", content=b"..."
+        )
+        oanda_client.session.request = MagicMock(return_value=resp_401)
+
+        with (
+            patch.object(oanda_mod, "_auth_backoff_delay_seconds", return_value=0.0),
+            patch.object(
+                oanda_client, "_build_session", return_value=oanda_client.session
+            ),
+            pytest.raises(OandaError, match="401"),
+        ):
+            oanda_client._request("GET", "/test", {})
+
+        # Initial attempt + 3 retries = 4 total request calls, matching
+        # the "fail hard after 3 retries" docstring contract.
+        assert oanda_client.session.request.call_count == 4
+
+    def test_other_4xx_still_fails_immediately(self, oanda_client):
+        """400 / 403 / 404 are genuine client errors — must NOT burn
+        extra retries + session resets."""
+        from agentfx.adapters.oanda import OandaError
+
+        resp_400 = MagicMock(status_code=400, text="Bad request", content=b"...")
+        oanda_client.session.request = MagicMock(return_value=resp_400)
+
+        with pytest.raises(OandaError, match="400"):
+            oanda_client._request("GET", "/test", {})
+
+        # Exactly one attempt — no retries, no session reset.
+        assert oanda_client.session.request.call_count == 1
+
+
+class TestAuthBackoff:
+    """`_auth_backoff_delay_seconds` returns the long-form 30/60/120s
+    schedule for OANDA 401 retries, with ±15% jitter."""
+
+    def test_schedule(self):
+        from agentfx.adapters.oanda import _auth_backoff_delay_seconds
+
+        # Center values with ±15% jitter → sanity-check each attempt is
+        # inside its expected envelope.
+        d0 = _auth_backoff_delay_seconds(0)
+        d1 = _auth_backoff_delay_seconds(1)
+        d2 = _auth_backoff_delay_seconds(2)
+        assert 25.0 <= d0 <= 35.0  # ~30s
+        assert 50.0 <= d1 <= 70.0  # ~60s
+        assert 100.0 <= d2 <= 140.0  # ~120s
+
+    def test_attempt_beyond_schedule_falls_back_to_cap(self):
+        from agentfx.adapters.oanda import _auth_backoff_delay_seconds
+
+        d = _auth_backoff_delay_seconds(99)
+        assert 100.0 <= d <= 140.0  # same ceiling as attempt=2
