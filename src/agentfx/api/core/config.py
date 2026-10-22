@@ -528,7 +528,43 @@ class Settings(BaseSettings):
             "GitHub Personal Access Token used by the PE Managed Agents "
             "workspace to push the agent sub-branch and open the PR "
             "against `feat/agent-fleet`. Empty string disables the "
-            "real adapter (stub falls through)."
+            "real adapter (stub falls through). Prefer putting the PAT "
+            "in a Managed Agents vault credential — this setting only "
+            "controls whether the adapter is enabled, it is not sent "
+            "to the sandbox."
+        ),
+    )
+    # Managed Agents (Beta) resource IDs — created once by the operator
+    # via console or a setup script, then referenced per-dispatch. All
+    # three must be set for ManagedAgentsAdapter to actually dispatch;
+    # any missing → graceful degrade to stub-equivalent behaviour.
+    AGENT_PE_WORKSPACE_AGENT_ID: str = Field(
+        default="",
+        env="AGENT_PE_WORKSPACE_AGENT_ID",
+        description=(
+            "ID of the pre-created Managed Agents agent config PE "
+            "dispatches sessions against. Create via "
+            "`client.beta.agents.create(...)` with Opus 5 + the "
+            "agent_toolset_20260401 toolset + GitHub MCP server + the "
+            "PE system prompt (see docs/pe-managed-agents-setup.md)."
+        ),
+    )
+    AGENT_PE_WORKSPACE_ENVIRONMENT_ID: str = Field(
+        default="",
+        env="AGENT_PE_WORKSPACE_ENVIRONMENT_ID",
+        description=(
+            "ID of the Managed Agents environment (compute profile) "
+            "used for PE sessions. Create via "
+            "`client.beta.environments.create(...)`."
+        ),
+    )
+    AGENT_PE_WORKSPACE_VAULT_ID: str = Field(
+        default="",
+        env="AGENT_PE_WORKSPACE_VAULT_ID",
+        description=(
+            "ID of the Managed Agents vault that holds the GitHub PAT "
+            "credential. Create via `client.beta.vaults.create(...)` "
+            "+ `vaults.credentials.create(...)`."
         ),
     )
 

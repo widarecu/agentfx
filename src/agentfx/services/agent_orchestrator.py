@@ -199,6 +199,42 @@ async def _evolution_filler_loop() -> None:
 # Opus 5 spend bounded (~$0.75/day worst case).
 _PE_SCAN_SECONDS = 60 * 60 * 24
 
+# PE workspace poll cadence — managed-agents sessions typically take
+# minutes to tens of minutes to terminate. 10 min keeps the status
+# dashboard fresh without hammering the API.
+_PE_WORKSPACE_POLL_SECONDS = 60 * 10
+
+
+async def _pe_workspace_poll_loop() -> None:
+    """Poll running Managed Agents workspace sessions; transition
+    terminated ones to PR_OPEN / TESTS_FAILED / WORKSPACE_FAILED.
+    Only runs when the workspace flag is on. Never raises."""
+    from agentfx.agents.fleet.pe_workspace import poll_running_dispatches
+
+    enabled = bool(getattr(settings, "AGENT_PE_WORKSPACE_ENABLED", False))
+    logger.info(
+        "agent_orchestrator: PE workspace poll loop armed (cadence=%ds, enabled=%s)",
+        _PE_WORKSPACE_POLL_SECONDS,
+        enabled,
+    )
+    while True:
+        try:
+            if getattr(settings, "AGENT_PE_WORKSPACE_ENABLED", False):
+                with SessionLocal() as db:
+                    counts = poll_running_dispatches(db)
+                    if counts.get("checked"):
+                        logger.info(
+                            "agent_orchestrator: PE workspace poll "
+                            "checked=%d pr_open=%d tests_failed=%d failed=%d",
+                            counts.get("checked", 0),
+                            counts.get("pr_open", 0),
+                            counts.get("tests_failed", 0),
+                            counts.get("failed", 0),
+                        )
+        except Exception:
+            logger.exception("agent_orchestrator: PE workspace poll iteration failed")
+        await asyncio.sleep(_PE_WORKSPACE_POLL_SECONDS)
+
 
 async def _pe_scan_loop() -> None:
     """Daily scan: find unprocessed QA work orders → generate PE
@@ -340,6 +376,7 @@ def register_lifespan_tasks() -> list[asyncio.Task[Any]]:
         asyncio.create_task(_evolution_filler_loop(), name="fleet_evolution_filler"),
         asyncio.create_task(_qa_scan_loop(), name="fleet_qa_scan"),
         asyncio.create_task(_pe_scan_loop(), name="fleet_pe_scan"),
+        asyncio.create_task(_pe_workspace_poll_loop(), name="fleet_pe_workspace_poll"),
     ]
     return _active_tasks
 

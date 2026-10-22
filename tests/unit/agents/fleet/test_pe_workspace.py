@@ -200,8 +200,11 @@ class TestManagedAgentsAdapterScaffold:
             .one()
         )
         assert row.adapter == "managed_agents"
+        # Without `AGENT_PE_WORKSPACE_*` IDs set, the adapter gracefully
+        # degrades to WORKSPACE_FAILED with an operator-readable summary
+        # instead of calling the SDK.
         assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
-        assert "SDK wire-up pending" in (row.summary or "")
+        assert "missing managed-agents config" in (row.summary or "")
 
     def test_dispatch_respects_budget(self, db, monkeypatch):
         monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_WORKSPACE_MAX_PER_DAY", 0)
@@ -461,3 +464,276 @@ class TestRenderDispatchNarrative:
         assert "src/foo.py" in md
         assert "- old\n+ new" in md
         assert "test_guard_blocks_bad_input" in md
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ManagedAgentsAdapter — real SDK path (v0.8.1 C.2 Phase 2b)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestManagedAgentsAdapterSDK:
+    """Covers the real `sessions.create` + `events.send` path. The
+    SDK itself is patched — these are unit tests for the dispatch
+    glue, not integration tests against Anthropic."""
+
+    def _configure_settings(self, monkeypatch):
+        monkeypatch.setattr(
+            pe_workspace.settings, "AGENT_PE_WORKSPACE_AGENT_ID", "agent_abc"
+        )
+        monkeypatch.setattr(
+            pe_workspace.settings,
+            "AGENT_PE_WORKSPACE_ENVIRONMENT_ID",
+            "env_xyz",
+        )
+        monkeypatch.setattr(
+            pe_workspace.settings, "AGENT_PE_WORKSPACE_VAULT_ID", "vault_123"
+        )
+
+    def test_missing_agent_id_degrades_without_sdk_call(self, db, monkeypatch):
+        """Any missing ID → row persisted as WORKSPACE_FAILED with an
+        operator-readable summary. No SDK call is made."""
+        self._configure_settings(monkeypatch)
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_WORKSPACE_AGENT_ID", "")
+        adapter = pe_workspace.ManagedAgentsAdapter()
+        result = adapter.dispatch(db, spec=_spec())
+        assert result.accepted is True  # Row persisted
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert "AGENT_PE_WORKSPACE_AGENT_ID" in (row.summary or "")
+        assert row.provider_run_id is None  # No session created
+
+    def test_happy_path_creates_session_and_sends_message(self, db, monkeypatch):
+        from unittest.mock import MagicMock
+
+        self._configure_settings(monkeypatch)
+
+        session = MagicMock()
+        session.id = "sess_opus5_xyz"
+        fake_client = MagicMock()
+        fake_client.beta.sessions.create.return_value = session
+
+        import anthropic as _anth
+
+        monkeypatch.setattr(_anth, "Anthropic", lambda **_kw: fake_client, raising=True)
+
+        adapter = pe_workspace.ManagedAgentsAdapter()
+        result = adapter.dispatch(db, spec=_spec())
+        assert result.accepted is True
+        assert result.provider_run_id == "sess_opus5_xyz"
+
+        # SDK was called with the expected args
+        fake_client.beta.sessions.create.assert_called_once()
+        kwargs = fake_client.beta.sessions.create.call_args.kwargs
+        assert kwargs["agent"] == {"id": "agent_abc"}
+        assert kwargs["environment_id"] == "env_xyz"
+        assert kwargs["vault_ids"] == ["vault_123"]
+        assert kwargs["title"] == "2026-10-15-fix-order-dedup"
+
+        fake_client.beta.sessions.events.send.assert_called_once()
+        events_kwargs = fake_client.beta.sessions.events.send.call_args.kwargs
+        assert events_kwargs["session_id"] == "sess_opus5_xyz"
+        assert events_kwargs["events"][0]["type"] == "user_message"
+
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.RUNNING
+        assert row.provider_run_id == "sess_opus5_xyz"
+        assert row.started_at is not None
+
+    def test_sessions_create_exception_marks_failed(self, db, monkeypatch):
+        from unittest.mock import MagicMock
+
+        self._configure_settings(monkeypatch)
+        fake_client = MagicMock()
+        fake_client.beta.sessions.create.side_effect = RuntimeError("503")
+
+        import anthropic as _anth
+
+        monkeypatch.setattr(_anth, "Anthropic", lambda **_kw: fake_client, raising=True)
+
+        adapter = pe_workspace.ManagedAgentsAdapter()
+        result = adapter.dispatch(db, spec=_spec())
+        assert result.accepted is True
+        assert "sessions_create_failed" in result.reason
+
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert row.provider_run_id is None
+        assert "sessions.create failed" in (row.summary or "")
+
+    def test_events_send_exception_preserves_session_id(self, db, monkeypatch):
+        """If the kickoff message fails, the row keeps the session id
+        so the operator can inspect the orphan in the console."""
+        from unittest.mock import MagicMock
+
+        self._configure_settings(monkeypatch)
+        session = MagicMock()
+        session.id = "sess_orphan"
+        fake_client = MagicMock()
+        fake_client.beta.sessions.create.return_value = session
+        fake_client.beta.sessions.events.send.side_effect = RuntimeError("network blip")
+
+        import anthropic as _anth
+
+        monkeypatch.setattr(_anth, "Anthropic", lambda **_kw: fake_client, raising=True)
+
+        adapter = pe_workspace.ManagedAgentsAdapter()
+        result = adapter.dispatch(db, spec=_spec())
+        assert result.accepted is True
+        assert result.provider_run_id == "sess_orphan"
+
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert row.provider_run_id == "sess_orphan"
+        assert "events.send failed" in (row.summary or "")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# poll_running_dispatches
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestPollRunningDispatches:
+    """Status polling — the loop that transitions RUNNING to a
+    terminal state once the Managed Agents session wraps up."""
+
+    def _seed_running(
+        self, db, *, session_id="sess_abc", status_at=None
+    ) -> AgentWorkspaceRun:
+        from datetime import datetime as _dt
+
+        row = AgentWorkspaceRun(
+            id="ws_running",
+            pe_proposal_decision_key="pe_proposal_xyz",
+            adapter="managed_agents",
+            status=AgentWorkspaceRunStatus.RUNNING,
+            provider_run_id=session_id,
+            started_at=status_at or _dt.now(UTC),
+            created_at=status_at or _dt.now(UTC),
+        )
+        db.add(row)
+        db.commit()
+        return row
+
+    def test_terminated_with_pr_url_transitions_to_pr_open(self, db, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        self._seed_running(db)
+
+        session_resp = SimpleNamespace(status="terminated")
+        events_resp = SimpleNamespace(
+            data=[
+                SimpleNamespace(
+                    content=[
+                        SimpleNamespace(
+                            text="PR opened: https://github.com/widarecu/agentfx/pull/42"
+                        )
+                    ]
+                )
+            ]
+        )
+        fake_client = MagicMock()
+        fake_client.beta.sessions.retrieve.return_value = session_resp
+        fake_client.beta.sessions.events.list.return_value = events_resp
+
+        import anthropic as _anth
+
+        monkeypatch.setattr(_anth, "Anthropic", lambda **_kw: fake_client, raising=True)
+
+        counts = pe_workspace.poll_running_dispatches(db)
+        assert counts["checked"] == 1
+        assert counts["pr_open"] == 1
+
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.PR_OPEN
+        assert row.pr_url == "https://github.com/widarecu/agentfx/pull/42"
+        assert row.pr_number == 42
+
+    def test_still_running_leaves_row_untouched(self, db, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        self._seed_running(db)
+
+        fake_client = MagicMock()
+        fake_client.beta.sessions.retrieve.return_value = SimpleNamespace(
+            status="running"
+        )
+
+        import anthropic as _anth
+
+        monkeypatch.setattr(_anth, "Anthropic", lambda **_kw: fake_client, raising=True)
+
+        counts = pe_workspace.poll_running_dispatches(db)
+        assert counts["checked"] == 1
+        assert counts["pr_open"] == 0
+
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.RUNNING
+
+    def test_terminated_without_pr_or_tests_marks_failed(self, db, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        self._seed_running(db)
+
+        fake_client = MagicMock()
+        fake_client.beta.sessions.retrieve.return_value = SimpleNamespace(
+            status="terminated"
+        )
+        fake_client.beta.sessions.events.list.return_value = SimpleNamespace(data=[])
+
+        import anthropic as _anth
+
+        monkeypatch.setattr(_anth, "Anthropic", lambda **_kw: fake_client, raising=True)
+
+        counts = pe_workspace.poll_running_dispatches(db)
+        assert counts["failed"] == 1
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+
+    def test_retrieve_exception_leaves_row_untouched(self, db, monkeypatch):
+        from unittest.mock import MagicMock
+
+        self._seed_running(db)
+
+        fake_client = MagicMock()
+        fake_client.beta.sessions.retrieve.side_effect = RuntimeError("blip")
+
+        import anthropic as _anth
+
+        monkeypatch.setattr(_anth, "Anthropic", lambda **_kw: fake_client, raising=True)
+
+        counts = pe_workspace.poll_running_dispatches(db)
+        assert counts["checked"] == 1
+        row = db.query(AgentWorkspaceRun).one()
+        # Transient retrieve failure → leave as RUNNING for next tick.
+        assert row.status == AgentWorkspaceRunStatus.RUNNING
+
+
+class TestClassifySessionOutcome:
+    def test_detects_github_pr_url(self):
+        s, url = pe_workspace._classify_session_outcome(
+            "created branch\nPR: https://github.com/widarecu/agentfx/pull/99 ready"
+        )
+        assert s == AgentWorkspaceRunStatus.PR_OPEN
+        assert url == "https://github.com/widarecu/agentfx/pull/99"
+
+    def test_last_pr_url_wins(self):
+        s, url = pe_workspace._classify_session_outcome(
+            "https://github.com/a/b/pull/1\nredirect\nhttps://github.com/a/b/pull/2"
+        )
+        assert s == AgentWorkspaceRunStatus.PR_OPEN
+        assert url.endswith("/pull/2")
+
+    def test_tests_failed_signal(self):
+        s, url = pe_workspace._classify_session_outcome(
+            "ran make test-unit — pytest exit code 1\nstopping"
+        )
+        assert s == AgentWorkspaceRunStatus.TESTS_FAILED
+        assert url is None
+
+    def test_unknown_falls_through_to_failed(self):
+        s, url = pe_workspace._classify_session_outcome("some random tail text")
+        assert s == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert url is None

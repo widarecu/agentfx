@@ -306,22 +306,36 @@ class StubWorkspaceAdapter:
 class ManagedAgentsAdapter:
     """Dispatches to Anthropic Managed Agents (Beta).
 
-    **This class is scaffolded but not wired to the SDK yet.** The
-    first `dispatch` call falls back to the stub behaviour so a
-    misconfigured enable-flag can't accidentally start burning
-    container-hours. The SDK wire-up is a focused follow-up:
+    SDK integration against `anthropic` ≥0.100 — namespaces:
+    `client.beta.agents` (persistent agent configs),
+    `client.beta.environments` (compute profiles),
+    `client.beta.vaults` + `vaults.credentials` (secret storage),
+    `client.beta.sessions` (one running workspace per dispatch),
+    `sessions.events.send/list` (talk to and observe the agent).
 
-    1. Confirm current Managed Agents namespace on the pinned
-       `anthropic` SDK version via that version's CHANGELOG (the
-       namespace moved between betas in 2026).
-    2. Set up the GitHub PAT in Anthropic's vault
-       (`environment_variable` credential) so the workspace can
-       push + open PRs without the token touching logs.
-    3. Replace the `_dispatch_managed` TODO block with the SDK
-       calls, re-run tests, flip the flag on in staging first.
+    Division of responsibility:
 
-    Everything AROUND the SDK call (budget check, DB row, task
-    slug, result shape) is live and tested in this commit.
+    - **Pre-created once by the operator** (via console or a one-off
+      setup script): the agent config, the environment, the vault +
+      GitHub PAT credential. Their IDs live in settings
+      (`AGENT_PE_WORKSPACE_AGENT_ID` / `_ENVIRONMENT_ID` / `_VAULT_ID`).
+      That boundary keeps our code idempotent and lets Wilson rotate
+      the PAT or tune the agent without a redeploy.
+
+    - **Per-dispatch (what this adapter does)**: create a session
+      against those IDs, send the user message with the task
+      narrative, persist `provider_run_id = session_id`, flip the
+      row to RUNNING. The outer polling loop
+      (`agent_orchestrator._pe_workspace_poll_loop`) then
+      transitions RUNNING → PR_OPEN / TESTS_FAILED /
+      WORKSPACE_FAILED by calling `sessions.retrieve` +
+      `sessions.events.list`.
+
+    Any missing config, missing SDK, or SDK exception → the row
+    is marked WORKSPACE_FAILED with an operator-readable summary;
+    the dispatch returns `accepted=True` (the row IS persisted and
+    audit-visible) so PE's scan loop doesn't retry the same
+    proposal next tick.
     """
 
     def __init__(self, *, timeout_minutes: int = 20) -> None:
@@ -348,6 +362,41 @@ class ManagedAgentsAdapter:
         )
         return self._dispatch_managed(db, row=row, spec=spec, now=now)
 
+    def _resolve_client(self) -> tuple[object | None, str | None]:
+        """Return `(client, missing_reason)` — exactly one is non-None.
+
+        Separated so tests can patch cleanly and so missing-config
+        paths are explicit, not implicit `try/except`.
+        """
+        try:
+            import anthropic  # noqa: F401 (checked for availability)
+        except ImportError:
+            return None, "anthropic SDK not installed"
+
+        agent_id = getattr(settings, "AGENT_PE_WORKSPACE_AGENT_ID", "") or ""
+        env_id = getattr(settings, "AGENT_PE_WORKSPACE_ENVIRONMENT_ID", "") or ""
+        vault_id = getattr(settings, "AGENT_PE_WORKSPACE_VAULT_ID", "") or ""
+        missing = [
+            name
+            for name, val in [
+                ("AGENT_PE_WORKSPACE_AGENT_ID", agent_id),
+                ("AGENT_PE_WORKSPACE_ENVIRONMENT_ID", env_id),
+                ("AGENT_PE_WORKSPACE_VAULT_ID", vault_id),
+            ]
+            if not val
+        ]
+        if missing:
+            return None, (
+                "missing managed-agents config — "
+                f"{', '.join(missing)} empty. "
+                "Create the resources via Anthropic console or a setup "
+                "script and set the IDs on Railway staging."
+            )
+
+        import anthropic
+
+        return anthropic.Anthropic(max_retries=2), None
+
     def _dispatch_managed(
         self,
         db: Session,
@@ -356,38 +405,138 @@ class ManagedAgentsAdapter:
         spec: WorkspaceTaskSpec,
         now: datetime,
     ) -> WorkspaceDispatchResult:
-        """TODO (v0.8.1 C.2 Phase 2b): wire the Anthropic Managed
-        Agents SDK call here.
+        """Create a Managed Agents session + send the task narrative
+        as the first user message. On success the row transitions
+        PENDING → RUNNING with `provider_run_id` set to the session
+        id. The polling loop takes it from there."""
+        client, missing_reason = self._resolve_client()
+        if client is None:
+            row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+            row.summary = f"ManagedAgentsAdapter: {missing_reason}"
+            row.started_at = now
+            row.ended_at = now
+            db.commit()
+            logger.warning(
+                "pe_workspace[managed]: dispatch degraded — %s", missing_reason
+            )
+            return WorkspaceDispatchResult(
+                accepted=True,
+                workspace_run_id=row.id,
+                agent_branch=row.agent_branch,
+                reason=missing_reason or "config_missing",
+            )
 
-        Expected shape (confirm against SDK docs before writing):
-        - Create a session with the repo mounted + GitHub PAT vault
-          credential.
-        - Supply a system prompt describing the three-tier gate
-          (sub-branch → feat/agent-fleet → main).
-        - Supply the user prompt = `spec.narrative`.
-        - Enable tool-use for file ops, bash (make test-unit),
-          and git (branch/commit/push).
-        - Return the provider's run id, poll for completion in a
-          follow-up worker (not inline — this call must stay async-
-          safe so the orchestrator's PE loop isn't blocked).
+        agent_id = settings.AGENT_PE_WORKSPACE_AGENT_ID
+        env_id = settings.AGENT_PE_WORKSPACE_ENVIRONMENT_ID
+        vault_id = settings.AGENT_PE_WORKSPACE_VAULT_ID
 
-        Until that lands: downgrade to stub behaviour so the fleet
-        is safe to run with AGENT_PE_WORKSPACE_ENABLED=true during
-        rollout (the row still records the intent).
-        """
-        row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
-        row.summary = (
-            "ManagedAgentsAdapter: SDK wire-up pending. Row persisted so "
-            "the orchestration path is exercised; no provider call made."
-        )
+        try:
+            session = client.beta.sessions.create(
+                agent={"id": agent_id},
+                environment_id=env_id,
+                vault_ids=[vault_id],
+                # Title is operator-facing in the Managed Agents console;
+                # the task slug keeps sessions correlated with the
+                # agent/<slug> branch they produce.
+                title=spec.task_slug,
+                metadata={
+                    "pe_proposal_decision_key": spec.pe_proposal_decision_key,
+                    "agent_branch": row.agent_branch or "",
+                    "target_branch": spec.target_branch,
+                },
+            )
+        except Exception as exc:
+            row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+            row.summary = (
+                f"ManagedAgentsAdapter: sessions.create failed — "
+                f"{type(exc).__name__}: {str(exc)[:400]}"
+            )
+            row.started_at = now
+            row.ended_at = now
+            db.commit()
+            logger.exception(
+                "pe_workspace[managed]: sessions.create failed for proposal=%s",
+                spec.pe_proposal_decision_key,
+            )
+            return WorkspaceDispatchResult(
+                accepted=True,
+                workspace_run_id=row.id,
+                agent_branch=row.agent_branch,
+                reason=f"sessions_create_failed:{type(exc).__name__}",
+            )
+
+        session_id = getattr(session, "id", None) or ""
+        if not session_id:
+            row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+            row.summary = "ManagedAgentsAdapter: session created but no id returned"
+            row.started_at = now
+            row.ended_at = now
+            db.commit()
+            return WorkspaceDispatchResult(
+                accepted=True,
+                workspace_run_id=row.id,
+                agent_branch=row.agent_branch,
+                reason="session_id_missing",
+            )
+
+        # Send the kickoff user message — the narrative explicitly
+        # calls out the three-tier branch gate.
+        try:
+            client.beta.sessions.events.send(
+                session_id=session_id,
+                events=[
+                    {
+                        "type": "user_message",
+                        "content": [
+                            {"type": "text", "text": spec.narrative},
+                        ],
+                    }
+                ],
+            )
+        except Exception as exc:
+            # Session was created but the kickoff failed — mark the
+            # row failed, but DO NOT lose the session id (it may still
+            # cost container-time; operator can inspect in console).
+            row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+            row.provider_run_id = session_id
+            row.summary = (
+                f"ManagedAgentsAdapter: events.send failed — "
+                f"{type(exc).__name__}: {str(exc)[:400]}"
+            )
+            row.started_at = now
+            row.ended_at = now
+            db.commit()
+            logger.exception(
+                "pe_workspace[managed]: events.send failed session=%s",
+                session_id,
+            )
+            return WorkspaceDispatchResult(
+                accepted=True,
+                workspace_run_id=row.id,
+                provider_run_id=session_id,
+                agent_branch=row.agent_branch,
+                reason=f"events_send_failed:{type(exc).__name__}",
+            )
+
+        # Happy path — session live, first message sent. The polling
+        # loop will transition this row the rest of the way.
+        row.provider_run_id = session_id
+        row.status = AgentWorkspaceRunStatus.RUNNING
         row.started_at = now
-        row.ended_at = now
         db.commit()
+        logger.info(
+            "pe_workspace[managed]: dispatched proposal=%s → session=%s "
+            "(agent_branch=%s)",
+            spec.pe_proposal_decision_key,
+            session_id,
+            row.agent_branch,
+        )
         return WorkspaceDispatchResult(
             accepted=True,
             workspace_run_id=row.id,
+            provider_run_id=session_id,
             agent_branch=row.agent_branch,
-            reason="managed_agents_sdk_pending",
+            reason="dispatched",
         )
 
 
@@ -460,6 +609,187 @@ def sweep_stuck_runs(db: Session, *, now: datetime | None = None) -> int:
         return 0
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Status polling — transition RUNNING → terminal state
+# ─────────────────────────────────────────────────────────────────────
+
+
+# Managed Agents status strings per the SDK (see sessions.list
+# `statuses` literal). Not all are terminal — `rescheduling` + `idle`
+# are transient. We transition on `terminated` only; the stuck-row
+# sweeper handles the pathological "never terminates" case.
+_SESSION_TERMINAL_STATUS = "terminated"
+
+
+# Hint strings we look for in the final events to classify the
+# session's outcome. Keep conservative — a false positive wrongly
+# claims a PR exists; a false negative just means Wilson gets an
+# "unclear outcome" email that still has the full event tail for him
+# to eyeball.
+_PR_URL_PATTERNS = (
+    "https://github.com/",  # The PR URL `gh pr create` prints.
+)
+_TESTS_FAILED_PATTERNS = (
+    "test failures remain after 3 iterations",
+    "tests still fail",
+    "pytest exit code 1",
+)
+
+
+def _classify_session_outcome(
+    events_text: str,
+) -> tuple[AgentWorkspaceRunStatus, str | None]:
+    """Scan the concatenated final-events text for a PR URL or a
+    tests-failed signal and return the target status + extracted
+    PR URL (or None).
+
+    Deliberately simple string matching: the first PR URL we find
+    wins. A richer parse (regex, structured event tags) is a
+    follow-up when real sessions show us the actual event shape.
+    """
+    import re
+
+    # First-URL-wins — pick the GitHub PR URL closest to the end of
+    # the event stream, which is almost always the "PR opened: …"
+    # line from gh.
+    pr_url = None
+    m = re.findall(r"https://github\.com/\S+/pull/\d+", events_text)
+    if m:
+        pr_url = m[-1]
+    if pr_url:
+        return AgentWorkspaceRunStatus.PR_OPEN, pr_url
+
+    lower = events_text.lower()
+    for pat in _TESTS_FAILED_PATTERNS:
+        if pat in lower:
+            return AgentWorkspaceRunStatus.TESTS_FAILED, None
+
+    # Terminated with no PR URL and no clear tests-failed signal —
+    # likely the agent gave up or hit the TTL. Operator-visible.
+    return AgentWorkspaceRunStatus.WORKSPACE_FAILED, None
+
+
+def _fetch_events_text(client: object, session_id: str) -> str:
+    """Pull the recent event tail from a session for outcome parsing.
+
+    Best-effort — any SDK failure just returns the empty string so
+    the caller still transitions the row (status defaults to
+    WORKSPACE_FAILED on an empty tail, which is correct: we can't
+    see what happened).
+    """
+    try:
+        resp = client.beta.sessions.events.list(  # type: ignore[attr-defined]
+            session_id=session_id, limit=50
+        )
+    except Exception:
+        logger.exception(
+            "pe_workspace[poll]: events.list failed session=%s", session_id
+        )
+        return ""
+
+    parts: list[str] = []
+    items = getattr(resp, "data", None) or []
+    for ev in items:
+        # Different event shapes: a user_message/assistant_message
+        # has `content` as a list of parts; tool-use events have a
+        # `tool_name` + `input`/`output`. Flatten anything we can
+        # see as text — matching is substring-based so recall
+        # matters more than structure.
+        for attr in ("content", "output", "result", "stdout"):
+            v = getattr(ev, attr, None)
+            if isinstance(v, str):
+                parts.append(v)
+            elif isinstance(v, list):
+                for p in v:
+                    t = getattr(p, "text", None) or (
+                        p.get("text") if isinstance(p, dict) else None
+                    )
+                    if t:
+                        parts.append(t)
+    return "\n".join(parts)
+
+
+def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict:
+    """Poll each RUNNING workspace row's provider status and
+    transition terminated ones to PR_OPEN / TESTS_FAILED /
+    WORKSPACE_FAILED. Returns a small counts dict for operator
+    logging. Never raises.
+    """
+    now = now or datetime.now(UTC)
+    counts = {"checked": 0, "pr_open": 0, "tests_failed": 0, "failed": 0}
+
+    try:
+        import anthropic  # noqa: F401
+    except ImportError:
+        return counts
+
+    try:
+        rows = (
+            db.query(AgentWorkspaceRun)
+            .filter(AgentWorkspaceRun.status == AgentWorkspaceRunStatus.RUNNING)
+            .filter(AgentWorkspaceRun.provider_run_id.isnot(None))
+            .filter(AgentWorkspaceRun.adapter == "managed_agents")
+            .all()
+        )
+    except Exception:
+        logger.exception("pe_workspace[poll]: row scan failed")
+        return counts
+
+    if not rows:
+        return counts
+
+    import anthropic as anth
+
+    client = anth.Anthropic(max_retries=2)
+
+    for row in rows:
+        counts["checked"] += 1
+        session_id = row.provider_run_id or ""
+        try:
+            session = client.beta.sessions.retrieve(session_id=session_id)
+        except Exception as exc:
+            logger.exception(
+                "pe_workspace[poll]: sessions.retrieve failed session=%s", session_id
+            )
+            # Don't flip the row — let the stuck-row sweeper handle
+            # it on TTL. A transient retrieve error shouldn't lose
+            # the dispatch.
+            continue
+        status = getattr(session, "status", "") or ""
+        if status != _SESSION_TERMINAL_STATUS:
+            continue  # Still running — leave the row alone.
+
+        events_text = _fetch_events_text(client, session_id)
+        target_status, pr_url = _classify_session_outcome(events_text)
+        row.status = target_status
+        row.ended_at = now
+        # Keep a tail of the events text in the summary so Wilson
+        # can see what happened without logging into the Managed
+        # Agents console.
+        summary_tail = (events_text or "(no event text extracted)")[-2000:]
+        row.summary = (row.summary or "") + "\n[poll] " + summary_tail
+        if pr_url is not None:
+            row.pr_url = pr_url
+            import re
+
+            m = re.search(r"/pull/(\d+)", pr_url)
+            if m:
+                row.pr_number = int(m.group(1))
+            counts["pr_open"] += 1
+        elif target_status == AgentWorkspaceRunStatus.TESTS_FAILED:
+            counts["tests_failed"] += 1
+        else:
+            counts["failed"] += 1
+
+    try:
+        db.commit()
+    except Exception:
+        logger.exception("pe_workspace[poll]: commit failed")
+        return counts
+
+    return counts
+
+
 __all__ = [
     "WorkspaceTaskSpec",
     "WorkspaceDispatchResult",
@@ -472,4 +802,5 @@ __all__ = [
     "check_budget_before_dispatch",
     "resolve_adapter",
     "sweep_stuck_runs",
+    "poll_running_dispatches",
 ]
