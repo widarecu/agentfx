@@ -477,7 +477,31 @@ Key settings:
 - `BACKFILL_DAYS` - Days of historical candle data to backfill (7 for dev, 1825 for 5 years)
 - `DEBUG` - `true` for DEBUG-level logging, `false` for INFO-level
 
+## Work Tracking (Linear) — rules for every agent
+
+**Linear is the source of truth for work items** (workspace `agentfx`, team key `AFX`). Use the `linear-server` MCP tools. The full operating model is in [planning/runbooks/linear-operating-model.md](planning/runbooks/linear-operating-model.md). Wilson is the only human and the only approver.
+
+States: `Triage` → `Backlog` → `Ready` → `In Progress` → `In Review` → `Done` (plus `Canceled` / `Duplicate`).
+
+**Filing issues**
+1. Search first. If an open issue covers the same problem (or carries the same `Fingerprint:`), comment with the new evidence instead of filing.
+2. File into **Triage** only. Use the matching template (Feature / Bug / Agent finding / Test gap), one label each from **Type**, **Area**, **Source** and **Risk**, plus the `agent-filed` flag. Bugs also get **Found in**.
+3. Max 5 new issues per agent per day.
+4. Never set priority, move an issue out of Triage, or change the scope of an approved issue. Propose changes as a comment or a new Triage issue.
+
+**Working issues**
+5. Only pick up issues in **Ready**, highest priority first. Make yourself the delegate (Wilson stays assignee) and move the issue to **In Progress**.
+6. Branch `agent/AFX-<n>-<slug>`, and put `AFX-<n>` in the PR title so Linear links it.
+7. Before opening the PR, `make lint` and `make test-unit` must be green. Comment on the issue with what was tested and the CI link.
+8. **Risk: Money-path** (order execution, sizing, kill switch, credentials, deploy gates) → the PR never auto-merges. Add `needs-wilson`.
+9. When blocked on a product decision, comment the question, add `needs-wilson`, and stop. Don't guess.
+10. All other rules in this file still apply: `test` profile only, practice OANDA keys only, never push to `main`.
+
+A bug found anywhere other than CI means a test was missing. File a **Test gap** issue alongside the fix.
+
 ## Planning System
+
+`planning/BACKLOG.md` is a **frozen snapshot** as of 2026-10-22. Open items were imported to Linear. Don't add new items there. ROADMAP.md stays the narrative of milestones; Linear projects mirror its releases.
 
 The `planning/` directory contains project governance:
 
@@ -495,8 +519,10 @@ The `planning/` directory contains project governance:
 
 The backlog is only useful if it matches reality. Two rules:
 
-1. **When you ship a backlog item, flip the checkbox in the SAME
-   commit.** Don't defer the doc update. `[ ] TODO` → `[x] DONE`
+1. **When you ship a work item, close it in the SAME change.** For
+   Linear issues this is automatic: `AFX-<n>` in the PR title moves it
+   to Done on merge. For legacy BACKLOG.md items, flip the checkbox in the SAME
+   commit. Don't defer the doc update. `[ ] TODO` → `[x] DONE`
    goes in the diff alongside the code change. If the change is
    spread across many commits, flip the checkbox in the last one
    that closes the item. Never leave "will update backlog later"

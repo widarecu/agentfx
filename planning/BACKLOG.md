@@ -1,5 +1,7 @@
 # AgentFX Backlog
 
+> **Frozen 2026-10-22. Work is now tracked in Linear** (workspace `agentfx`, team `AFX`). All open items below were imported there. Don't add or update items here. See [runbooks/linear-operating-model.md](runbooks/linear-operating-model.md).
+
 This backlog is organized by version milestone. Each item links to executable user stories in `planning/requirements/`.
 
 **Status Values:** `TODO` | `IN_PROGRESS` | `BLOCKED` | `DONE`
