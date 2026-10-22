@@ -44,6 +44,7 @@ from agentfx.agents.fleet.memory import (
 from agentfx.agents.fleet.pm_scheduler import (
     PMEvolutionAction,
     build_scheduling_context,
+    evolutions_remaining_today,
     schedule_evolution_from_pm_action,
 )
 from agentfx.api.core.config import settings
@@ -133,9 +134,12 @@ class PMBrief(BaseModel):
             "Evolution runs PM wants to START this cycle. Only "
             "priority='now' items actually fire; the rest are noted "
             "for the user and the next tick's Reflexion. Hard cap: "
-            "scheduler enforces max N evolutions/week fleet-wide. "
-            "Zero actions is fine when no pair/granularity warrants a "
-            "run right now."
+            "scheduler enforces max N evolutions/calendar-day UTC "
+            "fleet-wide (see "
+            "`evolution_scheduling_context.evolutions_remaining_today`). "
+            "Fill the available budget when the state warrants it; "
+            "zero actions is fine when no pair/granularity warrants "
+            "a run right now."
         ),
     )
 
@@ -385,6 +389,16 @@ Use the `evolution_actions` field for runs you want to start. Rules:
   `evolution_scheduling_context.evolutions_remaining_today` /
   `max_per_day`). If `evolutions_remaining_today` is 0, do NOT
   propose any 'now' actions this cycle.
+- Fill the available budget when the state warrants it: a healthy
+  morning brief with `evolutions_remaining_today=10` and no genome
+  clearing the validator yet should propose MULTIPLE 'now' actions
+  across different pair/granularity combinations, not just one.
+  Each action still needs its own concrete rationale tied to a
+  snapshot fact — don't pad the list with duplicates.
+- Earlier daily runs that produced only overfit / validator-failing
+  genomes are PRECISELY the reason to use more of the daily budget,
+  not less. Rotate the pair/granularity on each additional action
+  so the budget is spread over hypotheses, not stacked on one bet.
 - Pair MUST be in `evolution_scheduling_context.allowed_pairs`.
   Granularity MUST be in `allowed_granularities`. Scheduler drops
   anything else.
@@ -713,8 +727,179 @@ def _email_brief(
         logger.exception("pm_agent: email send failed (brief still logged in DB)")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Evolution filler loop (Wilson 2026-10-22)
+# ─────────────────────────────────────────────────────────────────────
+#
+# The problem Wilson flagged: PM runs the morning brief once a day,
+# so even with `_MAX_EVOLUTIONS_PER_DAY=10` only ~1 evolution fires
+# per calendar day in practice. He wants PM to keep firing while
+# there's budget AND no Gate-B-clearing genome has been produced
+# today.
+#
+# This filler isn't a second morning brief — it skips the Wilson
+# email + the `recommendations`/`concerns` output and just asks
+# Haiku to pick the next pair/granularity to try given current
+# state. Cheap (Haiku, bounded context, cached system prompt), so
+# running it every 2h costs ~$0.01-0.02/call.
+
+
+_FILLER_DECISION_KEY_PREFIX = "pm_evolution_filler_"
+
+
+def _any_genome_cleared_validator_today(db: Session, *, today: date) -> bool:
+    """True if ≥1 StrategyGenome created in this UTC day has
+    `validator_passed=True`. That's the Gate B signal — once we hit
+    it, filler stops firing (the fleet has produced something worth
+    paper-deploying; let Wilson approve it before burning more
+    budget).
+    """
+    from agentfx.api.models.evolution import StrategyGenome
+
+    today_start = datetime.combine(today, datetime.min.time(), tzinfo=UTC)
+    tomorrow_start = today_start + timedelta(days=1)
+    try:
+        return (
+            db.query(StrategyGenome)
+            .filter(StrategyGenome.validator_passed.is_(True))
+            .filter(StrategyGenome.created_at >= today_start)
+            .filter(StrategyGenome.created_at < tomorrow_start)
+            .limit(1)
+            .count()
+            > 0
+        )
+    except Exception:
+        logger.exception("pm_agent[filler]: gate B check failed")
+        return False
+
+
+def run_evolution_filler(*, db: Session, now: datetime | None = None) -> int:
+    """Top-up filler — if the daily cap has headroom AND no genome
+    cleared the validator today, ask Haiku to pick 1-N next
+    evolutions and fire them. Returns the number of 'now' actions
+    scheduled (0 means nothing fired, for any reason).
+
+    Never raises. The orchestrator calls this on a 2h cadence
+    between morning briefs.
+    """
+    now = now or datetime.now(UTC)
+    today = now.date()
+
+    try:
+        remaining = evolutions_remaining_today(db)
+    except Exception:
+        logger.exception("pm_agent[filler]: budget check failed")
+        return 0
+    if remaining <= 0:
+        logger.info("pm_agent[filler]: skip — daily cap already hit")
+        return 0
+
+    if _any_genome_cleared_validator_today(db, today=today):
+        logger.info(
+            "pm_agent[filler]: skip — a genome already cleared the "
+            "validator today (Gate B satisfied; let Wilson approve)"
+        )
+        return 0
+
+    try:
+        state = _snapshot_platform_state(db)
+    except Exception:
+        logger.exception("pm_agent[filler]: snapshot failed")
+        return 0
+
+    # The filler is a lightweight re-use of the morning-brief call:
+    # same system prompt (prompt-cache hit → cheap), different user
+    # framing so Haiku knows it's a top-up, not the daily brief.
+    user_prompt = _render_filler_user_prompt(state=state, remaining=remaining)
+    try:
+        llm = structured_call(
+            model=settings.AGENT_PM_MODEL,
+            system=_SYSTEM_PROMPT,
+            user=user_prompt,
+            schema=PMBrief,
+            max_tokens=4096,
+        )
+    except Exception:
+        logger.exception("pm_agent[filler]: Haiku call failed")
+        return 0
+
+    brief = llm.output
+    if brief is None:
+        logger.info(
+            "pm_agent[filler]: llm skipped reason=%s",
+            llm.skipped_reason,
+        )
+        return 0
+
+    decision_key = _FILLER_DECISION_KEY_PREFIX + now.strftime("%Y%m%d_%H%M")
+    try:
+        record_decision(
+            db,
+            DecisionRecord(
+                agent_role=AgentRole.PM,
+                action="evolution_filler",
+                decision_key=decision_key,
+                inputs={
+                    "snapshot": state,
+                    "remaining_budget": remaining,
+                },
+                outputs={"brief": brief.model_dump()},
+                reasoning=llm.reasoning or "",
+                model=llm.model,
+                input_tokens=llm.input_tokens,
+                output_tokens=llm.output_tokens,
+                cache_read_tokens=llm.cache_read_tokens,
+                usd_cost=llm.usd_cost,
+            ),
+        )
+        db.commit()
+    except Exception:
+        logger.exception("pm_agent[filler]: decision record failed")
+
+    results = _execute_evolution_actions(
+        db=db, brief=brief, pm_decision_key=decision_key
+    )
+    fired = sum(1 for r in results if r.get("outcome") == "scheduled")
+    if fired:
+        logger.info(
+            "pm_agent[filler]: fired %d evolution(s) (remaining today: %d)",
+            fired,
+            evolutions_remaining_today(db),
+        )
+    return fired
+
+
+def _render_filler_user_prompt(*, state: dict[str, Any], remaining: int) -> str:
+    """Thinner user prompt for the filler path — no Wilson-facing
+    narrative, just: here's state + budget, pick the next 1-N
+    evolutions.
+    """
+    import json
+
+    return (
+        f"EVOLUTION FILLER TICK — this is NOT the morning brief. The "
+        f"morning brief has already run today; this is a top-up to keep "
+        f"the daily budget flowing while no genome has cleared the "
+        f"validator yet.\n\n"
+        f"Current snapshot:\n```json\n{json.dumps(state, indent=2, default=str)}\n```\n\n"
+        f"Budget remaining today: {remaining}.\n\n"
+        f"Produce a PMBrief whose ONLY populated field matters: "
+        f"`evolution_actions`. Fill `headline` + `summary` briefly "
+        f"(one sentence each is fine, Wilson doesn't see this); "
+        f"leave `recommendations` and `concerns` empty. Propose "
+        f"1-{min(remaining, 3)} 'now' evolution actions, each on a "
+        f"different pair/granularity, each with a concrete rationale "
+        f"tied to today's results. If today's runs show a convergent "
+        f"failure pattern (e.g. everything overfitting on M1 EUR_USD), "
+        f"skip actions on that combo and favour an untried one. If "
+        f"nothing in the state suggests a new worthwhile hypothesis, "
+        f"return zero actions."
+    )
+
+
 __all__ = [
     "run_morning_brief_if_due",
+    "run_evolution_filler",
     "PMBrief",
     "PMRecommendation",
     "PMConcern",

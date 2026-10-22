@@ -325,3 +325,145 @@ class TestMarkdownRendering:
         assert "no activity in last 7 days" in md
         # Should NOT render the needs-attention warning when count is 0.
         assert "non-terminal non-RUNNING" not in md
+
+
+class TestEvolutionFiller:
+    """Filler loop — Wilson 2026-10-22. Must:
+    - skip when budget exhausted
+    - skip when a Gate-B genome landed today
+    - fire LLM + schedule actions otherwise
+    - never raise
+    """
+
+    def test_skips_when_budget_exhausted(self):
+        from agentfx.agents.fleet import portfolio_manager
+
+        db = MagicMock()
+        with (
+            patch.object(
+                portfolio_manager, "evolutions_remaining_today", return_value=0
+            ),
+            patch("agentfx.agents.fleet.portfolio_manager.structured_call") as llm,
+        ):
+            fired = portfolio_manager.run_evolution_filler(db=db)
+        assert fired == 0
+        llm.assert_not_called()
+
+    def test_skips_when_gate_b_cleared_today(self):
+        from agentfx.agents.fleet import portfolio_manager
+
+        db = MagicMock()
+        with (
+            patch.object(
+                portfolio_manager, "evolutions_remaining_today", return_value=5
+            ),
+            patch.object(
+                portfolio_manager,
+                "_any_genome_cleared_validator_today",
+                return_value=True,
+            ),
+            patch("agentfx.agents.fleet.portfolio_manager.structured_call") as llm,
+        ):
+            fired = portfolio_manager.run_evolution_filler(db=db)
+        assert fired == 0
+        llm.assert_not_called()
+
+    def test_fires_actions_when_budget_and_no_gate_b(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_MEMORY_ROOT", str(tmp_path))
+        from agentfx.agents.fleet import portfolio_manager
+        from agentfx.agents.fleet.portfolio_manager import (
+            PMBrief,
+            PMEvolutionAction,
+        )
+
+        db = MagicMock()
+
+        brief = PMBrief(
+            headline="filler tick",
+            summary="try new combo",
+            evolution_actions=[
+                PMEvolutionAction(
+                    pair="EUR_USD",
+                    granularity="H1",
+                    rationale="M1 lineage overfit; try H1",
+                    expected_profit_impact="OOS Sharpe > 1.0 on H1",
+                    priority="now",
+                )
+            ],
+        )
+        llm_result = MagicMock(
+            output=brief,
+            reasoning="",
+            model="claude-haiku-4-5",
+            input_tokens=100,
+            output_tokens=50,
+            cache_read_tokens=0,
+            usd_cost=0.001,
+            skipped_reason=None,
+        )
+
+        with (
+            patch.object(
+                portfolio_manager, "evolutions_remaining_today", return_value=5
+            ),
+            patch.object(
+                portfolio_manager,
+                "_any_genome_cleared_validator_today",
+                return_value=False,
+            ),
+            patch.object(
+                portfolio_manager, "_snapshot_platform_state", return_value={}
+            ),
+            patch(
+                "agentfx.agents.fleet.portfolio_manager.structured_call",
+                return_value=llm_result,
+            ),
+            patch.object(
+                portfolio_manager,
+                "_execute_evolution_actions",
+                return_value=[{"outcome": "scheduled"}],
+            ),
+            patch("agentfx.agents.fleet.portfolio_manager.record_decision"),
+        ):
+            fired = portfolio_manager.run_evolution_filler(db=db)
+        assert fired == 1
+
+    def test_llm_skipped_returns_zero_without_raising(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_MEMORY_ROOT", str(tmp_path))
+        from agentfx.agents.fleet import portfolio_manager
+
+        db = MagicMock()
+        llm_result = MagicMock(output=None, skipped_reason="api_failure")
+
+        with (
+            patch.object(
+                portfolio_manager, "evolutions_remaining_today", return_value=5
+            ),
+            patch.object(
+                portfolio_manager,
+                "_any_genome_cleared_validator_today",
+                return_value=False,
+            ),
+            patch.object(
+                portfolio_manager, "_snapshot_platform_state", return_value={}
+            ),
+            patch(
+                "agentfx.agents.fleet.portfolio_manager.structured_call",
+                return_value=llm_result,
+            ),
+        ):
+            fired = portfolio_manager.run_evolution_filler(db=db)
+        assert fired == 0
+
+    def test_internal_exception_does_not_raise(self):
+        from agentfx.agents.fleet import portfolio_manager
+
+        db = MagicMock()
+        with patch.object(
+            portfolio_manager,
+            "evolutions_remaining_today",
+            side_effect=RuntimeError("db exploded"),
+        ):
+            # Must not raise.
+            fired = portfolio_manager.run_evolution_filler(db=db)
+        assert fired == 0

@@ -153,6 +153,46 @@ async def _pm_daily_loop() -> None:
         await asyncio.sleep(60 * 60)
 
 
+# Evolution filler cadence — top up the daily evolution budget
+# throughout the day so the morning brief isn't the only trigger
+# (Wilson 2026-10-22: "I'd even say to keep trying evolutions one
+# after other until we clear at least one"). 2h strikes a balance:
+# frequent enough to use the full daily cap of 10 if warranted,
+# bounded enough that Haiku filler costs stay under ~$0.20/day.
+_EVOLUTION_FILLER_SECONDS = 60 * 60 * 2
+
+
+async def _evolution_filler_loop() -> None:
+    """Top-up filler for the daily evolution budget. Runs every
+    _EVOLUTION_FILLER_SECONDS between morning briefs. Never raises.
+    """
+    from agentfx.agents.fleet.portfolio_manager import run_evolution_filler
+
+    logger.info(
+        "agent_orchestrator: evolution filler loop armed (cadence=%ds)",
+        _EVOLUTION_FILLER_SECONDS,
+    )
+    while True:
+        try:
+            with SessionLocal() as db:
+                if not is_within_daily_budget(db):
+                    logger.warning(
+                        "agent_orchestrator: filler skipped — daily budget "
+                        "exceeded for %s",
+                        datetime.now(UTC).date(),
+                    )
+                else:
+                    fired = run_evolution_filler(db=db)
+                    if fired:
+                        logger.info(
+                            "agent_orchestrator: filler fired %d evolution(s)",
+                            fired,
+                        )
+        except Exception:
+            logger.exception("agent_orchestrator: filler loop iteration failed")
+        await asyncio.sleep(_EVOLUTION_FILLER_SECONDS)
+
+
 # PE scan cadence — daily is enough since Opus 5 is the pricey model
 # and QA work orders don't accumulate faster than once per day in
 # practice. One PE scan per day with a hard 3-proposal cap keeps
@@ -297,6 +337,7 @@ def register_lifespan_tasks() -> list[asyncio.Task[Any]]:
 
     _active_tasks = [
         asyncio.create_task(_pm_daily_loop(), name="fleet_pm_daily"),
+        asyncio.create_task(_evolution_filler_loop(), name="fleet_evolution_filler"),
         asyncio.create_task(_qa_scan_loop(), name="fleet_qa_scan"),
         asyncio.create_task(_pe_scan_loop(), name="fleet_pe_scan"),
     ]

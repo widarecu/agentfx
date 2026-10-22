@@ -142,14 +142,19 @@ class TestLifespanGating:
         with (
             patch.object(agent_orchestrator.settings, "AGENT_FLEET_ENABLED", True),
             patch("agentfx.services.agent_orchestrator._pm_daily_loop", _noop),
+            patch(
+                "agentfx.services.agent_orchestrator._evolution_filler_loop",
+                _noop,
+            ),
             patch("agentfx.services.agent_orchestrator._qa_scan_loop", _noop),
             patch("agentfx.services.agent_orchestrator._pe_scan_loop", _noop),
         ):
             tasks = agent_orchestrator.register_lifespan_tasks()
-            assert len(tasks) == 3
+            assert len(tasks) == 4
             names = {t.get_name() for t in tasks}
             assert names == {
                 "fleet_pm_daily",
+                "fleet_evolution_filler",
                 "fleet_qa_scan",
                 "fleet_pe_scan",
             }

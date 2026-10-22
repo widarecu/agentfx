@@ -107,7 +107,10 @@ class PMEvolutionAction(BaseModel):
         description=(
             "'now' (fire this scan), 'this_week' (queue for later), "
             "'watch' (don't fire yet, just note). Only 'now' items "
-            "trigger the scheduler. Max 1 'now' per brief."
+            "trigger the scheduler. Propose as many 'now' actions as "
+            "`evolution_scheduling_context.evolutions_remaining_today` "
+            "allows when the state warrants it — the scheduler fires "
+            "all of them subject to the daily cap."
         ),
     )
 

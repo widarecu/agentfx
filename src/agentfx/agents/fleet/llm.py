@@ -171,7 +171,13 @@ def structured_call(
         if anthropic is None:
             logger.warning("fleet.llm: anthropic SDK unavailable")
             return _skipped_result(model, "no_api_key")
-        client = anthropic.Anthropic(max_retries=2)
+        # SDK retries on 408/409/429/5xx with jittered exponential
+        # backoff. Bumped from 2 → 4 (Wilson 2026-10-22 — QA fell
+        # back to deterministic on a transient Anthropic blip).
+        # 4 retries covers ~1–2 min of API trouble before the SDK
+        # gives up; the application-level retry wrapper
+        # (`structured_call_with_backoff`) covers the longer tail.
+        client = anthropic.Anthropic(max_retries=4)
 
     try:
         resp = client.messages.parse(
@@ -264,6 +270,85 @@ def _skipped_result(model: str, reason: str) -> LLMCallResult:
         usd_cost=0.0,
         skipped_reason=reason,
     )
+
+
+# Default backoff schedule for `structured_call_with_backoff`: three
+# attempts after the first (fourth attempt), spaced to cover ~7
+# minutes of Anthropic trouble. The SDK's own `max_retries=4` already
+# covers ~1–2 min of 429/5xx bursts; this wraps a longer tail so a
+# brief outage doesn't force QA into the deterministic fallback that
+# surfaces to Wilson as "LLM analysis unavailable".
+_DEFAULT_BACKOFF_SECONDS = (30.0, 90.0, 270.0)
+
+
+def structured_call_with_backoff(
+    *,
+    model: str,
+    system: str,
+    user: str,
+    schema: type[T],
+    max_tokens: int = 2048,
+    client: Any = None,
+    backoff_seconds: tuple[float, ...] = _DEFAULT_BACKOFF_SECONDS,
+    retry_on_extract_none: bool = False,
+) -> LLMCallResult:
+    """`structured_call` with application-level retry on transient
+    API failure.
+
+    The SDK already retries 429/5xx inside each call (max_retries=4).
+    This wrapper adds an outer loop that retries the WHOLE call on
+    `skipped_reason="api_failure"` with escalating backoff, so a
+    short Anthropic outage doesn't push callers into deterministic
+    fallback.
+
+    - `no_api_key` is NOT retried (config is unlikely to change
+      inside the call window).
+    - `api_failure` IS retried.
+    - `extract_none` (model returned 200 but malformed output) is
+      only retried if `retry_on_extract_none=True` — defaults to
+      False because a schema-mismatch is deterministic, retrying
+      just wastes cost.
+
+    Preserves the signature of `structured_call` for the caller.
+    """
+    import time
+
+    attempt = 0
+    result = structured_call(
+        model=model,
+        system=system,
+        user=user,
+        schema=schema,
+        max_tokens=max_tokens,
+        client=client,
+    )
+    while attempt < len(backoff_seconds):
+        reason = result.skipped_reason
+        retryable = reason == "api_failure" or (
+            retry_on_extract_none and reason == "extract_none"
+        )
+        if result.output is not None or not retryable:
+            return result
+        wait = backoff_seconds[attempt]
+        logger.warning(
+            "fleet.llm: retrying after %s (model=%s, attempt=%d/%d, wait=%.1fs)",
+            reason,
+            model,
+            attempt + 1,
+            len(backoff_seconds),
+            wait,
+        )
+        time.sleep(wait)
+        attempt += 1
+        result = structured_call(
+            model=model,
+            system=system,
+            user=user,
+            schema=schema,
+            max_tokens=max_tokens,
+            client=client,
+        )
+    return result
 
 
 def _extract_parsed(resp: Any, schema: type[T]) -> T | None:
@@ -372,4 +457,5 @@ __all__ = [
     "ModelPricing",
     "MODEL_PRICING",
     "structured_call",
+    "structured_call_with_backoff",
 ]

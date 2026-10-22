@@ -36,7 +36,10 @@ from typing import Any
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from agentfx.agents.fleet.llm import LLMCallResult, structured_call
+from agentfx.agents.fleet.llm import (
+    LLMCallResult,
+    structured_call_with_backoff,
+)
 from agentfx.agents.fleet.log_buffer import get_global_buffer
 from agentfx.agents.fleet.memory import (
     DecisionRecord,
@@ -441,7 +444,12 @@ def _render_user_prompt(snapshot: dict[str, Any]) -> str:
 
 
 def _call_sonnet(snapshot: dict[str, Any]) -> LLMCallResult:
-    return structured_call(
+    # QA uses the retrying variant: a transient Anthropic blip during
+    # a 30-min scan window is the exact failure mode Wilson flagged on
+    # 2026-10-22 ("LLM analysis unavailable; rerun when reachable").
+    # Backoff schedule covers ~7 min of API trouble before falling
+    # back to deterministic.
+    return structured_call_with_backoff(
         model=settings.AGENT_QA_MODEL,
         system=_SYSTEM_PROMPT,
         user=_render_user_prompt(snapshot),
@@ -730,7 +738,8 @@ def _render_tech_user_prompt(snapshot: dict[str, Any]) -> str:
 
 
 def _call_sonnet_tech(snapshot: dict[str, Any]) -> LLMCallResult:
-    return structured_call(
+    # Same retry policy as the divergence path — see `_call_sonnet`.
+    return structured_call_with_backoff(
         model=settings.AGENT_QA_MODEL,
         system=_TECH_SYSTEM_PROMPT,
         user=_render_tech_user_prompt(snapshot),

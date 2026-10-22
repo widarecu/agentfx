@@ -186,3 +186,129 @@ class TestExtraction:
             client=client,
         )
         assert result.reasoning == "my reasoning"
+
+
+class TestStructuredCallWithBackoff:
+    """App-level retry on `api_failure` — covers Wilson's 2026-10-22
+    observation where QA fell back to deterministic on a transient
+    Anthropic blip."""
+
+    def _mk_resp(self, parsed) -> MagicMock:
+        resp = MagicMock()
+        resp.output_parsed = parsed
+        resp.content = []
+        resp.usage = SimpleNamespace(
+            input_tokens=1,
+            output_tokens=1,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        )
+        return resp
+
+    def test_success_on_first_try_no_retry(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
+        parsed = _DummySchema(text="ok", score=1.0)
+        client = MagicMock()
+        client.messages.parse.return_value = self._mk_resp(parsed)
+        slept: list[float] = []
+        with patch("time.sleep", side_effect=slept.append):
+            result = fleet_llm.structured_call_with_backoff(
+                model="claude-haiku-4-5",
+                system="s",
+                user="u",
+                schema=_DummySchema,
+                client=client,
+            )
+        assert result.output is parsed
+        assert slept == []  # No retry needed → no sleep
+        assert client.messages.parse.call_count == 1
+
+    def test_api_failure_then_success(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
+        parsed = _DummySchema(text="finally", score=0.9)
+        client = MagicMock()
+        # First call raises → api_failure. Second call succeeds.
+        client.messages.parse.side_effect = [
+            RuntimeError("502 bad gateway"),
+            self._mk_resp(parsed),
+        ]
+        slept: list[float] = []
+        with patch("time.sleep", side_effect=slept.append):
+            result = fleet_llm.structured_call_with_backoff(
+                model="claude-sonnet-5",
+                system="s",
+                user="u",
+                schema=_DummySchema,
+                client=client,
+                backoff_seconds=(0.01, 0.02, 0.03),
+            )
+        assert result.output is parsed
+        assert len(slept) == 1
+        assert slept[0] == 0.01
+        assert client.messages.parse.call_count == 2
+
+    def test_persistent_api_failure_exhausts_retries(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
+        client = MagicMock()
+        client.messages.parse.side_effect = RuntimeError("still 500")
+        slept: list[float] = []
+        with patch("time.sleep", side_effect=slept.append):
+            result = fleet_llm.structured_call_with_backoff(
+                model="claude-sonnet-5",
+                system="s",
+                user="u",
+                schema=_DummySchema,
+                client=client,
+                backoff_seconds=(0.01, 0.02, 0.03),
+            )
+        assert result.output is None
+        assert result.skipped_reason == "api_failure"
+        # Initial attempt + 3 retries = 4 calls; 3 sleeps between.
+        assert client.messages.parse.call_count == 4
+        assert slept == [0.01, 0.02, 0.03]
+
+    def test_extract_none_is_not_retried_by_default(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
+        resp = MagicMock()
+        # No parsed anywhere → extract_none path.
+        resp.output_parsed = None
+        resp.parsed_output = None
+        resp.parsed = None
+        resp.content = []
+        resp.usage = SimpleNamespace(
+            input_tokens=1,
+            output_tokens=1,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        )
+        client = MagicMock()
+        client.messages.parse.return_value = resp
+        slept: list[float] = []
+        with patch("time.sleep", side_effect=slept.append):
+            result = fleet_llm.structured_call_with_backoff(
+                model="claude-haiku-4-5",
+                system="s",
+                user="u",
+                schema=_DummySchema,
+                client=client,
+                backoff_seconds=(0.01, 0.02, 0.03),
+            )
+        assert result.output is None
+        # No retry — extract_none is deterministic, retrying wastes cost.
+        assert client.messages.parse.call_count == 1
+        assert slept == []
+
+    def test_no_api_key_short_circuits_without_retry(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        slept: list[float] = []
+        with patch("time.sleep", side_effect=slept.append):
+            result = fleet_llm.structured_call_with_backoff(
+                model="claude-haiku-4-5",
+                system="s",
+                user="u",
+                schema=_DummySchema,
+                backoff_seconds=(0.01, 0.02),
+            )
+        assert result.output is None
+        assert result.skipped_reason == "no_api_key"
+        assert slept == []
