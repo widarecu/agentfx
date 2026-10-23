@@ -1,0 +1,126 @@
+# Linear workspace definition for AgentFX.
+#
+# Applied by `scripts/linear/bootstrap.py` (idempotent — safe to re-run).
+# Change the workspace by editing this file in a PR, then re-running the
+# script. The operating model behind these choices lives in
+# planning/runbooks/linear-operating-model.md.
+#
+# Matching is by name: existing states/labels/projects/templates with the
+# same name are updated in place, never duplicated. Renames go through
+# `rename_from` so history on existing objects is preserved.
+
+team:
+  key: AFX
+  settings:
+    triageEnabled: true          # agent-filed issues land in Triage
+    cyclesEnabled: false         # agents don't need sprints
+    issueEstimationType: notUsed
+
+# Workflow states. `type` is Linear's category:
+# triage | backlog | unstarted | started | completed | canceled | duplicate
+states:
+  - name: Triage
+    type: triage
+    description: Proposed, not approved. Agents file every new issue here.
+  - name: Backlog
+    type: backlog
+    description: Approved by Wilson as worth doing, not yet scheduled.
+  - name: Ready
+    rename_from: Todo
+    type: unstarted
+    description: Approved and prioritised. The ONLY state agents may pick work from.
+  - name: In Progress
+    type: started
+    description: An agent is working on it on branch agent/AFX-<n>-<slug>.
+  - name: In Review
+    type: started
+    description: PR open; CI and review in progress.
+  - name: Done
+    type: completed
+    description: Merged.
+  - name: Canceled
+    type: canceled
+    description: Declined by Wilson.
+  - name: Duplicate
+    type: duplicate
+    description: Same as another issue.
+
+# Workspace-level labels (shared by any future team). Groups are
+# exclusive: an issue carries at most one label per group.
+label_groups:
+  - name: Type
+    color: "#6B7280"
+    labels:
+      - { name: Bug,         color: "#EB5757" }
+      - { name: Feature,     color: "#BB87FC" }
+      - { name: Improvement, color: "#4EA7FC" }
+      - { name: Tech debt,   color: "#95A2B3" }
+      - { name: Test gap,    color: "#F2C94C" }
+      - { name: Chore,       color: "#B3B3B3" }
+      - { name: Research,    color: "#26B5CE" }
+      - { name: Incident,    color: "#C52828" }
+  - name: Area
+    color: "#0F7488"
+    labels:
+      - { name: Backtest }
+      - { name: Evolution/DSL }
+      - { name: Validator }
+      - { name: Paper runner }
+      - { name: OANDA/data }
+      - { name: Agent fleet }
+      - { name: Portal }
+      - { name: Infra/CI }
+      - { name: Notifications }
+  - name: Source
+    color: "#5E6AD2"
+    labels:
+      - { name: Wilson }
+      - { name: PM agent }
+      - { name: QA agent }
+      - { name: PE agent }
+      - { name: Research agent }
+      - { name: Coding agent }
+      - { name: CI pipeline }
+  - name: Found in
+    color: "#D9730D"
+    description: Bugs only — where the defect was caught. Anything not "CI" means a test was missing.
+    labels:
+      - { name: CI }
+      - { name: Paper trading }
+      - { name: UAT }
+      - { name: Staging }
+  - name: Risk
+    color: "#C52828"
+    labels:
+      - name: Money-path
+        description: Order execution, sizing, kill switch, credentials, deploy gates. PR never auto-merges; Wilson approves.
+      - { name: Normal }
+
+# Ungrouped flags (several allowed per issue).
+labels:
+  - name: needs-wilson
+    color: "#F2994A"
+    description: An agent is blocked on a decision only Wilson can make.
+  - name: agent-filed
+    color: "#5E6AD2"
+    description: Created by an agent; awaiting Wilson's triage.
+
+# One project per roadmap release, plus a standing bucket for defects.
+projects:
+  - name: v0.8.1 Autonomous scheduling + code authorship
+    description: PM scheduling, PE Managed Agents workspace, agent-fleet CI.
+  - name: v0.8.2 Autonomous paper lifecycle
+    description: PM paper approval, account pool wiring, deploy-gate hardening, drift detection.
+  - name: v0.9.0 Live-nomination pipeline
+    description: Strategy nomination package + Wilson's review interface.
+  - name: v1.0.0 Live trading
+    description: OANDA live with second approval gate, portfolio allocation.
+  - name: Platform health
+    description: Defects and tech debt not tied to a release.
+
+# Issue templates. Bodies live in config/linear/templates/<file>.
+templates:
+  - { name: Feature / Improvement, file: feature.md,   labels: [Feature] }
+  - { name: Bug / Defect,          file: bug.md,       labels: [Bug] }
+  - { name: Agent finding,         file: finding.md,   labels: [agent-filed] }
+  - { name: Test gap,              file: test-gap.md,  labels: [Test gap] }
