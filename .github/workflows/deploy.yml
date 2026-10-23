@@ -27,7 +27,13 @@ jobs:
   # ---------------------------------------------------------------------------
   e2e:
     name: E2E Tests
-    runs-on: ubuntu-latest
+    # Pinned to 24.04: GitHub's `ubuntu-latest` rolled to 26.04 in late
+    # October 2026, and Playwright 1.57.0 only ships deps for ≤24.04.
+    # Attempting `--with-deps` on 26.04 bails with:
+    #   "ERROR: Playwright does not support chromium on ubuntu26.04-x64"
+    # Bump the pin when `@playwright/test` is upgraded to a release
+    # that officially supports 26.04.
+    runs-on: ubuntu-24.04
 
     services:
       postgres:
