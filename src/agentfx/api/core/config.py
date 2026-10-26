@@ -568,6 +568,47 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Linear filing (AFX-11) — fleet files findings as Triage issues
+    # instead of (or in addition to) emails. Dark by default: with
+    # the flag off, agents keep their email path untouched.
+    AGENT_LINEAR_ENABLED: bool = Field(
+        default=False,
+        env="AGENT_LINEAR_ENABLED",
+        description=(
+            "If true, QA/PE/PM findings are also filed into Linear "
+            "Triage via `agentfx.integrations.linear_client`. Email "
+            "notifications continue regardless."
+        ),
+    )
+    LINEAR_API_KEY: str = Field(
+        default="",
+        env="LINEAR_API_KEY",
+        description=(
+            "Linear API key the fleet uses to file Triage issues + "
+            "comment on open ones. Should belong to the fleet's "
+            "dedicated Linear user (not Wilson's personal key) so "
+            "`Source` labels + attribution are correct. Empty "
+            "disables filing even if the flag is on."
+        ),
+    )
+    AGENT_LINEAR_TEAM_KEY: str = Field(
+        default="AFX",
+        env="AGENT_LINEAR_TEAM_KEY",
+        description=(
+            "Linear team key the fleet files into. Only one team "
+            "today; placeholder for a future split."
+        ),
+    )
+    AGENT_LINEAR_DAILY_CAP_PER_AGENT: int = Field(
+        default=5,
+        env="AGENT_LINEAR_DAILY_CAP_PER_AGENT",
+        description=(
+            "Hard daily cap on new Triage issues each agent (QA / PE "
+            "/ PM / Research) can file per UTC day. Comments on "
+            "existing dedupe matches do not count toward the cap."
+        ),
+    )
+
     @property
     def instruments_list(self) -> list[str]:
         """Parse CANDLE_INSTRUMENTS into a list."""
