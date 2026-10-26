@@ -221,17 +221,49 @@ def file_finding(spec: FindingSpec, *, now: datetime | None = None) -> FilingRes
 
 
 def _build_client(api_key: str) -> requests.Session:
-    """Session with the Linear auth header. Linear uses the raw key,
-    not `Bearer`. Keep-alive is fine; a stale token causes a 401 which
-    callers handle (never raised to agent code)."""
+    """Session with the correct Linear auth header for whichever
+    kind of token the operator supplied. Keep-alive is fine; a
+    stale token causes a 401 which callers handle (never raised
+    to agent code)."""
     sess = requests.Session()
     sess.headers.update(
         {
-            "Authorization": api_key,
+            "Authorization": _format_auth_header(api_key),
             "Content-Type": "application/json",
         }
     )
     return sess
+
+
+def _format_auth_header(token: str) -> str:
+    """Return the right Authorization header value for `token`.
+
+    Linear accepts two token types with different conventions:
+      - **Personal API keys** (`lin_api_*`): sent raw, no prefix.
+      - **OAuth application tokens**: sent as `Bearer <token>` per
+        the OAuth 2.0 spec.
+
+    This helper covers three operator paths without needing a
+    separate setting:
+
+      1. Explicit `Bearer ` prefix in the env var → honoured as-is.
+         Lets an operator force a specific format if detection ever
+         misclassifies.
+      2. Token starts with `lin_api_` → raw (personal API key).
+      3. Anything else → OAuth app token, prefixed with `Bearer `.
+
+    The default (3) is the one the fleet actually needs: OAuth app
+    is the right identity for `AgentFX Fleet` (no email, no user
+    seat, correct bot attribution).
+    """
+    token = (token or "").strip()
+    if not token:
+        return ""
+    if token.lower().startswith("bearer "):
+        return token
+    if token.startswith("lin_api_"):
+        return token
+    return f"Bearer {token}"
 
 
 def _gql(client: requests.Session, query: str, variables: dict[str, Any]) -> dict:

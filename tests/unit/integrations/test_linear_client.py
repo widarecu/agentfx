@@ -266,3 +266,41 @@ class TestRendering:
         )
         # 0 means "no filing today" — getattr-or default must not clobber.
         assert linear_client._daily_cap_per_agent() == 0
+
+
+class TestAuthHeaderFormat:
+    """OAuth app tokens need `Bearer <token>`; personal API keys go
+    raw. Operator can also force a format with an explicit prefix."""
+
+    def test_oauth_token_gets_bearer_prefix(self):
+        # Typical OAuth app token — no `lin_api_` prefix.
+        assert linear_client._format_auth_header("abc.def.ghi") == "Bearer abc.def.ghi"
+
+    def test_personal_api_key_sent_raw(self):
+        # Personal keys documented to start with `lin_api_`.
+        assert (
+            linear_client._format_auth_header("lin_api_abcdef123")
+            == "lin_api_abcdef123"
+        )
+
+    def test_explicit_bearer_prefix_honoured(self):
+        # Operator override — if they pre-pended Bearer, trust them.
+        assert (
+            linear_client._format_auth_header("Bearer custom.token")
+            == "Bearer custom.token"
+        )
+        # Case-insensitive check for the prefix detection.
+        assert (
+            linear_client._format_auth_header("bearer lower.case.token")
+            == "bearer lower.case.token"
+        )
+
+    def test_whitespace_trimmed(self):
+        assert linear_client._format_auth_header("  lin_api_xyz  ") == "lin_api_xyz"
+        assert (
+            linear_client._format_auth_header("  oauth.token  ") == "Bearer oauth.token"
+        )
+
+    def test_empty_token_returns_empty(self):
+        assert linear_client._format_auth_header("") == ""
+        assert linear_client._format_auth_header("   ") == ""
