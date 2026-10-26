@@ -225,3 +225,118 @@ class TestMarkdownRender:
         md = qa._render_markdown(report, "run_x", date(2026, 10, 5))
         assert "## Classifications" not in md
         assert "## Work orders" not in md
+
+
+class TestLinearFiling:
+    """QA wire to AFX-11's linear_client — files each work order as a
+    Triage finding when the flag is on. Email path keeps running
+    regardless."""
+
+    def test_zero_work_orders_is_a_noop(self):
+        from unittest.mock import patch
+        from agentfx.agents.fleet.quant_analyst import (
+            QADivergenceReport,
+            _file_work_orders_to_linear,
+        )
+        from datetime import date
+
+        report = QADivergenceReport(headline="ok", summary="", work_orders=[])
+        with patch("agentfx.integrations.linear_client.file_finding") as file_finding:
+            _file_work_orders_to_linear(
+                report=report, run_id="run_x", today=date(2026, 10, 26)
+            )
+        file_finding.assert_not_called()
+
+    def test_each_work_order_gets_filed(self):
+        from unittest.mock import MagicMock, patch
+        from agentfx.agents.fleet.quant_analyst import (
+            QADivergenceReport,
+            QAWorkOrder,
+            _file_work_orders_to_linear,
+        )
+        from agentfx.integrations.linear_client import FilingResult
+        from datetime import date
+
+        report = QADivergenceReport(
+            headline="dup orders",
+            summary="",
+            work_orders=[
+                QAWorkOrder(
+                    title="Dedupe order submits",
+                    target_file="src/execution/order_manager.py",
+                    spec="Multiple identical orders fired in a 50ms window.",
+                    expected_profit_impact="Avoid ~$1k/wk loss",
+                ),
+                QAWorkOrder(
+                    title="Fix close-reason mapping",
+                    target_file="src/agentfx/services/paper_runner.py",
+                    spec="Stops record as 'tp' not 'sl'.",
+                    expected_profit_impact="Correct reporting; no direct $.",
+                ),
+            ],
+        )
+        file_finding_mock = MagicMock(
+            return_value=FilingResult(
+                filed=True, identifier="AFX-100", action="created"
+            )
+        )
+        with patch(
+            "agentfx.integrations.linear_client.file_finding",
+            file_finding_mock,
+        ):
+            _file_work_orders_to_linear(
+                report=report, run_id="run_abc", today=date(2026, 10, 26)
+            )
+        assert file_finding_mock.call_count == 2
+        # Each FindingSpec goes in positionally.
+        call_specs = [c.args[0] for c in file_finding_mock.call_args_list]
+        titles = {s.title for s in call_specs}
+        assert titles == {"Dedupe order submits", "Fix close-reason mapping"}
+        for s in call_specs:
+            assert s.source_label == "QA agent"
+            assert s.type_label == "Bug"
+            assert s.fingerprint.startswith("qa:")
+            assert "src/execution" in s.body or "src/agentfx/services" in s.body
+            assert "run_abc" in s.body
+
+    def test_filing_exception_does_not_raise(self):
+        from unittest.mock import patch
+        from agentfx.agents.fleet.quant_analyst import (
+            QADivergenceReport,
+            QAWorkOrder,
+            _file_work_orders_to_linear,
+        )
+        from datetime import date
+
+        report = QADivergenceReport(
+            headline="x",
+            summary="",
+            work_orders=[QAWorkOrder(title="t", target_file="x", spec="s")],
+        )
+        with patch(
+            "agentfx.integrations.linear_client.file_finding",
+            side_effect=RuntimeError("boom"),
+        ):
+            # Must not raise.
+            _file_work_orders_to_linear(
+                report=report, run_id="r", today=date(2026, 10, 26)
+            )
+
+    def test_area_label_heuristic(self):
+        from agentfx.agents.fleet.quant_analyst import _area_label_for
+
+        assert _area_label_for("src/agentfx/services/paper_runner.py") == "Paper runner"
+        assert _area_label_for("src/agentfx/services/backtest.py") == "Backtest"
+        assert _area_label_for("src/agentfx/adapters/oanda.py") == "OANDA/data"
+        assert _area_label_for("src/agentfx/agents/validator.py") == "Validator"
+        assert _area_label_for("src/agentfx/core/dsl/compiler.py") == "Evolution/DSL"
+        assert _area_label_for("portal/web/src/Dashboard.tsx") == "Portal"
+        assert _area_label_for("src/agentfx/notifications/email.py") == "Notifications"
+        assert _area_label_for(".github/workflows/ci.yml") == "Infra/CI"
+        assert (
+            _area_label_for("src/agentfx/agents/fleet/portfolio_manager.py")
+            == "Agent fleet"
+        )
+        # Default fallback
+        assert _area_label_for("") == "Paper runner"
+        assert _area_label_for("random/path.py") == "Paper runner"

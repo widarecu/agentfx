@@ -560,6 +560,11 @@ def _write_divergence_report(*, db: Session, run_id: str, today: date) -> None:
     # 3. Email with HTML template.
     _email_report(run_id=run_id, today=today, body=body_md, report=report)
 
+    # 4. File any work orders as Linear Triage issues (AFX-11). Dark
+    #    by default; see AGENT_LINEAR_ENABLED. Email still goes
+    #    regardless so this is additive, not a replacement.
+    _file_work_orders_to_linear(report=report, run_id=run_id, today=today)
+
 
 def _email_report(
     *,
@@ -587,6 +592,100 @@ def _email_report(
         )
     except Exception:
         logger.exception("qa_agent: email send failed (report still in DB)")
+
+
+def _file_work_orders_to_linear(
+    *, report: QADivergenceReport, run_id: str, today: date
+) -> None:
+    """File each QA work order as a Linear Triage issue (AFX-11).
+
+    One finding per work order. Fingerprint = `qa:<title-hash>:<file-hash>`
+    so the same work order recurring across runs dedupes to a single
+    Triage issue with evidence comments appended, instead of flooding
+    Triage with one issue per paper run.
+
+    Area label is picked from the target_file path heuristically — a
+    missing / unrecognised file maps to "Paper runner" since that's
+    where most QA findings land. Never raises.
+    """
+    if not report.work_orders:
+        return
+    try:
+        from agentfx.integrations.linear_client import FindingSpec, file_finding
+    except Exception:
+        logger.exception("qa_agent: linear_client import failed")
+        return
+
+    for wo in report.work_orders:
+        try:
+            fingerprint = _work_order_fingerprint(wo.title, wo.target_file)
+            area = _area_label_for(wo.target_file)
+            body = (
+                f"## Spec\n\n{wo.spec.strip()}\n\n"
+                f"## Expected profit impact\n\n"
+                f"{wo.expected_profit_impact.strip() or '(none stated)'}\n\n"
+                f"## Context\n\n"
+                f"- Source paper run: `{run_id}` ({today.isoformat()})\n"
+                f"- Target file: `{wo.target_file or '(unspecified)'}`\n"
+            )
+            spec = FindingSpec(
+                fingerprint=fingerprint,
+                title=wo.title[:255] if wo.title else "(QA work order)",
+                body=body,
+                source_label="QA agent",
+                type_label="Bug",
+                area_label=area,
+                risk_label="Normal",
+            )
+            result = file_finding(spec)
+            if result.action.startswith("skipped:"):
+                logger.info(
+                    "qa_agent: linear filing skipped for %r — %s",
+                    wo.title,
+                    result.action,
+                )
+        except Exception:
+            logger.exception(
+                "qa_agent: unexpected failure filing work order %r to Linear",
+                wo.title,
+            )
+
+
+def _work_order_fingerprint(title: str, target_file: str) -> str:
+    """Stable short fingerprint for a QA work order. Same (title,
+    target_file) on different runs → same fingerprint → dedupes to
+    the single existing Triage issue."""
+    import hashlib
+
+    key = f"{(title or '').strip().lower()}|{(target_file or '').strip().lower()}"
+    return f"qa:{hashlib.sha256(key.encode()).hexdigest()[:12]}"
+
+
+def _area_label_for(target_file: str) -> str:
+    """Map a repo path to one of the workspace's Area labels. Falls
+    back to 'Paper runner' which is where QA findings cluster."""
+    if not target_file:
+        return "Paper runner"
+    tf = target_file.lower()
+    if "paper_runner" in tf or "paper/" in tf:
+        return "Paper runner"
+    if "backtest" in tf:
+        return "Backtest"
+    if "oanda" in tf or "candle" in tf:
+        return "OANDA/data"
+    if "validator" in tf:
+        return "Validator"
+    if "dsl" in tf or "evolution" in tf:
+        return "Evolution/DSL"
+    if "portal" in tf:
+        return "Portal"
+    if "notifications" in tf or "email" in tf:
+        return "Notifications"
+    if ".github" in tf or "ci.yml" in tf or "makefile" in tf.lower():
+        return "Infra/CI"
+    if "fleet/" in tf or "orchestrator" in tf:
+        return "Agent fleet"
+    return "Paper runner"
 
 
 # ─────────────────────────────────────────────────────────────────────
