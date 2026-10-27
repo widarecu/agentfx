@@ -236,16 +236,28 @@ def _build_client(api_key: str) -> requests.Session:
 
 def _gql(client: requests.Session, query: str, variables: dict[str, Any]) -> dict:
     """Execute a GraphQL request. Returns the `data` field; raises on
-    HTTP error / GraphQL errors so callers can log + swallow uniformly."""
+    HTTP error / GraphQL errors so callers can log + swallow uniformly.
+
+    Linear uses HTTP 400 for schema violations + complexity-gate
+    rejections, with the actual error in the response body — so we
+    parse the body BEFORE `raise_for_status()` and surface the real
+    error message. Without this, a 400 only shows "Bad Request" in
+    logs, which cost us ~15 min debugging on 2026-10-27.
+    """
     resp = client.post(
         _LINEAR_API_URL,
         json={"query": query, "variables": variables},
         timeout=_HTTP_TIMEOUT_SECONDS,
     )
-    resp.raise_for_status()
-    payload = resp.json()
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {}
     if payload.get("errors"):
-        raise RuntimeError(f"linear graphql errors: {payload['errors']}")
+        raise RuntimeError(
+            f"linear graphql errors (status={resp.status_code}): {payload['errors']}"
+        )
+    resp.raise_for_status()
     return payload.get("data") or {}
 
 
@@ -396,13 +408,23 @@ def _resolve_team_and_labels(
     Labels that don't exist on the team are silently dropped — Linear
     rejects unknown label ids on `issueCreate`, so attaching only
     recognised ones keeps the filing path robust against a label
-    being renamed/retired."""
+    being renamed/retired.
+
+    `first: 50` is chosen deliberately: Linear's GraphQL complexity
+    gate rejects anything above ~100 nested label rows (seen
+    2026-10-27 as HTTP 400 "Query too complex. Complexity: 15055.
+    Maximum: 10000" when using 250). AFX currently has 37 labels, so
+    50 is comfortable headroom. If a team ever exceeds 50 labels,
+    label resolution would silently miss the overflow — unlikely in
+    practice, and `_resolve_team_and_labels` already warns about
+    unresolved labels.
+    """
     query = """
     query ResolveTeamAndLabels($teamKey: String!) {
       teams(filter: { key: { eq: $teamKey } }) {
         nodes {
           id
-          labels(first: 250) { nodes { id name } }
+          labels(first: 50) { nodes { id name } }
         }
       }
     }
