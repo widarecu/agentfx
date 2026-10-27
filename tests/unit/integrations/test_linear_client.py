@@ -266,3 +266,85 @@ class TestRendering:
         )
         # 0 means "no filing today" — getattr-or default must not clobber.
         assert linear_client._daily_cap_per_agent() == 0
+
+
+class TestGqlErrorSurfacing:
+    """`_gql` must surface Linear's GraphQL error body on HTTP 400 —
+    not just "Bad Request". Linear uses 400 for schema violations
+    + complexity-gate rejections (seen 2026-10-27 as "Query too
+    complex. Complexity: 15055")."""
+
+    def _mk_client_with_response(self, status_code, json_body):
+        """Build a mocked requests.Session returning the given status
+        + body on `.post()`."""
+        session = MagicMock()
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.json.return_value = json_body
+        import requests
+
+        if status_code >= 400:
+
+            def _raise():
+                err = requests.exceptions.HTTPError(
+                    f"{status_code} Client Error: Bad Request"
+                )
+                raise err
+
+            resp.raise_for_status.side_effect = _raise
+        session.post.return_value = resp
+        return session
+
+    def test_graphql_error_on_400_surfaces_user_message(self):
+        """A 400 with a GraphQL error body should raise with the
+        actual message visible (not just HTTP 400)."""
+        client = self._mk_client_with_response(
+            400,
+            {
+                "errors": [
+                    {
+                        "message": "Query too complex",
+                        "extensions": {
+                            "userPresentableMessage": "Complexity: 15055. Maximum: 10000"
+                        },
+                    }
+                ]
+            },
+        )
+        with pytest.raises(RuntimeError) as exc_info:
+            linear_client._gql(client, "query X { a }", {})
+        # The real error message must appear in the exception string
+        # — otherwise Railway log review shows just "HTTPError 400"
+        # and we lose 15 min debugging.
+        assert "Query too complex" in str(exc_info.value)
+        assert "status=400" in str(exc_info.value)
+
+    def test_200_with_graphql_errors_still_raises(self):
+        """GraphQL errors on a 200 (Linear's older behaviour) still raise."""
+        client = self._mk_client_with_response(
+            200, {"errors": [{"message": "field not found"}]}
+        )
+        with pytest.raises(RuntimeError) as exc_info:
+            linear_client._gql(client, "query X { a }", {})
+        assert "field not found" in str(exc_info.value)
+
+    def test_200_with_data_returns_data(self):
+        client = self._mk_client_with_response(200, {"data": {"team": {"id": "x"}}})
+        result = linear_client._gql(client, "query X { a }", {})
+        assert result == {"team": {"id": "x"}}
+
+    def test_400_without_graphql_body_falls_through_to_http_error(self):
+        """If the body isn't JSON or has no `errors`, `raise_for_status`
+        still runs and raises an HTTPError — don't swallow silently."""
+        import requests
+
+        session = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 400
+        resp.json.side_effect = ValueError("not json")
+        resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            "400 Bad Request"
+        )
+        session.post.return_value = resp
+        with pytest.raises(requests.exceptions.HTTPError):
+            linear_client._gql(session, "query X { a }", {})
