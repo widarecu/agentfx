@@ -180,7 +180,17 @@ def structured_call(
         client = anthropic.Anthropic(max_retries=4)
 
     try:
-        resp = client.messages.parse(
+        # Use streaming (not `messages.parse`) because Sonnet 5 with
+        # adaptive extended thinking + a large `max_tokens` budget
+        # can produce responses the SDK estimates > 10 min, and the
+        # non-streaming `.parse()` path raises
+        # `ValueError: Streaming is required...` pre-flight (seen in
+        # Railway logs 2026-10-27T10:41Z). `.stream()` is a context
+        # manager that returns the final completed message via
+        # `.get_final_message()`, with the same shape as
+        # `.parse()` returned — so `_extract_parsed` / `_extract_reasoning`
+        # continue to work unchanged downstream.
+        with client.messages.stream(
             model=model,
             max_tokens=max_tokens,
             system=[
@@ -192,7 +202,8 @@ def structured_call(
             ],
             messages=[{"role": "user", "content": user}],
             output_format=schema,
-        )
+        ) as stream:
+            resp = stream.get_final_message()
     except Exception as exc:  # noqa: BLE001 — logged + wrapped
         # Pydantic ValidationError includes the specific field + value
         # that failed. The default `str(exc)` cuts it off at

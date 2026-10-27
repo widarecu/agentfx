@@ -1,9 +1,10 @@
 """Unit tests for `agentfx.agents.fleet.llm`.
 
-The LLM helper is a thin wrapper around `anthropic.messages.parse`
-— tests focus on the pieces we actually own: pricing, skipped-
-result shape, structured-output extraction, and the never-raises
-contract.
+The LLM helper wraps `anthropic.messages.stream(...).get_final_message()`
+(switched from the sync `.parse()` call on 2026-10-27 after Sonnet 5
++ 32768 max_tokens tripped the SDK's 10-min pre-flight check). Tests
+focus on the pieces we actually own: pricing, skipped-result shape,
+structured-output extraction, and the never-raises contract.
 """
 
 from __future__ import annotations
@@ -22,6 +23,42 @@ pytestmark = pytest.mark.unit
 class _DummySchema(BaseModel):
     text: str
     score: float
+
+
+def _wire_stream(client, *, resp=None, exc=None):
+    """Wire `client.messages.stream(...)` to behave as a context
+    manager whose `get_final_message()` returns `resp` or raises
+    `exc`. Mirrors how the production code consumes the stream."""
+    cm = MagicMock()
+    inner = MagicMock()
+    if exc is not None:
+        inner.get_final_message.side_effect = exc
+    else:
+        inner.get_final_message.return_value = resp
+    cm.__enter__.return_value = inner
+    cm.__exit__.return_value = False
+    client.messages.stream.return_value = cm
+    return cm
+
+
+def _wire_stream_sequence(client, items):
+    """Per-call side_effect for `client.messages.stream`. Each item
+    in `items` is either a response (returned) or an Exception
+    (raised when the context manager entry runs). Used for multi-
+    attempt backoff tests."""
+
+    def _side_effect(*_args, **_kwargs):
+        item = items.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        cm = MagicMock()
+        inner = MagicMock()
+        inner.get_final_message.return_value = item
+        cm.__enter__.return_value = inner
+        cm.__exit__.return_value = False
+        return cm
+
+    client.messages.stream.side_effect = _side_effect
 
 
 class TestPricing:
@@ -98,7 +135,7 @@ class TestSkippedResult:
         on this never raising."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
         broken_client = MagicMock()
-        broken_client.messages.parse.side_effect = RuntimeError("api melted")
+        _wire_stream(broken_client, exc=RuntimeError("api melted"))
 
         result = fleet_llm.structured_call(
             model="claude-haiku-4-5",
@@ -109,6 +146,40 @@ class TestSkippedResult:
         )
         assert result.output is None
         assert result.skipped_reason == "api_failure"
+
+    def test_uses_streaming_not_parse(self, monkeypatch):
+        """AFX-41 regression: `structured_call` must use
+        `messages.stream(...)` (context manager) and never
+        `messages.parse(...)`. The non-streaming path hits the
+        SDK's 10-min pre-flight gate for Sonnet 5 with
+        max_tokens=32768."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
+        parsed = _DummySchema(text="x", score=0.1)
+        resp = MagicMock()
+        resp.output_parsed = parsed
+        resp.content = []
+        resp.usage = SimpleNamespace(
+            input_tokens=1,
+            output_tokens=1,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        )
+        client = MagicMock()
+        _wire_stream(client, resp=resp)
+
+        result = fleet_llm.structured_call(
+            model="claude-sonnet-5",
+            system="s",
+            user="u",
+            schema=_DummySchema,
+            max_tokens=32768,
+            client=client,
+        )
+        assert result.output is parsed
+        # stream was called with the long-request-safe path
+        assert client.messages.stream.called
+        # parse was NEVER called
+        assert not client.messages.parse.called
 
 
 class TestExtraction:
@@ -125,7 +196,7 @@ class TestExtraction:
             cache_read_input_tokens=0,
         )
         client = MagicMock()
-        client.messages.parse.return_value = resp
+        _wire_stream(client, resp=resp)
 
         result = fleet_llm.structured_call(
             model="claude-haiku-4-5",
@@ -153,7 +224,7 @@ class TestExtraction:
             cache_read_input_tokens=0,
         )
         client = MagicMock()
-        client.messages.parse.return_value = resp
+        _wire_stream(client, resp=resp)
 
         result = fleet_llm.structured_call(
             model="claude-haiku-4-5",
@@ -176,7 +247,7 @@ class TestExtraction:
             cache_read_input_tokens=0,
         )
         client = MagicMock()
-        client.messages.parse.return_value = resp
+        _wire_stream(client, resp=resp)
 
         result = fleet_llm.structured_call(
             model="claude-haiku-4-5",
@@ -209,7 +280,7 @@ class TestStructuredCallWithBackoff:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
         parsed = _DummySchema(text="ok", score=1.0)
         client = MagicMock()
-        client.messages.parse.return_value = self._mk_resp(parsed)
+        _wire_stream(client, resp=self._mk_resp(parsed))
         slept: list[float] = []
         with patch("time.sleep", side_effect=slept.append):
             result = fleet_llm.structured_call_with_backoff(
@@ -221,17 +292,20 @@ class TestStructuredCallWithBackoff:
             )
         assert result.output is parsed
         assert slept == []  # No retry needed → no sleep
-        assert client.messages.parse.call_count == 1
+        assert client.messages.stream.call_count == 1
 
     def test_api_failure_then_success(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
         parsed = _DummySchema(text="finally", score=0.9)
         client = MagicMock()
         # First call raises → api_failure. Second call succeeds.
-        client.messages.parse.side_effect = [
-            RuntimeError("502 bad gateway"),
-            self._mk_resp(parsed),
-        ]
+        _wire_stream_sequence(
+            client,
+            [
+                RuntimeError("502 bad gateway"),
+                self._mk_resp(parsed),
+            ],
+        )
         slept: list[float] = []
         with patch("time.sleep", side_effect=slept.append):
             result = fleet_llm.structured_call_with_backoff(
@@ -245,12 +319,12 @@ class TestStructuredCallWithBackoff:
         assert result.output is parsed
         assert len(slept) == 1
         assert slept[0] == 0.01
-        assert client.messages.parse.call_count == 2
+        assert client.messages.stream.call_count == 2
 
     def test_persistent_api_failure_exhausts_retries(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
         client = MagicMock()
-        client.messages.parse.side_effect = RuntimeError("still 500")
+        _wire_stream(client, exc=RuntimeError("still 500"))
         slept: list[float] = []
         with patch("time.sleep", side_effect=slept.append):
             result = fleet_llm.structured_call_with_backoff(
@@ -264,7 +338,7 @@ class TestStructuredCallWithBackoff:
         assert result.output is None
         assert result.skipped_reason == "api_failure"
         # Initial attempt + 3 retries = 4 calls; 3 sleeps between.
-        assert client.messages.parse.call_count == 4
+        assert client.messages.stream.call_count == 4
         assert slept == [0.01, 0.02, 0.03]
 
     def test_extract_none_is_not_retried_by_default(self, monkeypatch):
@@ -282,7 +356,7 @@ class TestStructuredCallWithBackoff:
             cache_read_input_tokens=0,
         )
         client = MagicMock()
-        client.messages.parse.return_value = resp
+        _wire_stream(client, resp=resp)
         slept: list[float] = []
         with patch("time.sleep", side_effect=slept.append):
             result = fleet_llm.structured_call_with_backoff(
@@ -295,7 +369,7 @@ class TestStructuredCallWithBackoff:
             )
         assert result.output is None
         # No retry — extract_none is deterministic, retrying wastes cost.
-        assert client.messages.parse.call_count == 1
+        assert client.messages.stream.call_count == 1
         assert slept == []
 
     def test_no_api_key_short_circuits_without_retry(self, monkeypatch):
