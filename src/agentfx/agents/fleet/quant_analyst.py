@@ -449,12 +449,20 @@ def _call_sonnet(snapshot: dict[str, Any]) -> LLMCallResult:
     # 2026-10-22 ("LLM analysis unavailable; rerun when reachable").
     # Backoff schedule covers ~7 min of API trouble before falling
     # back to deterministic.
+    #
+    # Token budget: Sonnet 5 uses adaptive extended thinking by
+    # default, and thinking tokens count against `max_tokens`. On
+    # 2026-10-27 QA fell back to deterministic because the entire
+    # 8192 budget was consumed by a `type=thinking` content block
+    # (stop_reason=max_tokens, parsed_output=None). 32768 gives
+    # Sonnet 5 ample room for thinking + the structured output, at
+    # ~$0.33/call worst case — still well under the fleet daily cap.
     return structured_call_with_backoff(
         model=settings.AGENT_QA_MODEL,
         system=_SYSTEM_PROMPT,
         user=_render_user_prompt(snapshot),
         schema=QADivergenceReport,
-        max_tokens=8192,
+        max_tokens=32768,
     )
 
 
@@ -837,13 +845,14 @@ def _render_tech_user_prompt(snapshot: dict[str, Any]) -> str:
 
 
 def _call_sonnet_tech(snapshot: dict[str, Any]) -> LLMCallResult:
-    # Same retry policy as the divergence path — see `_call_sonnet`.
+    # Same retry policy + thinking-budget headroom as the divergence
+    # path — see `_call_sonnet` for the 2026-10-27 fallback incident.
     return structured_call_with_backoff(
         model=settings.AGENT_QA_MODEL,
         system=_TECH_SYSTEM_PROMPT,
         user=_render_tech_user_prompt(snapshot),
         schema=TechnicalHealthReport,
-        max_tokens=8192,
+        max_tokens=32768,
     )
 
 
