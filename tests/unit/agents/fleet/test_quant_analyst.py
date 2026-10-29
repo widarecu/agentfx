@@ -227,6 +227,159 @@ class TestMarkdownRender:
         assert "## Work orders" not in md
 
 
+class TestMeaningfulActivity:
+    """`_run_has_meaningful_activity` controls what QA looks at.
+    Four qualifying paths: terminal stop_reason, ≥N closed trades,
+    zero-trade silence past granularity threshold (added 2026-10-29),
+    or 0 trades below threshold → skip."""
+
+    def _mk_run(
+        self, *, status, created_at, granularity="M30", stop_reason=None, run_id="r1"
+    ):
+        from agentfx.api.models.run import RunStatus
+
+        run = MagicMock()
+        run.id = run_id
+        run.status = status if isinstance(status, RunStatus) else RunStatus(status)
+        run.created_at = created_at
+        run.granularity = granularity
+        run.stop_reason = stop_reason
+        return run
+
+    def _mk_db_with_closed_count(self, count: int):
+        """Mock the SQLAlchemy chain that counts closed trades."""
+        db = MagicMock()
+        db.query.return_value.filter.return_value.filter.return_value.count.return_value = count
+        return db
+
+    def test_terminal_stop_reason_qualifies(self):
+        from datetime import UTC, datetime
+        from agentfx.api.models.run import RunStatus
+
+        run = self._mk_run(
+            status=RunStatus.HALTED_MANUAL,
+            created_at=datetime(2026, 10, 1, tzinfo=UTC),
+            stop_reason="USER_KILL",
+        )
+        db = self._mk_db_with_closed_count(0)
+        now = datetime(2026, 10, 29, tzinfo=UTC)
+        assert qa._run_has_meaningful_activity(db, run=run, now=now) is True
+
+    def test_three_or_more_closed_trades_qualifies(self):
+        from datetime import UTC, datetime
+        from agentfx.api.models.run import RunStatus
+
+        run = self._mk_run(
+            status=RunStatus.RUNNING, created_at=datetime(2026, 10, 29, tzinfo=UTC)
+        )
+        db = self._mk_db_with_closed_count(qa._MIN_TRADES_FOR_ANALYSIS)
+        now = datetime(2026, 10, 29, 1, tzinfo=UTC)
+        assert qa._run_has_meaningful_activity(db, run=run, now=now) is True
+
+    def test_zero_trades_m30_past_24h_qualifies(self):
+        """2026-10-29 incident path: AUD_USD/M30 running 2 days with
+        0 trades. The silence IS the finding."""
+        from datetime import UTC, datetime
+        from agentfx.api.models.run import RunStatus
+
+        run = self._mk_run(
+            status=RunStatus.RUNNING,
+            created_at=datetime(2026, 10, 27, 10, tzinfo=UTC),
+            granularity="M30",
+        )
+        db = self._mk_db_with_closed_count(0)
+        # 48 hours later — well past the 24h M30 threshold.
+        now = datetime(2026, 10, 29, 10, tzinfo=UTC)
+        assert qa._run_has_meaningful_activity(db, run=run, now=now) is True
+
+    def test_zero_trades_m30_within_24h_skipped(self):
+        from datetime import UTC, datetime
+        from agentfx.api.models.run import RunStatus
+
+        run = self._mk_run(
+            status=RunStatus.RUNNING,
+            created_at=datetime(2026, 10, 29, tzinfo=UTC),
+            granularity="M30",
+        )
+        db = self._mk_db_with_closed_count(0)
+        # 12 hours in — not yet suspicious.
+        now = datetime(2026, 10, 29, 12, tzinfo=UTC)
+        assert qa._run_has_meaningful_activity(db, run=run, now=now) is False
+
+    def test_zero_trades_h4_requires_7_days(self):
+        """Lower-frequency timeframes get longer silence windows."""
+        from datetime import UTC, datetime, timedelta
+        from agentfx.api.models.run import RunStatus
+
+        created_at = datetime(2026, 10, 20, tzinfo=UTC)
+        run = self._mk_run(
+            status=RunStatus.RUNNING, created_at=created_at, granularity="H4"
+        )
+        db = self._mk_db_with_closed_count(0)
+        # 3 days in — H4's silence threshold is 7 days, not yet triggered.
+        assert (
+            qa._run_has_meaningful_activity(
+                db, run=run, now=created_at + timedelta(days=3)
+            )
+            is False
+        )
+        # 8 days in — now qualifies.
+        assert (
+            qa._run_has_meaningful_activity(
+                db, run=run, now=created_at + timedelta(days=8)
+            )
+            is True
+        )
+
+    def test_unknown_granularity_uses_default(self):
+        from datetime import UTC, datetime, timedelta
+        from agentfx.api.models.run import RunStatus
+
+        created_at = datetime(2026, 10, 20, tzinfo=UTC)
+        run = self._mk_run(
+            status=RunStatus.RUNNING,
+            created_at=created_at,
+            granularity="SOMETHING_WEIRD",
+        )
+        db = self._mk_db_with_closed_count(0)
+        # Default is 48h — 1 day isn't enough.
+        assert (
+            qa._run_has_meaningful_activity(
+                db, run=run, now=created_at + timedelta(hours=24)
+            )
+            is False
+        )
+        # 72h — now qualifies against the 48h default.
+        assert (
+            qa._run_has_meaningful_activity(
+                db, run=run, now=created_at + timedelta(hours=72)
+            )
+            is True
+        )
+
+    def test_zero_trades_naive_created_at_normalised_to_utc(self):
+        """Postgres may hand back a tz-naive datetime depending on
+        dialect; the gate must still work without crashing."""
+        from datetime import UTC, datetime
+        from agentfx.api.models.run import RunStatus
+
+        run = self._mk_run(
+            status=RunStatus.RUNNING,
+            # TZ-naive on purpose.
+            created_at=datetime(2026, 10, 27, 10),
+            granularity="M30",
+        )
+        db = self._mk_db_with_closed_count(0)
+        now = datetime(2026, 10, 29, 10, tzinfo=UTC)
+        assert qa._run_has_meaningful_activity(db, run=run, now=now) is True
+
+    def test_silence_table_has_all_configured_granularities(self):
+        """Sanity: the operator table must at least cover the pairs
+        we actually ship."""
+        for g in ("M1", "M5", "M30", "H1", "H4", "D"):
+            assert g in qa._SILENCE_HOURS_BY_GRANULARITY
+
+
 class TestLinearFiling:
     """QA wire to AFX-11's linear_client — files each work order as a
     Triage finding when the flag is on. Email path keeps running
