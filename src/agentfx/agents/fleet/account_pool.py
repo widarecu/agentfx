@@ -176,6 +176,53 @@ def allocate_slot(
     """
     now = now or datetime.now(UTC)
     try:
+        # Idempotency on restart: if this run_id already holds an
+        # IN_USE row (crash + re-schedule within the lease window),
+        # reuse it. Allocating a NEW slot would strand positions on
+        # the old account. Safe to run before the sweeps since this
+        # path only touches rows explicitly keyed to `run_id`.
+        existing = (
+            db.query(OandaAccountPool)
+            .filter(OandaAccountPool.status == OandaAccountPoolStatus.IN_USE)
+            .filter(OandaAccountPool.current_run_id == run_id)
+            .first()
+        )
+        if existing is not None:
+            try:
+                from agentfx.api.core.secrets import decrypt_secret
+
+                plaintext = decrypt_secret(bytes(existing.api_key_encrypted))
+            except Exception as exc:
+                logger.exception(
+                    "account_pool: decrypt failed on restart-reuse "
+                    "pool row=%s account_id=%s",
+                    existing.id,
+                    existing.account_id,
+                )
+                return SlotAllocation(
+                    accepted=False,
+                    reason=f"decrypt_failed_on_reuse:{type(exc).__name__}",
+                )
+            logger.info(
+                "account_pool: reusing existing allocation for run_id=%s "
+                "(pool_row=%s, account_id=%s, lease_until=%s)",
+                run_id,
+                existing.id,
+                existing.account_id,
+                existing.lease_expires_at,
+            )
+            return SlotAllocation(
+                accepted=True,
+                pool_row_id=existing.id,
+                account_id=existing.account_id,
+                environment=(
+                    existing.environment.value
+                    if hasattr(existing.environment, "value")
+                    else str(existing.environment)
+                ),
+                api_key_plaintext=plaintext,
+            )
+
         _sweep_cooldowns(db, now=now)
         _sweep_expired_leases(db, now=now)
 
@@ -238,9 +285,11 @@ def allocate_slot(
             accepted=True,
             pool_row_id=row.id,
             account_id=row.account_id,
-            environment=row.environment.value
-            if hasattr(row.environment, "value")
-            else str(row.environment),
+            environment=(
+                row.environment.value
+                if hasattr(row.environment, "value")
+                else str(row.environment)
+            ),
             api_key_plaintext=plaintext,
         )
     except Exception as exc:
@@ -320,9 +369,11 @@ def pool_summary(db: Session, *, now: datetime | None = None) -> dict:
                 {
                     "account_id": r.account_id,
                     "nickname": r.nickname,
-                    "environment": r.environment.value
-                    if hasattr(r.environment, "value")
-                    else str(r.environment),
+                    "environment": (
+                        r.environment.value
+                        if hasattr(r.environment, "value")
+                        else str(r.environment)
+                    ),
                 }
             )
         elif r.status == OandaAccountPoolStatus.COOLING_DOWN:

@@ -106,6 +106,60 @@ class TestWatchdogNotificationWiring:
         assert "crashed_pre_init" in run.stop_reason
         assert len(calls) == 1
 
+    def test_crash_release_slot_called(self):
+        """AFX-7: the watchdog must release the pool slot (if any)
+        when flipping a crashed run to ERROR, otherwise a hard-killed
+        subprocess (SIGKILL / OOM / container swap) leaks its slot
+        until the 14-day lease TTL expires."""
+        from agentfx.api.models import RunStatus
+        from agentfx.api.workers.paper_runner import _mark_run_failed_after_crash
+
+        run = _stub_run(RunStatus.RUNNING)
+        db = MagicMock()
+
+        release_calls: list[dict] = []
+
+        def spy_release(session, *, run_id):
+            release_calls.append({"run_id": run_id})
+            return True
+
+        with (
+            patch("agentfx.api.core.database.SessionLocal", return_value=db),
+            patch("agentfx.api.services.paper.get_paper_run", return_value=run),
+            patch("agentfx.notifications.post_paper_run_alert", lambda **_: None),
+            patch(
+                "agentfx.agents.fleet.account_pool.release_slot",
+                side_effect=spy_release,
+            ),
+        ):
+            _mark_run_failed_after_crash("run_watchdog_crash", exit_code=137)
+
+        assert release_calls == [{"run_id": "run_watchdog_crash"}]
+        assert run.status == RunStatus.ERROR
+
+    def test_crash_release_slot_failure_does_not_break_watchdog(self):
+        """Pool release can fail (DB flake, missing table during
+        migration window) — the watchdog's ERROR commit must stand
+        and no exception may propagate."""
+        from agentfx.api.models import RunStatus
+        from agentfx.api.workers.paper_runner import _mark_run_failed_after_crash
+
+        run = _stub_run(RunStatus.RUNNING)
+        db = MagicMock()
+
+        def boom(session, *, run_id):
+            raise RuntimeError("pool DB down")
+
+        with (
+            patch("agentfx.api.core.database.SessionLocal", return_value=db),
+            patch("agentfx.api.services.paper.get_paper_run", return_value=run),
+            patch("agentfx.notifications.post_paper_run_alert", lambda **_: None),
+            patch("agentfx.agents.fleet.account_pool.release_slot", side_effect=boom),
+        ):
+            # Must not raise.
+            _mark_run_failed_after_crash("run_watchdog_crash", exit_code=1)
+        assert run.status == RunStatus.ERROR
+
     def test_hook_exception_does_not_break_watchdog(self):
         """If the notification hook explodes, the ERROR state must
         still be persisted. The watchdog is the last line of defence

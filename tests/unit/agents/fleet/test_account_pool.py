@@ -154,6 +154,54 @@ class TestAllocate:
 # ─────────────────────────────────────────────────────────────────────
 
 
+class TestRestartReuse:
+    """AFX-7: a crashed paper runner that gets re-scheduled with the
+    SAME run_id must reuse its existing pool slot — allocating a
+    different account would strand positions on the old one."""
+
+    def test_already_held_slot_is_reused_not_reallocated(self, db):
+        row = _seed(db, api_key="original-key")
+        first = account_pool.allocate_slot(db, run_id="run_rs1")
+        assert first.accepted is True
+        first_account = first.account_id
+        db.refresh(row)
+        original_lease = row.lease_expires_at
+
+        # Second call with the SAME run_id should return the SAME slot
+        # without changing status, lease, or the row.
+        second = account_pool.allocate_slot(db, run_id="run_rs1")
+        assert second.accepted is True
+        assert second.account_id == first_account
+        assert second.api_key_plaintext == "original-key"
+        db.refresh(row)
+        assert row.status == OandaAccountPoolStatus.IN_USE
+        assert row.current_run_id == "run_rs1"
+        # Lease untouched — reuse doesn't extend.
+        assert row.lease_expires_at == original_lease
+
+    def test_restart_reuse_takes_precedence_over_free_slot(self, db):
+        """If one slot is already held by this run AND another is free,
+        reuse wins — otherwise the restart would leak the old slot
+        until lease expiry AND use a different account."""
+        _seed(db, account_id="pool-A", api_key="A-key")
+        first = account_pool.allocate_slot(db, run_id="run_rs2")
+        assert first.account_id == "pool-A"
+        _seed(db, account_id="pool-B", api_key="B-key")
+        second = account_pool.allocate_slot(db, run_id="run_rs2")
+        assert second.account_id == "pool-A"
+        assert second.api_key_plaintext == "A-key"
+
+    def test_reuse_different_run_id_still_allocates_free(self, db):
+        """The reuse path keys on run_id — a different run_id should
+        skip reuse and allocate a FREE slot as usual."""
+        _seed(db, account_id="pool-A", api_key="A-key")
+        _seed(db, account_id="pool-B", api_key="B-key")
+        a = account_pool.allocate_slot(db, run_id="run_rs3a")
+        b = account_pool.allocate_slot(db, run_id="run_rs3b")
+        assert a.accepted and b.accepted
+        assert a.account_id != b.account_id
+
+
 class TestRelease:
     def test_release_flips_to_cooling_down(self, db):
         row = _seed(db)

@@ -134,6 +134,99 @@ class TestRecoverFromAuthLoss:
         assert result is fresh_client
         fresh_client.get_account_balance.assert_called_once()
 
+    def test_pool_sourced_run_uses_pool_key_not_user_creds(self):
+        """AFX-7: when the run was pool-allocated, auth refresh must
+        re-decrypt the pool row's key — not the owner's
+        UserOandaCredentials, which belong to a different account."""
+        db = MagicMock()
+        run = self._run()
+
+        pool_row = SimpleNamespace(
+            id="pool-row-abc",
+            api_key_encrypted=b"pool-cipher",
+            environment=SimpleNamespace(value="practice"),
+            account_id="101-pool-1",
+        )
+        # First `.first()` call returns the pool row; make sure no
+        # UserOandaCredentials query ever fires.
+        db.query.return_value.filter.return_value.filter.return_value.first.return_value = pool_row
+
+        fresh_client = MagicMock()
+        fresh_client.get_account_balance.return_value = {"balance": 10_000.0}
+
+        with (
+            patch(
+                "agentfx.api.core.secrets.decrypt_secret",
+                return_value="pool-plaintext-key",
+            ) as decrypt_mock,
+            patch(
+                "agentfx.adapters.oanda.OandaClient",
+                return_value=fresh_client,
+            ) as client_cls,
+        ):
+            result = _recover_from_auth_loss(db, run, OandaError("401"))
+
+        assert result is fresh_client
+        decrypt_mock.assert_called_once_with(b"pool-cipher")
+        # OandaClient must be instantiated with the POOL's account_id,
+        # not run.oanda_account_id (which was the owner default).
+        _, kwargs = client_cls.call_args
+        assert kwargs["account_id"] == "101-pool-1"
+        assert kwargs["api_key"] == "pool-plaintext-key"
+        assert kwargs["environment"] == "practice"
+
+    def test_pool_decrypt_failure_returns_none(self):
+        """A broken pool entry (Fernet key rotated, ciphertext
+        corrupted) must halt the auth refresh — do NOT silently fall
+        through to the user's own creds, which would trade on the
+        wrong account."""
+        db = MagicMock()
+        run = self._run()
+
+        pool_row = SimpleNamespace(
+            id="pool-row-x",
+            api_key_encrypted=b"bad-cipher",
+            environment=SimpleNamespace(value="practice"),
+            account_id="101-pool-1",
+        )
+        db.query.return_value.filter.return_value.filter.return_value.first.return_value = pool_row
+
+        with patch(
+            "agentfx.api.core.secrets.decrypt_secret",
+            side_effect=RuntimeError("fernet rotated"),
+        ):
+            result = _recover_from_auth_loss(db, run, OandaError("401"))
+        assert result is None
+
+    def test_pool_key_never_logged(self, caplog):
+        """Decrypted API keys must never appear in logs — a regression
+        here is a credential-exposure incident."""
+        import logging
+
+        db = MagicMock()
+        run = self._run()
+        pool_row = SimpleNamespace(
+            id="pool-row-y",
+            api_key_encrypted=b"cipher",
+            environment=SimpleNamespace(value="practice"),
+            account_id="101-pool-1",
+        )
+        db.query.return_value.filter.return_value.filter.return_value.first.return_value = pool_row
+
+        fresh_client = MagicMock()
+        fresh_client.get_account_balance.return_value = {"balance": 10_000.0}
+
+        secret_token = "ULTRA_SECRET_TOKEN_SHOULD_NEVER_LOG"
+        with (
+            patch("agentfx.api.core.secrets.decrypt_secret", return_value=secret_token),
+            patch("agentfx.adapters.oanda.OandaClient", return_value=fresh_client),
+            caplog.at_level(logging.DEBUG),
+        ):
+            _recover_from_auth_loss(db, run, OandaError("401"))
+
+        for record in caplog.records:
+            assert secret_token not in record.getMessage()
+
     def test_fresh_client_non_auth_error_propagates(self):
         """A 5xx during the recovery health-check is a real problem
         the caller must see — recovery didn't fail auth-wise, so we
