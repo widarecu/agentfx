@@ -125,6 +125,20 @@ class QAWorkOrder(BaseModel):
     """
 
     title: str = Field(default="", description="Short imperative, max ~12 words.")
+    category: str = Field(
+        default="other",
+        description=(
+            "The divergence category this fix addresses. Must match "
+            "one of the DivergenceClassification categories above: "
+            "'cost_model', 'execution_timing', 'indicator_handling', "
+            "'regime_shift', 'validator_weakness', 'novel_finding', "
+            "'idempotency' (duplicate orders / non-idempotent broker "
+            "operations), 'instrument_coverage' (a pair/granularity "
+            "silently not analysed), or 'other'. This drives dedupe "
+            "— same (category, code-area) across runs → one Triage "
+            "issue with evidence comments appended."
+        ),
+    )
     target_file: str = Field(
         default="",
         description="Repo-relative file path the fix most likely touches.",
@@ -323,9 +337,9 @@ def _snapshot_run(db: Session, *, run_id: str) -> dict[str, Any]:
         {
             "timestamp": e.timestamp.isoformat() if e.timestamp else None,
             "balance": float(e.balance) if e.balance is not None else None,
-            "unrealized_pnl": float(e.unrealized_pnl)
-            if e.unrealized_pnl is not None
-            else None,
+            "unrealized_pnl": (
+                float(e.unrealized_pnl) if e.unrealized_pnl is not None else None
+            ),
         }
         for e in equity
     ]
@@ -338,9 +352,9 @@ def _snapshot_run(db: Session, *, run_id: str) -> dict[str, Any]:
         if genome is not None:
             genome_payload = {
                 "id": genome.id,
-                "fitness": float(genome.fitness)
-                if genome.fitness is not None
-                else None,
+                "fitness": (
+                    float(genome.fitness) if genome.fitness is not None else None
+                ),
                 "validator_passed": bool(getattr(genome, "validator_passed", False)),
                 "validation_failures": getattr(genome, "validation_failures", None),
                 "dsl": getattr(genome, "dsl_json", None),
@@ -355,9 +369,9 @@ def _snapshot_run(db: Session, *, run_id: str) -> dict[str, Any]:
                     "fold_index": getattr(f, "fold_index", None),
                     "is_oos": bool(getattr(f, "is_oos", False)),
                     "sharpe": float(f.sharpe) if f.sharpe is not None else None,
-                    "max_drawdown": float(f.max_drawdown)
-                    if f.max_drawdown is not None
-                    else None,
+                    "max_drawdown": (
+                        float(f.max_drawdown) if f.max_drawdown is not None else None
+                    ),
                     "hit_rate": float(f.hit_rate) if f.hit_rate is not None else None,
                     "n_trades": getattr(f, "n_trades", None),
                     "passed_gate_b": bool(getattr(f, "passed_gate_b", False)),
@@ -371,12 +385,12 @@ def _snapshot_run(db: Session, *, run_id: str) -> dict[str, Any]:
         "run_name": getattr(run, "name", None),
         "pair": getattr(run, "pair", None),
         "stop_reason": getattr(run, "stop_reason", None),
-        "initial_balance": float(run.initial_balance)
-        if run.initial_balance is not None
-        else None,
-        "current_balance": float(run.current_balance)
-        if run.current_balance is not None
-        else None,
+        "initial_balance": (
+            float(run.initial_balance) if run.initial_balance is not None else None
+        ),
+        "current_balance": (
+            float(run.current_balance) if run.current_balance is not None else None
+        ),
         "pnl": float(run.pnl) if run.pnl is not None else None,
         "trades_recent": trade_payload,
         "equity_recent": equity_payload,
@@ -416,6 +430,15 @@ Platform context Wilson wants you to remember:
 
 Output must be a QADivergenceReport. Headline + 2-5 sentence
 summary + classifications list + work_orders list.
+
+Each work_order MUST set `category` to the divergence category
+it addresses — matching one of your classifications. This drives
+dedupe: the SAME conceptual bug reported on a later run must
+reuse the same category so it comments on the existing Triage
+issue instead of creating a new one. If a work order doesn't
+map to one of the standard divergence categories, use the
+closest match ('idempotency', 'instrument_coverage', 'other'
+are available in addition to the DivergenceClassification set).
 
 Style:
 - Terse. Wilson reads a lot.
@@ -626,8 +649,8 @@ def _file_work_orders_to_linear(
 
     for wo in report.work_orders:
         try:
-            fingerprint = _work_order_fingerprint(wo.title, wo.target_file)
             area = _area_label_for(wo.target_file)
+            fingerprint = _work_order_fingerprint(wo.category, area)
             body = (
                 f"## Spec\n\n{wo.spec.strip()}\n\n"
                 f"## Expected profit impact\n\n"
@@ -659,14 +682,26 @@ def _file_work_orders_to_linear(
             )
 
 
-def _work_order_fingerprint(title: str, target_file: str) -> str:
-    """Stable short fingerprint for a QA work order. Same (title,
-    target_file) on different runs → same fingerprint → dedupes to
-    the single existing Triage issue."""
-    import hashlib
+def _work_order_fingerprint(category: str, area: str) -> str:
+    """Stable fingerprint for a QA work order.
 
-    key = f"{(title or '').strip().lower()}|{(target_file or '').strip().lower()}"
-    return f"qa:{hashlib.sha256(key.encode()).hexdigest()[:12]}"
+    Keyed on (semantic category, code area), not (title, target_file).
+    Sonnet 5 generates different titles and names different files for
+    the same conceptual issue across runs — observed 2026-10-29 when
+    the same idempotency bug was filed three times (AFX-42, AFX-44,
+    AFX-46) with varying titles AND different (non-existent) file
+    paths. The only stable surface is the enum category Sonnet 5
+    picks, plus the Area label we already derive from target_file.
+
+    This means Sonnet 5 may file at most one Triage issue per
+    (category × area) pair per topic. That's correct: a second
+    idempotency finding in paper-runner is evidence on the existing
+    one (comment), not a new issue.
+    """
+    cat = (category or "other").strip().lower()
+    normalised_area = (area or "paper runner").strip().lower().replace(" ", "_")
+    normalised_area = normalised_area.replace("/", "_")
+    return f"qa:{cat}:{normalised_area}"
 
 
 def _area_label_for(target_file: str) -> str:
