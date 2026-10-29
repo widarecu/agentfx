@@ -33,15 +33,11 @@ from .user import User, UserRole
 from .user_credentials import (
     OandaEnvironment,
     UserOandaAccount,
+    UserOandaAccountPoolStatus,
     UserOandaCredentials,
 )
 from .agent_decision import AgentDecision, AgentRole
 from .agent_workspace_run import AgentWorkspaceRun, AgentWorkspaceRunStatus
-from .oanda_account_pool import (
-    OandaAccountPool,
-    OandaAccountPoolEnvironment,
-    OandaAccountPoolStatus,
-)
 from .verified_gap import VerifiedEmptyGap
 
 # Make models available at the package level
@@ -76,9 +72,10 @@ __all__ = [
     "DecisionLog",
     "AgentType",
     "UserAction",
-    # User credentials (US-019 / v0.6.0)
+    # User credentials (US-019 / v0.6.0; AFX-7 adds fleet-pool state)
     "UserOandaCredentials",
     "UserOandaAccount",
+    "UserOandaAccountPoolStatus",
     "OandaEnvironment",
     # Agent Fleet (v0.8.0)
     "AgentDecision",
@@ -86,8 +83,4 @@ __all__ = [
     # PE Managed Agents workspace dispatches (v0.8.1 C.2 Phase 2)
     "AgentWorkspaceRun",
     "AgentWorkspaceRunStatus",
-    # OANDA account pool (v0.8.1 C.3)
-    "OandaAccountPool",
-    "OandaAccountPoolStatus",
-    "OandaAccountPoolEnvironment",
 ]

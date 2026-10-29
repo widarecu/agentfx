@@ -128,6 +128,7 @@ from .user_credentials import (
     UserOandaAccountPublic,
     UserOandaAccountsList,
     UserOandaCredentialsPublic,
+    UserOandaCredentialsSettingsPatch,
     UserOandaCredentialsUpsert,
     VerifyCredentialsResponse,
 )
@@ -229,6 +230,7 @@ __all__ = [
     "ValidationFoldExport",
     # User credentials (US-019 / v0.6.0)
     "UserOandaCredentialsPublic",
+    "UserOandaCredentialsSettingsPatch",
     "UserOandaCredentialsUpsert",
     "UserOandaAccountPublic",
     "UserOandaAccountsList",

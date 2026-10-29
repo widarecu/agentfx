@@ -14,7 +14,6 @@ from .routers import (
     auth,
     evolution,
     market_data,
-    oanda_pool,
     optimization,
     paper,
     runs,
@@ -243,11 +242,6 @@ app.include_router(
     paper.router,
     prefix=settings.API_V1_STR,
     tags=["paper-runs"],
-)
-app.include_router(
-    oanda_pool.router,
-    prefix=f"{settings.API_V1_STR}/oanda-pool",
-    tags=["oanda-pool"],
 )
 
 
