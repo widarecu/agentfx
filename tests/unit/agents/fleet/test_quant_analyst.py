@@ -322,6 +322,86 @@ class TestLinearFiling:
                 report=report, run_id="r", today=date(2026, 10, 26)
             )
 
+    def test_fingerprint_stable_across_varying_titles_and_file_paths(self):
+        """Regression for AFX-42/44/46 (2026-10-29): the same bug was
+        filed three times because Sonnet 5 named the file differently
+        on each run and the fingerprint was keyed on
+        (title, target_file). Keying on (category, area) means two
+        work orders about the same conceptual issue map to one
+        Triage issue even when Sonnet 5 varies surface wording."""
+        from agentfx.agents.fleet.quant_analyst import (
+            _area_label_for,
+            _work_order_fingerprint,
+        )
+
+        day1_area = _area_label_for("src/agentfx/services/paper_runner.py")
+        day2_area = _area_label_for("agentfx/execution/paper_broker.py")
+        day3_area = _area_label_for("runner/paper_trading_loop.py")
+        # Different filenames (Sonnet 5 hallucinates nonexistent paths),
+        # all heuristically map to the same area — "Paper runner".
+        assert day1_area == day2_area == day3_area == "Paper runner"
+
+        fp1 = _work_order_fingerprint("idempotency", day1_area)
+        fp2 = _work_order_fingerprint("idempotency", day2_area)
+        fp3 = _work_order_fingerprint("idempotency", day3_area)
+        assert fp1 == fp2 == fp3 == "qa:idempotency:paper_runner"
+
+    def test_fingerprint_differs_by_category_in_same_area(self):
+        """A cost_model bug and an execution_timing bug in the same
+        area are DIFFERENT issues and must file separately."""
+        from agentfx.agents.fleet.quant_analyst import _work_order_fingerprint
+
+        assert _work_order_fingerprint(
+            "cost_model", "Paper runner"
+        ) != _work_order_fingerprint("execution_timing", "Paper runner")
+
+    def test_fingerprint_tolerates_missing_category(self):
+        """A pre-category Sonnet 5 response still gets a fingerprint
+        (default 'other') so dedupe doesn't crash."""
+        from agentfx.agents.fleet.quant_analyst import _work_order_fingerprint
+
+        assert _work_order_fingerprint("", "Paper runner") == "qa:other:paper_runner"
+        assert _work_order_fingerprint("other", "") == "qa:other:paper_runner"
+
+    def test_each_work_order_filed_uses_category_fingerprint(self):
+        """End-to-end: a QAWorkOrder with an explicit category produces
+        a fingerprint that reflects it."""
+        from datetime import date
+        from unittest.mock import MagicMock, patch
+        from agentfx.agents.fleet.quant_analyst import (
+            QADivergenceReport,
+            QAWorkOrder,
+            _file_work_orders_to_linear,
+        )
+        from agentfx.integrations.linear_client import FilingResult
+
+        report = QADivergenceReport(
+            headline="dup orders",
+            summary="",
+            work_orders=[
+                QAWorkOrder(
+                    title="Fix idempotency on broker submit",
+                    category="idempotency",
+                    target_file="src/agentfx/services/paper_runner.py",
+                    spec="Multiple identical orders in a 50ms window.",
+                    expected_profit_impact="Avoid duplicate-fill losses.",
+                ),
+            ],
+        )
+        file_finding_mock = MagicMock(
+            return_value=FilingResult(
+                filed=True, identifier="AFX-200", action="created"
+            )
+        )
+        with patch(
+            "agentfx.integrations.linear_client.file_finding", file_finding_mock
+        ):
+            _file_work_orders_to_linear(
+                report=report, run_id="run_x", today=date(2026, 10, 29)
+            )
+        spec = file_finding_mock.call_args_list[0].args[0]
+        assert spec.fingerprint == "qa:idempotency:paper_runner"
+
     def test_area_label_heuristic(self):
         from agentfx.agents.fleet.quant_analyst import _area_label_for
 

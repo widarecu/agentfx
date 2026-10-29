@@ -147,6 +147,41 @@ class TestSkippedResult:
         assert result.output is None
         assert result.skipped_reason == "api_failure"
 
+    def test_pydantic_validation_error_logs_field_details(self, monkeypatch, caplog):
+        """When the SDK bubbles a Pydantic ValidationError (seen
+        2026-10-29 on PMBrief), the log must include `exc.errors()`
+        so Railway log review can tell which field broke without
+        a second round trip. The call still returns skipped_result
+        — the orchestrator never crashes on an LLM error."""
+        import logging
+        from pydantic import ValidationError
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
+
+        try:
+            _DummySchema.model_validate({"text": "ok", "score": "not-a-number"})
+        except ValidationError as exc:
+            real_validation_error = exc
+
+        broken_client = MagicMock()
+        _wire_stream(broken_client, exc=real_validation_error)
+
+        with caplog.at_level(logging.WARNING, logger="agentfx.agents.fleet.llm"):
+            result = fleet_llm.structured_call(
+                model="claude-haiku-4-5",
+                system="sys",
+                user="user",
+                schema=_DummySchema,
+                client=broken_client,
+            )
+
+        assert result.output is None
+        assert result.skipped_reason == "api_failure"
+        # The log line must carry structured error detail.
+        joined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "pydantic_errors=" in joined
+        assert "score" in joined  # the specific field that failed
+
     def test_uses_streaming_not_parse(self, monkeypatch):
         """AFX-41 regression: `structured_call` must use
         `messages.stream(...)` (context manager) and never

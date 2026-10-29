@@ -205,17 +205,26 @@ def structured_call(
         ) as stream:
             resp = stream.get_final_message()
     except Exception as exc:  # noqa: BLE001 — logged + wrapped
-        # Pydantic ValidationError includes the specific field + value
-        # that failed. The default `str(exc)` cuts it off at
-        # "1 validation error for X" — use repr() + str(exc) together
-        # so we see the detailed field path. Previously (2026-10-07)
-        # this was silently costing us Sonnet 5 calls for a schema
-        # field mismatch we couldn't diagnose.
+        # For a Pydantic ValidationError, `exc.errors()` returns a
+        # structured list of (loc, msg, type, input) tuples that
+        # names the failing field + value. str(exc) gives a
+        # human-readable summary but truncates per-field detail.
+        # We log both so Railway log review can see which field
+        # Haiku/Sonnet broke on without a second round trip.
+        # Previous version (2026-10-07) logged only str(exc) and
+        # we lost ~15 min diagnosing a schema mismatch each time.
+        errors_detail: Any = None
+        try:
+            errors_detail = exc.errors()  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
         logger.warning(
-            "fleet.llm: structured call failed model=%s err_type=%s err=%s",
+            "fleet.llm: structured call failed model=%s err_type=%s err=%s "
+            "pydantic_errors=%s",
             model,
             type(exc).__name__,
             exc,
+            errors_detail,
         )
         return _skipped_result(model, "api_failure")
 
@@ -236,9 +245,11 @@ def structured_call(
                 {
                     "idx": i,
                     "type": getattr(block, "type", type(block).__name__),
-                    "text_head": (block_text[:500] + "…")
-                    if isinstance(block_text, str) and len(block_text) > 500
-                    else block_text,
+                    "text_head": (
+                        (block_text[:500] + "…")
+                        if isinstance(block_text, str) and len(block_text) > 500
+                        else block_text
+                    ),
                     "has_parsed_attr": hasattr(block, "parsed"),
                     "has_input_attr": hasattr(block, "input"),
                 }
