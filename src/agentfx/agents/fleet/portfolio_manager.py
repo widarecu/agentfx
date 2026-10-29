@@ -79,25 +79,43 @@ def _already_run_today(db: Session, *, today: date) -> bool:
 
 
 class PMRecommendation(BaseModel):
-    """One concrete suggestion from the morning brief."""
+    """One concrete suggestion from the morning brief.
+
+    Fields default so Haiku's structured output can omit any one
+    without tripping Pydantic strict validation (2026-10-29: a
+    missing `priority` on a single list item took the whole brief
+    into deterministic fallback). Rendering code already handles
+    empty strings cleanly.
+    """
 
     priority: str = Field(
+        default="watch",
         description=(
             "'now' for immediate action, 'this_week' for near-term, "
             "'watch' for monitor-only. Only one 'now' per brief at most."
-        )
+        ),
     )
-    headline: str = Field(description="One-line action, no more than ~15 words.")
+    headline: str = Field(
+        default="", description="One-line action, no more than ~15 words."
+    )
     rationale: str = Field(
-        description="Why — tie back to a specific state snapshot fact or prior decision."
+        default="",
+        description="Why — tie back to a specific state snapshot fact or prior decision.",
     )
 
 
 class PMConcern(BaseModel):
-    """A flag the PM is raising for Wilson's attention."""
+    """A flag the PM is raising for Wilson's attention.
 
-    severity: str = Field(description="'blocker' / 'degraded' / 'noted'.")
-    description: str = Field(description="What's wrong and what it affects.")
+    Fields default for the same reason as PMRecommendation above.
+    """
+
+    severity: str = Field(
+        default="noted", description="'blocker' / 'degraded' / 'noted'."
+    )
+    description: str = Field(
+        default="", description="What's wrong and what it affects."
+    )
 
 
 class PMBrief(BaseModel):
@@ -453,13 +471,19 @@ def _render_user_prompt(
 def _call_haiku(
     state: dict[str, Any], prior_briefs: list[dict[str, Any]]
 ) -> LLMCallResult:
-    """Fire the structured Claude Haiku 4.5 call."""
+    """Fire the structured Claude Haiku 4.5 call.
+
+    `max_tokens=4096` leaves headroom for a full brief (headline +
+    summary + up to 4 recommendations + concerns + evolution_actions).
+    1024 was tight — a long summary could truncate the JSON mid-list
+    and trip Pydantic (2026-10-29).
+    """
     return structured_call(
         model=settings.AGENT_PM_MODEL,
         system=_SYSTEM_PROMPT,
         user=_render_user_prompt(state, prior_briefs),
         schema=PMBrief,
-        max_tokens=1024,
+        max_tokens=4096,
     )
 
 

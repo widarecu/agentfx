@@ -327,6 +327,51 @@ class TestMarkdownRendering:
         assert "non-terminal non-RUNNING" not in md
 
 
+class TestPMBriefSchemaTolerance:
+    """Regression for 2026-10-29 production incident: Haiku returned a
+    structured PMBrief whose first PMRecommendation omitted
+    `priority`, tripping Pydantic strict validation and sending the
+    whole brief into deterministic fallback. The schema now defaults
+    every nested field so missing values don't blow up the brief."""
+
+    def test_pm_recommendation_builds_from_empty_dict(self):
+        from agentfx.agents.fleet.portfolio_manager import PMRecommendation
+
+        rec = PMRecommendation.model_validate({})
+        assert rec.priority == "watch"
+        assert rec.headline == ""
+        assert rec.rationale == ""
+
+    def test_pm_concern_builds_from_empty_dict(self):
+        from agentfx.agents.fleet.portfolio_manager import PMConcern
+
+        c = PMConcern.model_validate({})
+        assert c.severity == "noted"
+        assert c.description == ""
+
+    def test_pm_brief_builds_with_partial_recommendation(self):
+        """A single recommendation missing its `priority` must not
+        fail the whole brief — this was the exact 2026-10-29 shape."""
+        from agentfx.agents.fleet.portfolio_manager import PMBrief
+
+        brief = PMBrief.model_validate(
+            {
+                "headline": "H",
+                "summary": "S",
+                "recommendations": [
+                    {"headline": "do X"},
+                    {"priority": "now", "headline": "do Y", "rationale": "why"},
+                ],
+                "concerns": [{"description": "oops"}],
+            }
+        )
+        assert len(brief.recommendations) == 2
+        assert brief.recommendations[0].priority == "watch"
+        assert brief.recommendations[0].headline == "do X"
+        assert brief.recommendations[0].rationale == ""
+        assert brief.concerns[0].severity == "noted"
+
+
 class TestEvolutionFiller:
     """Filler loop — Wilson 2026-10-22. Must:
     - skip when budget exhausted
