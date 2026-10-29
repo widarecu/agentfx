@@ -243,6 +243,26 @@ def _mark_run_failed_after_crash(run_id: str, exit_code: int | None) -> None:
                     exit_code,
                     "APPROVED" if pre_init else "RUNNING",
                 )
+                # AFX-7: release the fleet pool slot if the crashed
+                # subprocess held one. The subprocess's _mark_terminal
+                # would have released on a clean exit; this covers hard
+                # crashes (SIGKILL, OOM, container swap). Never re-raises.
+                try:
+                    from agentfx.agents.fleet.account_pool import release_slot
+
+                    released = release_slot(db, run_id=run_id)
+                    if released:
+                        db.commit()
+                        logger.info(
+                            "watchdog: released pool slot for crashed run %s",
+                            run_id,
+                        )
+                except Exception:  # noqa: BLE001 — watchdog stability
+                    logger.exception(
+                        "watchdog: pool release errored for crashed run %s — "
+                        "lease TTL will reclaim",
+                        run_id,
+                    )
                 # v0.6.2 (Wilson UAT 2026-07-19): Slack alert on
                 # watchdog-detected crash. Idempotent — if the
                 # subprocess got as far as calling `_mark_terminal`

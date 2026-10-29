@@ -75,6 +75,7 @@ export function OandaAccountsTable({
                 <th className="text-left px-4 py-2 font-medium">Account ID</th>
                 <th className="text-left px-4 py-2 font-medium">Alias</th>
                 <th className="text-left px-4 py-2 font-medium">Currency</th>
+                <th className="text-left px-4 py-2 font-medium">Pool</th>
                 <th className="text-right px-4 py-2 font-medium">Last seen</th>
               </tr>
             </thead>
@@ -86,6 +87,9 @@ export function OandaAccountsTable({
                   </td>
                   <td className="px-4 py-2">{a.alias ?? '—'}</td>
                   <td className="px-4 py-2">{a.currency}</td>
+                  <td className="px-4 py-2">
+                    <PoolStatusPill account={a} />
+                  </td>
                   <td className="px-4 py-2 text-right text-xs text-slate-500">
                     {formatRelative(a.last_seen_at)}
                   </td>
@@ -119,3 +123,65 @@ function formatRelative(iso: string): string {
 }
 
 export { formatRelative as _formatRelative };
+
+/**
+ * AFX-7: compact badge showing a sub-account's fleet-pool status.
+ * Only meaningful when the parent credentials have opted into
+ * `allow_fleet_pool_use`; when they haven't, every row still reads
+ * "free" (default column value) but the pool never sees these rows.
+ * We keep the pill rendering here anyway so the operator can SEE
+ * the current state after flipping the toggle on.
+ */
+function PoolStatusPill({ account }: { account: UserOandaAccountPublic }) {
+  const status = account.pool_status;
+  const base =
+    'inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium';
+  if (status === 'in_use') {
+    return (
+      <span
+        title={
+          account.pool_current_run_id
+            ? `Held by run ${account.pool_current_run_id}`
+            : 'In use'
+        }
+        className={`${base} bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300`}
+      >
+        In use
+      </span>
+    );
+  }
+  if (status === 'cooling_down') {
+    const until = account.pool_cooling_until
+      ? Math.max(
+          0,
+          Math.floor(
+            (new Date(account.pool_cooling_until).getTime() - Date.now()) / 1000,
+          ),
+        )
+      : 0;
+    return (
+      <span
+        title={`Cools down in ${until}s`}
+        className={`${base} bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300`}
+      >
+        Cooling
+      </span>
+    );
+  }
+  if (status === 'disabled') {
+    return (
+      <span
+        className={`${base} bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300`}
+      >
+        Disabled
+      </span>
+    );
+  }
+  return (
+    <span
+      className={`${base} bg-emerald-50 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300`}
+    >
+      Free
+    </span>
+  );
+}
