@@ -57,6 +57,27 @@ logger = logging.getLogger(__name__)
 # variance. Terminal runs (any stop_reason) bypass this threshold.
 _MIN_TRADES_FOR_ANALYSIS = 3
 
+# Zero-trade silence threshold per granularity. A RUNNING paper
+# run with 0 closed trades for this many hours past its start
+# triggers QA analysis anyway — the silence IS the divergence from
+# backtest (which presumably had non-zero activity). Calibrated so
+# M30 → 24h (48 bars = one trading day's worth of M30 opportunities).
+# Scaled from there: low-frequency pairs (H4, D) take longer before
+# silence is suspicious; M1/M5 fire faster. Values are an operator
+# knob — adjust in prod if a timeframe reports too eagerly or too
+# late. 2026-10-29 incident: AUD_USD/M30 ran for 2 days with 0
+# trades and QA never looked at it; this gate exists for that case.
+_SILENCE_HOURS_BY_GRANULARITY: dict[str, float] = {
+    "M1": 6,
+    "M5": 12,
+    "M15": 18,
+    "M30": 24,
+    "H1": 48,
+    "H4": 7 * 24,
+    "D": 14 * 24,
+}
+_DEFAULT_SILENCE_HOURS = 48.0
+
 
 def _report_key_for(run_id: str, today: date) -> str:
     """`decision_key` for idempotency: one QA report per run per day."""
@@ -223,15 +244,19 @@ def scan_and_run_reports(*, db: Session, now: datetime | None = None) -> int:
     return produced
 
 
-def _candidate_runs(db: Session, *, today: date) -> list[str]:
+def _candidate_runs(
+    db: Session, *, today: date, now: datetime | None = None
+) -> list[str]:
     """Return paper run IDs that need a QA report for today.
 
     Candidate = PAPER environment AND (RUNNING with ≥N trades OR
-    reached a terminal stop_reason within the last day) AND no QA
-    report already written for `today`.
+    reached a terminal stop_reason within the last day OR running
+    silently with 0 trades past the granularity-scaled silence
+    threshold) AND no QA report already written for `today`.
     """
     from agentfx.api.models.run import Run, RunEnvironment, RunStatus
 
+    now = now or datetime.now(UTC)
     yesterday = today - timedelta(days=1)
     terminal_since = datetime.combine(yesterday, datetime.min.time(), tzinfo=UTC)
 
@@ -248,7 +273,7 @@ def _candidate_runs(db: Session, *, today: date) -> list[str]:
         # Idempotency check first — cheaper than counting trades.
         if _already_reported(db, run_id=str(r.id), today=today):
             continue
-        if _run_has_meaningful_activity(db, run=r):
+        if _run_has_meaningful_activity(db, run=r, now=now):
             out.append(str(r.id))
     return out
 
@@ -264,13 +289,18 @@ def _already_reported(db: Session, *, run_id: str, today: date) -> bool:
     return exists is not None
 
 
-def _run_has_meaningful_activity(db: Session, *, run: Any) -> bool:
+def _run_has_meaningful_activity(
+    db: Session, *, run: Any, now: datetime | None = None
+) -> bool:
     """Return True iff a run has produced enough data to analyse.
 
-    Three cases qualify:
+    Four cases qualify:
     1. A terminal stop_reason has been set — always worth a post-mortem.
-    2. Any trade has entered a closed state (exit_timestamp set).
-    3. ≥N trades exist for the run (RUNNING case).
+    2. ≥N closed trades exist for the run (the usual case).
+    3. RUNNING with 0 closed trades past the granularity-scaled
+       silence threshold — the silence IS the finding (zero-trade
+       runs are a divergence from backtest). Added 2026-10-29 after
+       AUD_USD/M30 ran 2 days with 0 trades and QA never looked.
     """
     from agentfx.api.models.run import RunStatus, Trade
 
@@ -283,7 +313,31 @@ def _run_has_meaningful_activity(db: Session, *, run: Any) -> bool:
         .filter(Trade.exit_timestamp.isnot(None))
         .count()
     )
-    return closed_count >= _MIN_TRADES_FOR_ANALYSIS
+    if closed_count >= _MIN_TRADES_FOR_ANALYSIS:
+        return True
+
+    # Zero/low-trade silence path — only for RUNNING runs. A
+    # terminally-stopped run with closed_count < N already fell
+    # through case 1 above (either stop_reason was set or it
+    # wasn't; if it was, we returned True; if it wasn't, we
+    # shouldn't synthesise activity from silence).
+    if closed_count == 0 and run.status == RunStatus.RUNNING:
+        now = now or datetime.now(UTC)
+        created_at = getattr(run, "created_at", None)
+        if created_at is None:
+            return False
+        # Normalise to UTC for the comparison — DB rows may come
+        # back as timezone-naive depending on dialect.
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        elapsed_hours = (now - created_at).total_seconds() / 3600.0
+        silence_hours = _SILENCE_HOURS_BY_GRANULARITY.get(
+            getattr(run, "granularity", ""), _DEFAULT_SILENCE_HOURS
+        )
+        if elapsed_hours >= silence_hours:
+            return True
+
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -379,11 +433,31 @@ def _snapshot_run(db: Session, *, run_id: str) -> dict[str, Any]:
                 for f in folds
             ]
 
+    closed_trades_count = (
+        db.query(Trade)
+        .filter(Trade.run_id == run_id)
+        .filter(Trade.exit_timestamp.isnot(None))
+        .count()
+    )
+    created_at = getattr(run, "created_at", None)
+    if created_at is not None and created_at.tzinfo is None:
+        created_at_aware = created_at.replace(tzinfo=UTC)
+    else:
+        created_at_aware = created_at
+    run_age_hours = (
+        (datetime.now(UTC) - created_at_aware).total_seconds() / 3600.0
+        if created_at_aware is not None
+        else None
+    )
+
     return {
         "run_id": run_id,
         "run_status": run.status.value if run.status else None,
         "run_name": getattr(run, "name", None),
         "pair": getattr(run, "pair", None),
+        "granularity": getattr(run, "granularity", None),
+        "created_at": created_at_aware.isoformat() if created_at_aware else None,
+        "run_age_hours": round(run_age_hours, 1) if run_age_hours is not None else None,
         "stop_reason": getattr(run, "stop_reason", None),
         "initial_balance": (
             float(run.initial_balance) if run.initial_balance is not None else None
@@ -392,6 +466,7 @@ def _snapshot_run(db: Session, *, run_id: str) -> dict[str, Any]:
             float(run.current_balance) if run.current_balance is not None else None
         ),
         "pnl": float(run.pnl) if run.pnl is not None else None,
+        "closed_trades_count": closed_trades_count,
         "trades_recent": trade_payload,
         "equity_recent": equity_payload,
         "genome": genome_payload,
@@ -427,6 +502,17 @@ Platform context Wilson wants you to remember:
   at least two staging runs; backtest cost model systematically
   under-models M1 spread. If what you see is one of these, say so
   explicitly — "same pattern as the 2026-09 incident."
+
+Zero-trade silence IS a divergence:
+- If `closed_trades_count == 0` and `run_age_hours` is substantial
+  for the granularity (e.g. >24h on M30, >48h on H1), that's a
+  signal-mechanism bug — the backtest produced trades, the live
+  genome isn't. Likely causes: entry-threshold mismatch between
+  backtest and live indicator values, indicator look-ahead that
+  the live loop can't honour, stale candle data, or a validator
+  that didn't catch a near-zero-trade genome. Classify as
+  `indicator_handling` or `validator_weakness` as appropriate and
+  propose a work order — this is NOT 'nothing to report'.
 
 Output must be a QADivergenceReport. Headline + 2-5 sentence
 summary + classifications list + work_orders list.
