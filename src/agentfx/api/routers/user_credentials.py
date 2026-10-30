@@ -59,6 +59,7 @@ def _public_view(
         verified_at=row.verified_at,
         verify_failure_reason=row.verify_failure_reason,
         key_version=row.key_version,
+        allow_fleet_pool_use=bool(row.allow_fleet_pool_use),
         updated_at=row.updated_at,
     )
 
@@ -68,12 +69,21 @@ def _account_view(
     *,
     active_paper_run_id: str | None = None,
 ) -> schemas.UserOandaAccountPublic:
+    pool_status = (
+        row.pool_status.value
+        if hasattr(row.pool_status, "value")
+        else str(row.pool_status or "free")
+    )
     return schemas.UserOandaAccountPublic(
         oanda_account_id=row.oanda_account_id,
         alias=row.alias,
         currency=row.currency,
         last_seen_at=row.last_seen_at,
         active_paper_run_id=active_paper_run_id,
+        pool_status=pool_status,
+        pool_current_run_id=row.current_run_id,
+        pool_in_use_since=row.in_use_since,
+        pool_cooling_until=row.cooling_until,
     )
 
 
@@ -145,6 +155,36 @@ def upsert_my_credentials(
         # Cached accounts are stale by definition now — drop.
         for acct in list(row.accounts):
             db.delete(acct)
+
+    db.commit()
+    db.refresh(row)
+    return _public_view(row)
+
+
+@router.patch(
+    "/users/me/credentials/settings",
+    response_model=schemas.UserOandaCredentialsPublic,
+)
+def patch_my_credentials_settings(
+    body: schemas.UserOandaCredentialsSettingsPatch,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> schemas.UserOandaCredentialsPublic:
+    """Update settings-side flags without rotating the API key.
+
+    AFX-7: this is how the caller flips `allow_fleet_pool_use` from
+    the Settings page. Separated from PUT so a low-privilege toggle
+    doesn't force the operator to re-paste their token.
+    """
+    row = _load_credentials(db, current_user.id)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No OANDA credentials set for this user",
+        )
+
+    if body.allow_fleet_pool_use is not None:
+        row.allow_fleet_pool_use = body.allow_fleet_pool_use
 
     db.commit()
     db.refresh(row)
@@ -578,9 +618,11 @@ def oanda_close_probe(
                     "body": (
                         {"longUnits": "ALL"}
                         if long_units > 0
-                        else {"shortUnits": "ALL"}
-                        if short_units != 0
-                        else "no open side"
+                        else (
+                            {"shortUnits": "ALL"}
+                            if short_units != 0
+                            else "no open side"
+                        )
                     ),
                 },
                 {

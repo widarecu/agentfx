@@ -134,6 +134,102 @@ class TestRecoverFromAuthLoss:
         assert result is fresh_client
         fresh_client.get_account_balance.assert_called_once()
 
+    def test_pool_sourced_run_uses_pool_credentials_not_owner(self):
+        """AFX-7: when the run holds a pool slot, auth refresh must
+        re-decrypt the POOL sub-account's parent credentials — not
+        the owner's own UserOandaCredentials, which belong to a
+        different account."""
+        db = MagicMock()
+        run = self._run()
+
+        pool_creds = SimpleNamespace(
+            oanda_api_key_encrypted=b"pool-cipher",
+            oanda_environment=SimpleNamespace(value="practice"),
+        )
+        pool_row = SimpleNamespace(
+            id="pool-row-abc",
+            oanda_account_id="101-pool-1",
+            credentials=pool_creds,
+        )
+        # First `.first()` call returns the pool row (pool path);
+        # the ensuing `.one_or_none()` for user creds should never fire.
+        db.query.return_value.filter.return_value.filter.return_value.first.return_value = pool_row
+
+        fresh_client = MagicMock()
+        fresh_client.get_account_balance.return_value = {"balance": 10_000.0}
+
+        with (
+            patch(
+                "agentfx.api.core.secrets.decrypt_secret",
+                return_value="pool-plaintext-key",
+            ) as decrypt_mock,
+            patch(
+                "agentfx.adapters.oanda.OandaClient", return_value=fresh_client
+            ) as client_cls,
+        ):
+            result = _recover_from_auth_loss(db, run, OandaError("401"))
+
+        assert result is fresh_client
+        decrypt_mock.assert_called_once_with(b"pool-cipher")
+        _, kwargs = client_cls.call_args
+        assert kwargs["account_id"] == "101-pool-1"
+        assert kwargs["api_key"] == "pool-plaintext-key"
+        assert kwargs["environment"] == "practice"
+
+    def test_pool_decrypt_failure_returns_none(self):
+        """Broken pool credentials halt the auth refresh — do NOT
+        silently fall through to the owner's own creds, which would
+        trade on the wrong account."""
+        db = MagicMock()
+        run = self._run()
+
+        pool_creds = SimpleNamespace(
+            oanda_api_key_encrypted=b"bad-cipher",
+            oanda_environment=SimpleNamespace(value="practice"),
+        )
+        pool_row = SimpleNamespace(
+            id="pool-row-x",
+            oanda_account_id="101-pool-1",
+            credentials=pool_creds,
+        )
+        db.query.return_value.filter.return_value.filter.return_value.first.return_value = pool_row
+
+        with patch(
+            "agentfx.api.core.secrets.decrypt_secret",
+            side_effect=RuntimeError("fernet rotated"),
+        ):
+            result = _recover_from_auth_loss(db, run, OandaError("401"))
+        assert result is None
+
+    def test_pool_key_never_logged(self, caplog):
+        """Decrypted api keys must never appear in logs — regression
+        here is a credential-exposure incident."""
+        import logging
+
+        db = MagicMock()
+        run = self._run()
+        pool_creds = SimpleNamespace(
+            oanda_api_key_encrypted=b"cipher",
+            oanda_environment=SimpleNamespace(value="practice"),
+        )
+        pool_row = SimpleNamespace(
+            id="pool-row-y",
+            oanda_account_id="101-pool-1",
+            credentials=pool_creds,
+        )
+        db.query.return_value.filter.return_value.filter.return_value.first.return_value = pool_row
+        fresh_client = MagicMock()
+        fresh_client.get_account_balance.return_value = {"balance": 10_000.0}
+        secret_token = "ULTRA_SECRET_TOKEN_SHOULD_NEVER_LOG"
+        with (
+            patch("agentfx.api.core.secrets.decrypt_secret", return_value=secret_token),
+            patch("agentfx.adapters.oanda.OandaClient", return_value=fresh_client),
+            caplog.at_level(logging.DEBUG),
+        ):
+            _recover_from_auth_loss(db, run, OandaError("401"))
+        for record in caplog.records:
+            assert secret_token not in record.getMessage()
+
     def test_fresh_client_non_auth_error_propagates(self):
         """A 5xx during the recovery health-check is a real problem
         the caller must see — recovery didn't fail auth-wise, so we
