@@ -22,9 +22,12 @@ import uuid
 from enum import Enum
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
+    Float,
     ForeignKey,
+    Index,
     Integer,
     LargeBinary,
     String,
@@ -44,6 +47,23 @@ class OandaEnvironment(str, Enum):
 
     PRACTICE = "practice"
     LIVE = "live"
+
+
+class UserOandaAccountPoolStatus(str, Enum):
+    """Fleet-pool lifecycle for a single UserOandaAccount row.
+
+    - FREE: available to the fleet's `allocate_slot` (default).
+    - IN_USE: a paper run is currently trading on this account.
+    - COOLING_DOWN: a run just released it; allocator re-flips to
+      FREE once `cooling_until` passes.
+    - DISABLED: operator took it out of rotation (future flag — not
+      editable from the current Settings UI).
+    """
+
+    FREE = "free"
+    IN_USE = "in_use"
+    COOLING_DOWN = "cooling_down"
+    DISABLED = "disabled"
 
 
 def _uuid_hex() -> str:
@@ -97,6 +117,16 @@ class UserOandaCredentials(Base):
     # and bump the version.
     key_version = Column(Integer, nullable=False, default=1)
 
+    # AFX-7 opt-in: when True, the fleet's `account_pool.allocate_slot`
+    # may lease sub-accounts under these credentials to paper runs it
+    # spawns. Default False — opt-in is explicit so a user who adds
+    # OANDA creds for their own portal use never has their accounts
+    # silently conscripted into fleet experiments. Flipped via the
+    # Settings page.
+    allow_fleet_pool_use = Column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
     created_at = Column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -149,6 +179,30 @@ class UserOandaAccount(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
+    # ─── Fleet pool state (AFX-7) ───
+    # Only consulted when the parent credentials row has
+    # `allow_fleet_pool_use=True`. All fields are server-managed by
+    # `agents/fleet/account_pool.py`; the portal is read-only on them.
+    pool_status = Column(
+        SQLEnum(
+            UserOandaAccountPoolStatus,
+            values_callable=lambda x: [e.value for e in x],
+            name="useroandaaccountpoolstatus",
+        ),
+        nullable=False,
+        default=UserOandaAccountPoolStatus.FREE,
+        server_default=UserOandaAccountPoolStatus.FREE.value,
+    )
+    current_run_id = Column(String(120), nullable=True)
+    in_use_since = Column(DateTime(timezone=True), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    cooling_until = Column(DateTime(timezone=True), nullable=True)
+    last_run_id = Column(String(120), nullable=True)
+    last_run_ended_at = Column(DateTime(timezone=True), nullable=True)
+    cumulative_pnl_14d = Column(
+        Float, nullable=False, default=0.0, server_default="0.0"
+    )
+
     created_at = Column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -160,6 +214,14 @@ class UserOandaAccount(Base):
             "user_credentials_id",
             "oanda_account_id",
             name="uq_user_oanda_account_per_credentials",
+        ),
+        Index(
+            "ix_user_oanda_account_pool_status",
+            "pool_status",
+        ),
+        Index(
+            "ix_user_oanda_account_current_run_id",
+            "current_run_id",
         ),
     )
 
@@ -173,5 +235,6 @@ class UserOandaAccount(Base):
 __all__ = [
     "OandaEnvironment",
     "UserOandaAccount",
+    "UserOandaAccountPoolStatus",
     "UserOandaCredentials",
 ]

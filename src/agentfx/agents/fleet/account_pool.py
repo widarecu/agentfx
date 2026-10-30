@@ -1,31 +1,38 @@
-"""OANDA account pool helpers (v0.8.1 C.3).
+"""OANDA account pool helpers (AFX-7 — pivoted 2026-10-29).
 
-Fleet-side allocation + release logic for the `oanda_account_pool`
-table. v0.8.1 ships the data model + admin surface + these helpers;
-v0.8.2 wires PM to actually call `allocate_slot` when it approves a
-paper deployment.
+The pool is derived from `UserOandaAccount` rows under
+`UserOandaCredentials.allow_fleet_pool_use=True`. OANDA's
+`/v3/accounts` already enumerates every sub-account under a user's
+single API token (synced on credential verify), so a separate pool
+table + admin UI was redundant architecture — the operator opts in
+once via a Settings toggle and every sub-account they can see is
+lendable to the fleet.
 
 Design philosophy:
-- The pool is append-only from the operator's side (Wilson POSTs new
-  accounts via `/oanda-pool/accounts`). Deletes are supported but
-  rare — status flips to DISABLED cover the usual "take this out of
-  rotation temporarily" case.
-- Allocation is simple-first: FIFO over the FREE set, oldest-created
-  first so cooled-down accounts cycle in evenly. v0.8.2 will swap
-  this for a scoring function (prefer accounts with positive 14d
-  P&L, etc.) once there's enough history to grade.
+- Allocation reads: FIFO over FREE sub-accounts belonging to any
+  consenting credentials row, oldest-created first so cooled-down
+  accounts cycle in evenly. The parent credentials' api_key is
+  decrypted per allocation (one shared key for all its sub-accounts).
 - Release is DB-authoritative: when a paper run terminates, the
-  paper runner calls `release_slot(run_id)` which flips the pool
-  row to COOLING_DOWN with a 1h gate. No background sweeper needed
-  — allocation reads automatically re-flip COOLING_DOWN rows to
-  FREE once `cooling_until` has passed.
+  paper runner calls `release_slot(run_id)` which flips the
+  `UserOandaAccount` row to COOLING_DOWN with a 1h gate. No
+  background sweeper needed — allocation reads automatically re-flip
+  COOLING_DOWN rows to FREE once `cooling_until` has passed.
 - Lease TTL protects against stuck IN_USE rows if a paper runner
   crashes without releasing. Default 14 days; allocation reads
   reclaim expired leases automatically.
+- Idempotency on same `run_id`: a crashed subprocess that gets
+  re-scheduled with the SAME run_id reuses its existing slot.
+  Allocating a different account would strand positions on the old
+  one.
 
-Why not an in-memory lock? Multiple backend processes (if we ever
-scale horizontally) would race. DB row-level status is the only
-consistent authority.
+Opt-in semantics: a user who adds OANDA creds for their own portal
+use is NEVER opted in by default (`allow_fleet_pool_use=False`). The
+Settings page is the only place that flips it.
+
+Environment: fleet pool is practice-only. Live credentials, even
+when consented, are refused — pool allocation returns
+`refused:live_env_blocked`.
 """
 
 from __future__ import annotations
@@ -36,10 +43,11 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
-from agentfx.api.models.oanda_account_pool import (
-    OandaAccountPool,
-    OandaAccountPoolEnvironment,
-    OandaAccountPoolStatus,
+from agentfx.api.models.user_credentials import (
+    OandaEnvironment,
+    UserOandaAccount,
+    UserOandaAccountPoolStatus,
+    UserOandaCredentials,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,8 +65,8 @@ _DEFAULT_LEASE_DAYS = 14
 _DEFAULT_COOLING_HOURS = 1
 
 # Soft cap: the fleet won't allocate past this many concurrent paper
-# runs. Prevents runaway even if Wilson adds a huge number of pool
-# accounts. Can be raised via settings later.
+# runs across the entire pool. Prevents runaway even if the operator
+# consents a huge number of sub-accounts.
 _MAX_CONCURRENT_PAPER_RUNS = 10
 
 
@@ -77,7 +85,7 @@ class SlotAllocation:
     time and should be consumed immediately (never logged, never
     persisted).
 
-    `pool_row_id` is the opaque pool-row id to pass back to
+    `pool_row_id` is the opaque UserOandaAccount id to pass back to
     `release_slot(run_id)` when the paper run terminates.
     """
 
@@ -101,14 +109,14 @@ def _sweep_cooldowns(db: Session, *, now: datetime) -> int:
 
     Returns the number of rows transitioned."""
     rows = (
-        db.query(OandaAccountPool)
-        .filter(OandaAccountPool.status == OandaAccountPoolStatus.COOLING_DOWN)
-        .filter(OandaAccountPool.cooling_until.isnot(None))
-        .filter(OandaAccountPool.cooling_until <= now)
+        db.query(UserOandaAccount)
+        .filter(UserOandaAccount.pool_status == UserOandaAccountPoolStatus.COOLING_DOWN)
+        .filter(UserOandaAccount.cooling_until.isnot(None))
+        .filter(UserOandaAccount.cooling_until <= now)
         .all()
     )
     for row in rows:
-        row.status = OandaAccountPoolStatus.FREE
+        row.pool_status = UserOandaAccountPoolStatus.FREE
         row.cooling_until = None
     if rows:
         db.flush()
@@ -122,17 +130,17 @@ def _sweep_expired_leases(db: Session, *, now: datetime) -> int:
 
     Returns the number of rows reclaimed."""
     rows = (
-        db.query(OandaAccountPool)
-        .filter(OandaAccountPool.status == OandaAccountPoolStatus.IN_USE)
-        .filter(OandaAccountPool.lease_expires_at.isnot(None))
-        .filter(OandaAccountPool.lease_expires_at <= now)
+        db.query(UserOandaAccount)
+        .filter(UserOandaAccount.pool_status == UserOandaAccountPoolStatus.IN_USE)
+        .filter(UserOandaAccount.lease_expires_at.isnot(None))
+        .filter(UserOandaAccount.lease_expires_at <= now)
         .all()
     )
     for row in rows:
         logger.warning(
             "account_pool: reclaiming expired lease on account_id=%s "
             "run_id=%s (lease was until %s, now %s)",
-            row.account_id,
+            row.oanda_account_id,
             row.current_run_id,
             row.lease_expires_at,
             now,
@@ -142,10 +150,26 @@ def _sweep_expired_leases(db: Session, *, now: datetime) -> int:
         row.current_run_id = None
         row.in_use_since = None
         row.lease_expires_at = None
-        row.status = OandaAccountPoolStatus.FREE
+        row.pool_status = UserOandaAccountPoolStatus.FREE
     if rows:
         db.flush()
     return len(rows)
+
+
+def _decrypt_credentials_key(creds: UserOandaCredentials) -> str | None:
+    """Decrypt the parent credentials row's api_key. Returns None on
+    failure (and logs); callers treat None as a refused allocation."""
+    try:
+        from agentfx.api.core.secrets import decrypt_secret
+
+        return decrypt_secret(bytes(creds.oanda_api_key_encrypted))
+    except Exception:
+        logger.exception(
+            "account_pool: decrypt failed for credentials id=%s user_id=%s",
+            creds.id,
+            creds.user_id,
+        )
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -157,31 +181,74 @@ def allocate_slot(
     db: Session,
     *,
     run_id: str,
-    environment: OandaAccountPoolEnvironment | None = None,
+    environment: OandaEnvironment | None = None,
     lease_days: int = _DEFAULT_LEASE_DAYS,
     now: datetime | None = None,
 ) -> SlotAllocation:
-    """Reserve a FREE pool account for `run_id`.
+    """Reserve a FREE sub-account for `run_id`.
 
+    - Idempotent on `run_id`: a reschedule of the same run reuses its
+      existing allocation (critical — allocating a different account
+      would strand OANDA positions on the old one).
+    - Only considers sub-accounts whose parent credentials have
+      `allow_fleet_pool_use=True`.
+    - LIVE environment is refused even when consented — fleet pool
+      is practice-only per AFX-7's off-limits list.
     - Sweeps expired leases + cooled-down rows first so the FREE set
       is current.
     - Enforces the fleet-wide concurrency cap.
-    - Allocates the oldest-FREE row matching `environment` (or any
-      environment if None).
-    - Flips the row to IN_USE with lease, decrypts the API key, and
-      returns the triple the paper runner needs.
+    - Allocates the oldest-created FREE sub-account matching
+      `environment` (or any environment if None).
+    - Flips the row to IN_USE with lease, decrypts the parent's
+      api_key, and returns the triple the paper runner needs.
 
     Never raises. On any error / no eligible row, returns
     `SlotAllocation(accepted=False, reason=...)`.
     """
+    if environment == OandaEnvironment.LIVE:
+        return SlotAllocation(accepted=False, reason="refused:live_env_blocked")
+
     now = now or datetime.now(UTC)
     try:
+        # Idempotency on restart: if this run_id already holds a row,
+        # reuse it. Safe to run before the sweeps.
+        existing = (
+            db.query(UserOandaAccount)
+            .filter(UserOandaAccount.pool_status == UserOandaAccountPoolStatus.IN_USE)
+            .filter(UserOandaAccount.current_run_id == run_id)
+            .first()
+        )
+        if existing is not None:
+            creds = existing.credentials
+            plaintext = _decrypt_credentials_key(creds)
+            if plaintext is None:
+                return SlotAllocation(accepted=False, reason="decrypt_failed_on_reuse")
+            env_value = (
+                creds.oanda_environment.value
+                if hasattr(creds.oanda_environment, "value")
+                else str(creds.oanda_environment)
+            )
+            logger.info(
+                "account_pool: reusing existing allocation for run_id=%s "
+                "(account_id=%s, lease_until=%s)",
+                run_id,
+                existing.oanda_account_id,
+                existing.lease_expires_at,
+            )
+            return SlotAllocation(
+                accepted=True,
+                pool_row_id=existing.id,
+                account_id=existing.oanda_account_id,
+                environment=env_value,
+                api_key_plaintext=plaintext,
+            )
+
         _sweep_cooldowns(db, now=now)
         _sweep_expired_leases(db, now=now)
 
         in_use_count = (
-            db.query(OandaAccountPool)
-            .filter(OandaAccountPool.status == OandaAccountPoolStatus.IN_USE)
+            db.query(UserOandaAccount)
+            .filter(UserOandaAccount.pool_status == UserOandaAccountPoolStatus.IN_USE)
             .count()
         )
         if in_use_count >= _MAX_CONCURRENT_PAPER_RUNS:
@@ -190,46 +257,45 @@ def allocate_slot(
                 reason=f"concurrent_cap_hit:{in_use_count}/{_MAX_CONCURRENT_PAPER_RUNS}",
             )
 
+        # Pick the oldest FREE sub-account whose parent credentials
+        # (a) consent to fleet use and (b) match the requested env.
         q = (
-            db.query(OandaAccountPool)
-            .filter(OandaAccountPool.status == OandaAccountPoolStatus.FREE)
-            .order_by(OandaAccountPool.created_at.asc())
+            db.query(UserOandaAccount)
+            .join(UserOandaCredentials, UserOandaAccount.credentials)
+            .filter(UserOandaCredentials.allow_fleet_pool_use.is_(True))
+            .filter(UserOandaCredentials.oanda_environment != OandaEnvironment.LIVE)
+            .filter(UserOandaAccount.pool_status == UserOandaAccountPoolStatus.FREE)
+            .order_by(UserOandaAccount.created_at.asc())
         )
         if environment is not None:
-            q = q.filter(OandaAccountPool.environment == environment)
+            q = q.filter(UserOandaCredentials.oanda_environment == environment)
         row = q.first()
         if row is None:
+            env_label = environment.value if environment else "any"
             return SlotAllocation(
-                accepted=False,
-                reason=f"no_free_account:env={environment or 'any'}",
+                accepted=False, reason=f"no_free_account:env={env_label}"
             )
 
-        # Decrypt the API key — fail allocation (don't commit the
-        # transition) if the Fernet key can't open the ciphertext.
-        try:
-            from agentfx.api.core.secrets import decrypt_secret
+        creds = row.credentials
+        plaintext = _decrypt_credentials_key(creds)
+        if plaintext is None:
+            return SlotAllocation(accepted=False, reason="decrypt_failed")
 
-            plaintext = decrypt_secret(bytes(row.api_key_encrypted))
-        except Exception as exc:
-            logger.exception(
-                "account_pool: decrypt failed for pool row=%s account_id=%s",
-                row.id,
-                row.account_id,
-            )
-            return SlotAllocation(
-                accepted=False, reason=f"decrypt_failed:{type(exc).__name__}"
-            )
-
-        row.status = OandaAccountPoolStatus.IN_USE
+        row.pool_status = UserOandaAccountPoolStatus.IN_USE
         row.current_run_id = run_id
         row.in_use_since = now
         row.lease_expires_at = now + timedelta(days=lease_days)
         db.flush()
 
+        env_value = (
+            creds.oanda_environment.value
+            if hasattr(creds.oanda_environment, "value")
+            else str(creds.oanda_environment)
+        )
         logger.info(
             "account_pool: allocated account_id=%s to run_id=%s "
-            "(pool_row=%s, lease=%d days)",
-            row.account_id,
+            "(row=%s, lease=%d days)",
+            row.oanda_account_id,
             run_id,
             row.id,
             lease_days,
@@ -237,10 +303,8 @@ def allocate_slot(
         return SlotAllocation(
             accepted=True,
             pool_row_id=row.id,
-            account_id=row.account_id,
-            environment=row.environment.value
-            if hasattr(row.environment, "value")
-            else str(row.environment),
+            account_id=row.oanda_account_id,
+            environment=env_value,
             api_key_plaintext=plaintext,
         )
     except Exception as exc:
@@ -259,21 +323,22 @@ def release_slot(
     cooling_hours: int = _DEFAULT_COOLING_HOURS,
     now: datetime | None = None,
 ) -> bool:
-    """Release the pool row currently held by `run_id`, transitioning
-    it to COOLING_DOWN with the specified cooling-down window.
+    """Release the sub-account currently held by `run_id`,
+    transitioning it to COOLING_DOWN with the specified cooling
+    window.
 
     Returns True iff a row was found and released. False means the
-    run wasn't holding any pool slot (benign — paper runs created
-    before the pool existed, or a double-release).
+    run wasn't holding any pool slot (benign — paper runs that
+    bypassed the pool, or a double-release).
 
     Never raises.
     """
     now = now or datetime.now(UTC)
     try:
         row = (
-            db.query(OandaAccountPool)
-            .filter(OandaAccountPool.status == OandaAccountPoolStatus.IN_USE)
-            .filter(OandaAccountPool.current_run_id == run_id)
+            db.query(UserOandaAccount)
+            .filter(UserOandaAccount.pool_status == UserOandaAccountPoolStatus.IN_USE)
+            .filter(UserOandaAccount.current_run_id == run_id)
             .first()
         )
         if row is None:
@@ -284,12 +349,12 @@ def release_slot(
         row.current_run_id = None
         row.in_use_since = None
         row.lease_expires_at = None
-        row.status = OandaAccountPoolStatus.COOLING_DOWN
+        row.pool_status = UserOandaAccountPoolStatus.COOLING_DOWN
         row.cooling_until = now + timedelta(hours=cooling_hours)
         db.flush()
         logger.info(
             "account_pool: released account_id=%s from run_id=%s (cooling until %s)",
-            row.account_id,
+            row.oanda_account_id,
             run_id,
             row.cooling_until,
         )
@@ -303,29 +368,40 @@ def pool_summary(db: Session, *, now: datetime | None = None) -> dict:
     """Lightweight snapshot of pool health, shaped for the PM
     scheduling-context payload.
 
-    Returns counts by status, concurrent-run usage against the cap,
-    and the oldest FREE/COOLING_DOWN rows so PM can anticipate
-    allocations.
+    Only counts sub-accounts whose parent credentials consent to
+    fleet use (`allow_fleet_pool_use=True`).
     """
     now = now or datetime.now(UTC)
-    rows = db.query(OandaAccountPool).all()
+    rows = (
+        db.query(UserOandaAccount)
+        .join(UserOandaCredentials, UserOandaAccount.credentials)
+        .filter(UserOandaCredentials.allow_fleet_pool_use.is_(True))
+        .all()
+    )
     counts: dict[str, int] = {}
     free_accounts: list[dict] = []
     cooling_accounts: list[dict] = []
     for r in rows:
-        key = r.status.value if hasattr(r.status, "value") else str(r.status)
+        key = (
+            r.pool_status.value
+            if hasattr(r.pool_status, "value")
+            else str(r.pool_status)
+        )
         counts[key] = counts.get(key, 0) + 1
-        if r.status == OandaAccountPoolStatus.FREE:
+        if r.pool_status == UserOandaAccountPoolStatus.FREE:
+            env = (
+                r.credentials.oanda_environment.value
+                if hasattr(r.credentials.oanda_environment, "value")
+                else str(r.credentials.oanda_environment)
+            )
             free_accounts.append(
                 {
-                    "account_id": r.account_id,
-                    "nickname": r.nickname,
-                    "environment": r.environment.value
-                    if hasattr(r.environment, "value")
-                    else str(r.environment),
+                    "account_id": r.oanda_account_id,
+                    "alias": r.alias,
+                    "environment": env,
                 }
             )
-        elif r.status == OandaAccountPoolStatus.COOLING_DOWN:
+        elif r.pool_status == UserOandaAccountPoolStatus.COOLING_DOWN:
             # SQLite drops tz-info on stored DateTime columns; Postgres
             # preserves it. Normalise both sides so the subtraction
             # works regardless of backend.
@@ -337,11 +413,11 @@ def pool_summary(db: Session, *, now: datetime | None = None) -> dict:
                 seconds_until_free = int((until - now).total_seconds())
             cooling_accounts.append(
                 {
-                    "account_id": r.account_id,
+                    "account_id": r.oanda_account_id,
                     "seconds_until_free": max(0, seconds_until_free),
                 }
             )
-    in_use_count = counts.get(OandaAccountPoolStatus.IN_USE.value, 0)
+    in_use_count = counts.get(UserOandaAccountPoolStatus.IN_USE.value, 0)
     return {
         "total_accounts": len(rows),
         "status_counts": counts,

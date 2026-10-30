@@ -22,6 +22,7 @@ import {
   deleteMyCredentials,
   getMyCredentials,
   listMyAccounts,
+  patchMyCredentialsSettings,
   upsertMyCredentials,
   verifyMyCredentials,
 } from '../services/credentialsApi';
@@ -242,6 +243,24 @@ export default function Settings() {
             reverifying={verifying}
           />
 
+          <FleetPoolOptInCard
+            allowFleetPoolUse={state.credentials.allow_fleet_pool_use}
+            onToggle={async (next) => {
+              try {
+                const updated = await patchMyCredentialsSettings({
+                  allow_fleet_pool_use: next,
+                });
+                setState((prev) =>
+                  prev.kind === 'verified'
+                    ? { ...prev, credentials: updated }
+                    : prev,
+                );
+              } catch (err) {
+                setPageError(err instanceof Error ? err.message : String(err));
+              }
+            }}
+          />
+
           <OandaAccountsTable
             accounts={state.accounts}
             verifiedAt={state.credentials.verified_at}
@@ -351,6 +370,65 @@ function VerifiedBadgeCard({
             Delete
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function FleetPoolOptInCard({
+  allowFleetPoolUse,
+  onToggle,
+}: {
+  allowFleetPoolUse: boolean;
+  onToggle: (next: boolean) => void | Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const handleClick = async () => {
+    setBusy(true);
+    try {
+      await onToggle(!allowFleetPoolUse);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-6">
+      <div className="flex items-start justify-between gap-6">
+        <div>
+          <div className="text-sm font-semibold mb-1">
+            Allow fleet to use my OANDA accounts for paper experiments
+          </div>
+          <p className="text-xs text-slate-500 dark:text-slate-400 max-w-xl">
+            When on, AgentFX's autonomous fleet may lease any of your
+            OANDA practice sub-accounts (shown below) for its own paper
+            runs. The fleet never uses your live creds — opt-in applies
+            to practice only. Each sub-account is held for at most one
+            paper run at a time; the "Pool" column below shows what's
+            currently in use. Turn off any time to stop new allocations
+            (runs already in flight keep their slot until they halt).
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={handleClick}
+          disabled={busy}
+          aria-pressed={allowFleetPoolUse}
+          className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 disabled:opacity-50 ${
+            allowFleetPoolUse
+              ? 'bg-emerald-500'
+              : 'bg-slate-300 dark:bg-slate-600'
+          }`}
+        >
+          <span className="sr-only">
+            {allowFleetPoolUse ? 'Disable fleet pool use' : 'Enable fleet pool use'}
+          </span>
+          <span
+            aria-hidden="true"
+            className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition ${
+              allowFleetPoolUse ? 'translate-x-5' : 'translate-x-0'
+            }`}
+          />
+        </button>
       </div>
     </div>
   );

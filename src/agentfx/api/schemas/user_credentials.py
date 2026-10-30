@@ -30,6 +30,10 @@ class UserOandaCredentialsPublic(BaseSchema):
     verified_at: datetime | None = None
     verify_failure_reason: str | None = None
     key_version: int
+    # AFX-7: when True, the fleet may lease the caller's OANDA sub-
+    # accounts for its own paper experiments. Default False — flipped
+    # from the Settings page.
+    allow_fleet_pool_use: bool = False
     updated_at: datetime | None = None
 
 
@@ -51,6 +55,23 @@ class UserOandaCredentialsUpsert(BaseSchema):
     )
 
 
+class UserOandaCredentialsSettingsPatch(BaseSchema):
+    """PATCH body — Settings-side toggles that don't rotate the API key.
+
+    Keeping key rotation separate (via the full PUT) means a
+    low-privilege toggle like `allow_fleet_pool_use` can be flipped
+    without forcing the operator to re-paste their token.
+    """
+
+    allow_fleet_pool_use: bool | None = Field(
+        default=None,
+        description=(
+            "Opt-in to lending your OANDA sub-accounts to the fleet "
+            "for paper experiments. Omit to leave unchanged."
+        ),
+    )
+
+
 class UserOandaAccountPublic(BaseSchema):
     """One row in the cached accounts list."""
 
@@ -65,6 +86,15 @@ class UserOandaAccountPublic(BaseSchema):
     # before submit. See `find_active_paper_run_on_account` in
     # services/paper.py for the exact query.
     active_paper_run_id: str | None = None
+    # AFX-7: fleet-pool state per sub-account. Read-only to the UI —
+    # it's server-managed by `agents/fleet/account_pool.py`. Only
+    # populated when the parent credentials have
+    # `allow_fleet_pool_use=True`; otherwise `pool_status` is "free"
+    # but the pool never sees these rows anyway.
+    pool_status: str = "free"
+    pool_current_run_id: str | None = None
+    pool_in_use_since: datetime | None = None
+    pool_cooling_until: datetime | None = None
 
 
 class UserOandaAccountsList(BaseSchema):
@@ -94,6 +124,7 @@ __all__ = [
     "UserOandaAccountPublic",
     "UserOandaAccountsList",
     "UserOandaCredentialsPublic",
+    "UserOandaCredentialsSettingsPatch",
     "UserOandaCredentialsUpsert",
     "VerifyCredentialsResponse",
 ]

@@ -12,6 +12,7 @@ import { API_BASE_URL } from './config';
 import type {
   UserOandaAccountsList,
   UserOandaCredentialsPublic,
+  UserOandaCredentialsSettingsPatch,
   UserOandaCredentialsUpsert,
   VerifyCredentialsResponse,
 } from '../types/credentials';
@@ -90,6 +91,17 @@ export async function verifyMyCredentials(): Promise<VerifyCredentialsResponse> 
   const res = await fetch(`${API_BASE_URL}/users/me/credentials/verify`, {
     method: 'POST',
     headers: authHeaders(),
+  });
+  return handleResponse(res);
+}
+
+export async function patchMyCredentialsSettings(
+  body: UserOandaCredentialsSettingsPatch,
+): Promise<UserOandaCredentialsPublic> {
+  const res = await fetch(`${API_BASE_URL}/users/me/credentials/settings`, {
+    method: 'PATCH',
+    headers: authHeaders(),
+    body: JSON.stringify(body),
   });
   return handleResponse(res);
 }
