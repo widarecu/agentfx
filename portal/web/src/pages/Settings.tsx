@@ -266,6 +266,7 @@ export default function Settings() {
             verifiedAt={state.credentials.verified_at}
             onReverify={handleVerify}
             reverifying={verifying}
+            allowFleetPoolUse={state.credentials.allow_fleet_pool_use}
           />
 
           {editing && (

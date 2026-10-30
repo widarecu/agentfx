@@ -22,6 +22,11 @@ interface OandaAccountsTableProps {
   verifiedAt: string | null;
   onReverify?: () => void;
   reverifying?: boolean;
+  /** AFX-7: whether the parent credentials have opted into the fleet
+   *  pool. Controls the Pool column's rendering so a "free" default
+   *  pool_status doesn't read as "fleet-available" when the account
+   *  isn't actually poolable. */
+  allowFleetPoolUse?: boolean;
 }
 
 export function OandaAccountsTable({
@@ -29,6 +34,7 @@ export function OandaAccountsTable({
   verifiedAt,
   onReverify,
   reverifying = false,
+  allowFleetPoolUse = false,
 }: OandaAccountsTableProps) {
   return (
     <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-6">
@@ -88,7 +94,10 @@ export function OandaAccountsTable({
                   <td className="px-4 py-2">{a.alias ?? '—'}</td>
                   <td className="px-4 py-2">{a.currency}</td>
                   <td className="px-4 py-2">
-                    <PoolStatusPill account={a} />
+                    <PoolStatusPill
+                      account={a}
+                      allowFleetPoolUse={allowFleetPoolUse}
+                    />
                   </td>
                   <td className="px-4 py-2 text-right text-xs text-slate-500">
                     {formatRelative(a.last_seen_at)}
@@ -126,62 +135,155 @@ export { formatRelative as _formatRelative };
 
 /**
  * AFX-7: compact badge showing a sub-account's fleet-pool status.
- * Only meaningful when the parent credentials have opted into
- * `allow_fleet_pool_use`; when they haven't, every row still reads
- * "free" (default column value) but the pool never sees these rows.
- * We keep the pill rendering here anyway so the operator can SEE
- * the current state after flipping the toggle on.
+ *
+ * Five distinguishable states so the operator sees the real picture:
+ *
+ * 1. Opt-in OFF (`allowFleetPoolUse=false`) → "Not pooled" (slate).
+ *    The row's `pool_status` is "free" by default but the fleet
+ *    never considers it — rendering "Free" here would read as
+ *    "fleet-available" and lie to the operator.
+ * 2. Opt-in ON + fleet is holding the slot (`pool_status=in_use`)
+ *    → "In use (fleet)" (blue). Tooltip names the run id.
+ * 3. Opt-in ON + a direct-path paper run is live on this account
+ *    (`active_paper_run_id` present but `pool_status != in_use`)
+ *    → "In use (direct)" (indigo). This covers runs started
+ *    before opt-in, or any path that bypassed the pool.
+ * 4. Opt-in ON + pool is cooling it down → "Cooling" (amber), with
+ *    countdown tooltip.
+ * 5. Opt-in ON + genuinely free → "Free" (emerald, fleet-available).
+ *
+ * Also DISABLED (operator took a sub-account out of rotation) still
+ * renders when opt-in is ON — distinct from "not pooled".
  */
-function PoolStatusPill({ account }: { account: UserOandaAccountPublic }) {
-  const status = account.pool_status;
-  const base =
-    'inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium';
-  if (status === 'in_use') {
-    return (
-      <span
-        title={
-          account.pool_current_run_id
-            ? `Held by run ${account.pool_current_run_id}`
-            : 'In use'
-        }
-        className={`${base} bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300`}
-      >
-        In use
-      </span>
-    );
+export type PoolColumnKind =
+  | 'not-pooled'
+  | 'fleet-in-use'
+  | 'direct-in-use'
+  | 'cooling'
+  | 'disabled'
+  | 'free';
+
+export interface PoolColumnView {
+  kind: PoolColumnKind;
+  label: string;
+  title: string;
+  /** Tailwind classes for the pill. Pulled out so tests don't need to
+   *  parse DOM to confirm which state rendered. */
+  tone: string;
+}
+
+/**
+ * Pure selector: given an account + the parent credentials' opt-in
+ * flag, pick which Pool-column pill to show. Kept pure so tests can
+ * assert all 5 states without rendering React / DOM.
+ *
+ * `now` is injected so cooldown countdowns are deterministic in tests.
+ */
+export function selectPoolColumnView(
+  account: UserOandaAccountPublic,
+  allowFleetPoolUse: boolean,
+  now: number = Date.now(),
+): PoolColumnView {
+  if (!allowFleetPoolUse) {
+    const extra = account.active_paper_run_id ? ' · paper run active' : '';
+    return {
+      kind: 'not-pooled',
+      label: 'Not pooled',
+      title:
+        'Opt-in to fleet pool is OFF — this account is not lendable to ' +
+        'fleet experiments.' + extra,
+      tone:
+        'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 ' +
+        'border border-slate-200 dark:border-slate-700',
+    };
   }
-  if (status === 'cooling_down') {
+
+  if (account.pool_status === 'in_use') {
+    return {
+      kind: 'fleet-in-use',
+      label: 'In use (fleet)',
+      title: account.pool_current_run_id
+        ? `Held by fleet run ${account.pool_current_run_id}`
+        : 'In use by the fleet',
+      tone: 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300',
+    };
+  }
+
+  // Opt-in is ON but there's a non-pool paper run running on this
+  // account. Common path: run started pre-opt-in and continued on
+  // owner creds. The fleet won't allocate this slot while the direct
+  // run holds it (OANDA single-run-per-account guard), so the badge
+  // tells the operator what's going on.
+  if (account.active_paper_run_id) {
+    return {
+      kind: 'direct-in-use',
+      label: 'In use (direct)',
+      title:
+        `Direct paper run ${account.active_paper_run_id} is active on ` +
+        'this account (not via the fleet pool — likely started before ' +
+        'opt-in, or deployed directly from the Approval Queue).',
+      tone:
+        'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300',
+    };
+  }
+
+  if (account.pool_status === 'cooling_down') {
     const until = account.pool_cooling_until
       ? Math.max(
           0,
           Math.floor(
-            (new Date(account.pool_cooling_until).getTime() - Date.now()) / 1000,
+            (new Date(account.pool_cooling_until).getTime() - now) / 1000,
           ),
         )
       : 0;
-    return (
-      <span
-        title={`Cools down in ${until}s`}
-        className={`${base} bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300`}
-      >
-        Cooling
-      </span>
-    );
+    return {
+      kind: 'cooling',
+      label: 'Cooling',
+      title: `Cools down in ${until}s before the fleet can reuse it`,
+      tone:
+        'bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300',
+    };
   }
-  if (status === 'disabled') {
-    return (
-      <span
-        className={`${base} bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300`}
-      >
-        Disabled
-      </span>
-    );
+
+  if (account.pool_status === 'disabled') {
+    return {
+      kind: 'disabled',
+      label: 'Disabled',
+      title: 'Operator took this account out of rotation',
+      tone:
+        'bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300',
+    };
   }
+
+  return {
+    kind: 'free',
+    label: 'Free',
+    title: 'Available for the fleet to allocate on the next run',
+    tone:
+      'bg-emerald-50 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300',
+  };
+}
+
+/**
+ * AFX-7: compact badge showing a sub-account's fleet-pool status.
+ * Thin wrapper around `selectPoolColumnView`.
+ */
+function PoolStatusPill({
+  account,
+  allowFleetPoolUse,
+}: {
+  account: UserOandaAccountPublic;
+  allowFleetPoolUse: boolean;
+}) {
+  const view = selectPoolColumnView(account, allowFleetPoolUse);
   return (
     <span
-      className={`${base} bg-emerald-50 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300`}
+      title={view.title}
+      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium ${view.tone}`}
     >
-      Free
+      {view.label}
     </span>
   );
 }
+
+export { PoolStatusPill as _PoolStatusPill };
