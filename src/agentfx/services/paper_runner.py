@@ -243,6 +243,42 @@ def pip_size_for_pair(pair: str) -> float:
 # ─────────────────────────────────────────────────────────────────────
 
 
+def _should_try_pool_on_boot(db, *, run) -> bool:
+    """Return True iff this subprocess boot is safe to call
+    `allocate_slot` on.
+
+    Two paths qualify:
+    1. First boot of a brand-new run (`started_at is None`). The run
+       has no OANDA state yet — a fresh pool account is correct.
+    2. Restart of a run that still holds a pool slot. The pool helper's
+       idempotent-reuse branch returns the SAME account, preserving
+       continuity.
+
+    Everything else — restarts of pre-opt-in runs, restarts whose
+    previous pool slot was released on terminal, orphan-recoveries —
+    MUST NOT grab a fresh pool account. Doing so strands positions
+    on the account the prior subprocess traded against (the AUD_USD
+    crash loop on 2026-10-30 was exactly this: 8 pool accounts in
+    2 hours, one held for 14 seconds, each subprocess crashing when
+    the reconciler couldn't find positions on the new account).
+    """
+    from agentfx.api.models.user_credentials import (
+        UserOandaAccount,
+        UserOandaAccountPoolStatus,
+    )
+
+    if run.started_at is None:
+        return True
+    has_held_slot = (
+        db.query(UserOandaAccount)
+        .filter(UserOandaAccount.pool_status == UserOandaAccountPoolStatus.IN_USE)
+        .filter(UserOandaAccount.current_run_id == str(run.id))
+        .first()
+        is not None
+    )
+    return has_held_slot
+
+
 def _ensure_started_at(run) -> None:
     """Set `run.started_at` to now IF and ONLY IF it's currently None.
 
@@ -282,7 +318,7 @@ def run_paper_run(
     # SQLAlchemy or the OANDA HTTP client (unit tests hit
     # `decide_action` and `_snapshot_balance_if_needed` directly).
     from agentfx.adapters.oanda import OandaClient
-    from agentfx.agents.fleet.account_pool import allocate_slot
+    from agentfx.agents.fleet.account_pool import SlotAllocation, allocate_slot
     from agentfx.api.core.database import SessionLocal
     from agentfx.api.core.secrets import decrypt_secret
     from agentfx.api.models import Run, RunStatus, UserOandaCredentials
@@ -302,13 +338,42 @@ def run_paper_run(
         # `allow_fleet_pool_use=True`. On empty pool / cap hit / any
         # other refusal, fall through to the owner's own credentials
         # exactly as before — the pool is additive, never a blocker.
+        #
+        # Restart safety (2026-10-31 incident): pool allocation on a
+        # subprocess boot is only safe when EITHER (a) this is the run's
+        # very first boot (started_at is None), OR (b) the run already
+        # holds a pool slot (so `allocate_slot`'s idempotent-reuse branch
+        # returns the same account_id). Any other restart — including
+        # recovery of a run that pre-dated the opt-in or whose previous
+        # pool slot was released on terminal — must NOT grab a fresh
+        # pool account, because that would strand positions on the
+        # account the earlier subprocess was trading against. On those
+        # restarts we skip the pool entirely and fall back to the
+        # run's stored `oanda_account_id` + owner creds.
         api_key: str | None = None
         env_value: str | None = None
         account_id: str | None = None
         used_pool = False
-        allocation = allocate_slot(
-            db, run_id=run_id, environment=OandaEnvironment.PRACTICE
-        )
+
+        is_first_boot = run.started_at is None
+        should_try_pool = _should_try_pool_on_boot(db, run=run)
+
+        if should_try_pool:
+            allocation = allocate_slot(
+                db, run_id=run_id, environment=OandaEnvironment.PRACTICE
+            )
+        else:
+            allocation = SlotAllocation(
+                accepted=False, reason="restart_without_held_slot_skipped"
+            )
+            logger.info(
+                "paper runner: run %s restart without held pool slot — "
+                "skipping pool allocation to preserve account_id continuity "
+                "(stored oanda_account_id=%s)",
+                run_id,
+                run.oanda_account_id,
+            )
+
         if allocation.accepted:
             api_key = allocation.api_key_plaintext
             env_value = allocation.environment
@@ -318,12 +383,16 @@ def run_paper_run(
             used_pool = True
             # NB: never log api_key — just the identifiers.
             logger.info(
-                "paper runner: run %s using pool slot account_id=%s env=%s",
+                "paper runner: run %s using pool slot account_id=%s env=%s "
+                "(first_boot=%s)",
                 run_id,
                 account_id,
                 env_value,
+                is_first_boot,
             )
-        else:
+        elif should_try_pool:
+            # Only log a "refused" diagnostic when we actually ASKED the
+            # pool. The restart-skip path above has its own log line.
             logger.info(
                 "paper runner: run %s pool allocation refused (%s); "
                 "falling back to owner UserOandaCredentials",
