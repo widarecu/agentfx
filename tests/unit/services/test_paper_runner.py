@@ -802,6 +802,52 @@ class TestMarkTerminal:
         db.commit.assert_called()
 
 
+class TestShouldTryPoolOnBoot:
+    """`_should_try_pool_on_boot` is the gate that prevents the 2026-10-30
+    AUD_USD crash loop from recurring: a run that already booted once
+    and has NO held pool slot must NOT trigger a fresh pool allocation,
+    because that would strand positions on the account the prior
+    subprocess used."""
+
+    def _mk_run(self, *, run_id="r1", started_at=None):
+        return SimpleNamespace(id=run_id, started_at=started_at)
+
+    def _db_with_held_slot(self, *, has_slot: bool):
+        """Mock the UserOandaAccount query chain used by the helper."""
+        db = MagicMock()
+        chain = db.query.return_value.filter.return_value.filter.return_value
+        chain.first.return_value = object() if has_slot else None
+        return db
+
+    def test_first_boot_qualifies(self):
+        from agentfx.services.paper_runner import _should_try_pool_on_boot
+
+        run = self._mk_run(started_at=None)
+        db = self._db_with_held_slot(has_slot=False)
+        assert _should_try_pool_on_boot(db, run=run) is True
+
+    def test_restart_without_held_slot_skips(self):
+        """The regression case: AUD_USD/M30 crash cycle 2026-10-30."""
+        from datetime import UTC, datetime
+
+        from agentfx.services.paper_runner import _should_try_pool_on_boot
+
+        run = self._mk_run(started_at=datetime(2026, 10, 27, 10, tzinfo=UTC))
+        db = self._db_with_held_slot(has_slot=False)
+        assert _should_try_pool_on_boot(db, run=run) is False
+
+    def test_restart_with_held_slot_qualifies(self):
+        """A restart that still holds a pool slot is safe — allocate_slot's
+        idempotent-reuse branch will return the same account."""
+        from datetime import UTC, datetime
+
+        from agentfx.services.paper_runner import _should_try_pool_on_boot
+
+        run = self._mk_run(started_at=datetime(2026, 10, 27, 10, tzinfo=UTC))
+        db = self._db_with_held_slot(has_slot=True)
+        assert _should_try_pool_on_boot(db, run=run) is True
+
+
 class TestEnsureStartedAt:
     """Wilson UAT 2026-07-24: `started_at` was being rewritten on every
     subprocess boot (including lifespan orphan-recovery after a Railway
