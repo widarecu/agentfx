@@ -134,31 +134,33 @@ function formatRelative(iso: string): string {
 export { formatRelative as _formatRelative };
 
 /**
- * AFX-7: compact badge showing a sub-account's fleet-pool status.
+ * AFX-7: compact badge showing a sub-account's pool status.
  *
- * Five distinguishable states so the operator sees the real picture:
+ * After the 2026-11-01 collapse there is ONE pool. The operator
+ * picks an account from it (deploy modal); the fleet will pick from
+ * it (via `allocate_slot`, future PM dispatch). Either way the
+ * account is bound to the run at creation and stays bound until the
+ * run is DELETED. So "fleet" vs "direct" is no longer a real
+ * distinction — bound is bound.
  *
- * 1. Opt-in OFF (`allowFleetPoolUse=false`) → "Not pooled" (slate).
- *    The row's `pool_status` is "free" by default but the fleet
- *    never considers it — rendering "Free" here would read as
- *    "fleet-available" and lie to the operator.
- * 2. Opt-in ON + fleet is holding the slot (`pool_status=in_use`)
- *    → "In use (fleet)" (blue). Tooltip names the run id.
- * 3. Opt-in ON + a direct-path paper run is live on this account
- *    (`active_paper_run_id` present but `pool_status != in_use`)
- *    → "In use (direct)" (indigo). This covers runs started
- *    before opt-in, or any path that bypassed the pool.
- * 4. Opt-in ON + pool is cooling it down → "Cooling" (amber), with
- *    countdown tooltip.
- * 5. Opt-in ON + genuinely free → "Free" (emerald, fleet-available).
+ * States, in precedence order:
  *
- * Also DISABLED (operator took a sub-account out of rotation) still
- * renders when opt-in is ON — distinct from "not pooled".
+ * 1. `pool_status === 'in_use'` → "In use" (blue). Tooltip names
+ *    the bound run id. Fires regardless of the opt-in flag — the
+ *    account truly is held.
+ * 2. `pool_status === 'disabled'` → "Disabled" (slate-dark).
+ *    Operator took the sub-account out of rotation.
+ * 3. Opt-in OFF (`allowFleetPoolUse=false`) and idle → "Not pooled"
+ *    (slate). The fleet never considers it for auto-pick, but
+ *    the operator can still pick it manually.
+ * 4. `pool_status === 'cooling_down'` → "Cooling" (amber). Legacy
+ *    state only — the new release path flips straight to FREE.
+ *    Kept so pre-collapse rows don't render blank.
+ * 5. Idle + opt-in ON → "Free" (emerald). Fleet-available.
  */
 export type PoolColumnKind =
   | 'not-pooled'
-  | 'fleet-in-use'
-  | 'direct-in-use'
+  | 'in-use'
   | 'cooling'
   | 'disabled'
   | 'free';
@@ -184,46 +186,43 @@ export function selectPoolColumnView(
   allowFleetPoolUse: boolean,
   now: number = Date.now(),
 ): PoolColumnView {
+  // Precedence 1: an account truly held by a run (pool_status
+  // written at approve time) wins regardless of opt-in — the
+  // operator needs to see it's bound.
+  if (account.pool_status === 'in_use') {
+    const runLabel =
+      account.pool_current_run_id ?? account.active_paper_run_id;
+    return {
+      kind: 'in-use',
+      label: 'In use',
+      title: runLabel
+        ? `Bound to paper run ${runLabel} — stays bound until the run is deleted`
+        : 'Bound to a paper run — stays bound until the run is deleted',
+      tone: 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300',
+    };
+  }
+
+  if (account.pool_status === 'disabled') {
+    return {
+      kind: 'disabled',
+      label: 'Disabled',
+      title: 'Operator took this account out of rotation',
+      tone:
+        'bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300',
+    };
+  }
+
   if (!allowFleetPoolUse) {
     const extra = account.active_paper_run_id ? ' · paper run active' : '';
     return {
       kind: 'not-pooled',
       label: 'Not pooled',
       title:
-        'Opt-in to fleet pool is OFF — this account is not lendable to ' +
-        'fleet experiments.' + extra,
+        'Opt-in to fleet pool is OFF — the fleet won’t auto-pick this ' +
+        'account, but you can still pick it manually in a deploy.' + extra,
       tone:
         'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 ' +
         'border border-slate-200 dark:border-slate-700',
-    };
-  }
-
-  if (account.pool_status === 'in_use') {
-    return {
-      kind: 'fleet-in-use',
-      label: 'In use (fleet)',
-      title: account.pool_current_run_id
-        ? `Held by fleet run ${account.pool_current_run_id}`
-        : 'In use by the fleet',
-      tone: 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300',
-    };
-  }
-
-  // Opt-in is ON but there's a non-pool paper run running on this
-  // account. Common path: run started pre-opt-in and continued on
-  // owner creds. The fleet won't allocate this slot while the direct
-  // run holds it (OANDA single-run-per-account guard), so the badge
-  // tells the operator what's going on.
-  if (account.active_paper_run_id) {
-    return {
-      kind: 'direct-in-use',
-      label: 'In use (direct)',
-      title:
-        `Direct paper run ${account.active_paper_run_id} is active on ` +
-        'this account (not via the fleet pool — likely started before ' +
-        'opt-in, or deployed directly from the Approval Queue).',
-      tone:
-        'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300',
     };
   }
 
@@ -239,19 +238,10 @@ export function selectPoolColumnView(
     return {
       kind: 'cooling',
       label: 'Cooling',
-      title: `Cools down in ${until}s before the fleet can reuse it`,
+      title:
+        `Legacy cooldown — swept back to Free on the next allocation (${until}s)`,
       tone:
         'bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300',
-    };
-  }
-
-  if (account.pool_status === 'disabled') {
-    return {
-      kind: 'disabled',
-      label: 'Disabled',
-      title: 'Operator took this account out of rotation',
-      tone:
-        'bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300',
     };
   }
 

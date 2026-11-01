@@ -26,6 +26,10 @@ from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..models.user_credentials import (
+    UserOandaAccount,
+    UserOandaAccountPoolStatus,
+)
 from ..schemas.paper import (
     ApprovalQueueMeta,
     ClosestGenome,
@@ -384,6 +388,21 @@ def approve_and_deploy(
     )
     db.add(run)
 
+    # AFX-7 (2026-11-01 collapse): bind the operator-picked
+    # sub-account to this run in the pool state. The account stays
+    # IN_USE until the run is DELETED (not when it terminates) so
+    # a stopped run's trade history isn't contaminated by a later
+    # run reusing the same account. `_validate_account_choice`
+    # above has already confirmed the row exists under the user's
+    # verified credentials.
+    _bind_pool_account_to_run(
+        db,
+        user_id=current_user.id,
+        oanda_account_id=body.oanda_account_id,
+        run_id=run.id,
+        now=now,
+    )
+
     # Audit trail (US-018) — a real user did this. `paper_run_id`
     # lives in `outputs_json` so `GET /paper-runs/{id}/decisions`
     # (US-025) surfaces this row — the endpoint filters on the
@@ -635,7 +654,8 @@ def resume_paper_run(
 
 
 def delete_paper_run(db: Session, run: models.Run) -> None:
-    """Delete a paper run row + its orphaned decision logs.
+    """Delete a paper run row + its orphaned decision logs + release
+    the OANDA sub-account back to the pool.
 
     Router-level guard refuses on non-terminal states so this
     function trusts its input.
@@ -646,7 +666,27 @@ def delete_paper_run(db: Session, run: models.Run) -> None:
     `outputs_json.paper_run_id` (see `paper_runner._write_decision`).
     Sweep those explicitly so redeploying doesn't leave a growing
     tail of unreferenced audit rows per delete cycle.
+
+    AFX-7 (2026-11-01 collapse): run deletion is the ONLY event
+    that releases the pool slot. Terminated-but-not-deleted runs
+    keep their account bound so no later run contaminates the
+    first run's trade history / P&L.
     """
+    # Release the pool slot BEFORE deleting the run row so the
+    # `current_run_id == run.id` lookup in release_slot still matches.
+    # Benign if the run never bound a pool account (legacy rows
+    # created before pool wiring, or a non-pool code path).
+    try:
+        from agentfx.agents.fleet.account_pool import release_slot
+
+        release_slot(db, run_id=str(run.id))
+    except Exception:  # noqa: BLE001 — delete is operator-initiated, must not fail
+        logger.exception(
+            "paper: pool release errored on delete of %s — "
+            "lease TTL will eventually reclaim the slot",
+            run.id,
+        )
+
     db.query(models.DecisionLog).filter(
         # Postgres JSON ->> operator extracts the value as text; works
         # for both JSON and JSONB columns. `outputs_json.astext` isn't
@@ -798,6 +838,66 @@ def _reject_if_account_has_active_run(
             f"other's risk gates. Pick a different sub-account or halt "
             f"the existing run first."
         )
+
+
+def _bind_pool_account_to_run(
+    db: Session,
+    *,
+    user_id: int,
+    oanda_account_id: str,
+    run_id: str,
+    now: datetime,
+) -> None:
+    """AFX-7 (2026-11-01 collapse): mark the user's picked
+    sub-account IN_USE for `run_id`.
+
+    One pool, two picking paths — operator picks via the deploy
+    modal (this function), fleet picks via `allocate_slot` — but
+    both land here conceptually: the row flips to IN_USE and stays
+    there until `release_slot(run_id)` is called at run DELETION.
+
+    No-op if the row is already IN_USE for this same run_id
+    (idempotent — the approve path only runs once per run, but a
+    double-call from a retried request shouldn't throw).
+
+    Raises ValueError only if the row doesn't exist under this
+    user's credentials — but `_validate_account_choice` runs
+    first in the caller, so this is defence-in-depth.
+    """
+    row = (
+        db.query(UserOandaAccount)
+        .join(models.UserOandaCredentials, UserOandaAccount.credentials)
+        .filter(models.UserOandaCredentials.user_id == user_id)
+        .filter(UserOandaAccount.oanda_account_id == oanda_account_id)
+        .first()
+    )
+    if row is None:
+        raise ValueError(
+            f"OANDA sub-account '{oanda_account_id}' not found under user {user_id} "
+            "(expected `_validate_account_choice` to catch this first)"
+        )
+    # Idempotency: skip if already bound to this run.
+    if (
+        row.pool_status == UserOandaAccountPoolStatus.IN_USE
+        and row.current_run_id == run_id
+    ):
+        return
+    row.pool_status = UserOandaAccountPoolStatus.IN_USE
+    row.current_run_id = run_id
+    row.in_use_since = now
+    # Lease stays for safety-net sweep. 365d matches the pool
+    # helper's `_DEFAULT_LEASE_DAYS` — a run that lives past this
+    # horizon likely needs a manual reclaim anyway.
+    from datetime import timedelta
+
+    row.lease_expires_at = now + timedelta(days=365)
+    row.cooling_until = None
+    db.flush()
+    logger.info(
+        "paper: bound OANDA sub-account %s to run %s (pool_status=IN_USE)",
+        oanda_account_id,
+        run_id,
+    )
 
 
 def _link_to_evolution_run_id(genome: models.StrategyGenome) -> str | None:
