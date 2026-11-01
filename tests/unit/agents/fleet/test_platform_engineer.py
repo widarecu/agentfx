@@ -300,6 +300,15 @@ class TestFailureBranches:
 
 
 class TestRetryGate:
+    @pytest.fixture(autouse=True)
+    def _lift_adapter_cap(self, monkeypatch):
+        """These tests seed prior WORKSPACE_FAILED rows that would
+        trip the adapter's default cap=2. Raise it so the budget
+        pre-flight doesn't short-circuit the gate under test."""
+        import agentfx.agents.fleet.pe_workspace as pw
+
+        monkeypatch.setattr(pw.settings, "AGENT_PE_WORKSPACE_MAX_PER_DAY", 50)
+
     def _seed_failed(
         self, db, *, identifier: str, summary: str, minutes_ago: int
     ) -> None:
@@ -407,9 +416,22 @@ class TestDailyDispatchCap:
     def test_cap_prevents_further_dispatches_this_tick(
         self, db, monkeypatch, linear_recorder
     ):
-        """Fill the daily cap with pre-existing rows → scan sees 0 budget."""
+        """Fill the adapter's daily cap with pre-existing rows → scan
+        pre-flight check refuses, no Linear transitions happen.
+
+        Regression for 2026-11-02 loop: with cap=2 already hit, every
+        scan tick was transitioning Ready → In Progress → rollback
+        → comment, in a 15-minute loop. Fix: `scan_and_dispatch` now
+        calls `check_budget_before_dispatch` upfront and exits
+        cleanly, touching no Linear state.
+        """
+        import agentfx.agents.fleet.pe_workspace as pw
+
+        monkeypatch.setattr(pw.settings, "AGENT_PE_WORKSPACE_MAX_PER_DAY", 2)
         now = datetime.now(UTC)
-        for i in range(platform_engineer._MAX_PE_DISPATCHES_PER_DAY):
+        # Pre-seed exactly cap=2 rows so the adapter's budget check
+        # returns False on the first pre-flight call.
+        for i in range(2):
             db.add(
                 AgentWorkspaceRun(
                     id=f"cap-filler-{i}",
@@ -430,6 +452,11 @@ class TestDailyDispatchCap:
         _, attempted = platform_engineer.scan_and_dispatch(db=db)
         assert attempted == 0
         assert adapter.calls == []
+        # Critical: no Linear state touched (no transition, no
+        # rollback, no attention filing). That's what breaks the loop.
+        assert linear_recorder["transitions_to_in_progress"] == []
+        assert linear_recorder["rollbacks_to_ready"] == []
+        assert linear_recorder["attention_filings"] == []
 
 
 # ─────────────────────────────────────────────────────────────────────
