@@ -354,7 +354,11 @@ class TestManagedAgentsAdapterSDK:
         fake_client.beta.sessions.events.send.assert_called_once()
         events_kwargs = fake_client.beta.sessions.events.send.call_args.kwargs
         assert events_kwargs["session_id"] == "sess_opus5_xyz"
-        assert events_kwargs["events"][0]["type"] == "user_message"
+        # 2026-11-02 fix: Managed Agents events API wants
+        # dot-separated event type names. `user_message` returned
+        # 400 on every live dispatch, which is why no session ever
+        # received its kickoff + no PR was ever opened.
+        assert events_kwargs["events"][0]["type"] == "user.message"
 
         row = db.query(AgentWorkspaceRun).one()
         assert row.status == AgentWorkspaceRunStatus.RUNNING

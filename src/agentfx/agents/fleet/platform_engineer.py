@@ -65,9 +65,13 @@ from agentfx.api.models.agent_workspace_run import (
 logger = logging.getLogger(__name__)
 
 
-# Hard cap on PE dispatches per calendar day. Set well below daily
-# budget so a backlog spike doesn't drain the Opus / container
-# budget. Scoped to a single UTC day; resets at 00:00 UTC.
+# The dispatch budget cap lives on the adapter
+# (`AGENT_PE_WORKSPACE_MAX_PER_DAY`) and is enforced by
+# `check_budget_before_dispatch`. The scan loop uses that single
+# source of truth so Scan and Adapter can never disagree.
+#
+# Legacy constant kept here only for pre-rewrite tests that read it.
+# All real decisions go through `check_budget_before_dispatch`.
 _MAX_PE_DISPATCHES_PER_DAY = 5
 
 
@@ -88,18 +92,33 @@ def scan_and_dispatch(*, db: Session, now: datetime | None = None) -> tuple[int,
     """
     now = now or datetime.now(UTC)
 
-    try:
-        remaining_budget = _dispatches_remaining_today(db, now=now)
-        if remaining_budget <= 0:
-            logger.info(
-                "pe_agent: daily dispatch cap reached (%d/day) — skipping scan",
-                _MAX_PE_DISPATCHES_PER_DAY,
-            )
-            return (0, 0)
-        max_per_scan = min(
-            remaining_budget,
-            getattr(settings, "PE_LINEAR_MAX_DISPATCH_PER_SCAN", 3),
+    # Lazy imports — the workspace modules shouldn't be imported
+    # unless a dispatch is actually attempted (keeps the orchestrator
+    # import graph light).
+    from agentfx.agents.fleet.pe_workspace import (
+        build_task_slug,
+        check_budget_before_dispatch,
+        resolve_adapter,
+        sweep_stuck_runs,
+    )
+
+    # Pre-flight budget check — if the adapter would refuse every
+    # candidate anyway, don't touch Linear. Prevents the loop Wilson
+    # observed on 2026-11-02: with cap=2 already hit, every scan tick
+    # was transitioning Ready → In Progress → rollback → comment, for
+    # every eligible issue, every 15 min, with no useful work done.
+    sweep_stuck_runs(db, now=now)
+    ok, reason = check_budget_before_dispatch(db, now=now)
+    if not ok:
+        logger.info(
+            "pe_agent: adapter budget exhausted (%s) — skipping scan tick, "
+            "no Linear state changed",
+            reason,
         )
+        return (0, 0)
+
+    try:
+        max_per_scan = getattr(settings, "PE_LINEAR_MAX_DISPATCH_PER_SCAN", 3)
         candidates = list_ready_dispatch_candidates(limit=max_per_scan)
     except Exception:
         logger.exception("pe_agent: Linear candidate scan failed")
@@ -108,21 +127,22 @@ def scan_and_dispatch(*, db: Session, now: datetime | None = None) -> tuple[int,
     if not candidates:
         return (0, 0)
 
-    # Lazy imports — the workspace modules shouldn't be imported
-    # unless a dispatch is actually attempted (keeps the orchestrator
-    # import graph light).
-    from agentfx.agents.fleet.pe_workspace import (
-        build_task_slug,
-        resolve_adapter,
-        sweep_stuck_runs,
-    )
-
-    sweep_stuck_runs(db, now=now)
     adapter = resolve_adapter()
     attempted = 0
 
     for issue in candidates:
         try:
+            # Per-candidate re-check: a successful dispatch earlier in
+            # this scan may have consumed the last budget slot, and
+            # the adapter will still refuse at count = cap. We stop
+            # the loop cleanly rather than transition-and-rollback.
+            ok, reason = check_budget_before_dispatch(db, now=now)
+            if not ok:
+                logger.info(
+                    "pe_agent: budget consumed mid-scan (%s) — stopping",
+                    reason,
+                )
+                break
             if _should_skip_due_to_retry_gate(db, issue):
                 continue
             if not transition_to_in_progress(issue.id):
@@ -136,6 +156,9 @@ def scan_and_dispatch(*, db: Session, now: datetime | None = None) -> tuple[int,
             result = adapter.dispatch(db, spec=spec, now=now)
             attempted += 1
             if not result.accepted:
+                # Shouldn't fire for budget any more (checked above),
+                # but keep the rollback for other refusal reasons
+                # (config missing, adapter unavailable). Still safe.
                 logger.info(
                     "pe_agent: adapter refused dispatch for %s — %s. "
                     "Rolling Linear back to Ready.",
@@ -372,26 +395,10 @@ def _render_dispatch_narrative(*, issue: ReadyIssue) -> str:
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _dispatches_remaining_today(db: Session, *, now: datetime) -> int:
-    """How many more dispatches PE can start today before hitting the
-    hard cap.
-
-    Counts every AgentWorkspaceRun created in this UTC day that
-    moved past PENDING at least once. A dispatch that WORKSPACE_FAILED
-    on sessions.create still counts (we paid the attempt), so a
-    broken deploy day doesn't let the cap drift.
-    """
-    try:
-        day_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
-        count = (
-            db.query(AgentWorkspaceRun)
-            .filter(AgentWorkspaceRun.created_at >= day_start)
-            .count()
-        )
-        return max(0, _MAX_PE_DISPATCHES_PER_DAY - count)
-    except Exception:
-        logger.exception("pe_agent: daily cap query failed; assuming no budget left")
-        return 0
+# Note: the old `_dispatches_remaining_today` helper was removed in
+# the 2026-11-02 budget-loop fix. Daily cap enforcement now lives on
+# the adapter via `check_budget_before_dispatch`, called upfront in
+# `scan_and_dispatch` and re-checked per candidate.
 
 
 __all__ = [

@@ -498,12 +498,21 @@ class ManagedAgentsAdapter:
 
         # Send the kickoff user message — the narrative explicitly
         # calls out the three-tier branch gate.
+        #
+        # 2026-11-02 fix: the Managed Agents events API wants
+        # dot-separated event type names (`user.message`,
+        # `user.define_outcome`, …). We were sending `user_message`
+        # (underscore) and every call returned
+        # `events[0].type: "user_message" is not a valid value`,
+        # which is why no session has ever received its kickoff
+        # since AFX-9 shipped — session was created, immediately
+        # abandoned, no code work done, no PR opened.
         try:
             client.beta.sessions.events.send(
                 session_id=session_id,
                 events=[
                     {
-                        "type": "user_message",
+                        "type": "user.message",
                         "content": [
                             {"type": "text", "text": spec.narrative},
                         ],
