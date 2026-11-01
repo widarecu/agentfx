@@ -323,28 +323,36 @@ def scan_and_dispatch(*, db: Session, now: datetime | None = None) -> tuple[int,
 def _collect_undispatched_high_confidence_proposals(
     db: Session, *, now: datetime
 ) -> list[tuple[str, str, dict[str, Any], dict[str, Any]]]:
-    """Find today's HIGH-confidence PE proposals that don't yet have
-    an `agent_workspace_runs` row.
+    """Find HIGH-confidence PE proposals that don't yet have an
+    `agent_workspace_runs` row — regardless of when the proposal
+    was created.
+
+    Rationale (2026-11-01 fix): the earlier same-day filter orphaned
+    any proposal that didn't dispatch on its creation day — notably
+    when the workspace flag was off, when the daily budget was
+    already consumed, when the orchestrator loop was mid-restart,
+    or when the proposal fired on a day the dispatcher simply didn't
+    pick it up. Age doesn't invalidate a committed judgment; stale
+    assumptions get caught by the PE workspace reading current code
+    before writing anything (WORKSPACE_FAILED surfaces that).
+
+    Dedupe is on `decision_key` across ALL `agent_workspace_runs`,
+    not today's rows only — once dispatched, don't re-dispatch.
 
     Returns `(decision_id, decision_key, proposal_dict, work_order_dict)`.
     """
     from agentfx.api.models.agent_workspace_run import AgentWorkspaceRun
 
-    today_start = datetime.combine(now.date(), datetime.min.time(), tzinfo=UTC)
     rows = (
         db.query(AgentDecision)
         .filter(AgentDecision.agent_role == AgentRole.PE.value)
         .filter(AgentDecision.action == "proposed_fix")
-        .filter(AgentDecision.created_at >= today_start)
         .order_by(AgentDecision.created_at.asc())
         .all()
     )
 
     already_dispatched_keys = {
-        r.pe_proposal_decision_key
-        for r in db.query(AgentWorkspaceRun)
-        .filter(AgentWorkspaceRun.created_at >= today_start)
-        .all()
+        r.pe_proposal_decision_key for r in db.query(AgentWorkspaceRun).all()
     }
 
     out: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []

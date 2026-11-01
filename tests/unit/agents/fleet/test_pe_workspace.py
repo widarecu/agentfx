@@ -409,6 +409,69 @@ class TestScanAndDispatch:
         # Still only the one pre-existing row.
         assert db.query(AgentWorkspaceRun).count() == 1
 
+    def test_yesterdays_undispatched_proposal_still_dispatches(self, db, monkeypatch):
+        """2026-11-01 fix: `_collect_undispatched_high_confidence_proposals`
+        used to filter by `created_at >= today_start`, which orphaned
+        any HIGH-confidence proposal that didn't dispatch on its
+        creation day (workspace flag off, budget hit, orchestrator
+        restart mid-dispatch, etc.). After the fix, age doesn't
+        matter — undispatched means dispatchable.
+        """
+        from agentfx.agents.fleet import platform_engineer
+        from agentfx.api.models.agent_decision import AgentDecision
+
+        monkeypatch.setattr(platform_engineer, "scan_and_propose", lambda **_: 0)
+
+        # Seed a HIGH-confidence proposal from 3 days ago, directly
+        # (bypassing the helper to control created_at).
+        three_days_ago = datetime.now(UTC) - timedelta(days=3)
+        db.add(
+            AgentDecision(
+                id="dec_stale",
+                agent_role="PE",
+                action="proposed_fix",
+                decision_key="pe_proposal_qa_old_1",
+                inputs_json={
+                    "qa_decision_id": "qa_old",
+                    "work_order_title": "Old but valid work",
+                    "target_file": "src/x.py",
+                    "file_was_readable": True,
+                },
+                outputs_json={
+                    "proposal": {
+                        "investigation_summary": "stale but committed judgment",
+                        "proposed_changes": [
+                            {
+                                "file_path": "src/x.py",
+                                "change_type": "modify",
+                                "rationale": "r",
+                                "diff": "+ x",
+                            }
+                        ],
+                        "new_tests": [
+                            {
+                                "file_path": "tests/x.py",
+                                "name": "t",
+                                "purpose": "p",
+                            }
+                        ],
+                        "risk_assessment": "low",
+                        "estimated_profit_impact": "$1/wk",
+                        "confidence": "high",
+                    }
+                },
+                created_at=three_days_ago,
+            )
+        )
+        db.commit()
+
+        _, attempted = platform_engineer.scan_and_dispatch(db=db)
+        assert attempted == 1, (
+            "a HIGH-confidence proposal from 3 days ago must dispatch "
+            "once the same-day filter is removed"
+        )
+        assert db.query(AgentWorkspaceRun).count() == 1
+
 
 class TestRenderDispatchNarrative:
     """The workspace prompt — must call out the branch gate explicitly
