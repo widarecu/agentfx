@@ -106,10 +106,13 @@ class TestWatchdogNotificationWiring:
         assert "crashed_pre_init" in run.stop_reason
         assert len(calls) == 1
 
-    def test_crash_release_slot_called(self):
-        """AFX-7: watchdog must release the pool slot when flipping a
-        crashed run to ERROR, otherwise a hard-killed subprocess
-        leaks its slot until the 14-day lease TTL expires."""
+    def test_crash_does_NOT_release_pool_slot(self):
+        """AFX-7 (2026-11-01 collapse): a crashed-but-undeleted run
+        keeps its sub-account bound so the operator can inspect
+        the crash state before deleting. Deletion is the sole
+        release trigger — the watchdog just flips the run to ERROR
+        and alerts.
+        """
         from agentfx.api.models import RunStatus
         from agentfx.api.workers.paper_runner import _mark_run_failed_after_crash
 
@@ -133,26 +136,11 @@ class TestWatchdogNotificationWiring:
         ):
             _mark_run_failed_after_crash("run_watchdog_crash", exit_code=137)
 
-        assert release_calls == [{"run_id": "run_watchdog_crash"}]
-        assert run.status == RunStatus.ERROR
-
-    def test_crash_release_slot_failure_does_not_break_watchdog(self):
-        from agentfx.api.models import RunStatus
-        from agentfx.api.workers.paper_runner import _mark_run_failed_after_crash
-
-        run = _stub_run(RunStatus.RUNNING)
-        db = MagicMock()
-
-        def boom(session, *, run_id):
-            raise RuntimeError("pool DB down")
-
-        with (
-            patch("agentfx.api.core.database.SessionLocal", return_value=db),
-            patch("agentfx.api.services.paper.get_paper_run", return_value=run),
-            patch("agentfx.notifications.post_paper_run_alert", lambda **_: None),
-            patch("agentfx.agents.fleet.account_pool.release_slot", side_effect=boom),
-        ):
-            _mark_run_failed_after_crash("run_watchdog_crash", exit_code=1)
+        assert release_calls == [], (
+            "watchdog must not release the pool slot on crash — delete "
+            "is the only release trigger (operator decides when the "
+            "trade history can be dropped)"
+        )
         assert run.status == RunStatus.ERROR
 
     def test_hook_exception_does_not_break_watchdog(self):

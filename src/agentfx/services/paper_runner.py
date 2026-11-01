@@ -282,11 +282,9 @@ def run_paper_run(
     # SQLAlchemy or the OANDA HTTP client (unit tests hit
     # `decide_action` and `_snapshot_balance_if_needed` directly).
     from agentfx.adapters.oanda import OandaClient
-    from agentfx.agents.fleet.account_pool import allocate_slot
     from agentfx.api.core.database import SessionLocal
     from agentfx.api.core.secrets import decrypt_secret
     from agentfx.api.models import Run, RunStatus, UserOandaCredentials
-    from agentfx.api.models.user_credentials import OandaEnvironment
     from agentfx.core.dsl import StrategySpec, compile_spec
 
     db = SessionLocal()
@@ -296,67 +294,36 @@ def run_paper_run(
             logger.error("paper runner: run %s not found; exiting", run_id)
             return
 
-        # Try to acquire a credential + account from the fleet pool
-        # first (AFX-7 wiring). The pool is derived from
-        # UserOandaAccount rows under credentials with
-        # `allow_fleet_pool_use=True`. On empty pool / cap hit / any
-        # other refusal, fall through to the owner's own credentials
-        # exactly as before — the pool is additive, never a blocker.
-        api_key: str | None = None
-        env_value: str | None = None
-        account_id: str | None = None
-        used_pool = False
-        allocation = allocate_slot(
-            db, run_id=run_id, environment=OandaEnvironment.PRACTICE
+        # AFX-7 (2026-11-01 collapse): pool allocation is a run-CREATION
+        # event, not a run-BOOT event. The sub-account is already
+        # bound to `run.oanda_account_id` from the approve path (or
+        # the fleet's dispatch path when that lands). On every boot
+        # — first start or restart — we just load the user's
+        # credentials and open an OANDA client on the stored account.
+        # No allocation decisions here. The sub-account stays bound
+        # until the run is DELETED.
+        creds = (
+            db.query(UserOandaCredentials)
+            .filter(UserOandaCredentials.user_id == run.user_id)
+            .one_or_none()
         )
-        if allocation.accepted:
-            api_key = allocation.api_key_plaintext
-            env_value = allocation.environment
-            account_id = allocation.account_id
-            run.oanda_account_id = account_id
-            db.commit()
-            used_pool = True
-            # NB: never log api_key — just the identifiers.
-            logger.info(
-                "paper runner: run %s using pool slot account_id=%s env=%s",
-                run_id,
-                account_id,
-                env_value,
-            )
-        else:
-            logger.info(
-                "paper runner: run %s pool allocation refused (%s); "
-                "falling back to owner UserOandaCredentials",
-                run_id,
-                allocation.reason,
-            )
+        if creds is None:
+            _mark_terminal(db, run, RunStatus.ERROR, "CREDENTIALS_REVOKED")
+            return
 
-        if not used_pool:
-            # Load user's credentials and decrypt the API key. If the
-            # credentials were revoked between approval and start, halt
-            # cleanly with a specific stop reason.
-            creds = (
-                db.query(UserOandaCredentials)
-                .filter(UserOandaCredentials.user_id == run.user_id)
-                .one_or_none()
-            )
-            if creds is None:
-                _mark_terminal(db, run, RunStatus.ERROR, "CREDENTIALS_REVOKED")
-                return
+        try:
+            api_key = decrypt_secret(creds.oanda_api_key_encrypted)
+        except Exception:  # noqa: BLE001
+            logger.exception("paper runner: decrypt failed for run %s", run_id)
+            _mark_terminal(db, run, RunStatus.ERROR, "CREDENTIALS_DECRYPT_FAILED")
+            return
 
-            try:
-                api_key = decrypt_secret(creds.oanda_api_key_encrypted)
-            except Exception:  # noqa: BLE001
-                logger.exception("paper runner: decrypt failed for run %s", run_id)
-                _mark_terminal(db, run, RunStatus.ERROR, "CREDENTIALS_DECRYPT_FAILED")
-                return
-
-            env_value = (
-                creds.oanda_environment.value
-                if hasattr(creds.oanda_environment, "value")
-                else str(creds.oanda_environment)
-            )
-            account_id = run.oanda_account_id
+        env_value = (
+            creds.oanda_environment.value
+            if hasattr(creds.oanda_environment, "value")
+            else str(creds.oanda_environment)
+        )
+        account_id = run.oanda_account_id
 
         client = OandaClient(
             api_key=api_key,
@@ -2281,62 +2248,11 @@ def _recover_from_auth_loss(db, run, original_exc: Exception):
     from agentfx.adapters.oanda import OandaClient, OandaError
     from agentfx.api.core.secrets import decrypt_secret
     from agentfx.api.models import UserOandaCredentials
-    from agentfx.api.models.user_credentials import (
-        UserOandaAccount,
-        UserOandaAccountPoolStatus,
-    )
 
-    # AFX-7: if the run was pool-allocated, re-decrypt the pool
-    # sub-account's parent credentials — the owner's own creds don't
-    # apply, the run trades on a different account entirely.
-    pool_row = (
-        db.query(UserOandaAccount)
-        .filter(UserOandaAccount.pool_status == UserOandaAccountPoolStatus.IN_USE)
-        .filter(UserOandaAccount.current_run_id == str(run.id))
-        .first()
-    )
-    if pool_row is not None:
-        pool_creds = pool_row.credentials
-        try:
-            api_key = decrypt_secret(bytes(pool_creds.oanda_api_key_encrypted))
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "auth-refresh: pool decrypt failed for run %s pool_row=%s",
-                run.id,
-                pool_row.id,
-            )
-            return None
-        env_value = (
-            pool_creds.oanda_environment.value
-            if hasattr(pool_creds.oanda_environment, "value")
-            else str(pool_creds.oanda_environment)
-        )
-        new_client = OandaClient(
-            api_key=api_key,
-            environment=env_value,
-            account_id=pool_row.oanda_account_id,
-        )
-        try:
-            new_client.get_account_balance()
-        except OandaError as exc:
-            if _is_auth_error(exc):
-                logger.warning(
-                    "auth-refresh: pool-sourced client still 401 for run %s "
-                    "(pool_row=%s, account=%s): %s",
-                    run.id,
-                    pool_row.id,
-                    pool_row.oanda_account_id,
-                    original_exc,
-                )
-                return None
-            raise
-        logger.info(
-            "auth-refresh: pool key refresh succeeded for run %s (original: %s)",
-            run.id,
-            original_exc,
-        )
-        return new_client
-
+    # AFX-7 (2026-11-01 collapse): the pool/direct split is gone.
+    # The sub-account on `run.oanda_account_id` is a sibling of the
+    # user's other sub-accounts, all under their single
+    # UserOandaCredentials row — so one decrypt covers it.
     creds = (
         db.query(UserOandaCredentials)
         .filter(UserOandaCredentials.user_id == run.user_id)
@@ -2588,22 +2504,11 @@ def _mark_terminal(db, run, status, reason: str) -> None:
     run.stop_reason = reason
     run.completed_at = datetime.now(UTC)
     db.commit()
-    # AFX-7: release the fleet pool slot (if any) so the sub-account
-    # can cool down + rotate back to FREE. Benign noop when the run
-    # wasn't pool-allocated. Never re-raises — a release failure must
-    # not un-commit the terminal state above.
-    try:
-        from agentfx.agents.fleet.account_pool import release_slot
-
-        released = release_slot(db, run_id=str(run.id))
-        if released:
-            db.commit()
-    except Exception:  # noqa: BLE001 — belt-and-braces
-        logger.exception(
-            "paper runner: pool release errored on %s — "
-            "lease TTL will reclaim the slot",
-            run.id,
-        )
+    # AFX-7 (2026-11-01 collapse): the pool slot is NOT released
+    # here — a terminated run keeps its sub-account bound so no
+    # later run contaminates this run's trade history. The slot
+    # is released only when the operator DELETES the run via
+    # `delete_paper_run`.
     # v0.6.2 (Wilson UAT 2026-07-19): Slack alert on every terminal
     # event. Idempotent per (run_id, reason) via
     # `run.parameters['notified']` so re-entrant halt paths + the
