@@ -8,23 +8,24 @@ table + admin UI was redundant architecture — the operator opts in
 once via a Settings toggle and every sub-account they can see is
 lendable to the fleet.
 
-Design philosophy:
+Design philosophy (rewritten 2026-11-01 — AFX-7 collapse):
+- Allocation is a run-creation event, not a run-boot event. The
+  account is bound to the run once (operator picks it in the
+  deploy modal, or the fleet picks it via `allocate_slot`) and
+  stays bound until the run is explicitly DELETED. A terminated
+  run keeps its account so no later run contaminates the first
+  run's P&L / trade history.
+- Release is a run-deletion event. `release_slot(run_id)` flips
+  the `UserOandaAccount` row straight back to FREE (no cooldown
+  — the account is immediately available for re-use since the
+  run that was holding it is gone).
 - Allocation reads: FIFO over FREE sub-accounts belonging to any
-  consenting credentials row, oldest-created first so cooled-down
-  accounts cycle in evenly. The parent credentials' api_key is
-  decrypted per allocation (one shared key for all its sub-accounts).
-- Release is DB-authoritative: when a paper run terminates, the
-  paper runner calls `release_slot(run_id)` which flips the
-  `UserOandaAccount` row to COOLING_DOWN with a 1h gate. No
-  background sweeper needed — allocation reads automatically re-flip
-  COOLING_DOWN rows to FREE once `cooling_until` has passed.
-- Lease TTL protects against stuck IN_USE rows if a paper runner
-  crashes without releasing. Default 14 days; allocation reads
-  reclaim expired leases automatically.
-- Idempotency on same `run_id`: a crashed subprocess that gets
-  re-scheduled with the SAME run_id reuses its existing slot.
-  Allocating a different account would strand positions on the old
-  one.
+  consenting credentials row, oldest-created first so accounts
+  cycle in evenly. The parent credentials' api_key is decrypted
+  per allocation (one shared key for all its sub-accounts).
+- No boot-time allocation. On restart, the paper runner loads
+  `run.oanda_account_id` from the row and uses it directly — no
+  pool call is made.
 
 Opt-in semantics: a user who adds OANDA creds for their own portal
 use is NEVER opted in by default (`allow_fleet_pool_use=False`). The
@@ -53,16 +54,12 @@ from agentfx.api.models.user_credentials import (
 logger = logging.getLogger(__name__)
 
 
-# Default lease length — a paper run grabs an account for this long
-# before the allocator reclaims it (assuming the runner crashed
-# without calling release). 14 days matches typical UAT paper-run
-# windows; override per-call if a specific experiment needs longer.
-_DEFAULT_LEASE_DAYS = 14
-
-# Default cooling-down period after a run ends — gives OANDA a chance
-# to reconcile position state + avoids rate-limit edge cases on
-# back-to-back runs against the same account.
-_DEFAULT_COOLING_HOURS = 1
+# Lease TTL kept as a safety net against stuck IN_USE rows if the
+# deletion endpoint ever failed to call release_slot. In the
+# normal flow the row stays IN_USE for the full lifetime of the
+# paper run (from approve to delete), which may be weeks or months
+# — the sweeper only kicks in past this horizon.
+_DEFAULT_LEASE_DAYS = 365
 
 # Soft cap: the fleet won't allocate past this many concurrent paper
 # runs across the entire pool. Prevents runaway even if the operator
@@ -102,17 +99,16 @@ class SlotAllocation:
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _sweep_cooldowns(db: Session, *, now: datetime) -> int:
-    """Flip COOLING_DOWN rows whose `cooling_until` has passed back
-    to FREE. Called at the top of each allocation attempt so pool
-    reads don't miss recently-cooled accounts.
+def _sweep_leftover_cooldowns(db: Session) -> int:
+    """One-shot migration helper: any UserOandaAccount still in
+    COOLING_DOWN from the pre-collapse design (where release
+    transitioned IN_USE → COOLING_DOWN with a 1h gate) is now
+    stale state. Flip it back to FREE so the allocator sees it.
 
-    Returns the number of rows transitioned."""
+    Called at the top of each allocation attempt. Idempotent."""
     rows = (
         db.query(UserOandaAccount)
         .filter(UserOandaAccount.pool_status == UserOandaAccountPoolStatus.COOLING_DOWN)
-        .filter(UserOandaAccount.cooling_until.isnot(None))
-        .filter(UserOandaAccount.cooling_until <= now)
         .all()
     )
     for row in rows:
@@ -243,7 +239,7 @@ def allocate_slot(
                 api_key_plaintext=plaintext,
             )
 
-        _sweep_cooldowns(db, now=now)
+        _sweep_leftover_cooldowns(db)
         _sweep_expired_leases(db, now=now)
 
         in_use_count = (
@@ -320,16 +316,17 @@ def release_slot(
     db: Session,
     *,
     run_id: str,
-    cooling_hours: int = _DEFAULT_COOLING_HOURS,
     now: datetime | None = None,
 ) -> bool:
-    """Release the sub-account currently held by `run_id`,
-    transitioning it to COOLING_DOWN with the specified cooling
-    window.
+    """Release the sub-account held by `run_id` back to FREE.
+
+    Called when a paper run is DELETED (not when it terminates —
+    terminated-but-not-deleted runs keep their account bound so
+    no later run contaminates the first run's trade history).
 
     Returns True iff a row was found and released. False means the
-    run wasn't holding any pool slot (benign — paper runs that
-    bypassed the pool, or a double-release).
+    run wasn't holding any pool slot (benign — operator deleted a
+    run that was created before pool wiring, or a double-release).
 
     Never raises.
     """
@@ -349,14 +346,13 @@ def release_slot(
         row.current_run_id = None
         row.in_use_since = None
         row.lease_expires_at = None
-        row.pool_status = UserOandaAccountPoolStatus.COOLING_DOWN
-        row.cooling_until = now + timedelta(hours=cooling_hours)
+        row.cooling_until = None
+        row.pool_status = UserOandaAccountPoolStatus.FREE
         db.flush()
         logger.info(
-            "account_pool: released account_id=%s from run_id=%s (cooling until %s)",
+            "account_pool: released account_id=%s from run_id=%s (now FREE)",
             row.oanda_account_id,
             run_id,
-            row.cooling_until,
         )
         return True
     except Exception:
