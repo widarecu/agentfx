@@ -242,14 +242,21 @@ async def _pe_workspace_poll_loop() -> None:
 
 
 async def _pe_scan_loop() -> None:
-    """Daily scan: find unprocessed QA work orders → generate PE
-    fix proposals via Opus 5. When the workspace flag is on, also
-    hand HIGH-confidence proposals to the Managed Agents adapter
-    for autonomous PR creation. Never raises."""
-    from agentfx.agents.fleet.platform_engineer import (
-        scan_and_dispatch,
-        scan_and_propose,
-    )
+    """15-min scan: Linear-driven PE dispatch. Lists Ready AFX
+    issues the fleet filed, applies the retry gate, dispatches
+    eligible ones to the Managed Agents workspace. Never raises.
+
+    2026-11-01: Phase 1 (`scan_and_propose`) is removed — the
+    Managed Agents session now does its own code reasoning inside
+    the sandbox from the Linear ticket description, so there is no
+    Opus-generated proposal step.
+
+    When `AGENT_PE_WORKSPACE_ENABLED=false`, the dispatch call is a
+    no-op (the adapter resolver returns a stub that records intent
+    but never dispatches), so this loop is safe to run with the
+    flag off.
+    """
+    from agentfx.agents.fleet.platform_engineer import scan_and_dispatch
 
     logger.info(
         "agent_orchestrator: PE scan loop armed (cadence=%ds, workspace=%s)",
@@ -265,21 +272,13 @@ async def _pe_scan_loop() -> None:
                         "budget exceeded for %s",
                         datetime.now(UTC).date(),
                     )
-                elif getattr(settings, "AGENT_PE_WORKSPACE_ENABLED", False):
-                    produced, attempted = scan_and_dispatch(db=db)
-                    if produced or attempted:
-                        logger.info(
-                            "agent_orchestrator: PE produced %d proposal(s), "
-                            "attempted %d workspace dispatch(es)",
-                            produced,
-                            attempted,
-                        )
                 else:
-                    produced = scan_and_propose(db=db)
-                    if produced:
+                    _, attempted = scan_and_dispatch(db=db)
+                    if attempted:
                         logger.info(
-                            "agent_orchestrator: PE produced %d proposal(s)",
-                            produced,
+                            "agent_orchestrator: PE attempted %d workspace "
+                            "dispatch(es)",
+                            attempted,
                         )
         except Exception:
             logger.exception("agent_orchestrator: PE scan iteration failed")

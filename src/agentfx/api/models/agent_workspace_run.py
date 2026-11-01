@@ -79,10 +79,19 @@ class AgentWorkspaceRun(Base):
     id = Column(String(36), primary_key=True, default=_uuid_hex)
 
     # Back-reference to the PE proposal that triggered this dispatch.
-    # Not a formal FK — `agent_decisions.decision_key` isn't a unique
-    # column (append-only log), and a soft reference is operationally
-    # safer here.
+    # 2026-11-01 (Linear-driven dispatch rewrite): legacy field,
+    # retained only so historical rows keep their decision_key.
+    # New dispatches set this to the Linear identifier (e.g.
+    # "AFX-56") so one column still identifies "what triggered the
+    # dispatch" when reading the audit trail. Not a formal FK.
     pe_proposal_decision_key = Column(String(200), nullable=False, index=True)
+
+    # Linear issue identifier (e.g. "AFX-56") this dispatch is working
+    # on. Populated for every dispatch from 2026-11-01 forward
+    # (Linear-driven rewrite); nullable so pre-rewrite rows stay
+    # readable. The retry gate and `[NEEDS DESIGN]` handoff query
+    # on this column.
+    linear_issue_identifier = Column(String(32), nullable=True, index=True)
 
     # Target branch for the PR. v0.8.1 pins this to `feat/agent-fleet`
     # per Wilson's approval model; recorded here so we can tell at a
