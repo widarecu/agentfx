@@ -714,11 +714,12 @@ class TestMarkTerminal:
         # Here we just assert the hook wiring itself works.
         assert len(calls) == 2  # hook fires; dedup lives inside the hook
 
-    def test_release_slot_invoked_on_terminal(self, monkeypatch):
-        """AFX-7: every terminal event must release the pool slot (if
-        any) so the sub-account can cool down + rotate back to FREE.
-        The release call must come AFTER the status commit — a
-        release failure must not un-commit the terminal state."""
+    def test_terminal_does_NOT_release_pool_slot(self, monkeypatch):
+        """AFX-7 (2026-11-01 collapse): terminated-but-not-deleted
+        runs KEEP their sub-account bound so no later run
+        contaminates this run's trade history. The pool is released
+        only when the operator deletes the run via `delete_paper_run`.
+        """
         from agentfx.api.models import RunStatus
 
         calls: list[dict] = []
@@ -745,34 +746,11 @@ class TestMarkTerminal:
 
         _mark_terminal(db, run, RunStatus.HALTED_MANUAL, "USER_KILL")
 
-        assert calls == [{"run_id": "run_t1"}]
+        assert calls == [], (
+            "release_slot must not fire on terminal — the account is "
+            "released only when the run is deleted"
+        )
         assert run.status == RunStatus.HALTED_MANUAL
-
-    def test_release_failure_does_not_break_terminal_write(self, monkeypatch):
-        """A broken pool helper must never un-commit the terminal
-        state. We still log the exception and let the lease TTL
-        reclaim the slot."""
-        from agentfx.api.models import RunStatus
-
-        def boom(db, *, run_id):
-            raise RuntimeError("pool DB down")
-
-        monkeypatch.setattr("agentfx.agents.fleet.account_pool.release_slot", boom)
-        monkeypatch.setattr(
-            "agentfx.notifications.post_paper_run_alert", lambda **_: None
-        )
-
-        run = SimpleNamespace(
-            status=RunStatus.RUNNING,
-            stop_reason=None,
-            completed_at=None,
-            id="run_t2",
-            parameters={},
-        )
-        db = MagicMock()
-
-        _mark_terminal(db, run, RunStatus.ERROR, "SOMETHING_BAD")
-        assert run.status == RunStatus.ERROR
 
     def test_hook_exception_does_not_break_terminal_write(self, monkeypatch):
         """If the notification hook itself raises, the terminal state

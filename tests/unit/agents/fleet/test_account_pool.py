@@ -236,15 +236,18 @@ class TestRestartReuse:
 
 
 class TestRelease:
-    def test_release_flips_to_cooling_down(self, db):
+    def test_release_flips_straight_to_free(self, db):
+        """AFX-7 collapse (2026-11-01): release is a run-DELETION
+        event, and the account is immediately available for the
+        next run — no cooldown gate."""
         creds = _mk_creds(db)
         row = _mk_account(db, creds)
         account_pool.allocate_slot(db, run_id="run_r1")
         released = account_pool.release_slot(db, run_id="run_r1")
         assert released is True
         db.refresh(row)
-        assert row.pool_status == UserOandaAccountPoolStatus.COOLING_DOWN
-        assert row.cooling_until is not None
+        assert row.pool_status == UserOandaAccountPoolStatus.FREE
+        assert row.cooling_until is None
         assert row.current_run_id is None
         assert row.last_run_id == "run_r1"
         assert row.last_run_ended_at is not None
@@ -256,21 +259,10 @@ class TestRelease:
 
 
 class TestSweepers:
-    def test_expired_cooldown_sweeps_back_to_free_on_allocate(self, db):
-        creds = _mk_creds(db)
-        past = datetime.now(UTC) - timedelta(minutes=5)
-        row = _mk_account(
-            db,
-            creds,
-            pool_status=UserOandaAccountPoolStatus.COOLING_DOWN,
-            cooling_until=past,
-        )
-        result = account_pool.allocate_slot(db, run_id="run_sweep")
-        assert result.accepted is True
-        db.refresh(row)
-        assert row.pool_status == UserOandaAccountPoolStatus.IN_USE
-
-    def test_active_cooldown_is_not_swept(self, db):
+    def test_leftover_cooldown_rows_sweep_to_free_on_allocate(self, db):
+        """Pre-collapse rows may still be in COOLING_DOWN. The
+        allocator's one-shot sweeper flips them back to FREE
+        regardless of `cooling_until` so they aren't stuck."""
         creds = _mk_creds(db)
         future = datetime.now(UTC) + timedelta(hours=1)
         row = _mk_account(
@@ -279,10 +271,12 @@ class TestSweepers:
             pool_status=UserOandaAccountPoolStatus.COOLING_DOWN,
             cooling_until=future,
         )
-        result = account_pool.allocate_slot(db, run_id="run_wait")
-        assert result.accepted is False
+        result = account_pool.allocate_slot(db, run_id="run_sweep")
+        assert result.accepted is True
         db.refresh(row)
-        assert row.pool_status == UserOandaAccountPoolStatus.COOLING_DOWN
+        assert row.pool_status == UserOandaAccountPoolStatus.IN_USE
+        assert row.current_run_id == "run_sweep"
+        assert row.cooling_until is None
 
     def test_expired_lease_is_reclaimed(self, db):
         creds = _mk_creds(db)

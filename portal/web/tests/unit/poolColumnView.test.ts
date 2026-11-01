@@ -1,13 +1,12 @@
 /**
  * Unit tests for the `selectPoolColumnView` selector that drives the
- * Pool column in `OandaAccountsTable` (AFX-7 UI follow-up 2026-10-30).
+ * Pool column in `OandaAccountsTable`.
  *
- * The gap this closes: the first cut of the column always rendered
- * the DB `pool_status` ("free" by default), which read as
- * "fleet-available" even when the parent credentials had
- * `allow_fleet_pool_use=false` — misleading in exactly the state
- * every operator starts in. These tests pin all five labels so a
- * future regression on the opt-in gate fails loudly.
+ * Rewritten 2026-11-01 for the AFX-7 collapse: one pool, pool state
+ * is written at approve-time and cleared at delete-time, no "fleet
+ * vs direct" distinction. These cases pin all four live labels
+ * (plus the legacy "Cooling") so a regression on the precedence
+ * fails loudly.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -30,33 +29,8 @@ function _acct(overrides: Partial<UserOandaAccountPublic> = {}): UserOandaAccoun
 }
 
 describe('selectPoolColumnView', () => {
-  describe('opt-in OFF', () => {
-    it('renders "Not pooled" even when pool_status is the default "free"', () => {
-      // The regression Wilson surfaced on 2026-10-30: default
-      // `pool_status="free"` was reading as "fleet-available" when
-      // the account wasn't actually poolable.
-      const view = selectPoolColumnView(_acct(), false);
-      expect(view.kind).toBe('not-pooled');
-      expect(view.label).toBe('Not pooled');
-      expect(view.title).toContain('Opt-in to fleet pool is OFF');
-    });
-
-    it('still renders "Not pooled" when a direct paper run is active', () => {
-      // Wilson's actual state 2026-10-30: 2 active paper runs on
-      // owner creds, opt-in off → both must render "Not pooled",
-      // with a hint that a direct run is live.
-      const view = selectPoolColumnView(
-        _acct({ active_paper_run_id: 'run_1788294076495_paper_EUR_USD_M1' }),
-        false,
-      );
-      expect(view.kind).toBe('not-pooled');
-      expect(view.label).toBe('Not pooled');
-      expect(view.title).toContain('paper run active');
-    });
-  });
-
-  describe('opt-in ON', () => {
-    it('fleet-held slot renders "In use (fleet)" and names the run', () => {
+  describe('IN_USE wins over everything', () => {
+    it('renders "In use" and names the bound run (via pool_current_run_id)', () => {
       const view = selectPoolColumnView(
         _acct({
           pool_status: 'in_use',
@@ -64,43 +38,74 @@ describe('selectPoolColumnView', () => {
         }),
         true,
       );
-      expect(view.kind).toBe('fleet-in-use');
-      expect(view.label).toBe('In use (fleet)');
+      expect(view.kind).toBe('in-use');
+      expect(view.label).toBe('In use');
       expect(view.title).toContain('run_abc');
+      expect(view.title).toContain('until the run is deleted');
     });
 
-    it('direct-path paper run renders "In use (direct)" distinctly', () => {
-      // The subtle case: opt-in is ON but a run started pre-opt-in
-      // is still live on the account via owner-creds. Must NOT render
-      // as "Free" — that would misrepresent availability.
-      const view = selectPoolColumnView(
-        _acct({
-          active_paper_run_id: 'run_direct_xyz',
-          pool_status: 'free', // not pool-held
-        }),
-        true,
-      );
-      expect(view.kind).toBe('direct-in-use');
-      expect(view.label).toBe('In use (direct)');
-      expect(view.title).toContain('run_direct_xyz');
-      expect(view.title).toContain('not via the fleet pool');
-    });
-
-    it('fleet-held takes precedence over active_paper_run_id', () => {
-      // If BOTH are set (shouldn't normally — same run) prefer the
-      // explicit fleet state so the operator sees it's leased.
+    it('falls back to active_paper_run_id if pool_current_run_id is unset', () => {
+      // Defensive — the backend writes both at approve-time, but a
+      // legacy row (bound before the collapse landed) might have
+      // only active_paper_run_id. Still show "In use" with the run.
       const view = selectPoolColumnView(
         _acct({
           pool_status: 'in_use',
-          pool_current_run_id: 'run_fleet',
-          active_paper_run_id: 'run_fleet',
+          pool_current_run_id: null,
+          active_paper_run_id: 'run_legacy',
         }),
         true,
       );
-      expect(view.kind).toBe('fleet-in-use');
+      expect(view.kind).toBe('in-use');
+      expect(view.title).toContain('run_legacy');
     });
 
-    it('cooling renders countdown in title relative to injected now', () => {
+    it('renders "In use" regardless of the opt-in flag', () => {
+      // The whole point of the collapse: operator may manually pick
+      // an account from a non-opted-in credentials row. If that
+      // account is bound to a run, the badge truthfully says so.
+      const view = selectPoolColumnView(
+        _acct({
+          pool_status: 'in_use',
+          pool_current_run_id: 'run_manual',
+        }),
+        false, // opt-in off
+      );
+      expect(view.kind).toBe('in-use');
+      expect(view.label).toBe('In use');
+    });
+  });
+
+  describe('disabled', () => {
+    it('renders a dedicated pill, higher precedence than opt-in', () => {
+      const viewOptIn = selectPoolColumnView(
+        _acct({ pool_status: 'disabled' }),
+        true,
+      );
+      expect(viewOptIn.kind).toBe('disabled');
+      expect(viewOptIn.label).toBe('Disabled');
+
+      const viewNoOptIn = selectPoolColumnView(
+        _acct({ pool_status: 'disabled' }),
+        false,
+      );
+      expect(viewNoOptIn.kind).toBe('disabled');
+    });
+  });
+
+  describe('opt-in OFF (idle)', () => {
+    it('renders "Not pooled" when pool_status is the default "free"', () => {
+      const view = selectPoolColumnView(_acct(), false);
+      expect(view.kind).toBe('not-pooled');
+      expect(view.label).toBe('Not pooled');
+      expect(view.title).toContain('Opt-in to fleet pool is OFF');
+    });
+  });
+
+  describe('legacy cooling state', () => {
+    it('still renders "Cooling" if a pre-collapse row has that status', () => {
+      // Allocation reads will sweep this back to FREE on the next
+      // call, but until then the pill truthfully reflects the DB.
       const view = selectPoolColumnView(
         _acct({
           pool_status: 'cooling_down',
@@ -113,30 +118,10 @@ describe('selectPoolColumnView', () => {
       expect(view.label).toBe('Cooling');
       expect(view.title).toContain('30s');
     });
+  });
 
-    it('cooling with expired cooling_until shows 0s (clamped)', () => {
-      const view = selectPoolColumnView(
-        _acct({
-          pool_status: 'cooling_down',
-          pool_cooling_until: '2026-10-30T11:50:00Z',
-        }),
-        true,
-        new Date('2026-10-30T12:00:00Z').getTime(),
-      );
-      expect(view.kind).toBe('cooling');
-      expect(view.title).toContain('0s');
-    });
-
-    it('disabled renders a dedicated pill, not "Free"', () => {
-      const view = selectPoolColumnView(
-        _acct({ pool_status: 'disabled' }),
-        true,
-      );
-      expect(view.kind).toBe('disabled');
-      expect(view.label).toBe('Disabled');
-    });
-
-    it('truly free renders "Free" (fleet-available)', () => {
+  describe('truly free', () => {
+    it('renders "Free" when idle + opt-in ON', () => {
       const view = selectPoolColumnView(_acct(), true);
       expect(view.kind).toBe('free');
       expect(view.label).toBe('Free');
@@ -149,12 +134,9 @@ describe('selectPoolColumnView', () => {
     // so the pill can't render invisibly on a Tailwind cache miss.
     it('every kind has a non-empty tone', () => {
       const cases = [
-        selectPoolColumnView(_acct(), false),
         selectPoolColumnView(_acct({ pool_status: 'in_use' }), true),
-        selectPoolColumnView(
-          _acct({ active_paper_run_id: 'r' }),
-          true,
-        ),
+        selectPoolColumnView(_acct({ pool_status: 'disabled' }), true),
+        selectPoolColumnView(_acct(), false), // not-pooled
         selectPoolColumnView(
           _acct({
             pool_status: 'cooling_down',
@@ -162,8 +144,7 @@ describe('selectPoolColumnView', () => {
           }),
           true,
         ),
-        selectPoolColumnView(_acct({ pool_status: 'disabled' }), true),
-        selectPoolColumnView(_acct(), true),
+        selectPoolColumnView(_acct(), true), // free
       ];
       for (const v of cases) {
         expect(v.tone.trim().length).toBeGreaterThan(0);
