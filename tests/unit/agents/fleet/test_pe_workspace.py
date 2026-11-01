@@ -587,7 +587,10 @@ class TestManagedAgentsAdapterSDK:
         # SDK was called with the expected args
         fake_client.beta.sessions.create.assert_called_once()
         kwargs = fake_client.beta.sessions.create.call_args.kwargs
-        assert kwargs["agent"] == {"id": "agent_abc"}
+        # 2026-11-01 fix: agent discriminated union needs `type`.
+        # The staging deploy of this adapter without `type` returned
+        # 400 `agent.selector.type: Field required` from the API.
+        assert kwargs["agent"] == {"type": "agent", "id": "agent_abc"}
         assert kwargs["environment_id"] == "env_xyz"
         assert kwargs["vault_ids"] == ["vault_123"]
         assert kwargs["title"] == "2026-10-15-fix-order-dedup"

@@ -432,7 +432,14 @@ class ManagedAgentsAdapter:
 
         try:
             session = client.beta.sessions.create(
-                agent={"id": agent_id},
+                # 2026-11-01 fix: the SDK requires a selector `type`
+                # on the agent discriminated union — without it the
+                # Anthropic API returns
+                # `agent.selector.type: Field required` (400).
+                # Pinned-form object with just `type` + `id` is the
+                # documented shape; omitting `version` picks the
+                # latest.
+                agent={"type": "agent", "id": agent_id},
                 environment_id=env_id,
                 vault_ids=[vault_id],
                 # Title is operator-facing in the Managed Agents console;
