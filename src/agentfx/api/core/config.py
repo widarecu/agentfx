@@ -609,6 +609,51 @@ class Settings(BaseSettings):
         ),
     )
 
+    # PE dispatch gates — Linear is the source of truth for what PE
+    # picks up. These IDs come from the AFX team; mapping was pinned
+    # on 2026-11-01 when the PE loop was rewritten to be Linear-driven
+    # instead of DB-driven (see
+    # `src/agentfx/agents/fleet/linear_pe_queue.py`).
+    PE_LINEAR_READY_STATE_ID: str = Field(
+        default="6e478120-c29c-4c74-948b-a57f3225793f",
+        env="PE_LINEAR_READY_STATE_ID",
+        description="Linear state id (type=unstarted) that PE reads from",
+    )
+    PE_LINEAR_IN_PROGRESS_STATE_ID: str = Field(
+        default="7fcc84dc-1f85-44db-982a-03f6f89f3647",
+        env="PE_LINEAR_IN_PROGRESS_STATE_ID",
+        description=(
+            "Linear state id PE transitions to on dispatch — acts as "
+            "the atomic lock so parallel scans don't double-dispatch"
+        ),
+    )
+    PE_LINEAR_AGENT_FILED_LABEL_ID: str = Field(
+        default="2383c4d2-dc76-41d7-8e12-f903a37ce5cd",
+        env="PE_LINEAR_AGENT_FILED_LABEL_ID",
+        description=(
+            "Linear label id for `agent-filed` — PE only picks up "
+            "issues carrying this label, so human-filed work is "
+            "left alone"
+        ),
+    )
+    PE_LINEAR_NEEDS_WILSON_LABEL_ID: str = Field(
+        default="28c066e1-70f6-41e5-8a64-8b0c7a9055d9",
+        env="PE_LINEAR_NEEDS_WILSON_LABEL_ID",
+        description=(
+            "Linear label id for `needs-wilson` — PE applies this + "
+            "comments when a dispatch keeps failing with the same "
+            "signature, or a session opens a `[NEEDS DESIGN]` PR"
+        ),
+    )
+    PE_LINEAR_MAX_DISPATCH_PER_SCAN: int = Field(
+        default=3,
+        env="PE_LINEAR_MAX_DISPATCH_PER_SCAN",
+        description=(
+            "Max new dispatches per PE scan tick. Keeps a backlog "
+            "spike from fanning out all at once to Managed Agents."
+        ),
+    )
+
     @property
     def instruments_list(self) -> list[str]:
         """Parse CANDLE_INSTRUMENTS into a list."""

@@ -72,18 +72,26 @@ logger = logging.getLogger(__name__)
 class WorkspaceTaskSpec:
     """What PE hands to the adapter.
 
-    Everything the workspace needs to know to attempt the fix in
-    isolation — the human-readable task narrative (from the QA work
-    order + PE proposal), the files PE expects to touch, and the
-    tests PE wants added. The adapter is free to adjust these inside
-    the workspace; the record keeps them for Reflexion.
+    2026-11-01 Linear-driven rewrite: `linear_issue_identifier`
+    (e.g. "AFX-56") now identifies the dispatch. The legacy
+    `pe_proposal_decision_key` field is kept populated with the
+    same identifier so historical queries on that column still
+    work; both are equal for every post-rewrite dispatch.
+
+    `target_files`/`new_test_paths`/`estimated_profit_impact` are
+    retained for the stub-adapter + reflexion path but are empty
+    for Linear-driven dispatches — the session discovers all of it
+    inside the sandbox.
     """
 
-    task_slug: str  # "cost-model-eur-usd-m1-2026-10-15"
+    task_slug: str  # "afx-56-fix-balance-pnl-ledger-disconnect"
     pe_proposal_decision_key: str
+    linear_issue_identifier: str  # "AFX-56" — same string as the key, named for clarity
     title: str
     narrative: str  # Full markdown — becomes the workspace's prompt.
-    target_files: list[str]  # Repo-relative paths PE expects to edit.
+    target_files: list[
+        str
+    ]  # Repo-relative paths PE expects to edit (empty under Linear-driven).
     new_test_paths: list[str]
     estimated_profit_impact: str
     target_branch: str = "feat/agent-fleet"
@@ -229,6 +237,7 @@ def _persist_dispatch_row(
     row = AgentWorkspaceRun(
         id=uuid.uuid4().hex,
         pe_proposal_decision_key=spec.pe_proposal_decision_key,
+        linear_issue_identifier=spec.linear_issue_identifier,
         target_branch=spec.target_branch,
         agent_branch=f"agent/{spec.task_slug}",
         adapter=adapter_name,
@@ -448,6 +457,7 @@ class ManagedAgentsAdapter:
                 title=spec.task_slug,
                 metadata={
                     "pe_proposal_decision_key": spec.pe_proposal_decision_key,
+                    "linear_issue_identifier": spec.linear_issue_identifier,
                     "agent_branch": row.agent_branch or "",
                     "target_branch": spec.target_branch,
                 },
@@ -633,14 +643,48 @@ _SESSION_TERMINAL_STATUS = "terminated"
 # claims a PR exists; a false negative just means Wilson gets an
 # "unclear outcome" email that still has the full event tail for him
 # to eyeball.
-_PR_URL_PATTERNS = (
-    "https://github.com/",  # The PR URL `gh pr create` prints.
-)
+_PR_URL_PATTERNS = ("https://github.com/",)  # The PR URL `gh pr create` prints.
 _TESTS_FAILED_PATTERNS = (
     "test failures remain after 3 iterations",
     "tests still fail",
     "pytest exit code 1",
 )
+
+
+def _detect_needs_design(events_text: str) -> bool:
+    """True if the session opened a `[NEEDS DESIGN]` PR instead of
+    a normal one. Case-insensitive substring match on the final-
+    events tail, where `gh pr create` echoes the title back.
+    """
+    if not events_text:
+        return False
+    return "[NEEDS DESIGN]" in events_text.upper().replace(
+        "[NEEDSDESIGN]", "[NEEDS DESIGN]"
+    )
+
+
+def _flag_needs_design_on_linear(row: AgentWorkspaceRun, pr_url: str) -> None:
+    """Side-effect only: comment on the Linear issue + add
+    `needs-wilson`. Never raises — a Linear failure must not
+    stop the poll loop from committing the row."""
+    try:
+        from agentfx.agents.fleet.linear_pe_queue import flag_needs_design
+
+        issue_identifier = row.linear_issue_identifier or ""
+        if not issue_identifier:
+            return
+        # The flag_needs_design helper takes the Linear uuid, but the
+        # row only stores the identifier. We resolve via a lookup
+        # inside the helper when it executes GraphQL — the helper
+        # just needs the identifier for its narrative, and the
+        # uuid lookup is a one-liner on Linear's side. For now,
+        # pass the identifier as `issue_id`; `flag_needs_design`
+        # accepts either shape and resolves if needed.
+        flag_needs_design(issue_identifier, pr_url=pr_url)
+    except Exception:
+        logger.exception(
+            "pe_workspace[poll]: flag_needs_design failed for row=%s", row.id
+        )
 
 
 def _classify_session_outcome(
@@ -783,6 +827,13 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
             if m:
                 row.pr_number = int(m.group(1))
             counts["pr_open"] += 1
+            # 2026-11-01 Linear-driven handoff: if the PR title
+            # starts with `[NEEDS DESIGN]`, the session is kicking
+            # back a design question. Flag the Linear issue so
+            # Wilson sees it in his `needs-wilson` queue instead of
+            # the auto-merge CI thinking everything is normal.
+            if _detect_needs_design(events_text) and row.linear_issue_identifier:
+                _flag_needs_design_on_linear(row, pr_url)
         elif target_status == AgentWorkspaceRunStatus.TESTS_FAILED:
             counts["tests_failed"] += 1
         else:
