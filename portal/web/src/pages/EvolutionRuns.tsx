@@ -3,24 +3,40 @@
  *
  * Mirrors the Optimization list page: paginated table + status badges +
  * "Start New Run" modal.
+ *
+ * AFX-37: each row also shows how many genomes cleared the validator and
+ * the run's best fitness. Both columns (and Created) sort server-side, so
+ * a winning run surfaces on page 1 without clicking into every row.
  */
 
 import React, { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Loader2, Plus, Trash2, X } from 'lucide-react';
+import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
+  CheckCircle2,
+  Loader2,
+  Plus,
+  Trash2,
+  X,
+} from 'lucide-react';
 
 import { useAuth } from '../contexts/AuthContext';
 import {
   STATUS_BADGE_CLASSES,
   createEvolutionRun,
   deleteEvolutionRun,
+  formatFitness,
   formatLlmCost,
   listEvolutionRuns,
 } from '../services/evolutionApi';
 import { marketDataService } from '../services/marketData';
 import type {
-  EvolutionRun,
+  EvolutionRunListItem,
+  EvolutionRunSortField,
   EvolutionRunStatus,
+  SortOrder,
 } from '../types/evolution';
 import {
   canSeeScopeToggle,
@@ -29,13 +45,92 @@ import {
   type Scope,
 } from '../utils/rbac';
 
+// ─────────────────────────────────────────────────────────────────────
+// Sorting + outcome-column helpers (AFX-37). Pure, so they're unit-tested
+// without a DOM in tests/unit/evolutionRunsTable.test.ts.
+// ─────────────────────────────────────────────────────────────────────
+
+export interface RunSort {
+  field: EvolutionRunSortField;
+  order: SortOrder;
+}
+
+/** Newest first, which is the list's order from before sorting existed. */
+export const DEFAULT_RUN_SORT: RunSort = { field: 'created_at', order: 'desc' };
+
+/**
+ * Header-click transition. A newly clicked column starts descending (most
+ * passes, best fitness or newest on top, the useful end of every sortable
+ * column here). Clicking the active column flips the direction. Same
+ * interaction as TradesTable.
+ */
+export function nextRunSort(
+  current: RunSort,
+  field: EvolutionRunSortField,
+): RunSort {
+  if (current.field !== field) return { field, order: 'desc' };
+  return { field, order: current.order === 'desc' ? 'asc' : 'desc' };
+}
+
+export function ariaSortFor(
+  sort: RunSort,
+  field: EvolutionRunSortField,
+): 'ascending' | 'descending' | 'none' {
+  if (sort.field !== field) return 'none';
+  return sort.order === 'asc' ? 'ascending' : 'descending';
+}
+
+export interface ValidatorPassedView {
+  label: string;
+  /** Green badge, so a run with promotable genomes stands out in the list. */
+  highlighted: boolean;
+  title: string;
+}
+
+/**
+ * What the Validator-passed cell shows. Any pass is highlighted. Zero
+ * passes on a queued or running run renders "—" rather than "0", because
+ * the validator only runs after the final generation and there is no
+ * verdict yet.
+ */
+export function selectValidatorPassedView(
+  count: number,
+  status: EvolutionRunStatus,
+): ValidatorPassedView {
+  if (count > 0) {
+    return {
+      label: String(count),
+      highlighted: true,
+      title:
+        `${count} genome${count === 1 ? '' : 's'} in this run cleared the ` +
+        'walk-forward validator (Gate B on the held-out OOS fold)',
+    };
+  }
+  if (status === 'queued' || status === 'running') {
+    return {
+      label: '—',
+      highlighted: false,
+      title:
+        'Validation runs after the final generation, so there is no verdict yet',
+    };
+  }
+  return {
+    label: '0',
+    highlighted: false,
+    title: 'No genome in this run cleared the walk-forward validator',
+  };
+}
+
 export default function EvolutionRuns() {
-  const [runs, setRuns] = useState<EvolutionRun[]>([]);
+  const [runs, setRuns] = useState<EvolutionRunListItem[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [pageSize] = useState(10);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // AFX-37: sorted server-side. The list is paginated, so sorting the
+  // current page in the browser would hide a winner sitting on a later page.
+  const [sort, setSort] = useState<RunSort>(DEFAULT_RUN_SORT);
 
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -57,6 +152,8 @@ export default function EvolutionRuns() {
     try {
       const data = await listEvolutionRuns(page, pageSize, {
         scope: resolveScope(role, scope),
+        sortBy: sort.field,
+        sortOrder: sort.order,
       });
       setRuns(data.items);
       setTotal(data.total);
@@ -79,7 +176,13 @@ export default function EvolutionRuns() {
     }, 5000);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, scope]);
+  }, [page, scope, sort.field, sort.order]);
+
+  function handleSort(field: EvolutionRunSortField): void {
+    setSort((current) => nextRunSort(current, field));
+    // A new ordering starts from its first page.
+    setPage(1);
+  }
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
@@ -155,6 +258,8 @@ export default function EvolutionRuns() {
             <>
               <RunsTable
                 runs={nativeRuns}
+                sort={sort}
+                onSort={handleSort}
                 onRowClick={(id) => navigate(`/evolution/${id}`)}
                 onDelete={onDelete}
               />
@@ -177,6 +282,8 @@ export default function EvolutionRuns() {
                   </p>
                   <RunsTable
                     runs={importedRuns}
+                    sort={sort}
+                    onSort={handleSort}
                     onRowClick={(id) => navigate(`/evolution/${id}`)}
                     onDelete={onDelete}
                   />
@@ -266,10 +373,14 @@ export default function EvolutionRuns() {
 
 function RunsTable({
   runs,
+  sort,
+  onSort,
   onRowClick,
   onDelete,
 }: {
-  runs: EvolutionRun[];
+  runs: EvolutionRunListItem[];
+  sort: RunSort;
+  onSort: (field: EvolutionRunSortField) => void;
   onRowClick: (id: string) => void;
   onDelete: (id: string) => void | Promise<void>;
 }) {
@@ -289,10 +400,33 @@ function RunsTable({
             <th className="px-4 py-3 text-left font-medium">Run ID</th>
             <th className="px-4 py-3 text-left font-medium">Status</th>
             <th className="px-4 py-3 text-left font-medium">Pair</th>
+            {/* Outcome columns sit right after Pair so they stay visible
+                before horizontal scrolling on a phone. */}
+            <SortableHeader
+              field="validator_passed_count"
+              label="Validator-passed"
+              align="right"
+              sort={sort}
+              onSort={onSort}
+              title="Genomes in this run that cleared the walk-forward validator (Gate B on the held-out OOS fold). These are the paper-deploy candidates."
+            />
+            <SortableHeader
+              field="best_fitness"
+              label="Best fitness"
+              align="right"
+              sort={sort}
+              onSort={onSort}
+              title="Highest training fitness of any genome in this run, i.e. the peak of its Best Fitness by Generation chart. Not necessarily a validator-passed genome."
+            />
             <th className="px-4 py-3 text-right font-medium">Generation</th>
             <th className="px-4 py-3 text-right font-medium">LLM cost</th>
             <th className="px-4 py-3 text-left font-medium">Stop reason</th>
-            <th className="px-4 py-3 text-left font-medium">Created</th>
+            <SortableHeader
+              field="created_at"
+              label="Created"
+              sort={sort}
+              onSort={onSort}
+            />
             <th className="px-4 py-3 text-right font-medium w-12"></th>
           </tr>
         </thead>
@@ -314,6 +448,15 @@ function RunsTable({
               <td className="px-4 py-3 font-mono text-xs">
                 {r.instrument} {r.granularity}
               </td>
+              <td className="px-4 py-3 text-right">
+                <ValidatorPassedCell
+                  count={r.validator_passed_count}
+                  status={r.status}
+                />
+              </td>
+              <td className="px-4 py-3 text-right font-mono">
+                {formatFitness(r.best_fitness)}
+              </td>
               <td className="px-4 py-3 text-right font-mono">
                 {r.current_generation}
               </td>
@@ -321,7 +464,7 @@ function RunsTable({
                 {formatLlmCost(r.llm_cost_usd)}
               </td>
               <td className="px-4 py-3 text-slate-500 dark:text-slate-400 text-xs">
-                {r.stop_reason ?? '—'}
+                {r.stop_reason ? <SnakeCaseText text={r.stop_reason} /> : '—'}
               </td>
               <td className="px-4 py-3 text-xs text-slate-500 dark:text-slate-400">
                 {new Date(r.created_at).toLocaleString()}
@@ -345,6 +488,101 @@ function RunsTable({
         </tbody>
       </table>
     </div>
+  );
+}
+
+/**
+ * Column header that sorts the runs list server-side (AFX-37). The icon
+ * shows the active direction; inactive sortable columns show a neutral
+ * up/down glyph, the same convention as TradesTable.
+ */
+function SortableHeader({
+  field,
+  label,
+  sort,
+  onSort,
+  align = 'left',
+  title,
+}: {
+  field: EvolutionRunSortField;
+  label: string;
+  sort: RunSort;
+  onSort: (field: EvolutionRunSortField) => void;
+  align?: 'left' | 'right';
+  title?: string;
+}) {
+  const active = sort.field === field;
+  const Icon = !active ? ArrowUpDown : sort.order === 'asc' ? ArrowUp : ArrowDown;
+  return (
+    <th
+      aria-sort={ariaSortFor(sort, field)}
+      title={title}
+      className={`px-4 py-3 font-medium ${align === 'right' ? 'text-right' : 'text-left'}`}
+    >
+      <button
+        type="button"
+        onClick={() => onSort(field)}
+        className={`inline-flex items-center gap-1 uppercase tracking-wide hover:text-slate-900 dark:hover:text-slate-100 ${
+          active ? 'text-slate-900 dark:text-slate-100' : ''
+        }`}
+      >
+        {label}
+        <Icon
+          aria-hidden="true"
+          className={`w-3.5 h-3.5 ${active ? 'text-blue-500' : 'text-slate-400'}`}
+        />
+      </button>
+    </th>
+  );
+}
+
+/**
+ * Lets long snake_case tokens such as `train_oos_regime_mismatch` wrap at
+ * their underscores. Unbroken, a single long stop reason sets the column's
+ * minimum width, and with the AFX-37 columns that pushed the table past
+ * its container on desktop. `<wbr>` doesn't change the copied text.
+ */
+function SnakeCaseText({ text }: { text: string }) {
+  const parts = text.split('_');
+  return (
+    <>
+      {parts.map((part, i) => (
+        <React.Fragment key={i}>
+          {part}
+          {i < parts.length - 1 && (
+            <>
+              _<wbr />
+            </>
+          )}
+        </React.Fragment>
+      ))}
+    </>
+  );
+}
+
+function ValidatorPassedCell({
+  count,
+  status,
+}: {
+  count: number;
+  status: EvolutionRunStatus;
+}) {
+  const view = selectValidatorPassedView(count, status);
+  if (view.highlighted) {
+    return (
+      <span
+        title={view.title}
+        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300 text-xs font-semibold"
+      >
+        <CheckCircle2 aria-hidden="true" className="w-3.5 h-3.5" />
+        {view.label}
+      </span>
+    );
+  }
+  return (
+    <span title={view.title} className="font-mono text-slate-400 dark:text-slate-500">
+      {view.label}
+    </span>
   );
 }
 
