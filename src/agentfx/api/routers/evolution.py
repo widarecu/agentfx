@@ -2,7 +2,7 @@
 
 Endpoints:
 - POST   /api/v1/evolution-runs                          (TRADER+, 202)
-- GET    /api/v1/evolution-runs                          (paginated)
+- GET    /api/v1/evolution-runs                          (paginated, sortable)
 - GET    /api/v1/evolution-runs/{run_id}                 (detail)
 - DELETE /api/v1/evolution-runs/{run_id}                 (TRADER+, terminal-state only)
 - POST   /api/v1/evolution-runs/{run_id}/stop            (TRADER+, manual halt)
@@ -156,6 +156,15 @@ def create_evolution_run(
     )
 
 
+def _to_list_item(row: evolution_service.RunListRow) -> schemas.EvolutionRunListItem:
+    return schemas.EvolutionRunListItem.model_validate(row.run).model_copy(
+        update={
+            "validator_passed_count": row.validator_passed_count,
+            "best_fitness": row.best_fitness,
+        }
+    )
+
+
 @router.get("/evolution-runs", response_model=schemas.EvolutionRunList)
 def list_evolution_runs(
     page: int = 1,
@@ -163,6 +172,9 @@ def list_evolution_runs(
     status_filter: str | None = None,
     instrument: str | None = None,
     scope: rbac.Scope = "my",
+    # AFX-37: sort the whole filtered set server-side, before paging.
+    sort_by: evolution_service.RunSortField = "created_at",
+    sort_order: evolution_service.SortOrder = "desc",
     db: Session = Depends(get_db),
     current_user: models.User = Depends(user_service.get_current_active_user),
 ) -> schemas.EvolutionRunList:
@@ -177,16 +189,18 @@ def list_evolution_runs(
         if current_user.role == models.UserRole.ADMIN and scope == "all"
         else current_user.id
     )
-    items, total = evolution_service.list_runs(
+    rows, total = evolution_service.list_runs(
         db,
         skip=skip,
         limit=page_size,
         status=status_filter,
         instrument=instrument,
         created_by=created_by_filter,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )
     return schemas.EvolutionRunList(
-        items=[schemas.EvolutionRunPublic.model_validate(r) for r in items],
+        items=[_to_list_item(row) for row in rows],
         total=total,
         page=page,
         page_size=page_size,

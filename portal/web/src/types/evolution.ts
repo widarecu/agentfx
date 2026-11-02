@@ -107,8 +107,31 @@ export interface EvolutionRun {
   imported_from_run_id: string | null;
 }
 
+/**
+ * One row of `GET /evolution-runs` (AFX-37): the run plus per-run outcome
+ * aggregates computed server-side. List-only. The detail endpoint returns
+ * a plain `EvolutionRun`.
+ */
+export interface EvolutionRunListItem extends EvolutionRun {
+  /** Genomes in this run that cleared the walk-forward validator (Gate B
+   * on the held-out OOS fold). */
+  validator_passed_count: number;
+  /** Highest training fitness of any genome in the run, i.e. the peak of
+   * the run-detail "Best Fitness by Generation" chart. Not restricted to
+   * validator-passed genomes. Null until the first generation is scored. */
+  best_fitness: number | null;
+}
+
+/** Server-side sort keys for `GET /evolution-runs` (`sort_by`). */
+export type EvolutionRunSortField =
+  | 'created_at'
+  | 'validator_passed_count'
+  | 'best_fitness';
+
+export type SortOrder = 'asc' | 'desc';
+
 export interface EvolutionRunListResponse {
-  items: EvolutionRun[];
+  items: EvolutionRunListItem[];
   total: number;
   page: number;
   page_size: number;
