@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
-from sqlalchemy import desc
+from sqlalchemy import and_, case, desc, func, select
 from sqlalchemy.orm import Session
 
 from agentfx.agents.evolution import Genome
@@ -526,6 +527,82 @@ def find_prior_winners(
     ]
 
 
+# Columns the runs list can be ordered by (AFX-37). A Literal, like
+# `rbac.Scope`, so FastAPI rejects anything else with a 422 before it can
+# reach an ORDER BY.
+RunSortField = Literal["created_at", "validator_passed_count", "best_fitness"]
+SortOrder = Literal["asc", "desc"]
+
+
+@dataclass(frozen=True)
+class RunListRow:
+    """One row of the runs list: the run plus its outcome aggregates.
+
+    The aggregates are computed in SQL rather than in the portal so the
+    list can be sorted by them across every page, not just the page in
+    view.
+    """
+
+    run: models.EvolutionRun
+    # Genomes in this run with validator_passed=True, i.e. they cleared
+    # Gate B on the held-out OOS fold.
+    validator_passed_count: int
+    # Highest finite training fitness of any genome in the run, which is
+    # the peak of the run-detail "Best Fitness by Generation" chart. Not
+    # restricted to validator-passed genomes. None until a generation has
+    # been scored.
+    best_fitness: float | None
+
+
+def _run_outcome_columns():
+    """Per-run `validator_passed_count` and `best_fitness` columns for the
+    runs list, as correlated scalar subqueries over that run's genomes.
+
+    Correlated subqueries rather than a GROUP BY over the whole genome
+    table, so Postgres aggregates only the runs it needs. Under the default
+    newest-first sort that is just the page's rows (the subplans run after
+    the top-N sort). Sorting by one of these columns aggregates every
+    filtered run for that column. Each lookup uses the existing
+    `generations.run_id` and `strategy_genomes.generation_id` indexes.
+    Checked with EXPLAIN ANALYZE on Postgres 16 at 300 runs / 270k
+    genomes: about 6 ms for the default sort, 60-70 ms for the outcome
+    sorts.
+    """
+    genome = models.StrategyGenome
+    generation = models.Generation
+    run = models.EvolutionRun
+
+    def _per_run(aggregate, *where):
+        return (
+            select(aggregate)
+            .select_from(genome)
+            .join(generation, genome.generation_id == generation.id)
+            .where(generation.run_id == run.id, *where)
+            .correlate(run)
+            .scalar_subquery()
+        )
+
+    validator_passed_count = _per_run(
+        func.count(genome.id), genome.validator_passed.is_(True)
+    ).label("validator_passed_count")
+
+    # compute_fitness() returns -inf when no training fold yields a finite
+    # Sharpe. Such a genome must not become a run's "best". The value also
+    # can't be serialised, so FastAPI would return 500 for the whole list.
+    # The two bounds also drop NaN on Postgres, which sorts NaN above every
+    # number.
+    finite_fitness = case(
+        (
+            and_(genome.fitness > float("-inf"), genome.fitness < float("inf")),
+            genome.fitness,
+        ),
+        else_=None,
+    )
+    best_fitness = _per_run(func.max(finite_fitness)).label("best_fitness")
+
+    return validator_passed_count, best_fitness
+
+
 def list_runs(
     db: Session,
     *,
@@ -534,14 +611,23 @@ def list_runs(
     status: str | None = None,
     instrument: str | None = None,
     created_by: int | None = None,
-) -> tuple[list[models.EvolutionRun], int]:
-    """Paginated listing. Returns (items, total).
+    sort_by: RunSortField = "created_at",
+    sort_order: SortOrder = "desc",
+) -> tuple[list[RunListRow], int]:
+    """Paginated listing. Returns (rows, total).
 
     When `created_by` is provided, the query is filtered to that user's
     runs — the routing layer sets this from `current_user.id` unless the
     caller is ADMIN + `scope=all` (US-018). Callers that leave it as
     None get an unfiltered listing; the router MUST NOT do so for
     non-admin sessions.
+
+    Each row carries the run's validator-pass count and best fitness
+    (AFX-37). The sort applies to the whole filtered set *before*
+    pagination, so page 1 of "best fitness, descending" is the best run
+    across all pages. Runs with no best fitness yet sort last in either
+    direction. Ties fall back to newest first, then to id, so paging is
+    stable.
     """
     q = db.query(models.EvolutionRun)
     if status:
@@ -551,10 +637,34 @@ def list_runs(
     if created_by is not None:
         q = q.filter(models.EvolutionRun.created_by == created_by)
     total = q.count()
-    items = (
-        q.order_by(desc(models.EvolutionRun.created_at)).offset(skip).limit(limit).all()
+
+    validator_passed_count, best_fitness = _run_outcome_columns()
+    sort_column = {
+        "created_at": models.EvolutionRun.created_at,
+        "validator_passed_count": validator_passed_count,
+        "best_fitness": best_fitness,
+    }[sort_by]
+    primary = sort_column.asc() if sort_order == "asc" else sort_column.desc()
+
+    rows = (
+        q.add_columns(validator_passed_count, best_fitness)
+        .order_by(
+            primary.nulls_last(),
+            desc(models.EvolutionRun.created_at),
+            desc(models.EvolutionRun.id),
+        )
+        .offset(skip)
+        .limit(limit)
+        .all()
     )
-    return items, total
+    return [
+        RunListRow(
+            run=run,
+            validator_passed_count=int(passed or 0),
+            best_fitness=best,
+        )
+        for run, passed, best in rows
+    ], total
 
 
 def create_run(
@@ -1165,6 +1275,9 @@ class SqlAlchemyPersister:
 
 
 __all__ = [
+    "RunListRow",
+    "RunSortField",
+    "SortOrder",
     "SqlAlchemyPersister",
     "create_run",
     "find_orphaned_running_runs",
