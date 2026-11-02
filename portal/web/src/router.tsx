@@ -73,8 +73,12 @@ export const router = createBrowserRouter([
           </RequireRole>
         ),
       },
+      // AFX-38: optional `:genomeId` deep-links one approval row (the PM
+      // brief email links here) — the queue pins + highlights it. A path
+      // segment rather than `?genome=` because the login redirect only
+      // carries the pathname through.
       {
-        path: 'paper/approvals',
+        path: 'paper/approvals/:genomeId?',
         element: (
           <RequireRole allowed={['trader', 'admin']}>
             <ApprovalQueue />

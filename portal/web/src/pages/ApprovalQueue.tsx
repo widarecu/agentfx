@@ -5,10 +5,15 @@
  * with the OANDA account picker lands in PR-J. Reject is fully
  * functional (required reason + quick-picks + backend persists the
  * decision log entry).
+ *
+ * AFX-38: /paper/approvals/:genomeId deep-links one row (the PM
+ * morning-brief email links here). The linked row is pinned first and
+ * highlighted; nothing is auto-approved — Approve stays a deliberate
+ * tap.
  */
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { AlertCircle, CheckCircle2, Loader2, PackageOpen, PlayCircle, Upload } from 'lucide-react';
 
 import { useToast } from '../contexts/ToastContext';
@@ -33,6 +38,11 @@ export default function ApprovalQueue() {
   );
   const { showToast } = useToast();
   const navigate = useNavigate();
+  const { genomeId: focusGenomeId } = useParams<{ genomeId?: string }>();
+  const { ordered: orderedItems, focusFound } = _focusApprovalItems(
+    items,
+    focusGenomeId,
+  );
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [importing, setImporting] = useState(false);
 
@@ -171,6 +181,18 @@ export default function ApprovalQueue() {
         </div>
       )}
 
+      {focusGenomeId && !loading && !error && !focusFound && (
+        <div
+          role="status"
+          className="mb-4 px-4 py-3 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-sm text-amber-800 dark:text-amber-300"
+        >
+          Genome{' '}
+          <code className="font-mono text-xs break-all">{focusGenomeId}</code>{' '}
+          isn&apos;t on your approval queue — it may already be deployed or
+          rejected.
+        </div>
+      )}
+
       {loading ? (
         <div className="flex items-center justify-center h-40">
           <Loader2 className="w-8 h-8 text-emerald-500 animate-spin" />
@@ -179,12 +201,13 @@ export default function ApprovalQueue() {
         <EmptyState meta={meta} />
       ) : (
         <div className="space-y-4">
-          {items.map((item) => (
+          {orderedItems.map((item) => (
             <ApprovalQueueCard
               key={item.strategy_genome_id}
               item={item}
               onApprove={handleApprove}
               onReject={handleRejectClick}
+              highlighted={focusFound && item.strategy_genome_id === focusGenomeId}
             />
           ))}
         </div>
@@ -207,6 +230,30 @@ export default function ApprovalQueue() {
       )}
     </div>
   );
+}
+
+/**
+ * Deep-link focus for /paper/approvals/:genomeId (AFX-38).
+ *
+ * The queue often holds several candidates for the same
+ * pair/granularity (2026-10-27: 5+ AUD_USD M30 rows), so "go to the
+ * queue" isn't actionable from a phone. The linked row is pinned first
+ * (the backend returns no meaningful order to preserve) and the page
+ * highlights it. Full-id match only — genomes of one run share a long
+ * prefix, so a truncated id must never focus an arbitrary sibling.
+ * Pure (and exported) so Vitest can lock it without a jsdom pass.
+ */
+export function _focusApprovalItems(
+  items: ApprovalQueueItem[],
+  focusGenomeId: string | undefined,
+): { ordered: ApprovalQueueItem[]; focusFound: boolean } {
+  if (!focusGenomeId) return { ordered: items, focusFound: false };
+  const idx = items.findIndex((i) => i.strategy_genome_id === focusGenomeId);
+  if (idx < 0) return { ordered: items, focusFound: false };
+  return {
+    ordered: [items[idx], ...items.slice(0, idx), ...items.slice(idx + 1)],
+    focusFound: true,
+  };
 }
 
 /**

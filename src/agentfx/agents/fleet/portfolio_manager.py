@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -101,6 +102,18 @@ class PMRecommendation(BaseModel):
     rationale: str = Field(
         default="",
         description="Why — tie back to a specific state snapshot fact or prior decision.",
+    )
+    genome_id: str = Field(
+        default="",
+        description=(
+            "AFX-38: when this recommendation is about one specific genome "
+            "(deploy / approve it to paper, kill it), that genome's FULL id "
+            "copied verbatim from the snapshot "
+            "(`top_validated_genomes_last_30_days[].id` or "
+            "`evolution_scheduling_context.per_pair_coverage[]"
+            ".current_best_genome_id`). Empty string otherwise. Never "
+            "invent or shorten an id."
+        ),
     )
 
 
@@ -214,6 +227,7 @@ def _snapshot_platform_state(db: Session) -> dict[str, Any]:
     from agentfx.api.models.evolution import (
         EvolutionRun,
         EvolutionRunStatus,
+        Generation,
         StrategyGenome,
     )
     from agentfx.api.models.run import Run, RunEnvironment
@@ -268,8 +282,21 @@ def _snapshot_platform_state(db: Session) -> dict[str, Any]:
         .count()
     )
 
+    # StrategyGenome has no instrument/granularity columns — they live
+    # on the parent EvolutionRun (join through Generation, same as
+    # `pm_scheduler.build_scheduling_context`). Reading them off the
+    # genome row always yielded None, so PM saw ids with no pair and
+    # couldn't name the genome behind "AUD_USD/M30 fitness 1.264"
+    # (AFX-38).
     top_genomes_last_30d = (
-        db.query(StrategyGenome)
+        db.query(
+            StrategyGenome.id,
+            StrategyGenome.fitness,
+            EvolutionRun.instrument,
+            EvolutionRun.granularity,
+        )
+        .join(Generation, Generation.id == StrategyGenome.generation_id)
+        .join(EvolutionRun, EvolutionRun.id == Generation.run_id)
         .filter(StrategyGenome.validator_passed.is_(True))
         .filter(StrategyGenome.created_at >= month_ago)
         .order_by(StrategyGenome.fitness.desc())
@@ -280,8 +307,8 @@ def _snapshot_platform_state(db: Session) -> dict[str, Any]:
         {
             "id": g.id,
             "fitness": float(g.fitness) if g.fitness is not None else None,
-            "pair": getattr(g, "instrument", None),
-            "granularity": getattr(g, "granularity", None),
+            "pair": g.instrument,
+            "granularity": g.granularity,
         }
         for g in top_genomes_last_30d
     ]
@@ -384,9 +411,29 @@ How to read the paper-run snapshot:
 Your output must be a PMBrief with these fields:
 - headline (one sentence)
 - summary (2-4 sentences)
-- recommendations (0-4 items, ranked by priority 'now'/'this_week'/'watch')
+- recommendations (0-4 items, ranked by priority 'now'/'this_week'/'watch';
+  each: priority, headline, rationale, genome_id)
 - concerns (0-N items, severity 'blocker'/'degraded'/'noted')
 - evolution_actions (0-N items, priority 'now'/'this_week'/'watch')
+
+Naming genomes — Wilson acts on the brief from his phone, so every
+genome you point at must be identifiable without a laptop:
+- The genome ids you may cite are in the snapshot:
+  `top_validated_genomes_last_30_days[].id` (with pair, granularity,
+  fitness) and `evolution_scheduling_context.per_pair_coverage[]
+  .current_best_genome_id` (that pair/granularity's champion).
+- A recommendation to deploy / approve a specific genome to paper (or
+  any recommendation about one specific genome) MUST set `genome_id`
+  to that genome's FULL id, copied verbatim, AND quote the same full
+  id in its `rationale`.
+- Any evolution action `rationale` that refers to a specific genome
+  must quote its full id too.
+- "AUD_USD/M30 genome (fitness 1.264)" alone is NOT actionable — the
+  approval queue often holds several candidates for the same
+  pair/granularity, and ids from one run share a long prefix.
+- Never invent, shorten or paraphrase an id. If the genome you mean is
+  not in the snapshot, say so in the rationale and leave `genome_id`
+  empty.
 
 Style:
 - Terse. Wilson reads a lot — don't pad.
@@ -514,6 +561,123 @@ def _deterministic_fallback(state: dict[str, Any], today: date) -> PMBrief:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Genome-id resolution (AFX-38)
+# ─────────────────────────────────────────────────────────────────────
+#
+# "Deploy AUD_USD/M30 genome (fitness 1.264)" isn't actionable when the
+# approval queue holds five AUD_USD M30 candidates. Haiku names the
+# genome (`PMRecommendation.genome_id`, or the full id quoted in a
+# rationale); these helpers check it against the ids the snapshot
+# actually showed PM, so the email can print DB-sourced facts next to
+# the id and flag any id PM wasn't shown.
+
+
+def _snapshot_genome_index(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Every genome id the snapshot exposed to PM → its facts
+    (`pair`, `granularity`, `fitness`). Never raises — a shape
+    surprise costs the genome lines, not the brief email."""
+    index: dict[str, dict[str, Any]] = {}
+    try:
+        for g in state.get("top_validated_genomes_last_30_days") or []:
+            if g.get("id"):
+                index[g["id"]] = {
+                    "pair": g.get("pair"),
+                    "granularity": g.get("granularity"),
+                    "fitness": g.get("fitness"),
+                }
+        ctx = state.get("evolution_scheduling_context") or {}
+        for row in ctx.get("per_pair_coverage") or []:
+            gid = row.get("current_best_genome_id")
+            if gid and gid not in index:
+                index[gid] = {
+                    "pair": row.get("pair"),
+                    "granularity": row.get("granularity"),
+                    "fitness": row.get("current_best_fitness"),
+                }
+    except Exception:  # noqa: BLE001 — rendering aid only
+        logger.exception("pm_agent: genome index build failed")
+    return index
+
+
+def _genome_refs(
+    *,
+    explicit_id: str,
+    texts: list[str],
+    index: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Resolve the genome(s) one recommendation / action points at.
+
+    - `explicit_id` (from `PMRecommendation.genome_id`) comes first and
+      is kept even when it isn't in the snapshot — flagged
+      `verified=False` so the email warns rather than silently dropping
+      what PM said.
+    - Plus any snapshot id quoted verbatim in `texts`, in order of
+      appearance. Exact, token-bounded matches only: no fuzzy
+      pair/fitness guessing, which could point Wilson at the wrong row.
+
+    Each ref: `id`, `verified`, `pair`, `granularity`, `fitness`,
+    `approval_url` (deep link to the genome's approval-queue row).
+    Never raises — a failure costs the genome lines, not the email.
+    """
+    try:
+        from agentfx.notifications.email import approval_row_url
+
+        ordered: list[str] = []
+        explicit = (explicit_id or "").strip()
+        if explicit:
+            ordered.append(explicit)
+        blob = "\n".join(t for t in texts if t)
+        hits: list[tuple[int, str]] = []
+        for gid in index:
+            m = re.search(rf"(?<![A-Za-z0-9_]){re.escape(gid)}(?![A-Za-z0-9_])", blob)
+            if m:
+                hits.append((m.start(), gid))
+        ordered.extend(gid for _, gid in sorted(hits) if gid not in ordered)
+
+        refs: list[dict[str, Any]] = []
+        for gid in ordered:
+            facts = index.get(gid) or {}
+            refs.append(
+                {
+                    "id": gid,
+                    "verified": gid in index,
+                    "pair": facts.get("pair"),
+                    "granularity": facts.get("granularity"),
+                    "fitness": facts.get("fitness"),
+                    "approval_url": approval_row_url(gid),
+                }
+            )
+        return refs
+    except Exception:  # noqa: BLE001 — rendering aid only
+        logger.exception("pm_agent: genome ref resolution failed")
+        return []
+
+
+def _recommendation_genome_refs(
+    rec: PMRecommendation, index: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    return _genome_refs(
+        explicit_id=rec.genome_id, texts=[rec.headline, rec.rationale], index=index
+    )
+
+
+def _genome_ref_markdown_lines(ref: dict[str, Any]) -> list[str]:
+    """Plain-text twin of `notifications.email._genome_refs_html`."""
+    if ref["verified"]:
+        parts = [" ".join(str(v) for v in (ref["pair"], ref["granularity"]) if v)]
+        if isinstance(ref["fitness"], (int, float)):
+            parts.append(f"fitness {ref['fitness']:.3f}")
+        facts = ", ".join(p for p in parts if p)
+        note = f" ({facts})" if facts else ""
+    else:
+        note = " — ⚠️ not in today's snapshot; double-check before approving"
+    return [
+        f"  - _Genome:_ `{ref['id']}`{note}",
+        f"  - _Approval row:_ {ref['approval_url']}",
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Markdown + email rendering
 # ─────────────────────────────────────────────────────────────────────
 
@@ -529,11 +693,14 @@ def _render_markdown(brief: PMBrief, today: date, state: dict[str, Any]) -> str:
         "",
     ]
     if brief.recommendations:
+        genome_index = _snapshot_genome_index(state)
         lines.append("## Recommendations")
         lines.append("")
         for rec in brief.recommendations:
             lines.append(f"- **[{rec.priority}]** {rec.headline}")
             lines.append(f"  - _Why:_ {rec.rationale}")
+            for ref in _recommendation_genome_refs(rec, genome_index):
+                lines.extend(_genome_ref_markdown_lines(ref))
         lines.append("")
     if brief.concerns:
         lines.append("## Concerns")
@@ -641,6 +808,18 @@ def _write_morning_brief(*, db: Session, today: date) -> None:
     scheduling_results = _execute_evolution_actions(
         db=db, brief=brief, pm_decision_key=_brief_key_for(today)
     )
+    # AFX-38: name + link any genome a recommendation or an evolution
+    # action's rationale points at, so Wilson can act from his phone.
+    genome_index = _snapshot_genome_index(state)
+    for result in scheduling_results:
+        result["genome_refs"] = _genome_refs(
+            explicit_id="",
+            texts=[
+                result.get("rationale") or "",
+                result.get("expected_profit_impact") or "",
+            ],
+            index=genome_index,
+        )
     if scheduling_results:
         body_md = _append_scheduling_outcomes(body_md, scheduling_results)
         write_memory_file("scoreboard.md", body_md)
@@ -651,6 +830,10 @@ def _write_morning_brief(*, db: Session, today: date) -> None:
         body=body_md,
         brief=brief,
         scheduling_results=scheduling_results,
+        recommendation_genome_refs=[
+            _recommendation_genome_refs(rec, genome_index)
+            for rec in brief.recommendations
+        ],
     )
 
 
@@ -718,6 +901,8 @@ def _append_scheduling_outcomes(body_md: str, results: list[dict[str, Any]]) -> 
                 f"- ⏭️  **Not started** {r['pair']}/{r['granularity']} "
                 f"(priority={r['priority']}) — reason: `{r['reason']}`"
             )
+        for ref in r.get("genome_refs") or []:
+            lines.extend(_genome_ref_markdown_lines(ref))
     return body_md + "\n".join(lines) + "\n"
 
 
@@ -727,6 +912,7 @@ def _email_brief(
     body: str,
     brief: PMBrief,
     scheduling_results: list[dict[str, Any]] | None = None,
+    recommendation_genome_refs: list[list[dict[str, Any]]] | None = None,
 ) -> None:
     """Send the brief via the tagged SendGrid pipeline.
 
@@ -734,13 +920,21 @@ def _email_brief(
     formatting backlog item (Wilson 2026-10-05) is addressed by
     passing `html_body` to `send_agent_message`. v0.8.1 Phase C.1
     extends the HTML with the "evolution actions executed this
-    tick" section when PM scheduled anything.
+    tick" section when PM scheduled anything. AFX-38 adds the
+    genome id + approval-row link under each recommendation that
+    names a genome (`recommendation_genome_refs`, parallel to
+    `brief.recommendations`).
     """
     try:
         from agentfx.notifications.email import render_pm_brief_html, send_agent_message
 
         subject = f"Morning brief — {subject_date.isoformat()}: {brief.headline}"
-        html = render_pm_brief_html(brief, body, scheduling_results=scheduling_results)
+        html = render_pm_brief_html(
+            brief,
+            body,
+            scheduling_results=scheduling_results,
+            recommendation_genome_refs=recommendation_genome_refs,
+        )
         send_agent_message(
             agent_role="PM",
             subject=subject,

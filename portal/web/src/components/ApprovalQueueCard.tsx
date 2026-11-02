@@ -31,12 +31,16 @@ interface ApprovalQueueCardProps {
    *  deploy modal (PR-J) or a placeholder toast in PR-I. */
   onApprove: (item: ApprovalQueueItem) => void;
   onReject: (item: ApprovalQueueItem) => void;
+  /** AFX-38: this row was opened via `/paper/approvals/:genomeId`
+   *  (e.g. the PM brief's "Open approval row" link). */
+  highlighted?: boolean;
 }
 
 export function ApprovalQueueCard({
   item,
   onApprove,
   onReject,
+  highlighted = false,
 }: ApprovalQueueCardProps) {
   const m = item.metrics_summary ?? {};
   const sharpe = toNum(m.sharpe);
@@ -49,11 +53,17 @@ export function ApprovalQueueCard({
   const cardBorder = passesAll
     ? 'border-2 border-emerald-400 dark:border-emerald-600'
     : 'border border-slate-200 dark:border-slate-700';
+  // Ring (not border) so the Gate B border signal survives the highlight.
+  const highlightRing = highlighted
+    ? ' ring-2 ring-sky-500 ring-offset-2 dark:ring-offset-slate-900'
+    : '';
 
   return (
     <div
-      className={`bg-white dark:bg-slate-800 rounded-lg p-5 ${cardBorder}`}
+      className={`bg-white dark:bg-slate-800 rounded-lg p-5 ${cardBorder}${highlightRing}`}
       data-testid="approval-queue-card"
+      data-genome-id={item.strategy_genome_id}
+      aria-current={highlighted ? 'true' : undefined}
     >
       <div className="flex items-start justify-between gap-6">
         <div className="flex-1 min-w-0">
@@ -62,6 +72,14 @@ export function ApprovalQueueCard({
               {item.instrument} {item.granularity}
             </div>
             <GateBSummaryBadge passesAll={passesAll} />
+            {highlighted && (
+              <span
+                className="px-1.5 py-0.5 text-[10px] uppercase tracking-wider font-semibold rounded bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-300"
+                title="Opened from a direct link to this genome (e.g. the PM morning brief)"
+              >
+                Linked
+              </span>
+            )}
             {item.imported_from_email && (
               <span
                 className="px-1.5 py-0.5 text-[10px] uppercase tracking-wider font-semibold rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300"

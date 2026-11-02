@@ -345,7 +345,8 @@ def build_scheduling_context(db: Session) -> dict[str, Any]:
     Returns a dict shaped for the PM prompt:
     - available pairs + granularities
     - per-pair: days since last COMPLETED evolution, current best
-      genome's fitness
+      genome's fitness + id (AFX-38: so PM can name the genome it
+      recommends, not just quote its fitness)
     - evolutions_remaining_today (rate-limit headroom)
     - prior PM scheduling decisions in the last 30 days + their
       current outcomes (Reflexion signal)
@@ -384,39 +385,46 @@ def build_scheduling_context(db: Session) -> dict[str, Any]:
         (r.instrument, r.granularity): r.last_completed_at for r in rows
     }
 
-    # Per-pair current best validated genome fitness (last 30 days).
-    # StrategyGenome doesn't have instrument/granularity columns —
-    # they live on the parent EvolutionRun. Join through Generation.
+    # Per-pair current best validated genome (last 30 days): fitness
+    # AND id. StrategyGenome doesn't have instrument/granularity
+    # columns — they live on the parent EvolutionRun. Join through
+    # Generation. Rows come fitness-desc, so the first row per
+    # pair/granularity is the champion (same pick as max(fitness);
+    # NULL fitness excluded like max() ignores it; id tie-break keeps
+    # the champion id stable across ticks). Validator-passed genomes
+    # over 30 days are a small set, so the scan is cheap.
     champ_rows = (
         db.query(
             EvolutionRun.instrument,
             EvolutionRun.granularity,
-            sa_func.max(StrategyGenome.fitness).label("best_fitness"),
+            StrategyGenome.id,
+            StrategyGenome.fitness,
         )
         .join(Generation, Generation.id == StrategyGenome.generation_id)
         .join(EvolutionRun, EvolutionRun.id == Generation.run_id)
         .filter(StrategyGenome.validator_passed.is_(True))
         .filter(StrategyGenome.created_at >= month_ago)
-        .group_by(EvolutionRun.instrument, EvolutionRun.granularity)
+        .filter(StrategyGenome.fitness.isnot(None))
+        .order_by(StrategyGenome.fitness.desc(), StrategyGenome.id)
         .all()
     )
-    champions: dict[tuple[str, str], float] = {
-        (r.instrument, r.granularity): float(r.best_fitness)
-        for r in champ_rows
-        if r.best_fitness is not None
-    }
+    champions: dict[tuple[str, str], tuple[float, str]] = {}
+    for r in champ_rows:
+        champions.setdefault((r.instrument, r.granularity), (float(r.fitness), r.id))
 
     per_pair = []
     for pair in allowed_pairs:
         for gran in allowed_grans:
             last_ts = last_completed.get((pair, gran))
             days_since = (now - last_ts).days if last_ts is not None else None
+            champ_fitness, champ_id = champions.get((pair, gran), (None, None))
             per_pair.append(
                 {
                     "pair": pair,
                     "granularity": gran,
                     "days_since_last_completed_evo": days_since,
-                    "current_best_fitness": champions.get((pair, gran)),
+                    "current_best_fitness": champ_fitness,
+                    "current_best_genome_id": champ_id,
                 }
             )
 
