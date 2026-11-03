@@ -268,10 +268,17 @@ def _search_open_by_fingerprint(
     `Fingerprint: <fingerprint>`, or None.
 
     "Open" = any non-terminal state (Triage / Backlog / Ready /
-    In Progress / In Review). We treat Done / Canceled / Duplicate
-    as closed — a historical Done issue should not block a fresh
-    report of the same problem."""
-    marker = f"{_FINGERPRINT_MARKER} {fingerprint}"
+    In Progress / In Review / In Staging). We treat Done / Canceled /
+    Duplicate as closed — a historical Done issue should not block a
+    fresh report of the same problem.
+
+    AFX-76: the marker must mirror exactly what `_render_body_with_fingerprint`
+    writes, including the backticks around the fingerprint value.
+    `description: { contains }` is a substring filter and a backtick
+    mismatch here is why dedupe never fired between 2026-10-27 and
+    2026-11-03 (12 duplicate QA tickets filed on the same 3 findings).
+    """
+    marker = f"{_FINGERPRINT_MARKER} `{fingerprint}`"
     query = """
     query SearchByFingerprint($query: String!, $teamKey: String!) {
       issues(
