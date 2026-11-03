@@ -189,8 +189,26 @@ class EvolutionRunPublic(BaseSchema):
     imported_from_run_id: str | None = None
 
 
+class EvolutionRunListItem(EvolutionRunPublic):
+    """One row of GET /evolution-runs (AFX-37).
+
+    Adds per-run outcome aggregates so the portal's runs table can show,
+    and sort by, validator passes and best fitness without fetching each
+    run's genomes. List-only: the detail endpoint keeps the plain
+    `EvolutionRunPublic` shape instead of carrying placeholder values.
+    """
+
+    # Genomes in this run that cleared the walk-forward validator (Gate B
+    # on the held-out OOS fold).
+    validator_passed_count: int = 0
+    # Highest finite training fitness of any genome in the run, i.e. the
+    # peak of the run-detail "Best Fitness by Generation" chart. Null until
+    # the first generation has been scored.
+    best_fitness: float | None = None
+
+
 class EvolutionRunList(BaseModel):
-    items: list[EvolutionRunPublic]
+    items: list[EvolutionRunListItem]
     total: int
     page: int
     page_size: int
@@ -391,6 +409,7 @@ __all__ = [
     "EvolutionRunCreate",
     "EvolutionRunCreated",
     "EvolutionRunList",
+    "EvolutionRunListItem",
     "EvolutionRunPublic",
     "GenerationList",
     "GenerationPublic",

@@ -294,6 +294,95 @@ class TestSchedulingContext:
         for entry in ctx["per_pair_coverage"]:
             assert entry["days_since_last_completed_evo"] is None
             assert entry["current_best_fitness"] is None
+            assert entry["current_best_genome_id"] is None
+
+
+class TestChampionGenomeId:
+    """AFX-38: each pair/granularity champion must carry its genome id,
+    or PM can quote "AUD_USD/M30 fitness 1.264" but not name the genome
+    Wilson should approve. Real SQL over in-memory SQLite."""
+
+    @pytest.fixture
+    def db(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+
+        from agentfx.api.core.database import Base
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        with Session(engine) as session:
+            yield session
+        engine.dispose()
+
+    def _seed_run(self, db, run_id, pair, gran, genomes):
+        """`genomes`: iterable of (genome_id, fitness, validator_passed)."""
+        from agentfx.api import models
+
+        gen_id = f"gen_{run_id}_000"
+        db.add(
+            models.EvolutionRun(
+                id=run_id,
+                status=models.EvolutionRunStatus.COMPLETED,
+                instrument=pair,
+                granularity=gran,
+                config_json={},
+                stop_conditions_json={},
+                current_generation=1,
+                llm_cost_usd=0,
+            )
+        )
+        db.add(models.Generation(id=gen_id, run_id=run_id, index=0))
+        for genome_id, fitness, passed in genomes:
+            db.add(
+                models.StrategyGenome(
+                    id=genome_id,
+                    generation_id=gen_id,
+                    dsl_json={"stub": True},
+                    parent_ids=[],
+                    origin=models.GenomeOrigin.SEED,
+                    fitness=fitness,
+                    validator_passed=passed,
+                    validation_failures=[],
+                )
+            )
+        db.commit()
+
+    def test_champion_id_is_best_validator_passed_genome_per_combo(
+        self, db, monkeypatch
+    ):
+        monkeypatch.setattr(
+            pm_scheduler.settings, "CANDLE_INSTRUMENTS", "AUD_USD,EUR_USD"
+        )
+        monkeypatch.setattr(pm_scheduler.settings, "CANDLE_GRANULARITIES", "M30")
+        self._seed_run(
+            db,
+            "evorun_20261027_ab12cd34",
+            "AUD_USD",
+            "M30",
+            [
+                ("genome_gen_evorun_20261027_ab12cd34_000_004", 1.201, True),
+                ("genome_gen_evorun_20261027_ab12cd34_000_017", 1.264, True),
+                # Higher fitness but validator-failed → not a champion.
+                ("genome_gen_evorun_20261027_ab12cd34_000_009", 2.5, False),
+                # NULL fitness never wins (max() semantics preserved).
+                ("genome_gen_evorun_20261027_ab12cd34_000_001", None, True),
+            ],
+        )
+
+        ctx = pm_scheduler.build_scheduling_context(db)
+
+        coverage = {(p["pair"], p["granularity"]): p for p in ctx["per_pair_coverage"]}
+        aud = coverage[("AUD_USD", "M30")]
+        assert aud["current_best_fitness"] == 1.264
+        assert (
+            aud["current_best_genome_id"]
+            == "genome_gen_evorun_20261027_ab12cd34_000_017"
+        )
+        # No validated genome on EUR_USD → no champion, no id.
+        eur = coverage[("EUR_USD", "M30")]
+        assert eur["current_best_fitness"] is None
+        assert eur["current_best_genome_id"] is None
 
 
 class TestNeverRaises:

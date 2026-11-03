@@ -170,7 +170,7 @@ class TestListRuns:
 
         items, total = evolution_service.list_runs(db, status="queued")
         assert total == 1
-        assert items[0].instrument == "EUR_USD"
+        assert items[0].run.instrument == "EUR_USD"
 
     def test_filter_by_instrument(self, db: Session) -> None:
         evolution_service.create_run(
@@ -182,7 +182,7 @@ class TestListRuns:
 
         items, total = evolution_service.list_runs(db, instrument="GBP_USD")
         assert total == 1
-        assert items[0].instrument == "GBP_USD"
+        assert items[0].run.instrument == "GBP_USD"
 
     def test_pagination(self, db: Session) -> None:
         for _ in range(5):
@@ -192,6 +192,321 @@ class TestListRuns:
         items, total = evolution_service.list_runs(db, skip=0, limit=2)
         assert total == 5
         assert len(items) == 2
+
+
+class TestListRunsOutcomeColumns:
+    """AFX-37: each listed run carries how many of its genomes cleared the
+    walk-forward validator and the best fitness it reached, and the list
+    sorts on both server-side.
+
+    Sorting has to happen in SQL, before pagination: the portal shows 10
+    runs per page, so a client-side sort would only reorder the visible
+    page and never surface a winner sitting on page 4.
+
+    "Best fitness" is the highest *training* fitness of any genome in the
+    run, which is the peak of the run-detail page's "Best Fitness by
+    Generation" chart. It is deliberately NOT restricted to validator-passed
+    genomes; the validator outcome has its own column.
+    """
+
+    _T0 = datetime(2026, 10, 27, 8, 0, tzinfo=UTC)
+
+    def _run(
+        self,
+        db: Session,
+        run_id: str,
+        *,
+        hours_after_t0: int = 0,
+        instrument: str = "EUR_USD",
+        granularity: str = "M1",
+        status: models.EvolutionRunStatus = models.EvolutionRunStatus.COMPLETED,
+    ) -> models.EvolutionRun:
+        # Explicit created_at so tie-break ordering is deterministic
+        # (server_default=now() has 1s resolution on SQLite).
+        run = models.EvolutionRun(
+            id=run_id,
+            status=status,
+            instrument=instrument,
+            granularity=granularity,
+            config_json={},
+            stop_conditions_json={},
+            created_at=self._T0 + timedelta(hours=hours_after_t0),
+        )
+        db.add(run)
+        db.commit()
+        return run
+
+    def _genome(
+        self,
+        db: Session,
+        run: models.EvolutionRun,
+        *,
+        fitness: float | None,
+        validator_passed: bool | None = None,
+        gen_index: int = 0,
+        idx: int = 0,
+    ) -> None:
+        gen_id = evolution_service.generate_generation_id(run.id, gen_index)
+        if db.get(models.Generation, gen_id) is None:
+            db.add(models.Generation(id=gen_id, run_id=run.id, index=gen_index))
+            db.commit()
+        db.add(
+            models.StrategyGenome(
+                id=evolution_service.generate_genome_id(gen_id, idx),
+                generation_id=gen_id,
+                dsl_json=MA_CROSSOVER_SEED.model_dump(mode="json"),
+                origin=models.GenomeOrigin.SEED,
+                fitness=fitness,
+                validator_passed=validator_passed,
+            )
+        )
+        db.commit()
+
+    @staticmethod
+    def _ids(rows) -> list[str]:
+        return [row.run.id for row in rows]
+
+    @staticmethod
+    def _by_id(rows) -> dict:
+        return {row.run.id: row for row in rows}
+
+    # ── aggregates ──────────────────────────────────────────────────
+
+    def test_counts_only_validator_passed_genomes_across_all_generations(
+        self, db: Session
+    ) -> None:
+        run = self._run(db, "evorun_a")
+        self._genome(db, run, fitness=0.9, validator_passed=True, gen_index=0, idx=0)
+        self._genome(db, run, fitness=1.1, validator_passed=False, gen_index=0, idx=1)
+        self._genome(db, run, fitness=0.5, validator_passed=None, gen_index=0, idx=2)
+        self._genome(db, run, fitness=1.2, validator_passed=True, gen_index=7, idx=0)
+
+        rows, _ = evolution_service.list_runs(db)
+
+        assert len(rows) == 1
+        # False (failed Gate B) and None (never validated) don't count.
+        assert rows[0].validator_passed_count == 2
+
+    def test_best_fitness_is_run_wide_max_even_when_that_genome_failed_validation(
+        self, db: Session
+    ) -> None:
+        run = self._run(db, "evorun_a")
+        self._genome(db, run, fitness=1.264, validator_passed=True, gen_index=3)
+        # Training-fitness leader that failed OOS. It is still the best
+        # fitness the run achieved (= peak of the detail-page chart).
+        self._genome(db, run, fitness=1.41, validator_passed=False, gen_index=9)
+        self._genome(db, run, fitness=-0.2, gen_index=0)
+
+        rows, _ = evolution_service.list_runs(db)
+
+        assert rows[0].best_fitness == pytest.approx(1.41)
+        assert rows[0].validator_passed_count == 1
+
+    def test_run_without_genomes_has_zero_passed_and_no_best_fitness(
+        self, db: Session
+    ) -> None:
+        self._run(db, "evorun_queued", status=models.EvolutionRunStatus.QUEUED)
+
+        rows, total = evolution_service.list_runs(db)
+
+        assert total == 1
+        assert rows[0].validator_passed_count == 0
+        assert rows[0].best_fitness is None
+
+    def test_aggregates_do_not_bleed_across_runs(self, db: Session) -> None:
+        winner = self._run(db, "evorun_winner", hours_after_t0=0)
+        loser = self._run(db, "evorun_loser", hours_after_t0=1)
+        self._genome(db, winner, fitness=1.3, validator_passed=True, idx=0)
+        self._genome(db, winner, fitness=1.1, validator_passed=True, idx=1)
+        self._genome(db, loser, fitness=0.4, validator_passed=False)
+
+        by_id = self._by_id(evolution_service.list_runs(db)[0])
+
+        assert by_id["evorun_winner"].validator_passed_count == 2
+        assert by_id["evorun_winner"].best_fitness == pytest.approx(1.3)
+        assert by_id["evorun_loser"].validator_passed_count == 0
+        assert by_id["evorun_loser"].best_fitness == pytest.approx(0.4)
+
+    def test_non_finite_fitness_is_ignored(self, db: Session) -> None:
+        """compute_fitness returns -inf when no training fold yields a
+        finite Sharpe. Such a value must not become a run's "best"; if
+        it did, the list endpoint would fail to serialise it (FastAPI
+        returns 500 for non-finite floats) and the whole page would be
+        unusable."""
+        mixed = self._run(db, "evorun_mixed", hours_after_t0=0)
+        self._genome(db, mixed, fitness=float("-inf"), idx=0)
+        self._genome(db, mixed, fitness=0.3, idx=1)
+        all_inf = self._run(db, "evorun_all_inf", hours_after_t0=1)
+        self._genome(db, all_inf, fitness=float("-inf"))
+
+        by_id = self._by_id(evolution_service.list_runs(db)[0])
+
+        assert by_id["evorun_mixed"].best_fitness == pytest.approx(0.3)
+        assert by_id["evorun_all_inf"].best_fitness is None
+
+    def test_total_counts_runs_not_genomes(self, db: Session) -> None:
+        busy = self._run(db, "evorun_busy", hours_after_t0=0)
+        for i in range(5):
+            self._genome(db, busy, fitness=0.1 * i, validator_passed=True, idx=i)
+        self._run(db, "evorun_empty", hours_after_t0=1)
+
+        rows, total = evolution_service.list_runs(db)
+
+        assert total == 2
+        assert sorted(self._ids(rows)) == ["evorun_busy", "evorun_empty"]
+
+    # ── sorting ─────────────────────────────────────────────────────
+
+    def _seed_three_runs(self, db: Session) -> None:
+        # oldest: strong fitness, 1 pass; middle: no genomes yet;
+        # newest: weak fitness, 2 passes.
+        oldest = self._run(db, "evorun_oldest", hours_after_t0=0)
+        self._genome(db, oldest, fitness=1.5, validator_passed=True)
+        self._run(db, "evorun_middle", hours_after_t0=1)
+        newest = self._run(db, "evorun_newest", hours_after_t0=2)
+        self._genome(db, newest, fitness=0.2, validator_passed=True, idx=0)
+        self._genome(db, newest, fitness=0.1, validator_passed=True, idx=1)
+
+    def test_default_sort_is_still_newest_first(self, db: Session) -> None:
+        self._seed_three_runs(db)
+
+        rows, _ = evolution_service.list_runs(db)
+
+        assert self._ids(rows) == ["evorun_newest", "evorun_middle", "evorun_oldest"]
+
+    def test_sort_by_created_at_ascending(self, db: Session) -> None:
+        self._seed_three_runs(db)
+
+        rows, _ = evolution_service.list_runs(
+            db, sort_by="created_at", sort_order="asc"
+        )
+
+        assert self._ids(rows) == ["evorun_oldest", "evorun_middle", "evorun_newest"]
+
+    def test_sort_by_best_fitness_desc_puts_runs_without_fitness_last(
+        self, db: Session
+    ) -> None:
+        self._seed_three_runs(db)
+
+        rows, _ = evolution_service.list_runs(db, sort_by="best_fitness")
+
+        assert self._ids(rows) == ["evorun_oldest", "evorun_newest", "evorun_middle"]
+
+    def test_sort_by_best_fitness_asc_still_puts_runs_without_fitness_last(
+        self, db: Session
+    ) -> None:
+        self._seed_three_runs(db)
+
+        rows, _ = evolution_service.list_runs(
+            db, sort_by="best_fitness", sort_order="asc"
+        )
+
+        assert self._ids(rows) == ["evorun_newest", "evorun_oldest", "evorun_middle"]
+
+    def test_sort_by_validator_passed_count_desc(self, db: Session) -> None:
+        self._seed_three_runs(db)
+
+        rows, _ = evolution_service.list_runs(db, sort_by="validator_passed_count")
+
+        assert self._ids(rows) == ["evorun_newest", "evorun_oldest", "evorun_middle"]
+        assert [r.validator_passed_count for r in rows] == [2, 1, 0]
+
+    def test_sort_by_validator_passed_count_asc(self, db: Session) -> None:
+        self._seed_three_runs(db)
+
+        rows, _ = evolution_service.list_runs(
+            db, sort_by="validator_passed_count", sort_order="asc"
+        )
+
+        assert [r.validator_passed_count for r in rows] == [0, 1, 2]
+
+    def test_ties_are_broken_newest_first(self, db: Session) -> None:
+        for hours in (0, 2, 1):
+            run = self._run(db, f"evorun_h{hours}", hours_after_t0=hours)
+            self._genome(db, run, fitness=0.7, validator_passed=True)
+
+        for sort_by in ("best_fitness", "validator_passed_count"):
+            for sort_order in ("desc", "asc"):
+                rows, _ = evolution_service.list_runs(
+                    db, sort_by=sort_by, sort_order=sort_order
+                )
+                assert self._ids(rows) == ["evorun_h2", "evorun_h1", "evorun_h0"], (
+                    sort_by,
+                    sort_order,
+                )
+
+    def test_sort_is_applied_before_pagination(self, db: Session) -> None:
+        """The run with the best fitness is the OLDEST one, so under the
+        default order it lands on the last page. Sorting by best fitness
+        must bring it to page 1. A per-page sort can't do that."""
+        self._seed_three_runs(db)
+
+        page1, total = evolution_service.list_runs(
+            db, skip=0, limit=1, sort_by="best_fitness"
+        )
+        page3, _ = evolution_service.list_runs(
+            db, skip=2, limit=1, sort_by="best_fitness"
+        )
+
+        assert total == 3
+        assert self._ids(page1) == ["evorun_oldest"]
+        assert self._ids(page3) == ["evorun_middle"]
+
+    def test_filters_compose_with_outcome_sort(self, db: Session) -> None:
+        eur = self._run(db, "evorun_eur", hours_after_t0=0)
+        self._genome(db, eur, fitness=2.0, validator_passed=True)
+        aud = self._run(db, "evorun_aud", hours_after_t0=1, instrument="AUD_USD")
+        self._genome(db, aud, fitness=0.5, validator_passed=True)
+
+        rows, total = evolution_service.list_runs(
+            db, instrument="AUD_USD", sort_by="best_fitness"
+        )
+
+        assert total == 1
+        assert self._ids(rows) == ["evorun_aud"]
+
+    def test_pm_brief_winner_is_identifiable_from_the_first_page(
+        self, db: Session
+    ) -> None:
+        """The ticket's scenario. The PM brief on 2026-10-27 said "AUD_USD/M30
+        produced the first validator-passing genome in 48h (fitness 1.264)".
+        That run has to stand out in the list without clicking in, and
+        sorting by validator passes has to put it first even when newer
+        runs push it off page 1."""
+        winner = self._run(
+            db,
+            "evorun_20261027_dcef6ac7",
+            hours_after_t0=0,
+            instrument="AUD_USD",
+            granularity="M30",
+        )
+        self._genome(db, winner, fitness=0.81, validator_passed=False, gen_index=2)
+        self._genome(db, winner, fitness=1.264, validator_passed=True, gen_index=11)
+        # Twelve newer runs today, none with a validator pass, which is
+        # enough to push the winner off a 10-row first page.
+        for i in range(12):
+            run = self._run(
+                db,
+                f"evorun_20261027_other{i:02d}",
+                hours_after_t0=1 + i,
+                instrument="AUD_USD" if i % 2 else "EUR_USD",
+                granularity="M30",
+            )
+            self._genome(db, run, fitness=0.05 * i, validator_passed=False)
+
+        default_page1, _ = evolution_service.list_runs(db, limit=10)
+        assert "evorun_20261027_dcef6ac7" not in self._ids(default_page1)
+
+        sorted_page1, total = evolution_service.list_runs(
+            db, limit=10, sort_by="validator_passed_count", sort_order="desc"
+        )
+
+        assert total == 13
+        top = sorted_page1[0]
+        assert top.run.id == "evorun_20261027_dcef6ac7"
+        assert top.validator_passed_count == 1
+        assert top.best_fitness == pytest.approx(1.264)
+        assert all(r.validator_passed_count == 0 for r in sorted_page1[1:])
 
 
 class TestStopRun:

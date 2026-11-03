@@ -89,6 +89,158 @@ class TestPMBriefHTML:
         assert "&lt;script&gt;" in html
 
 
+_GENOME_ID = "genome_gen_evorun_20261027_ab12cd34_003_017"
+_APPROVAL_URL = f"https://agentfx-liart.vercel.app/paper/approvals/{_GENOME_ID}"
+
+
+def _genome_ref(**overrides):
+    """Resolved genome reference as PM hands it to the renderer."""
+    ref = {
+        "id": _GENOME_ID,
+        "verified": True,
+        "pair": "AUD_USD",
+        "granularity": "M30",
+        "fitness": 1.264,
+        "approval_url": _APPROVAL_URL,
+    }
+    ref.update(overrides)
+    return ref
+
+
+class TestPMBriefGenomeRefsHTML:
+    """AFX-38: a recommendation / evolution action that names a genome
+    renders the full id, DB-sourced facts and a deep link to the
+    approval row."""
+
+    def _brief(self, *headlines):
+        from agentfx.agents.fleet.portfolio_manager import PMBrief, PMRecommendation
+
+        return PMBrief(
+            headline="h",
+            summary="s",
+            recommendations=[
+                PMRecommendation(priority="now", headline=h, rationale="r")
+                for h in headlines
+            ],
+        )
+
+    def test_renders_full_id_facts_and_approval_link(self):
+        html = email_module.render_pm_brief_html(
+            self._brief("Deploy AUD_USD/M30 genome"),
+            plaintext_body="",
+            recommendation_genome_refs=[[_genome_ref()]],
+        )
+        assert _GENOME_ID in html
+        assert f'href="{_APPROVAL_URL}"' in html
+        assert "Open approval row" in html
+        assert "AUD_USD M30" in html
+        assert "fitness 1.264" in html
+
+    def test_refs_attach_to_the_matching_recommendation(self):
+        html = email_module.render_pm_brief_html(
+            self._brief("Halt losing run", "Deploy AUD_USD/M30 genome"),
+            plaintext_body="",
+            recommendation_genome_refs=[[], [_genome_ref()]],
+        )
+        assert html.index("Halt losing run") < html.index("Deploy AUD_USD/M30")
+        assert html.index("Deploy AUD_USD/M30") < html.index(_APPROVAL_URL)
+
+    def test_unverified_ref_warns_instead_of_showing_facts(self):
+        html = email_module.render_pm_brief_html(
+            self._brief("Deploy something"),
+            plaintext_body="",
+            recommendation_genome_refs=[
+                [_genome_ref(verified=False, pair=None, granularity=None, fitness=None)]
+            ],
+        )
+        assert _GENOME_ID in html
+        assert "not in today's snapshot" in html
+        assert "AUD_USD M30" not in html
+
+    def test_relative_path_renders_as_text_not_a_broken_link(self):
+        """No portal base URL known (dev/test) → a relative href would be
+        dead in a mail client; show the path as text instead."""
+        path = f"/paper/approvals/{_GENOME_ID}"
+        html = email_module.render_pm_brief_html(
+            self._brief("Deploy AUD_USD/M30 genome"),
+            plaintext_body="",
+            recommendation_genome_refs=[[_genome_ref(approval_url=path)]],
+        )
+        assert path in html
+        assert 'href="/paper' not in html
+
+    def test_ref_values_are_escaped(self):
+        evil = '"><script>alert(1)</script>'
+        html = email_module.render_pm_brief_html(
+            self._brief("Deploy"),
+            plaintext_body="",
+            recommendation_genome_refs=[
+                [_genome_ref(id=evil, pair=evil, verified=True)]
+            ],
+        )
+        assert "<script>" not in html
+
+    def test_no_refs_renders_exactly_as_before(self):
+        brief = self._brief("Deploy AUD_USD/M30 genome")
+        assert email_module.render_pm_brief_html(
+            brief, plaintext_body=""
+        ) == email_module.render_pm_brief_html(
+            brief, plaintext_body="", recommendation_genome_refs=[[]]
+        )
+        assert "approval row" not in email_module.render_pm_brief_html(
+            brief, plaintext_body=""
+        )
+
+    def test_scheduling_result_genome_refs_render_link(self):
+        results = [
+            {
+                "pair": "AUD_USD",
+                "granularity": "M30",
+                "priority": "watch",
+                "rationale": f"Champion {_GENOME_ID} already clears Gate B.",
+                "expected_profit_impact": "Paper P&L within 7d.",
+                "accepted": False,
+                "evo_run_id": None,
+                "reason": "wrong_priority:watch",
+                "genome_refs": [_genome_ref()],
+            }
+        ]
+        html = email_module.render_pm_brief_html(
+            self._brief(), plaintext_body="", scheduling_results=results
+        )
+        assert f'href="{_APPROVAL_URL}"' in html
+
+
+class TestApprovalRowUrl:
+    """AFX-38: single source of truth for the approval-row deep link
+    (`/paper/approvals/:genomeId` in the portal router)."""
+
+    def test_absolute_url_with_explicit_base(self):
+        assert (
+            email_module.approval_row_url(
+                _GENOME_ID, portal_base_url="https://agentfx-liart.vercel.app/"
+            )
+            == _APPROVAL_URL
+        )
+
+    def test_base_inferred_from_environment(self, monkeypatch):
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        assert email_module.approval_row_url(_GENOME_ID) == _APPROVAL_URL
+
+    def test_bare_path_when_no_portal_is_known(self, monkeypatch):
+        monkeypatch.setenv("ENVIRONMENT", "test")
+        assert (
+            email_module.approval_row_url(_GENOME_ID)
+            == f"/paper/approvals/{_GENOME_ID}"
+        )
+
+    def test_id_is_url_quoted_as_one_path_segment(self):
+        assert (
+            email_module.approval_row_url("a/b?c d", portal_base_url="https://p")
+            == "https://p/paper/approvals/a%2Fb%3Fc%20d"
+        )
+
+
 class TestQADivergenceHTML:
     def _report(self):
         from agentfx.agents.fleet.quant_analyst import (

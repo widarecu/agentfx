@@ -32,6 +32,7 @@ import time
 from datetime import UTC, datetime
 from email.message import EmailMessage
 from typing import Any
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +306,24 @@ def _infer_portal_base_url() -> str | None:
     return None
 
 
+def approval_row_url(genome_id: str, *, portal_base_url: str | None = None) -> str:
+    """Deep link to one genome's row on the approval queue (AFX-38).
+
+    The portal route `/paper/approvals/:genomeId` pins + highlights the
+    matching card — the queue often holds several candidates for the
+    same pair/granularity, so "go to the queue" isn't actionable from a
+    phone. A path segment (not `?query`) because the login redirect
+    only carries the pathname through.
+
+    Absolute when a portal base URL is known (explicit arg, else
+    inferred from ENVIRONMENT like the paper-run alerts); otherwise the
+    bare path, so plain-text renders still say where to go.
+    """
+    base = portal_base_url or _infer_portal_base_url()
+    path = f"/paper/approvals/{quote(genome_id, safe='')}"
+    return f"{base.rstrip('/')}{path}" if base else path
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────
@@ -408,6 +427,7 @@ def post_paper_run_alert(
 
 
 __all__ = [
+    "approval_row_url",
     "post_paper_run_alert",
     "send_agent_message",
     "render_pm_brief_html",
@@ -566,10 +586,62 @@ def _escape(text: str) -> str:
     )
 
 
+def _genome_refs_html(refs: list[dict[str, Any]] | None) -> str:
+    """AFX-38: one line per genome a recommendation / action names.
+
+    Each ref (resolved by `portfolio_manager._genome_refs`) carries
+    `id`, `verified`, `pair`, `granularity`, `fitness`, `approval_url`.
+    Renders the FULL id — genome ids share long prefixes (every genome
+    of a run shares its first ~36 chars), so a truncated id doesn't
+    identify the row. Verified refs show DB-sourced facts so Wilson can
+    sanity-check that the id matches PM's prose; ids PM wasn't shown
+    get a warning instead. Returns "" when there's nothing to show.
+    """
+    if not refs:
+        return ""
+    lines: list[str] = []
+    for ref in refs:
+        gid = _escape(str(ref.get("id") or ""))
+        if not gid:
+            continue
+        if ref.get("verified"):
+            facts = " ".join(
+                _escape(str(v)) for v in (ref.get("pair"), ref.get("granularity")) if v
+            )
+            fitness = ref.get("fitness")
+            if isinstance(fitness, (int, float)):
+                facts += f" &middot; fitness {fitness:.3f}"
+            note = f'<span style="color:#6b7280;"> {facts}</span>' if facts else ""
+        else:
+            note = (
+                '<span style="color:#d97706;"> &#9888; not in today\'s snapshot '
+                "&mdash; double-check before approving</span>"
+            )
+        url = str(ref.get("approval_url") or "")
+        if url.startswith(("https://", "http://")):
+            link = (
+                f' &middot; <a href="{_escape(url)}" '
+                f'style="color:#059669;font-weight:600;">Open approval row &rarr;</a>'
+            )
+        elif url:
+            # No portal base URL known: a relative href is dead in a
+            # mail client, so show the path as text.
+            link = f" &middot; <code>{_escape(url)}</code>"
+        else:
+            link = ""
+        lines.append(
+            f'<div style="color:#374151;font-size:12px;margin-top:4px;">Genome: '
+            f'<code style="background:#f3f4f6;padding:1px 4px;font-size:11px;'
+            f'word-break:break-all;">{gid}</code>{note}{link}</div>'
+        )
+    return "".join(lines)
+
+
 def render_pm_brief_html(
     brief: Any,
     plaintext_body: str,
     scheduling_results: list[dict[str, Any]] | None = None,
+    recommendation_genome_refs: list[list[dict[str, Any]]] | None = None,
 ) -> str:
     """Render a `PMBrief` as styled HTML for the fleet email.
 
@@ -583,7 +655,14 @@ def render_pm_brief_html(
     PM's evolution-scheduling tool invocations this tick. When
     non-empty, rendered as a dedicated section with accept/reject
     badges and the launched `evo_run_id` so Wilson can trace back
-    to the actual evolution.
+    to the actual evolution. A result's optional `genome_refs`
+    (AFX-38) renders like `recommendation_genome_refs` below.
+
+    `recommendation_genome_refs` (AFX-38): parallel to
+    `brief.recommendations` — entry *i* lists the genomes
+    recommendation *i* names (see `_genome_refs_html`), rendered under
+    its rationale with a deep link to each approval row. Missing /
+    short lists render as no refs.
 
     `plaintext_body` is accepted but unused in the main render
     path — only shown as fallback if an exception breaks the
@@ -594,12 +673,14 @@ def render_pm_brief_html(
         summary = _escape(getattr(brief, "summary", "") or "")
         recs = getattr(brief, "recommendations", []) or []
         concerns = getattr(brief, "concerns", []) or []
+        rec_refs = recommendation_genome_refs or []
 
         rec_html_parts: list[str] = []
-        for r in recs:
+        for i, r in enumerate(recs):
             prio = _escape(getattr(r, "priority", "") or "")
             head = _escape(getattr(r, "headline", "") or "")
             why = _escape(getattr(r, "rationale", "") or "")
+            refs_html = _genome_refs_html(rec_refs[i] if i < len(rec_refs) else None)
             prio_color = {
                 "now": "#dc2626",
                 "this_week": "#d97706",
@@ -612,6 +693,7 @@ def render_pm_brief_html(
                 f'margin-right:6px;">{prio}</span>'
                 f"<strong>{head}</strong>"
                 f'<div style="color:#6b7280;font-size:13px;margin-top:2px;">{why}</div>'
+                f"{refs_html}"
                 f"</li>"
             )
         rec_html = (
@@ -689,6 +771,10 @@ def _render_scheduling_results_html(
         priority = _escape(r.get("priority") or "")
         rationale = _escape(r.get("rationale") or "")
         impact = _escape(r.get("expected_profit_impact") or "")
+        # AFX-38: a rationale naming a specific genome gets its id +
+        # approval link even when the action was skipped (whose
+        # rationale isn't otherwise shown).
+        refs_html = _genome_refs_html(r.get("genome_refs"))
         if r.get("accepted"):
             evo_id = _escape(r.get("evo_run_id") or "")
             parts.append(
@@ -702,6 +788,7 @@ def _render_scheduling_results_html(
                 f"<em>Why:</em> {rationale}</div>"
                 f'<div style="color:#6b7280;font-size:13px;">'
                 f"<em>Expected:</em> {impact}</div>"
+                f"{refs_html}"
                 f"</li>"
             )
         else:
@@ -713,6 +800,7 @@ def _render_scheduling_results_html(
                 f"<strong>{pair}/{gran}</strong> "
                 f'<span style="color:#6b7280;">(priority={priority}, '
                 f"reason: <code>{reason}</code>)</span>"
+                f"{refs_html}"
                 f"</li>"
             )
     return (

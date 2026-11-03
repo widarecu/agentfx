@@ -14,12 +14,14 @@ import type {
   EvolutionRunCreateRequest,
   EvolutionRunCreated,
   EvolutionRunListResponse,
+  EvolutionRunSortField,
   EvolutionRunStatus,
   Generation,
   GenerationListResponse,
   GenomeBacktestResult,
   GenomeExportPayload,
   GenomeImportResponse,
+  SortOrder,
   StrategyGenome,
   StrategyGenomeSummaryList,
 } from '../types/evolution';
@@ -79,6 +81,13 @@ export async function listEvolutionRuns(
      * `'my'`.
      */
     scope?: 'my' | 'all';
+    /**
+     * AFX-37: server-side sort, applied before pagination so page 1 of
+     * "best fitness, descending" is the best run overall. Omit for the
+     * backend default (newest first).
+     */
+    sortBy?: EvolutionRunSortField;
+    sortOrder?: SortOrder;
   } = {},
 ): Promise<EvolutionRunListResponse> {
   const params = new URLSearchParams({
@@ -88,6 +97,8 @@ export async function listEvolutionRuns(
   if (filters.status) params.set('status_filter', filters.status);
   if (filters.instrument) params.set('instrument', filters.instrument);
   if (filters.scope) params.set('scope', filters.scope);
+  if (filters.sortBy) params.set('sort_by', filters.sortBy);
+  if (filters.sortOrder) params.set('sort_order', filters.sortOrder);
 
   const res = await fetch(`${API_BASE_URL}/evolution-runs?${params}`, {
     headers: authHeaders(),
@@ -281,4 +292,14 @@ export function formatLlmCost(decimalString: string): string {
   const n = Number(decimalString);
   if (!Number.isFinite(n)) return '—';
   return `$${n.toFixed(4)}`;
+}
+
+/**
+ * Fitness to 3 decimals, the precision the PM brief and the genome pages
+ * use ("fitness 1.264"), so a number quoted in a brief can be matched by
+ * eye.
+ */
+export function formatFitness(value: number | null): string {
+  if (value == null || !Number.isFinite(value)) return '—';
+  return value.toFixed(3);
 }
