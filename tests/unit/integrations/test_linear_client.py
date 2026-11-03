@@ -254,6 +254,31 @@ class TestRendering:
         assert "Saw it again." in rendered
         assert "qa:test:xyz" in rendered
 
+    def test_search_marker_is_substring_of_rendered_body(self):
+        """AFX-76 pin: the string `_search_open_by_fingerprint` sends to
+        Linear's `description: { contains }` filter MUST be a substring
+        of what `_render_body_with_fingerprint` actually writes.
+
+        Between 2026-10-27 and 2026-11-03 the two drifted (search string
+        had no backticks, rendering wrapped the fingerprint in backticks),
+        and the dedupe filter never matched a real duplicate. The QA
+        agent re-filed the same findings on every scan (12 duplicate
+        tickets across 3 real findings). This test closes that gap.
+        """
+        fingerprint = "qa:test:paper_runner"
+        spec = _spec(fingerprint=fingerprint)
+        body = linear_client._render_body_with_fingerprint(
+            spec, now=datetime(2026, 11, 3, 11, 46, tzinfo=UTC)
+        )
+        # Mirror the exact construction `_search_open_by_fingerprint`
+        # uses — if either side changes shape without the other, this
+        # fails and the operator sees the drift before Linear does.
+        search_marker = f"{linear_client._FINGERPRINT_MARKER} `{fingerprint}`"
+        assert search_marker in body, (
+            f"Search marker {search_marker!r} not found in rendered body — "
+            "dedupe would fail against this issue in Linear."
+        )
+
     def test_daily_cap_defaults_to_5_on_bad_settings(self, monkeypatch):
         monkeypatch.setattr(
             linear_client.settings, "AGENT_LINEAR_DAILY_CAP_PER_AGENT", "oops"
