@@ -603,3 +603,74 @@ class TestPostPaperRunAlert:
         ):
             # Must not raise.
             email_module.post_paper_run_alert(run=run, reason="USER_KILL", db=db)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# send_agent_message — env-driven SMTP config pin (AFX-77)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestSendAgentMessageUsesEnvSmtpConfig:
+    """Pin that `send_agent_message` actually reads the SMTP settings
+    and passes them through to `smtplib.SMTP`. The existing transport
+    tests inject their own `smtp_factory`, which bypasses that
+    resolution — so a future rename of `SMTP_HOST` would break
+    production delivery while the suite stayed green.
+
+    This test closes that gap by exercising the real production
+    default factory, with `smtplib.SMTP` stubbed at the module level
+    and settings pinned to Resend-shaped values. If any of the four
+    SMTP settings fields are renamed or dropped without updating this
+    test, the test fails before the next deploy ships broken.
+    """
+
+    def _resend_settings(self):
+        return SimpleNamespace(
+            AGENT_FLEET_ENABLED=True,
+            NOTIFICATIONS_ENABLED=True,
+            SMTP_HOST="smtp.resend.com",
+            SMTP_PORT=587,
+            SMTP_USER="resend",
+            SMTP_PASSWORD="re_test_fake_key",
+            EMAIL_FROM="fleet@plusfx.net",
+            EMAIL_TO="wilson@example.com",
+            ENVIRONMENT="staging",
+        )
+
+    def test_send_agent_message_uses_env_smtp_config(self):
+        smtp_instance = MagicMock()
+        smtp_instance.__enter__ = MagicMock(return_value=smtp_instance)
+        smtp_instance.__exit__ = MagicMock(return_value=False)
+        smtp_ctor = MagicMock(return_value=smtp_instance)
+
+        with (
+            patch(
+                "agentfx.api.core.config.settings",
+                self._resend_settings(),
+            ),
+            patch.object(email_module.smtplib, "SMTP", smtp_ctor),
+        ):
+            email_module.send_agent_message(
+                agent_role="PM",
+                subject="Morning brief",
+                body="Fleet overnight: 2 PRs merged, 0 rollbacks.",
+            )
+
+        # SMTP constructor took host + port from settings (not hard-coded
+        # anywhere). Timeout is a module constant — pin by presence, not value.
+        assert smtp_ctor.call_count == 1
+        args, kwargs = smtp_ctor.call_args
+        assert args[0] == "smtp.resend.com"
+        assert args[1] == 587
+        assert "timeout" in kwargs
+
+        # STARTTLS fired before login — Resend requires it on port 587.
+        smtp_instance.starttls.assert_called_once()
+
+        # Login used SMTP_USER + SMTP_PASSWORD verbatim.
+        smtp_instance.login.assert_called_once_with("resend", "re_test_fake_key")
+
+        # send_message carried the EMAIL_FROM and parsed EMAIL_TO list.
+        send_call = smtp_instance.send_message.call_args
+        assert send_call.kwargs["from_addr"] == "fleet@plusfx.net"
+        assert send_call.kwargs["to_addrs"] == ["wilson@example.com"]
