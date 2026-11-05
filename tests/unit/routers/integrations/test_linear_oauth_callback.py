@@ -196,3 +196,79 @@ class TestHelpers:
         assert "<!doctype html>" in html
         assert "<title>Hello world</title>" in html
         assert "Install OK" in html
+
+
+class TestRedirectUriProxyScheme:
+    """Regression pin for the Railway TLS-termination case.
+
+    Seen in production 2026-11-05: Railway's edge terminates TLS and
+    forwards the request as http to FastAPI. Without honoring
+    X-Forwarded-Proto, `_derive_redirect_uri` sent
+    `http://agentfx-staging.up.railway.app/...` to Linear's token
+    endpoint; Linear's App had `https://...` registered and rejected
+    the exchange with `invalid_request: redirect_uri mismatch`.
+
+    Any future refactor of `_derive_redirect_uri` that drops the
+    X-Forwarded-Proto handling trips this test before the next deploy.
+    """
+
+    def test_x_forwarded_proto_https_overrides_inbound_scheme(self, client):
+        """Mimic Railway: inbound http, X-Forwarded-Proto: https."""
+        with patch.object(
+            linear_router.requests, "post", return_value=_mock_token_response()
+        ) as mock_post:
+            resp = client.get(
+                "/api/v1/integrations/linear/oauth/callback",
+                params={"code": "abc"},
+                headers={"X-Forwarded-Proto": "https"},
+            )
+        assert resp.status_code == 200
+        sent_redirect = mock_post.call_args.kwargs["data"]["redirect_uri"]
+        assert sent_redirect.startswith("https://"), (
+            f"expected https:// scheme from X-Forwarded-Proto header, "
+            f"got {sent_redirect!r}"
+        )
+
+    def test_x_forwarded_proto_chain_takes_leftmost(self, client):
+        """Multiple proxies chained → first value is client-facing
+        scheme per RFC 7239. Linear sees whatever the user's browser
+        connected over, which is always the leftmost."""
+        with patch.object(
+            linear_router.requests, "post", return_value=_mock_token_response()
+        ) as mock_post:
+            client.get(
+                "/api/v1/integrations/linear/oauth/callback",
+                params={"code": "abc"},
+                headers={"X-Forwarded-Proto": "https, http"},
+            )
+        sent_redirect = mock_post.call_args.kwargs["data"]["redirect_uri"]
+        assert sent_redirect.startswith("https://")
+
+    def test_no_forwarded_proto_keeps_inbound_scheme(self, client):
+        """Local dev: no proxy header → use whatever FastAPI saw.
+        TestClient uses http, so the redirect stays http."""
+        with patch.object(
+            linear_router.requests, "post", return_value=_mock_token_response()
+        ) as mock_post:
+            client.get(
+                "/api/v1/integrations/linear/oauth/callback",
+                params={"code": "abc"},
+            )
+        sent_redirect = mock_post.call_args.kwargs["data"]["redirect_uri"]
+        assert sent_redirect.startswith("http://")
+
+    def test_malformed_forwarded_proto_is_ignored(self, client):
+        """Garbage value (e.g. `ws`) must NOT corrupt the scheme —
+        fall back to the inbound scheme."""
+        with patch.object(
+            linear_router.requests, "post", return_value=_mock_token_response()
+        ) as mock_post:
+            client.get(
+                "/api/v1/integrations/linear/oauth/callback",
+                params={"code": "abc"},
+                headers={"X-Forwarded-Proto": "ws"},
+            )
+        sent_redirect = mock_post.call_args.kwargs["data"]["redirect_uri"]
+        assert sent_redirect.startswith("http://"), (
+            "malformed X-Forwarded-Proto must not override the real scheme"
+        )
