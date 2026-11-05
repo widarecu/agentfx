@@ -654,6 +654,50 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Linear Agent webhook receiver (AFX-66) — PE registered as a
+    # Linear Agent app user; Linear POSTs AgentSessionEvent webhooks
+    # here on delegation / @mention / comment reply. Phase 1 is
+    # log-only (verify + persist). Phase 2 wires dispatch.
+    LINEAR_AGENT_ENABLED: bool = Field(
+        default=False,
+        env="LINEAR_AGENT_ENABLED",
+        description=(
+            "If true, the POST /api/v1/integrations/linear/agent-webhook "
+            "endpoint verifies + persists incoming Linear Agent events. "
+            "If false, the endpoint ACKs with no processing. Dark launch "
+            "default so staging only acts when explicitly enabled."
+        ),
+    )
+    LINEAR_AGENT_WEBHOOK_SECRET: str = Field(
+        default="",
+        env="LINEAR_AGENT_WEBHOOK_SECRET",
+        description=(
+            "HMAC-SHA256 signing secret for the Linear Agent webhook, "
+            "shown on the Application's webhook detail page in Linear. "
+            "Used to verify the `Linear-Signature` header against the "
+            "raw request body. Never logged."
+        ),
+    )
+    LINEAR_AGENT_CLIENT_ID: str = Field(
+        default="",
+        env="LINEAR_AGENT_CLIENT_ID",
+        description=(
+            "OAuth 2.0 client ID of the Linear Application the fleet "
+            "is registered as. Used in Phase 2 to obtain actor=app "
+            "tokens for outbound agentActivityCreate mutations. "
+            "Phase 1 does not read this."
+        ),
+    )
+    LINEAR_AGENT_CLIENT_SECRET: str = Field(
+        default="",
+        env="LINEAR_AGENT_CLIENT_SECRET",
+        description=(
+            "OAuth 2.0 client secret pair for LINEAR_AGENT_CLIENT_ID. "
+            "Required in Phase 2 for the client-credentials grant. "
+            "Never logged."
+        ),
+    )
+
     @property
     def instruments_list(self) -> list[str]:
         """Parse CANDLE_INSTRUMENTS into a list."""
