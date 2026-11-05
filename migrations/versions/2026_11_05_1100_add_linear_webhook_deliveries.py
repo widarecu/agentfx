@@ -7,8 +7,15 @@ insert, which the handler maps to a 200 duplicate response. Phase 1
 is log-only; Phase 2 adds the dispatch wiring that reads this table.
 
 Revision ID: b4f8e2d1c7a9
-Revises: f1a2b3c4d5e6
+Revises: a7e5b1d9c3f4
 Create Date: 2026-11-05 11:00:00.000000
+
+Note on chain: originally cut with down_revision=f1a2b3c4d5e6 because
+feat/agent-fleet (where the PR was branched) didn't have a7e5b1d9c3f4
+yet. On merge to main, main already had a7e5b1d9c3f4 (linear_issue_
+identifier) chained off f1a2b3c4d5e6, producing TWO heads and
+breaking `alembic upgrade head` on the first main deploy. Rechained
+to a7e5b1d9c3f4 as a hotfix so main has a single head again.
 """
 
 import sqlalchemy as sa
@@ -16,7 +23,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision = "b4f8e2d1c7a9"
-down_revision = "f1a2b3c4d5e6"
+down_revision = "a7e5b1d9c3f4"
 branch_labels = None
 depends_on = None
 
