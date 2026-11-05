@@ -20,6 +20,7 @@ from .routers import (
     strategies,
     user_credentials,
 )
+from .routers.integrations import linear as linear_integration
 
 # Configure root logger to use stdout (so Railway tags normal logs as [inf], not [err])
 logging.basicConfig(
@@ -242,6 +243,11 @@ app.include_router(
     paper.router,
     prefix=settings.API_V1_STR,
     tags=["paper-runs"],
+)
+app.include_router(
+    linear_integration.router,
+    prefix=f"{settings.API_V1_STR}/integrations/linear",
+    tags=["integrations-linear"],
 )
 
 
