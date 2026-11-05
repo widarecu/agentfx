@@ -38,6 +38,7 @@ from .user_credentials import (
 )
 from .agent_decision import AgentDecision, AgentRole
 from .agent_workspace_run import AgentWorkspaceRun, AgentWorkspaceRunStatus
+from .linear_webhook_delivery import LinearWebhookDelivery
 from .verified_gap import VerifiedEmptyGap
 
 # Make models available at the package level
@@ -83,4 +84,6 @@ __all__ = [
     # PE Managed Agents workspace dispatches (v0.8.1 C.2 Phase 2)
     "AgentWorkspaceRun",
     "AgentWorkspaceRunStatus",
+    # Linear Agent webhook deliveries (AFX-66 Phase 1)
+    "LinearWebhookDelivery",
 ]
