@@ -409,11 +409,30 @@ def _derive_redirect_uri(request: Request) -> str:
 
     Linear's token exchange rejects a `redirect_uri` that differs
     even cosmetically (trailing slash, query string, scheme case)
-    from the one it saw on the authorize request. Deriving from the
-    incoming request is the least error-prone approach — we end up
-    with the same scheme + host + path FastAPI just served.
+    from the one it saw on the authorize request.
+
+    **Behind a TLS-terminating proxy** (Railway, Heroku, nginx) the
+    request arrives at FastAPI with `scheme='http'` because TLS was
+    already terminated at the edge. `request.url` reflects that
+    inbound scheme — in our case `http://agentfx-staging.up.railway.app/...`
+    — but Linear's registered redirect is `https://...` and the
+    token endpoint responds `invalid_request: redirect_uri mismatch`
+    (observed 2026-11-05).
+
+    Standard fix: trust the proxy's `X-Forwarded-Proto` header and
+    use that for the scheme. Railway always sets this to `https`
+    for TLS-terminated traffic. Local dev stays correct because
+    there's no X-Forwarded-Proto when nothing's proxying.
+
+    If multiple proxies chain the header (comma-separated values),
+    the leftmost is the original client-facing scheme per RFC 7239.
     """
     parsed = urlparse(str(request.url))
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    if forwarded_proto:
+        scheme = forwarded_proto.split(",")[0].strip().lower()
+        if scheme in ("http", "https"):
+            parsed = parsed._replace(scheme=scheme)
     return urlunparse(parsed._replace(query="", fragment=""))
 
 
