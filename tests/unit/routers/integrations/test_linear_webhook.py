@@ -283,3 +283,73 @@ class TestPersistedRowShape:
         assert row.agent_session_id == "ags_01PINME"
         assert row.processing_status == "logged"
         assert row.raw_body == body
+
+
+class TestPhase2DispatchWiring:
+    """AFX-66 Phase 2: on action=created, the handler must schedule a
+    background task that calls `dispatch_from_linear_webhook`. Phase 1
+    was log-only; this test pins that the Phase 2 behaviour fires.
+
+    We patch asyncio.create_task so no real task runs — this is a pin
+    for the wiring, not the dispatch logic itself (that's tested in
+    test_linear_webhook_dispatch.py)."""
+
+    def test_action_created_schedules_background_dispatch(self, client, mock_db):
+        body = {
+            "action": "created",
+            "webhookTimestamp": _now_ms(),
+            "agentSession": {"id": "ags_01DISPATCH"},
+            "promptContext": "<issue>dispatch me</issue>",
+        }
+        from unittest.mock import patch as _patch
+
+        # Patch asyncio.create_task where the handler imports it from.
+        import asyncio as _aio
+
+        with _patch.object(_aio, "create_task", autospec=True) as mock_create_task:
+            resp = _post(client, body, delivery="dlv-dispatch-wire")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "logged"}
+        # Exactly one background task scheduled.
+        assert mock_create_task.call_count == 1
+
+    def test_action_prompted_does_not_schedule_dispatch_yet(self, client):
+        """Phase 2 only wires `action=created`. `prompted` (resume
+        path) lands in Phase 3 — this test pins that regression."""
+        body = {
+            "action": "prompted",
+            "webhookTimestamp": _now_ms(),
+            "agentSession": {"id": "ags_01REPLY"},
+            "agentActivity": {"content": {"body": "follow-up"}},
+        }
+        from unittest.mock import patch as _patch
+
+        import asyncio as _aio
+
+        with _patch.object(_aio, "create_task", autospec=True) as mock_create_task:
+            resp = _post(client, body, delivery="dlv-prompted")
+
+        assert resp.status_code == 200
+        mock_create_task.assert_not_called()
+
+    def test_duplicate_delivery_skips_background_dispatch(self, client, mock_db):
+        """If the delivery was already seen (IntegrityError on insert),
+        we return `duplicate` without scheduling a dispatch — otherwise
+        Linear retries become duplicate dispatches."""
+        mock_db.commit.side_effect = IntegrityError("dupe", {}, Exception())
+        body = {
+            "action": "created",
+            "webhookTimestamp": _now_ms(),
+            "agentSession": {"id": "ags_01DUPE"},
+        }
+        from unittest.mock import patch as _patch
+
+        import asyncio as _aio
+
+        with _patch.object(_aio, "create_task", autospec=True) as mock_create_task:
+            resp = _post(client, body, delivery="dlv-dupe-retry")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "duplicate"}
+        mock_create_task.assert_not_called()
