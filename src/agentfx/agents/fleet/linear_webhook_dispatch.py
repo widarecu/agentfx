@@ -347,22 +347,38 @@ def _build_task_spec(
 
     Lazy-imports WorkspaceTaskSpec so this module doesn't drag the
     full pe_workspace stack when it's only needed for parsing tests.
+
+    **Portability note (AFX-66):** `WorkspaceTaskSpec` on `main`
+    carries a `linear_issue_identifier` field that `feat/agent-fleet`
+    doesn't yet have (the 2026-11-01 Linear-driven dispatch rewrite
+    was promoted to main but never back-merged into feat/agent-fleet).
+    We inspect the dataclass at runtime and only pass the field when
+    it's actually defined. Keeps this module working on both branch
+    shapes until feat/agent-fleet re-syncs.
     """
+    import dataclasses
+
     from agentfx.agents.fleet.pe_workspace import WorkspaceTaskSpec
 
     task_slug = slug_fn(f"{identifier}-{title}", now=now)
-    return WorkspaceTaskSpec(
-        task_slug=task_slug,
+    kwargs: dict[str, Any] = {
+        "task_slug": task_slug,
         # Use the Linear identifier as the proposal key. That keeps
         # the audit trail obvious (the "proposal" here is Wilson's
         # delegation, not a PE-generated one).
-        pe_proposal_decision_key=f"linear:{identifier}",
-        title=f"{identifier}: {title}",
-        narrative=narrative,
-        target_files=[],  # Agent discovers these inside the sandbox.
-        new_test_paths=[],
-        estimated_profit_impact="see Linear issue",
-    )
+        "pe_proposal_decision_key": f"linear:{identifier}",
+        "title": f"{identifier}: {title}",
+        "narrative": narrative,
+        "target_files": [],  # Agent discovers these inside the sandbox.
+        "new_test_paths": [],
+        "estimated_profit_impact": "see Linear issue",
+    }
+
+    spec_field_names = {f.name for f in dataclasses.fields(WorkspaceTaskSpec)}
+    if "linear_issue_identifier" in spec_field_names:
+        kwargs["linear_issue_identifier"] = identifier
+
+    return WorkspaceTaskSpec(**kwargs)
 
 
 __all__ = [
