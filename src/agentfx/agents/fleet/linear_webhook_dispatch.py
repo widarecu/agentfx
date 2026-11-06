@@ -41,7 +41,10 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from agentfx.api.core.database import SessionLocal
-from agentfx.api.models.agent_workspace_run import AgentWorkspaceRun
+from agentfx.api.models.agent_workspace_run import (
+    AgentWorkspaceRun,
+    AgentWorkspaceRunStatus,
+)
 from agentfx.integrations.linear_agent_api import emit_error, emit_thought
 
 logger = logging.getLogger(__name__)
@@ -71,6 +74,18 @@ _ERROR_DUPLICATE_TEMPLATE = (
     "Already dispatched for this agent session (workspace run "
     "`{run_id}`). If that run is stuck, cancel it in the Managed "
     "Agents console and reopen the ticket."
+)
+# Emitted when the adapter accepted the row (so the scan loop won't
+# retry the proposal) but the underlying provider call failed — e.g.
+# Anthropic 400'd `sessions.create`. Without this the webhook caller
+# would see the generic "Dispatched to Managed Agents workspace.
+# Watching for PR." success thought even though nothing actually
+# dispatched. `summary` comes from the AgentWorkspaceRun row.
+_ERROR_DISPATCH_PERSISTED_BUT_FAILED_TEMPLATE = (
+    "**Dispatch failed** — workspace row recorded (run `{run_id}`) but "
+    "the underlying provider call did not start a session: {summary}. "
+    "No PR will open. Check Railway logs for `pe_workspace[managed]` "
+    "entries around this timestamp for the full trace."
 )
 
 
@@ -216,8 +231,13 @@ def dispatch_from_linear_webhook(
             return False, f"adapter_refused:{result.reason}"
 
         # Step 6 — Link the row back to the Linear session so the
-        # resume path (Phase 3, action=prompted) can find it.
+        # resume path (Phase 3, action=prompted) can find it. Also
+        # fetch the row so Step 7 can check whether the adapter's
+        # provider-side call actually succeeded — `accepted=True` is
+        # scan-loop-friendly (don't retry) but doesn't by itself mean
+        # a session is live. The row's status is the source of truth.
         run_id = result.workspace_run_id
+        row: AgentWorkspaceRun | None = None
         if run_id:
             row = (
                 db.query(AgentWorkspaceRun)
@@ -235,9 +255,36 @@ def dispatch_from_linear_webhook(
                     run_id,
                 )
 
-        # Step 7 — Emit a confirmation thought so the Linear UI
-        # shows the session as active (session-id + branch for the
-        # operator to trace).
+        # Step 7 — Surface the real outcome to Linear. The adapter
+        # may have persisted a WORKSPACE_FAILED row (e.g. Anthropic
+        # 400'd sessions.create from a billing cap) while still
+        # returning `accepted=True` to spare the scan loop a futile
+        # retry. For a webhook-initiated dispatch we want Wilson to
+        # see the actual failure, not a false "Watching for PR".
+        row_failed = (
+            row is not None and row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        )
+        if row_failed:
+            emit_error(
+                session_id,
+                _ERROR_DISPATCH_PERSISTED_BUT_FAILED_TEMPLATE.format(
+                    run_id=(row.id[:8] if row is not None else "<unknown>"),
+                    summary=(
+                        (row.summary or "no summary recorded")
+                        if row is not None
+                        else "no summary recorded"
+                    ),
+                ),
+            )
+            logger.info(
+                "linear_webhook_dispatch: adapter persisted-but-failed "
+                "session=%s workspace_run=%s summary=%r",
+                session_id,
+                run_id,
+                row.summary if row is not None else None,
+            )
+            return False, "adapter_persisted_but_failed"
+
         emit_thought(
             session_id,
             _THOUGHT_DISPATCHED_TEMPLATE.format(
