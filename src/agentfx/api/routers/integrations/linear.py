@@ -190,16 +190,22 @@ async def linear_agent_webhook(
         agent_session_id or "<unknown>",
     )
 
-    # AFX-66 Phase 2 — on `action=created`, fire a background task
-    # that emits the responsiveness `thought` activity and dispatches
-    # to the Managed Agents workspace. The handler itself returns 200
-    # immediately (Linear's 5s SLA); the dispatcher has its own 10s
-    # budget to emit the first activity.
+    # AFX-66 Phase 2 — fire a background dispatch on:
+    # - `action=created` — fresh delegation (the Phase-2 happy path).
+    # - `action=prompted` — Linear "Retry" or a user comment reply.
+    #   We dispatch here too: the dispatcher's idempotency check will
+    #   skip it cleanly if a workspace run is already linked to the
+    #   session (Phase 3 true-resume stays deferred), or treat it as
+    #   a first-time dispatch if the prior `created` never persisted a
+    #   row (e.g. the dispatch failed before the idempotency link).
+    #   Covers the "retry after a crash" case we hit 2026-11-06.
     #
+    # The handler itself returns 200 immediately (Linear's 5s SLA);
+    # the dispatcher has its own 10s budget to emit the first activity.
     # `asyncio.create_task` + `asyncio.to_thread` keeps the (sync)
     # dispatcher off the event loop so a slow adapter can't stall
     # other webhooks.
-    if action == "created":
+    if action in ("created", "prompted"):
         import asyncio
 
         from agentfx.agents.fleet.linear_webhook_dispatch import (
