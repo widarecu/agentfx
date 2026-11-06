@@ -338,6 +338,55 @@ class TestFailureBranches:
         err_body = mocks["error"].call_args.args[1]
         assert "RuntimeError" in err_body
 
+    def test_adapter_persisted_but_failed_emits_error_not_success(self, monkeypatch):
+        """ManagedAgentsAdapter returns accepted=True even when
+        sessions.create fails (scan-loop retry-dedup semantics), but
+        marks the row WORKSPACE_FAILED with a summary. For webhook
+        dispatches that would falsely show 'Watching for PR' in
+        Linear — we need to detect it and emit an error instead.
+        This is the exact failure we hit 2026-11-06 when Wilson's
+        Anthropic usage cap 400'd sessions.create."""
+        from agentfx.api.models.agent_workspace_run import (
+            AgentWorkspaceRunStatus,
+        )
+
+        failed_row = MagicMock(spec=AgentWorkspaceRun)
+        failed_row.id = "run_failed_" + ("0" * 25)  # 36 chars
+        failed_row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        failed_row.summary = (
+            "ManagedAgentsAdapter: sessions.create failed — "
+            "BadRequestError: 400 — usage limit reached"
+        )
+
+        mocks = _patch_bg(
+            monkeypatch,
+            linked_row=failed_row,
+            adapter_result=WorkspaceDispatchResult(
+                accepted=True,  # scan-loop-friendly, but row failed
+                workspace_run_id=failed_row.id,
+                provider_run_id=None,
+                agent_branch="agent/2026-11-06-afx-8-qa-tech-health",
+                reason="sessions_create_failed:BadRequestError",
+            ),
+        )
+
+        dispatched, reason = lwd.dispatch_from_linear_webhook(
+            delivery_id=_DELIVERY_ID,
+            payload=_real_payload(),
+            now=_NOW,
+        )
+
+        assert dispatched is False
+        assert reason == "adapter_persisted_but_failed"
+        # Error emitted, success thought NOT (only the first "picking up")
+        mocks["error"].assert_called_once()
+        err_body = mocks["error"].call_args.args[1]
+        assert "Dispatch failed" in err_body
+        assert "usage limit reached" in err_body
+        # Only the initial "picking up" thought — no "Watching for PR"
+        assert mocks["thought"].call_count == 1
+        assert "Picking up" in mocks["thought"].call_args_list[0].args[1]
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Resilience: Linear outage mid-flow doesn't break dispatch

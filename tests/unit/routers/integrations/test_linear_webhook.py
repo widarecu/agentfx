@@ -314,9 +314,14 @@ class TestPhase2DispatchWiring:
         # Exactly one background task scheduled.
         assert mock_create_task.call_count == 1
 
-    def test_action_prompted_does_not_schedule_dispatch_yet(self, client):
-        """Phase 2 only wires `action=created`. `prompted` (resume
-        path) lands in Phase 3 — this test pins that regression."""
+    def test_action_prompted_schedules_background_dispatch(self, client):
+        """`action=prompted` (Linear "Retry" button, user comment reply)
+        also schedules the dispatcher. The dispatcher's idempotency
+        check skips cleanly when a workspace run is already linked to
+        the session; if the prior `created` never persisted a row (the
+        2026-11-06 retry-after-crash case) it treats this as a first-
+        time dispatch. True Phase 3 resume-on-active-session stays
+        deferred but the wiring must fire so retries don't hang."""
         body = {
             "action": "prompted",
             "webhookTimestamp": _now_ms(),
@@ -331,7 +336,7 @@ class TestPhase2DispatchWiring:
             resp = _post(client, body, delivery="dlv-prompted")
 
         assert resp.status_code == 200
-        mock_create_task.assert_not_called()
+        assert mock_create_task.call_count == 1
 
     def test_duplicate_delivery_skips_background_dispatch(self, client, mock_db):
         """If the delivery was already seen (IntegrityError on insert),
