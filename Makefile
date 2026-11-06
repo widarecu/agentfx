@@ -132,10 +132,17 @@ format:
 	$(VENV)/bin/black .
 
 # --- .env workflow and smoke run ---
-.PHONY: dotenv run-backfill smoke
+.PHONY: dotenv run-backfill smoke check-env-example
 
 dotenv:
 	@test -f .env.development || cp .env.example .env.development
+
+# Fail if .env.example is missing a setting declared in
+# src/agentfx/api/core/config.py (AFX-80). Stdlib only, so no venv needed.
+# CI runs the same check through the unit suite
+# (tests/unit/scripts/test_check_env_example.py).
+check-env-example:
+	$(PY) scripts/check_env_example.py
 
 # Usage: make run-backfill PAIRS="AUDUSD,EURUSD" DAYS=2
 run-backfill: dev dotenv
