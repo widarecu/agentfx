@@ -135,6 +135,13 @@ class AgentWorkspaceRun(Base):
     ended_at = Column(DateTime(timezone=True), nullable=True)
     merged_at = Column(DateTime(timezone=True), nullable=True)
 
+    # Linear agent-session linkage (AFX-66 Phase 2). Both nullable so
+    # scan-loop dispatches (pre-Phase 2 and the parallel safety path)
+    # keep working. Indexed on `linear_agent_session_id` because the
+    # resume path (action=prompted) looks a row up by it.
+    linear_agent_session_id = Column(String(64), nullable=True, index=True)
+    linear_webhook_delivery_id = Column(String(64), nullable=True)
+
     # Daily-cap query hits this heavily; indexed accordingly.
     __table_args__ = (
         Index("idx_agent_workspace_runs_created_status", "created_at", "status"),
