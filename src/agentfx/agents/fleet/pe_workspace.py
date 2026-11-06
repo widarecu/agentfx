@@ -95,6 +95,13 @@ class WorkspaceTaskSpec:
     new_test_paths: list[str]
     estimated_profit_impact: str
     target_branch: str = "feat/agent-fleet"
+    # "scan" (default) = autonomous PE scan-loop dispatch, subject to
+    # both the daily count cap and the daily USD cap.
+    # "webhook" = user-initiated via Linear delegation. Skips the count
+    # cap (a human just asked for it; capping clicks makes no sense)
+    # but KEEPS the USD cap so a runaway webhook flood can't drain
+    # budget silently.
+    trigger: str = "scan"
 
 
 @dataclass
@@ -204,17 +211,27 @@ def _max_usd_per_day() -> float:
 
 
 def check_budget_before_dispatch(
-    db: Session, *, now: datetime | None = None
+    db: Session, *, now: datetime | None = None, trigger: str = "scan"
 ) -> tuple[bool, str]:
     """Returns `(ok, reason)` — reason is empty when ok=True.
 
     Called by every adapter before any provider-side work so the
     stub and real adapters share the same guardrails.
+
+    `trigger` governs which caps apply:
+    - `"scan"` (default) — autonomous scan-loop dispatch. Both caps
+      enforced; the count cap bounds how many autonomous dispatches
+      the loop can start per day.
+    - `"webhook"` — user clicked "Delegate" on a Linear issue. The
+      count cap is skipped (a human just asked for this; blocking on
+      a 2/day budget designed for autonomous dispatches is wrong),
+      but the USD cap is kept as the real $ guardrail.
     """
-    count = dispatches_today(db, now=now)
-    cap = _max_dispatches_per_day()
-    if count >= cap:
-        return False, f"daily_dispatch_cap_hit:{count}/{cap}"
+    if trigger != "webhook":
+        count = dispatches_today(db, now=now)
+        cap = _max_dispatches_per_day()
+        if count >= cap:
+            return False, f"daily_dispatch_cap_hit:{count}/{cap}"
 
     spent = spent_usd_today(db, now=now)
     usd_cap = _max_usd_per_day()
@@ -278,7 +295,10 @@ class StubWorkspaceAdapter:
         now: datetime | None = None,
     ) -> WorkspaceDispatchResult:
         now = now or datetime.now(UTC)
-        ok, reason = check_budget_before_dispatch(db, now=now)
+        # getattr guards cross-branch shape drift: `trigger` doesn't
+        # exist on main's WorkspaceTaskSpec yet.
+        trigger = getattr(spec, "trigger", "scan")
+        ok, reason = check_budget_before_dispatch(db, now=now, trigger=trigger)
         if not ok:
             logger.info("pe_workspace[stub]: budget refusal — %s", reason)
             return WorkspaceDispatchResult(accepted=False, reason=reason)
@@ -362,7 +382,8 @@ class ManagedAgentsAdapter:
         now: datetime | None = None,
     ) -> WorkspaceDispatchResult:
         now = now or datetime.now(UTC)
-        ok, reason = check_budget_before_dispatch(db, now=now)
+        trigger = getattr(spec, "trigger", "scan")
+        ok, reason = check_budget_before_dispatch(db, now=now, trigger=trigger)
         if not ok:
             return WorkspaceDispatchResult(accepted=False, reason=reason)
 

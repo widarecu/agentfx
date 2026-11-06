@@ -227,16 +227,22 @@ class TestHappyPath:
         assert first.args[0] == _SESSION_ID
         assert "Picking up AFX-8" in first.args[1]
 
-        # Budget checked once, adapter called once
+        # Budget checked once with the webhook trigger (the whole point
+        # of this call site: a human click shouldn't be gated by the
+        # autonomous scan loop's per-day count cap).
         mocks["budget"].assert_called_once()
+        assert mocks["budget"].call_args.kwargs.get("trigger") == "webhook"
         mocks["adapter"].dispatch.assert_called_once()
 
         # Spec passed to adapter carries the Linear-prefixed decision key
+        # and trigger="webhook" so the adapter's own budget re-check also
+        # skips the count cap.
         spec = mocks["adapter"].dispatch.call_args.kwargs["spec"]
         assert isinstance(spec, WorkspaceTaskSpec)
         assert spec.pe_proposal_decision_key == "linear:AFX-8"
         assert spec.title.startswith("AFX-8:")
         assert "User request" in spec.narrative
+        assert getattr(spec, "trigger", "scan") == "webhook"
 
         # Row linked: linear_agent_session_id + linear_webhook_delivery_id set
         assert linked.linear_agent_session_id == _SESSION_ID

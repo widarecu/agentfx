@@ -122,6 +122,58 @@ class TestBudget:
         ok, _ = pe_workspace.check_budget_before_dispatch(db)
         assert ok is True
 
+    def test_webhook_trigger_skips_count_cap(self, db, monkeypatch):
+        """User-initiated (Linear delegation) dispatches ignore the
+        daily count cap. The cap bounds autonomous scan-loop churn;
+        a human click doesn't belong under that budget."""
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_WORKSPACE_MAX_PER_DAY", 1)
+        now = datetime.now(UTC)
+        db.add(
+            AgentWorkspaceRun(
+                id="r1",
+                pe_proposal_decision_key="k1",
+                adapter="stub",
+                status=AgentWorkspaceRunStatus.WORKSPACE_FAILED,
+                created_at=now,
+            )
+        )
+        db.commit()
+        # scan trigger (default) should still be blocked.
+        ok_scan, _ = pe_workspace.check_budget_before_dispatch(db, now=now)
+        assert ok_scan is False
+        # webhook trigger bypasses the count cap.
+        ok_webhook, reason = pe_workspace.check_budget_before_dispatch(
+            db, now=now, trigger="webhook"
+        )
+        assert ok_webhook is True
+        assert reason == ""
+
+    def test_webhook_trigger_still_honors_usd_cap(self, db, monkeypatch):
+        """The USD cap is the real $ guardrail — webhook dispatches
+        must NOT bypass it, or a runaway click flood could drain
+        budget silently."""
+        monkeypatch.setattr(
+            pe_workspace.settings, "AGENT_PE_WORKSPACE_DAILY_USD_CAP", 1.00
+        )
+        now = datetime.now(UTC)
+        db.add(
+            AgentWorkspaceRun(
+                id="r1",
+                pe_proposal_decision_key="k1",
+                adapter="managed_agents",
+                status=AgentWorkspaceRunStatus.PR_OPEN,
+                container_usd=0.75,
+                llm_usd=0.50,  # 1.25 total → over 1.00 cap
+                created_at=now,
+            )
+        )
+        db.commit()
+        ok, reason = pe_workspace.check_budget_before_dispatch(
+            db, now=now, trigger="webhook"
+        )
+        assert ok is False
+        assert "daily_usd_cap_hit" in reason
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Task slug
