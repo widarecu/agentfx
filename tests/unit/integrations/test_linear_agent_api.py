@@ -118,6 +118,10 @@ class TestGetAppToken:
         assert sent["grant_type"] == "client_credentials"
         assert sent["client_id"] == _CLIENT_ID
         assert sent["client_secret"] == _CLIENT_SECRET
+        # AFX-66 2026-11-06: `write` is required by
+        # agentActivityCreate. Without it Linear returns
+        # `Invalid scope: write required` on every mutation.
+        assert "write" in sent["scope"]
         assert "app:assignable" in sent["scope"]
         assert "app:mentionable" in sent["scope"]
 
