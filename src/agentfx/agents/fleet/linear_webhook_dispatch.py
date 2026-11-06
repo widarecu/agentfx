@@ -159,7 +159,11 @@ def dispatch_from_linear_webhook(
 
         # Step 3 — Budget pre-flight. Over cap → emit error activity
         # so Wilson sees the reason in Linear, not just Railway logs.
-        budget_ok, budget_reason = check_budget_before_dispatch(db, now=now)
+        # trigger="webhook" skips the count cap (user-initiated) but
+        # keeps the USD cap as the real runaway-cost guardrail.
+        budget_ok, budget_reason = check_budget_before_dispatch(
+            db, now=now, trigger="webhook"
+        )
         if not budget_ok:
             logger.info(
                 "linear_webhook_dispatch: budget denied session=%s reason=%s",
@@ -377,6 +381,11 @@ def _build_task_spec(
     spec_field_names = {f.name for f in dataclasses.fields(WorkspaceTaskSpec)}
     if "linear_issue_identifier" in spec_field_names:
         kwargs["linear_issue_identifier"] = identifier
+    if "trigger" in spec_field_names:
+        # Webhook dispatches skip the daily count cap — Wilson clicking
+        # Delegate is a deliberate human action, not autonomous fleet
+        # churn. The USD cap is still enforced by the adapter.
+        kwargs["trigger"] = "webhook"
 
     return WorkspaceTaskSpec(**kwargs)
 
