@@ -228,7 +228,20 @@ def emit_agent_activity(
             continue
 
         if resp.status_code != 200:
-            return False, f"HTTP {resp.status_code}"
+            # Linear responds to GraphQL *validation* errors with 200 +
+            # an `errors` array, but reserves actual HTTP non-2xx for
+            # request-level problems: missing scope on the token,
+            # malformed input shape, authz failures on the mutation.
+            # The body usually carries the exact message. Log the first
+            # 500 chars so the operator can diagnose from Railway logs
+            # instead of having to curl Linear by hand.
+            body_snippet = (resp.text or "")[:500]
+            logger.warning(
+                "linear_agent_api: agentActivityCreate HTTP %s body=%r",
+                resp.status_code,
+                body_snippet,
+            )
+            return False, f"HTTP {resp.status_code}:{body_snippet[:200]}"
 
         try:
             data = resp.json()

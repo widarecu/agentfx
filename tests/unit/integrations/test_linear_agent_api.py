@@ -292,20 +292,33 @@ class TestEmitAgentActivity:
         assert ok is False
         assert err == "graphql:agentSession not found"
 
-    def test_non_200_returns_http_reason(self):
+    def test_non_200_returns_http_reason_with_body_snippet(self):
+        """Non-2xx responses from Linear's GraphQL endpoint usually
+        carry the exact cause in the body (missing scope, bad input,
+        etc.). The reason string now embeds a body snippet so the
+        operator can diagnose from the dispatcher's log line without
+        having to tail Linear or curl the API by hand.
+
+        Staging 2026-11-06: emit_thought on real delegation was
+        returning bare `HTTP 400` with no diagnostic — this test
+        pins the richer format."""
         with patch.object(
             linear_agent_api.requests,
             "post",
             side_effect=[
                 _mock_response(200, _token_ok_body()),
-                _mock_response(500, text_body="server error"),
+                _mock_response(
+                    500,
+                    text_body='{"errors":["Internal server error"]}',
+                ),
             ],
         ):
             ok, err = linear_agent_api.emit_agent_activity(
                 agent_session_id=_SESSION_ID, content_type="thought", body="x"
             )
         assert ok is False
-        assert err == "HTTP 500"
+        assert err.startswith("HTTP 500:")
+        assert "Internal server error" in err
 
     def test_success_false_in_response_is_an_error(self):
         """Linear's mutation returning success:false is not ok."""
