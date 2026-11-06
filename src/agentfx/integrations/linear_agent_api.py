@@ -104,11 +104,15 @@ def get_app_token(*, force_refresh: bool = False) -> tuple[str | None, str]:
                     "grant_type": "client_credentials",
                     "client_id": client_id,
                     "client_secret": client_secret,
-                    # Scope must be subset of what the app is
-                    # registered for; "read" is always granted.
-                    # `app:assignable` + `app:mentionable` carry
-                    # the agent capabilities (per Linear's docs).
-                    "scope": "read,app:assignable,app:mentionable,comments:create,issues:create",
+                    # Scope must be a subset of what the app is
+                    # installed with. `write` is required to call
+                    # `agentActivityCreate` (surfaced on 2026-11-06
+                    # staging as `Invalid scope: write required`).
+                    # Individual `comments:create` / `issues:create`
+                    # scopes are NOT sufficient for agent mutations.
+                    # `app:assignable` + `app:mentionable` are the
+                    # agent-user-shape scopes per Linear's docs.
+                    "scope": "read,write,app:assignable,app:mentionable",
                 },
                 timeout=_HTTP_TIMEOUT_SECONDS,
             )
