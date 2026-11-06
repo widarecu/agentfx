@@ -140,8 +140,9 @@ async def linear_agent_webhook(
 
     # Idempotent persist. If this Linear-Delivery was already received,
     # the PK collision raises IntegrityError and we return a
-    # "duplicate" ACK. Phase 2 will branch on action/session for
-    # dispatch; Phase 1 just records.
+    # "duplicate" ACK. Phase 2 branches on `action=created` to
+    # dispatch via a background task (see below); Phase 1 was
+    # purely log-only.
     row = LinearWebhookDelivery(
         delivery_id=linear_delivery,
         event_action=action[:32] if action else None,
@@ -166,6 +167,41 @@ async def linear_agent_webhook(
         action or "<unknown>",
         agent_session_id or "<unknown>",
     )
+
+    # AFX-66 Phase 2 — on `action=created`, fire a background task
+    # that emits the responsiveness `thought` activity and dispatches
+    # to the Managed Agents workspace. The handler itself returns 200
+    # immediately (Linear's 5s SLA); the dispatcher has its own 10s
+    # budget to emit the first activity.
+    #
+    # `asyncio.create_task` + `asyncio.to_thread` keeps the (sync)
+    # dispatcher off the event loop so a slow adapter can't stall
+    # other webhooks.
+    if action == "created":
+        import asyncio
+
+        from agentfx.agents.fleet.linear_webhook_dispatch import (
+            dispatch_from_linear_webhook,
+        )
+
+        # Shallow-copy the payload so later mutations can't race.
+        payload_snapshot = dict(payload)
+
+        async def _bg() -> None:
+            try:
+                await asyncio.to_thread(
+                    dispatch_from_linear_webhook,
+                    delivery_id=linear_delivery,
+                    payload=payload_snapshot,
+                )
+            except Exception:  # noqa: BLE001 — bg tasks mustn't bubble
+                logger.exception(
+                    "linear_webhook: dispatch background task crashed delivery=%s",
+                    linear_delivery,
+                )
+
+        asyncio.create_task(_bg())
+
     return {"status": "logged"}
 
 
