@@ -48,6 +48,7 @@ Guardrails baked into every adapter path:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import uuid
@@ -55,12 +56,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
+import requests
 from sqlalchemy.orm import Session
 
 from agentfx.api.core.config import settings
 from agentfx.api.models import AgentWorkspaceRun, AgentWorkspaceRunStatus
 
 logger = logging.getLogger(__name__)
+
+_DEVIN_API_BASE = "https://api.devin.ai"
+_DEVIN_HTTP_TIMEOUT_SECONDS = 30.0
+_DEVIN_TERMINAL_STATUSES = {"finished", "expired", "stopped", "failed"}
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -562,22 +568,363 @@ class ManagedAgentsAdapter:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# DevinWorkspaceAdapter — Cognition Labs backend (AFX-79)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class DevinWorkspaceAdapter:
+    """Pluggable PE worker backend using Devin (devin.ai / Cognition Labs).
+
+    Devin is a direct alternative to Anthropic Managed Agents for the
+    "give a ticket, get a PR" shape. On every dispatch we:
+
+    1. POST `/v3/organizations/{org_id}/sessions` with the task prompt
+       (narrative + target repo + target branch instructions baked in)
+       and a per-session ACU cap.
+    2. Record the returned session id as `provider_run_id` on the row,
+       flip status PENDING → RUNNING.
+    3. The outer `poll_running_dispatches` loop later polls
+       `GET /v1/sessions/{id}` to transition RUNNING → PR_OPEN /
+       WORKSPACE_FAILED as Devin's `status_enum` + `pull_request.url`
+       fields update.
+
+    Devin pricing is ACU-based (~15 min of active work = 1 ACU, ~$2.25
+    per ACU PAYG per Nov-2026 third-party figures). Trial cost
+    comparisons vs ManagedAgentsAdapter live in the `agent_workspace_runs`
+    table — `llm_usd` is populated from `acu_consumed × DEVIN_ACU_USD_RATE`
+    when the poll loop sees a terminal status.
+
+    Any missing config (API key, org id), network error, or non-2xx
+    response marks the row WORKSPACE_FAILED with an operator-readable
+    summary and returns `accepted=True` (scan-loop semantic — don't
+    retry the same proposal next tick). The webhook orchestrator
+    re-reads `row.status` after dispatch and emits an error activity
+    on Linear when WORKSPACE_FAILED, so a dispatch failure is still
+    surfaced to the user.
+
+    Secrets (API key) are NEVER logged. Devin's error responses are
+    truncated to 400 chars in summaries to avoid pasting a long body
+    that could echo header context.
+    """
+
+    def dispatch(
+        self,
+        db: Session,
+        *,
+        spec: WorkspaceTaskSpec,
+        now: datetime | None = None,
+    ) -> WorkspaceDispatchResult:
+        now = now or datetime.now(UTC)
+        # getattr guards cross-branch shape drift: `trigger` doesn't
+        # exist on main's WorkspaceTaskSpec yet (AFX-81).
+        trigger = getattr(spec, "trigger", "scan")
+        ok, reason = check_budget_before_dispatch(db, now=now, trigger=trigger)
+        if not ok:
+            return WorkspaceDispatchResult(accepted=False, reason=reason)
+
+        row = _persist_dispatch_row(db, spec=spec, adapter_name="devin", now=now)
+        return self._dispatch_devin(db, row=row, spec=spec, now=now)
+
+    def _resolve_credentials(
+        self,
+    ) -> tuple[tuple[str, str] | None, str | None]:
+        """Return ((api_key, org_id), None) on success or (None, reason)
+        on missing config. Credentials are never logged by this method
+        or its callers."""
+        api_key = (getattr(settings, "DEVIN_API_KEY", "") or "").strip()
+        org_id = (getattr(settings, "DEVIN_ORG_ID", "") or "").strip()
+        missing = [
+            name
+            for name, val in [
+                ("DEVIN_API_KEY", api_key),
+                ("DEVIN_ORG_ID", org_id),
+            ]
+            if not val
+        ]
+        if missing:
+            return None, f"missing devin config — {', '.join(missing)} empty"
+        return (api_key, org_id), None
+
+    def _dispatch_devin(
+        self,
+        db: Session,
+        *,
+        row: AgentWorkspaceRun,
+        spec: WorkspaceTaskSpec,
+        now: datetime,
+    ) -> WorkspaceDispatchResult:
+        creds, missing_reason = self._resolve_credentials()
+        if creds is None:
+            row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+            row.summary = f"DevinWorkspaceAdapter: {missing_reason}"
+            row.started_at = now
+            row.ended_at = now
+            db.commit()
+            logger.warning(
+                "pe_workspace[devin]: dispatch degraded — %s", missing_reason
+            )
+            return WorkspaceDispatchResult(
+                accepted=True,
+                workspace_run_id=row.id,
+                agent_branch=row.agent_branch,
+                reason=missing_reason or "config_missing",
+            )
+
+        api_key, org_id = creds
+        prompt = _build_devin_prompt(spec=spec, agent_branch=row.agent_branch or "")
+        max_acu = int(getattr(settings, "DEVIN_MAX_ACU_PER_SESSION", 10) or 10)
+
+        url = f"{_DEVIN_API_BASE}/v3/organizations/{org_id}/sessions"
+        payload = {
+            "prompt": prompt,
+            "limits": {"max_acu_limit": max_acu},
+        }
+
+        try:
+            resp = requests.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=_DEVIN_HTTP_TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as exc:
+            row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+            row.summary = (
+                f"DevinWorkspaceAdapter: sessions.create request failed — "
+                f"{type(exc).__name__}"
+            )
+            row.started_at = now
+            row.ended_at = now
+            db.commit()
+            logger.exception(
+                "pe_workspace[devin]: sessions.create request failed proposal=%s",
+                spec.pe_proposal_decision_key,
+            )
+            return WorkspaceDispatchResult(
+                accepted=True,
+                workspace_run_id=row.id,
+                agent_branch=row.agent_branch,
+                reason=f"request_failed:{type(exc).__name__}",
+            )
+
+        if resp.status_code not in (200, 201):
+            body_snippet = (resp.text or "")[:400]
+            row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+            row.summary = (
+                f"DevinWorkspaceAdapter: sessions.create HTTP "
+                f"{resp.status_code}: {body_snippet}"
+            )
+            row.started_at = now
+            row.ended_at = now
+            db.commit()
+            logger.warning(
+                "pe_workspace[devin]: sessions.create HTTP %s body=%r",
+                resp.status_code,
+                body_snippet,
+            )
+            return WorkspaceDispatchResult(
+                accepted=True,
+                workspace_run_id=row.id,
+                agent_branch=row.agent_branch,
+                reason=f"sessions_create_failed:HTTP {resp.status_code}",
+            )
+
+        try:
+            data = resp.json()
+        except ValueError:
+            row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+            row.summary = "DevinWorkspaceAdapter: sessions.create returned non-JSON"
+            row.started_at = now
+            row.ended_at = now
+            db.commit()
+            return WorkspaceDispatchResult(
+                accepted=True,
+                workspace_run_id=row.id,
+                agent_branch=row.agent_branch,
+                reason="malformed_response",
+            )
+
+        session_id = data.get("session_id") or data.get("id") or ""
+        if not isinstance(session_id, str) or not session_id:
+            row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+            row.summary = (
+                "DevinWorkspaceAdapter: sessions.create succeeded but no "
+                "session id in response"
+            )
+            row.started_at = now
+            row.ended_at = now
+            db.commit()
+            return WorkspaceDispatchResult(
+                accepted=True,
+                workspace_run_id=row.id,
+                agent_branch=row.agent_branch,
+                reason="session_id_missing",
+            )
+
+        # Happy path — Devin accepted the session, we have its id.
+        row.provider_run_id = session_id
+        row.status = AgentWorkspaceRunStatus.RUNNING
+        row.started_at = now
+        db.commit()
+        logger.info(
+            "pe_workspace[devin]: dispatched proposal=%s → session=%s "
+            "(agent_branch=%s, max_acu=%d)",
+            spec.pe_proposal_decision_key,
+            session_id,
+            row.agent_branch,
+            max_acu,
+        )
+        return WorkspaceDispatchResult(
+            accepted=True,
+            workspace_run_id=row.id,
+            provider_run_id=session_id,
+            agent_branch=row.agent_branch,
+            reason="dispatched",
+        )
+
+
+def _build_devin_prompt(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str:
+    """Build the single-string prompt Devin takes on sessions.create.
+
+    Devin's API has no explicit `target_branch` / `agent_branch` fields
+    — everything goes in the prompt. We embed the task narrative,
+    pin the target repo via an @owner/repo reference token (so Devin's
+    repo-indexer picks it up), and explicitly tell Devin to:
+
+    - Base its PR against `spec.target_branch` (NEVER main directly).
+    - Use `agent_branch` as the head branch name if possible, so our
+      poll/tracking reconciles with the `agent/<slug>` convention
+      established by the Managed Agents adapter.
+    - Include the Linear issue identifier (if any) in the PR title so
+      Linear's GitHub integration auto-links it.
+    """
+    lines = [
+        "# Task",
+        "",
+        spec.narrative or "(no narrative provided)",
+        "",
+        "# Repository + branch instructions",
+        "",
+        "- Work in the `@widarecu/agentfx` repository.",
+        f"- Base your PR against the `{spec.target_branch}` branch. "
+        "Do NOT target `main` directly.",
+    ]
+    if agent_branch:
+        lines.append(
+            f"- Prefer the head branch name `{agent_branch}` so the "
+            "AgentFX poller can reconcile the session with its tracking "
+            "row. If Cognition's branch policy overrides this, proceed "
+            "with Devin's chosen name — the poller falls back to PR URL."
+        )
+    identifier = getattr(spec, "linear_issue_identifier", "") or ""
+    if identifier:
+        lines.append(
+            f"- Prefix the PR title with `{identifier}:` so Linear's "
+            "GitHub integration auto-links the PR to the ticket."
+        )
+    lines += [
+        "- All code changes must be covered by unit tests. Add or "
+        "update tests alongside the fix. Do not land a PR without "
+        "`make test-unit` green locally in the sandbox.",
+        "- Follow the repository's `CLAUDE.md` work-tracking + "
+        "testing conventions (Docker test profile only, never touch "
+        "`dev`/`uat` profiles, never push to `main` directly).",
+    ]
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Adapter resolution — one place that picks the right adapter per env
 # ─────────────────────────────────────────────────────────────────────
 
 
-def resolve_adapter() -> WorkspaceAdapter:
+def _parse_backend_route(route_str: str) -> dict[str, str]:
+    """Parse `AGENT_PE_BACKEND_ROUTE` as `label:backend,label:backend,...`.
+    Tolerant of surrounding whitespace, trailing commas, and empty
+    entries. Invalid entries are logged + skipped (not an error)."""
+    out: dict[str, str] = {}
+    if not route_str:
+        return out
+    for raw in route_str.split(","):
+        pair = raw.strip()
+        if not pair:
+            continue
+        if ":" not in pair:
+            logger.warning(
+                "pe_workspace: AGENT_PE_BACKEND_ROUTE entry %r missing `:` — skipping.",
+                pair,
+            )
+            continue
+        label, backend = pair.split(":", 1)
+        label = label.strip()
+        backend = backend.strip().lower()
+        if not label or not backend:
+            continue
+        out[label] = backend
+    return out
+
+
+def _route_backend_for_spec(spec: WorkspaceTaskSpec | None) -> str | None:
+    """Return the backend name to use based on label routing, or None
+    if no spec labels match a route rule."""
+    if spec is None:
+        return None
+    labels: list[str] = list(getattr(spec, "labels", []) or [])
+    if not labels:
+        return None
+    route = _parse_backend_route(getattr(settings, "AGENT_PE_BACKEND_ROUTE", "") or "")
+    if not route:
+        return None
+    for label in labels:
+        backend = route.get(label)
+        if backend:
+            return backend
+    return None
+
+
+def resolve_adapter(spec: WorkspaceTaskSpec | None = None) -> WorkspaceAdapter:
     """Return the adapter the orchestrator should use.
 
+    Legacy call sites pass no spec and get the global-flag default
+    backend. New Linear-driven call sites pass the spec so per-label
+    routing (`AGENT_PE_BACKEND_ROUTE`) can steer specific ticket
+    classes to a specific backend during the Devin trial.
+
     - Flag off → always `StubWorkspaceAdapter`.
-    - Flag on + no GitHub PAT → `StubWorkspaceAdapter` (fail-safe —
-      without a PAT, no PR can land, so dispatch would just burn
-      cost).
-    - Flag on + PAT set → `ManagedAgentsAdapter`.
+    - Flag on + routed to `devin` → `DevinWorkspaceAdapter`.
+    - Flag on + routed to `managed_agents` + no GitHub PAT →
+      `StubWorkspaceAdapter` (fail-safe).
+    - Flag on + routed to `managed_agents` + PAT set →
+      `ManagedAgentsAdapter`.
+    - Unknown backend string → logged warning + fall back to
+      `managed_agents` default (never silently switch to stub).
     """
     enabled = bool(getattr(settings, "AGENT_PE_WORKSPACE_ENABLED", False))
     if not enabled:
         return StubWorkspaceAdapter()
+
+    # Per-spec route wins over the global default. Route evaluator
+    # tolerates no-spec / no-labels calls by returning None.
+    routed = _route_backend_for_spec(spec)
+    backend = (
+        routed
+        or (getattr(settings, "AGENT_PE_BACKEND", "managed_agents") or "managed_agents")
+    ).lower()
+
+    if backend == "devin":
+        return DevinWorkspaceAdapter()
+
+    if backend != "managed_agents":
+        logger.warning(
+            "pe_workspace: unknown AGENT_PE_BACKEND=%r — falling back to "
+            "managed_agents",
+            backend,
+        )
+        backend = "managed_agents"
+
     pat = getattr(settings, "GITHUB_TOKEN", "") or ""
     if not pat:
         logger.warning(
@@ -733,21 +1080,31 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
     transition terminated ones to PR_OPEN / TESTS_FAILED /
     WORKSPACE_FAILED. Returns a small counts dict for operator
     logging. Never raises.
+
+    Handles both `adapter="managed_agents"` rows (Anthropic session
+    retrieve + events) and `adapter="devin"` rows (Cognition Labs
+    HTTP GET on `/v1/sessions/{id}`). Devin rows use the row's
+    `provider_run_id` and the `DEVIN_API_KEY` credential.
     """
     now = now or datetime.now(UTC)
     counts = {"checked": 0, "pr_open": 0, "tests_failed": 0, "failed": 0}
 
+    # Managed Agents rows need the anthropic SDK; Devin rows don't.
+    # If the SDK isn't installed we skip managed_agents rows but still
+    # poll Devin rows (if any).
     try:
         import anthropic  # noqa: F401
+
+        has_anthropic = True
     except ImportError:
-        return counts
+        has_anthropic = False
 
     try:
         rows = (
             db.query(AgentWorkspaceRun)
             .filter(AgentWorkspaceRun.status == AgentWorkspaceRunStatus.RUNNING)
             .filter(AgentWorkspaceRun.provider_run_id.isnot(None))
-            .filter(AgentWorkspaceRun.adapter == "managed_agents")
+            .filter(AgentWorkspaceRun.adapter.in_(("managed_agents", "devin")))
             .all()
         )
     except Exception:
@@ -757,11 +1114,34 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
     if not rows:
         return counts
 
+    devin_rows = [r for r in rows if r.adapter == "devin"]
+    managed_rows = [r for r in rows if r.adapter == "managed_agents" and has_anthropic]
+
+    # Devin rows first — they don't need the Anthropic SDK and the HTTP
+    # client is cheap. Updates go through `_poll_devin_row`.
+    for row in devin_rows:
+        counts["checked"] += 1
+        outcome = _poll_devin_row(row, now=now)
+        if outcome == "pr_open":
+            counts["pr_open"] += 1
+        elif outcome == "tests_failed":
+            counts["tests_failed"] += 1
+        elif outcome == "failed":
+            counts["failed"] += 1
+        # "still_running" / "poll_error" → no counter bump; row untouched.
+
+    if not managed_rows:
+        try:
+            db.commit()
+        except Exception:
+            logger.exception("pe_workspace[poll]: commit failed (devin-only)")
+        return counts
+
     import anthropic as anth
 
     client = anth.Anthropic(max_retries=2)
 
-    for row in rows:
+    for row in managed_rows:
         counts["checked"] += 1
         session_id = row.provider_run_id or ""
         try:
@@ -809,12 +1189,120 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
     return counts
 
 
+def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
+    """Poll one Devin workspace row. Updates row in place (caller
+    commits). Returns one of:
+      - "pr_open"       → row flipped PR_OPEN with pr_url set
+      - "tests_failed"  → row flipped TESTS_FAILED
+      - "failed"        → row flipped WORKSPACE_FAILED
+      - "still_running" → session not terminal; row untouched
+      - "poll_error"    → transient fetch error; row untouched
+
+    Never raises. Credentials (DEVIN_API_KEY) never logged.
+    """
+    api_key = (getattr(settings, "DEVIN_API_KEY", "") or "").strip()
+    if not api_key:
+        # Flag on but credentials absent — can't poll. Leave row for
+        # the stuck-row sweeper to eventually reclaim on TTL.
+        return "poll_error"
+
+    session_id = row.provider_run_id or ""
+    if not session_id:
+        return "poll_error"
+
+    try:
+        resp = requests.get(
+            f"{_DEVIN_API_BASE}/v1/sessions/{session_id}",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=_DEVIN_HTTP_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException:
+        logger.exception(
+            "pe_workspace[devin-poll]: GET /v1/sessions/%s failed", session_id
+        )
+        return "poll_error"
+
+    if resp.status_code == 404:
+        # Session gone (Devin TTL passed, or wrong org id). Mark failed
+        # so the row doesn't poll forever.
+        row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        row.summary = (
+            (row.summary or "")
+            + "\n[devin-poll] 404 on session retrieve — Devin dropped the "
+            "session or the org id changed. Marked WORKSPACE_FAILED."
+        ).strip()
+        row.ended_at = now
+        return "failed"
+
+    if resp.status_code != 200:
+        body_snippet = (resp.text or "")[:200]
+        logger.warning(
+            "pe_workspace[devin-poll]: HTTP %s on session %s body=%r",
+            resp.status_code,
+            session_id,
+            body_snippet,
+        )
+        return "poll_error"
+
+    try:
+        data = resp.json()
+    except ValueError:
+        logger.warning(
+            "pe_workspace[devin-poll]: non-JSON response for session %s",
+            session_id,
+        )
+        return "poll_error"
+
+    status_enum = (data.get("status_enum") or data.get("status") or "").lower()
+    if status_enum and status_enum not in _DEVIN_TERMINAL_STATUSES:
+        return "still_running"
+
+    # Terminal — extract PR url + ACU consumed if present.
+    pr_block = data.get("pull_request") or {}
+    pr_url = pr_block.get("url") if isinstance(pr_block, dict) else None
+    acu_consumed = data.get("acu_consumed")
+    rate = float(getattr(settings, "DEVIN_ACU_USD_RATE", 2.25) or 2.25)
+    cost_usd = None
+    if isinstance(acu_consumed, (int, float)) and acu_consumed >= 0:
+        cost_usd = float(acu_consumed) * rate
+        row.llm_usd = cost_usd
+
+    summary_tail = json.dumps(
+        {
+            "status_enum": status_enum or "<missing>",
+            "pull_request_url": pr_url,
+            "acu_consumed": acu_consumed,
+            "estimated_usd": (round(cost_usd, 4) if cost_usd is not None else None),
+        },
+        default=str,
+    )
+    row.summary = (row.summary or "") + "\n[devin-poll] " + summary_tail
+    row.ended_at = now
+
+    if pr_url and isinstance(pr_url, str):
+        row.status = AgentWorkspaceRunStatus.PR_OPEN
+        row.pr_url = pr_url
+        m = re.search(r"/pull/(\d+)", pr_url)
+        if m:
+            row.pr_number = int(m.group(1))
+        return "pr_open"
+
+    # Terminal without a PR URL — treat as WORKSPACE_FAILED. Devin's
+    # `finished` status without a pull_request means the session
+    # completed but didn't ship code (ran out of ACUs, hit a block,
+    # etc.). TESTS_FAILED could be inferred from session events in a
+    # follow-up; for the initial trial we classify as plain failed.
+    row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+    return "failed"
+
+
 __all__ = [
     "WorkspaceTaskSpec",
     "WorkspaceDispatchResult",
     "WorkspaceAdapter",
     "StubWorkspaceAdapter",
     "ManagedAgentsAdapter",
+    "DevinWorkspaceAdapter",
     "build_task_slug",
     "dispatches_today",
     "spent_usd_today",
