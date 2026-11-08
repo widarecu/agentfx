@@ -292,6 +292,377 @@ class TestResolveAdapter:
             pe_workspace.resolve_adapter(), pe_workspace.ManagedAgentsAdapter
         )
 
+    def test_flag_on_backend_devin_returns_devin(self, monkeypatch):
+        """AFX-79: `AGENT_PE_BACKEND=devin` routes to DevinWorkspaceAdapter."""
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_WORKSPACE_ENABLED", True)
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "ghp_abc")
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_BACKEND", "devin")
+        assert isinstance(
+            pe_workspace.resolve_adapter(), pe_workspace.DevinWorkspaceAdapter
+        )
+
+    def test_flag_on_backend_managed_agents_still_default(self, monkeypatch):
+        """Default AGENT_PE_BACKEND=managed_agents preserves pre-AFX-79
+        behaviour. No surprise switches."""
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_WORKSPACE_ENABLED", True)
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "ghp_abc")
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_BACKEND", "managed_agents")
+        assert isinstance(
+            pe_workspace.resolve_adapter(), pe_workspace.ManagedAgentsAdapter
+        )
+
+    def test_unknown_backend_falls_back_to_managed_agents(self, monkeypatch):
+        """Unknown backend value logs a warning and falls back, never
+        silently switches to stub (that would hide a config typo)."""
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_WORKSPACE_ENABLED", True)
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "ghp_abc")
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_BACKEND", "cursor")
+        assert isinstance(
+            pe_workspace.resolve_adapter(), pe_workspace.ManagedAgentsAdapter
+        )
+
+    def test_route_label_overrides_default_backend(self, monkeypatch):
+        """Per-label routing beats the global default. Spec carrying a
+        routed label picks the mapped backend."""
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_WORKSPACE_ENABLED", True)
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "ghp_abc")
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_BACKEND", "managed_agents")
+        monkeypatch.setattr(
+            pe_workspace.settings,
+            "AGENT_PE_BACKEND_ROUTE",
+            "UX:devin, Portal:devin",
+        )
+        spec = _spec()
+        spec.labels = ["UX", "Validator"]  # noqa: attribute-defined-outside-init
+        assert isinstance(
+            pe_workspace.resolve_adapter(spec=spec),
+            pe_workspace.DevinWorkspaceAdapter,
+        )
+
+    def test_route_falls_through_on_no_label_match(self, monkeypatch):
+        """Spec whose labels don't match any route entry uses the
+        global default backend."""
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_WORKSPACE_ENABLED", True)
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "ghp_abc")
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_BACKEND", "managed_agents")
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_BACKEND_ROUTE", "UX:devin")
+        spec = _spec()
+        spec.labels = ["Validator", "Money-path"]  # noqa
+        assert isinstance(
+            pe_workspace.resolve_adapter(spec=spec),
+            pe_workspace.ManagedAgentsAdapter,
+        )
+
+    def test_malformed_route_entries_are_tolerated(self, monkeypatch):
+        """Routing config tolerates whitespace, trailing commas, and
+        no-colon entries (logged + skipped) without raising."""
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_WORKSPACE_ENABLED", True)
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "ghp_abc")
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_BACKEND", "managed_agents")
+        monkeypatch.setattr(
+            pe_workspace.settings,
+            "AGENT_PE_BACKEND_ROUTE",
+            "  UX:devin ,bad_entry_no_colon, ,:missing_label,  ",
+        )
+        spec = _spec()
+        spec.labels = ["UX"]  # noqa
+        # UX:devin still works; other malformed entries skipped.
+        assert isinstance(
+            pe_workspace.resolve_adapter(spec=spec),
+            pe_workspace.DevinWorkspaceAdapter,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# DevinWorkspaceAdapter — AFX-79
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestDevinAdapterDispatch:
+    """Covers the HTTP contract against devin.ai/v3 — all requests
+    patched, no network. Pins:
+    - missing credentials → WORKSPACE_FAILED row + accepted=True
+      (scan-loop don't-retry semantic)
+    - happy path → RUNNING row + provider_run_id populated
+    - HTTP error → WORKSPACE_FAILED row carrying body snippet
+    - request exception → WORKSPACE_FAILED row
+    - missing session id in payload → WORKSPACE_FAILED row
+    - API key never appears in persisted summaries or log messages
+    """
+
+    def _enable(self, monkeypatch, *, api_key="cog_test", org_id="org_123"):
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_WORKSPACE_ENABLED", True)
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "ghp_x")
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_BACKEND", "devin")
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", api_key)
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_ORG_ID", org_id)
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_MAX_ACU_PER_SESSION", 5)
+        # Raise dispatch caps so the budget check doesn't short-circuit.
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_WORKSPACE_MAX_PER_DAY", 50)
+
+    def test_missing_api_key_fails_row_accepted_true(self, db, monkeypatch):
+        self._enable(monkeypatch, api_key="")
+        adapter = pe_workspace.DevinWorkspaceAdapter()
+        result = adapter.dispatch(db, spec=_spec())
+        assert result.accepted is True, "scan-loop semantic preserved"
+        row = (
+            db.query(AgentWorkspaceRun)
+            .filter(AgentWorkspaceRun.id == result.workspace_run_id)
+            .one()
+        )
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert "DEVIN_API_KEY" in (row.summary or "")
+
+    def test_missing_org_id_fails_row_accepted_true(self, db, monkeypatch):
+        self._enable(monkeypatch, org_id="")
+        adapter = pe_workspace.DevinWorkspaceAdapter()
+        result = adapter.dispatch(db, spec=_spec())
+        assert result.accepted is True
+        row = (
+            db.query(AgentWorkspaceRun)
+            .filter(AgentWorkspaceRun.id == result.workspace_run_id)
+            .one()
+        )
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert "DEVIN_ORG_ID" in (row.summary or "")
+
+    def test_happy_path_records_session_id_and_flips_running(self, db, monkeypatch):
+        self._enable(monkeypatch)
+
+        class _Resp:
+            status_code = 201
+            text = ""
+
+            def json(self_inner):
+                return {"session_id": "sesn_dev_test_01", "status_enum": "working"}
+
+        captured: dict = {}
+
+        def _mock_post(url, *, headers, json, timeout):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return _Resp()
+
+        monkeypatch.setattr(pe_workspace.requests, "post", _mock_post)
+
+        adapter = pe_workspace.DevinWorkspaceAdapter()
+        result = adapter.dispatch(db, spec=_spec())
+
+        assert result.accepted is True
+        assert result.provider_run_id == "sesn_dev_test_01"
+        row = (
+            db.query(AgentWorkspaceRun)
+            .filter(AgentWorkspaceRun.id == result.workspace_run_id)
+            .one()
+        )
+        assert row.status == AgentWorkspaceRunStatus.RUNNING
+        assert row.provider_run_id == "sesn_dev_test_01"
+        assert row.adapter == "devin"
+
+        # URL pins org id + v3 endpoint shape.
+        assert captured["url"] == (
+            "https://api.devin.ai/v3/organizations/org_123/sessions"
+        )
+        # Auth header carries the key (verify, then make sure it
+        # doesn't leak into persisted fields below).
+        assert captured["headers"]["Authorization"] == "Bearer cog_test"
+        # max_acu honored.
+        assert captured["json"]["limits"]["max_acu_limit"] == 5
+        # Prompt carries target branch + repo reference + no secrets.
+        prompt = captured["json"]["prompt"]
+        assert "feat/agent-fleet" in prompt
+        assert "@widarecu/agentfx" in prompt
+        assert "cog_test" not in prompt  # never bake the secret
+
+        # Credential MUST NOT appear in the DB row's summary.
+        assert "cog_test" not in (row.summary or "")
+
+    def test_http_error_body_persisted_without_secret_leak(self, db, monkeypatch):
+        self._enable(monkeypatch)
+
+        class _Resp:
+            status_code = 403
+            text = '{"error": "forbidden: scope insufficient"}'
+
+            def json(self_inner):
+                raise AssertionError("don't parse non-2xx body as JSON")
+
+        monkeypatch.setattr(pe_workspace.requests, "post", lambda *a, **k: _Resp())
+
+        adapter = pe_workspace.DevinWorkspaceAdapter()
+        result = adapter.dispatch(db, spec=_spec())
+        assert result.accepted is True
+        row = (
+            db.query(AgentWorkspaceRun)
+            .filter(AgentWorkspaceRun.id == result.workspace_run_id)
+            .one()
+        )
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert "HTTP 403" in (row.summary or "")
+        assert "scope insufficient" in (row.summary or "")
+        assert "cog_test" not in (row.summary or "")
+
+    def test_request_exception_handled(self, db, monkeypatch):
+        self._enable(monkeypatch)
+
+        def _boom(*a, **k):
+            raise pe_workspace.requests.ConnectionError("devin down")
+
+        monkeypatch.setattr(pe_workspace.requests, "post", _boom)
+
+        adapter = pe_workspace.DevinWorkspaceAdapter()
+        result = adapter.dispatch(db, spec=_spec())
+        assert result.accepted is True
+        row = (
+            db.query(AgentWorkspaceRun)
+            .filter(AgentWorkspaceRun.id == result.workspace_run_id)
+            .one()
+        )
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert "ConnectionError" in (row.summary or "")
+
+    def test_response_missing_session_id_fails(self, db, monkeypatch):
+        self._enable(monkeypatch)
+
+        class _Resp:
+            status_code = 200
+            text = "{}"
+
+            def json(self_inner):
+                return {"status_enum": "working"}  # no session_id
+
+        monkeypatch.setattr(pe_workspace.requests, "post", lambda *a, **k: _Resp())
+
+        adapter = pe_workspace.DevinWorkspaceAdapter()
+        result = adapter.dispatch(db, spec=_spec())
+        assert result.accepted is True
+        row = (
+            db.query(AgentWorkspaceRun)
+            .filter(AgentWorkspaceRun.id == result.workspace_run_id)
+            .one()
+        )
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert "no session id" in (row.summary or "").lower()
+
+
+class TestDevinPollRow:
+    """Covers `_poll_devin_row` state transitions. HTTP patched."""
+
+    def _row(self, *, session_id="sesn_poll_01"):
+        return AgentWorkspaceRun(
+            id=f"wsrun-{session_id}",
+            pe_proposal_decision_key="k",
+            adapter="devin",
+            status=AgentWorkspaceRunStatus.RUNNING,
+            provider_run_id=session_id,
+            created_at=datetime.now(UTC),
+            started_at=datetime.now(UTC),
+        )
+
+    def test_still_running_leaves_row_alone(self, monkeypatch):
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+
+        class _Resp:
+            status_code = 200
+            text = "{}"
+
+            def json(self_inner):
+                return {"status_enum": "working"}
+
+        monkeypatch.setattr(pe_workspace.requests, "get", lambda *a, **k: _Resp())
+        row = self._row()
+        outcome = pe_workspace._poll_devin_row(row, now=datetime.now(UTC))
+        assert outcome == "still_running"
+        assert row.status == AgentWorkspaceRunStatus.RUNNING
+
+    def test_finished_with_pr_url_flips_pr_open(self, monkeypatch):
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_ACU_USD_RATE", 2.5)
+
+        class _Resp:
+            status_code = 200
+            text = "{}"
+
+            def json(self_inner):
+                return {
+                    "status_enum": "finished",
+                    "pull_request": {
+                        "url": "https://github.com/widarecu/agentfx/pull/999"
+                    },
+                    "acu_consumed": 2,
+                }
+
+        monkeypatch.setattr(pe_workspace.requests, "get", lambda *a, **k: _Resp())
+        row = self._row()
+        outcome = pe_workspace._poll_devin_row(row, now=datetime.now(UTC))
+        assert outcome == "pr_open"
+        assert row.status == AgentWorkspaceRunStatus.PR_OPEN
+        assert row.pr_url == "https://github.com/widarecu/agentfx/pull/999"
+        assert row.pr_number == 999
+        assert row.llm_usd == 5.0  # 2 ACU × $2.50
+
+    def test_finished_without_pr_flips_failed(self, monkeypatch):
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+
+        class _Resp:
+            status_code = 200
+            text = "{}"
+
+            def json(self_inner):
+                return {"status_enum": "finished", "pull_request": None}
+
+        monkeypatch.setattr(pe_workspace.requests, "get", lambda *a, **k: _Resp())
+        row = self._row()
+        outcome = pe_workspace._poll_devin_row(row, now=datetime.now(UTC))
+        assert outcome == "failed"
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+
+    def test_404_marks_row_failed(self, monkeypatch):
+        """Devin dropped the session (TTL / wrong org id) — don't poll
+        this row forever, mark it failed so the sweeper + budget can
+        reconcile."""
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+
+        class _Resp:
+            status_code = 404
+            text = ""
+
+            def json(self_inner):
+                return {}
+
+        monkeypatch.setattr(pe_workspace.requests, "get", lambda *a, **k: _Resp())
+        row = self._row()
+        outcome = pe_workspace._poll_devin_row(row, now=datetime.now(UTC))
+        assert outcome == "failed"
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert "404" in (row.summary or "")
+
+    def test_transient_http_error_leaves_row_alone(self, monkeypatch):
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+
+        class _Resp:
+            status_code = 500
+            text = "oops"
+
+            def json(self_inner):
+                raise ValueError()
+
+        monkeypatch.setattr(pe_workspace.requests, "get", lambda *a, **k: _Resp())
+        row = self._row()
+        outcome = pe_workspace._poll_devin_row(row, now=datetime.now(UTC))
+        assert outcome == "poll_error"
+        assert row.status == AgentWorkspaceRunStatus.RUNNING
+
+    def test_missing_api_key_returns_poll_error(self, monkeypatch):
+        """No credential → can't poll. Row untouched; stuck-sweeper
+        will reclaim on TTL if credentials don't come back."""
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "")
+        row = self._row()
+        outcome = pe_workspace._poll_devin_row(row, now=datetime.now(UTC))
+        assert outcome == "poll_error"
+        assert row.status == AgentWorkspaceRunStatus.RUNNING
+
 
 # ─────────────────────────────────────────────────────────────────────
 # sweep_stuck_runs
