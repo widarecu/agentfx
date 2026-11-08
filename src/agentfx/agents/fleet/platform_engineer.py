@@ -43,7 +43,7 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -213,21 +213,34 @@ def scan_and_dispatch(*, db: Session, now: datetime | None = None) -> tuple[int,
 # ─────────────────────────────────────────────────────────────────────
 
 
+_RETRY_GATE_WINDOW_DAYS = 7
+
+
 def _should_skip_due_to_retry_gate(db: Session, issue: ReadyIssue) -> bool:
     """Apply Wilson's "try twice; file for attention on same-signature
     failures" rule.
 
     Reads prior AgentWorkspaceRun rows for this Linear issue, filters
-    to WORKSPACE_FAILED ones, newest first. If `should_file_for_attention`
-    says the latest two share a signature, flag the issue on Linear
-    with `needs-wilson` + comment and return True (skip dispatch).
+    to WORKSPACE_FAILED ones within the last 7 days, newest first. If
+    `should_file_for_attention` says the latest two share a signature,
+    flag the issue on Linear with `needs-wilson` + comment and return
+    True (skip dispatch).
+
+    **7-day window (2026-11-08)**: a global condition like an Anthropic
+    monthly cap can mark every attempt WORKSPACE_FAILED with identical
+    signatures. Old failures past the window don't gate NEW attempts
+    once the cap clears — so when Wilson removes `needs-wilson`, the
+    issue gets a fresh two tries instead of inheriting weeks of
+    cap-shaped history. Autonomous recovery when quota returns Dec 1.
 
     Returns False if the issue should proceed to dispatch.
     """
+    window_start = datetime.now(UTC) - timedelta(days=_RETRY_GATE_WINDOW_DAYS)
     prior = (
         db.query(AgentWorkspaceRun)
         .filter(AgentWorkspaceRun.linear_issue_identifier == issue.identifier)
         .filter(AgentWorkspaceRun.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED)
+        .filter(AgentWorkspaceRun.created_at >= window_start)
         .order_by(AgentWorkspaceRun.created_at.desc())
         .limit(10)
         .all()

@@ -131,13 +131,22 @@ def list_ready_dispatch_candidates(limit: int) -> list[ReadyIssue]:
         return []
 
     client = _build_client(settings.LINEAR_API_KEY)
+    # 2026-11-08 — needs-wilson exclusion moved from the GraphQL filter
+    # to a Python post-filter. Linear's `labels: { id: { nin: [...] } }`
+    # on a nested collection matches issues where AT LEAST ONE label
+    # isn't in the exclude list, not issues where NO label is — since
+    # every issue has multiple labels, that filter was effectively a
+    # no-op, and already-flagged tickets (AFX-50/52/73) kept coming
+    # back every 15 min, triggering the retry gate's comment storm.
+    # Filtering in Python is semantically obvious and not dependent on
+    # Linear's nested-collection filter edge cases.
+    needs_wilson_label_id = settings.PE_LINEAR_NEEDS_WILSON_LABEL_ID
     try:
         query = """
         query ListPEReady(
           $teamKey: String!,
           $stateId: ID!,
           $agentFiledLabelId: ID!,
-          $needsWilsonLabelId: ID!,
           $limit: Int!
         ) {
           issues(
@@ -147,10 +156,7 @@ def list_ready_dispatch_candidates(limit: int) -> list[ReadyIssue]:
               team: { key: { eq: $teamKey } },
               state: { id: { eq: $stateId } },
               labels: { id: { eq: $agentFiledLabelId } },
-              and: [
-                { labels: { id: { nin: [$needsWilsonLabelId] } } },
-                { assignee: { null: true } }
-              ]
+              assignee: { null: true }
             }
           ) {
             nodes {
@@ -162,7 +168,7 @@ def list_ready_dispatch_candidates(limit: int) -> list[ReadyIssue]:
               priority
               createdAt
               labels(first: 50) {
-                nodes { name }
+                nodes { id name }
               }
             }
           }
@@ -175,7 +181,6 @@ def list_ready_dispatch_candidates(limit: int) -> list[ReadyIssue]:
                 "teamKey": settings.AGENT_LINEAR_TEAM_KEY,
                 "stateId": settings.PE_LINEAR_READY_STATE_ID,
                 "agentFiledLabelId": settings.PE_LINEAR_AGENT_FILED_LABEL_ID,
-                "needsWilsonLabelId": settings.PE_LINEAR_NEEDS_WILSON_LABEL_ID,
                 "limit": max(
                     1, min(50, limit * 2)
                 ),  # over-fetch; we sort+trim client-side
@@ -185,6 +190,23 @@ def list_ready_dispatch_candidates(limit: int) -> list[ReadyIssue]:
     except Exception:
         logger.exception("linear_pe_queue: list_ready failed")
         return []
+
+    # Python-side needs-wilson exclusion — see note above.
+    def _label_ids(node: dict) -> set[str]:
+        return {
+            lbl.get("id")
+            for lbl in (node.get("labels") or {}).get("nodes") or []
+            if lbl.get("id")
+        }
+
+    filtered_nodes = [n for n in nodes if needs_wilson_label_id not in _label_ids(n)]
+    excluded_count = len(nodes) - len(filtered_nodes)
+    if excluded_count:
+        logger.info(
+            "linear_pe_queue: %d Ready candidate(s) excluded by needs-wilson "
+            "label (post-filter).",
+            excluded_count,
+        )
 
     issues = [
         ReadyIssue(
@@ -197,7 +219,7 @@ def list_ready_dispatch_candidates(limit: int) -> list[ReadyIssue]:
             labels=[lbl["name"] for lbl in (n.get("labels") or {}).get("nodes") or []],
             created_at=n["createdAt"],
         )
-        for n in nodes
+        for n in filtered_nodes
     ]
 
     # Priority: 0 = No priority, 1 = Urgent, 2 = High, 3 = Medium, 4 = Low.
@@ -287,6 +309,9 @@ def rollback_to_ready(issue_id: str, *, reason_summary: str) -> bool:
     return ok_transition
 
 
+_FILE_FOR_ATTENTION_MARKER = "<!-- pe:file_for_attention -->"
+
+
 def file_for_attention(
     issue_id: str,
     *,
@@ -300,6 +325,15 @@ def file_for_attention(
     since this is called before rollback — see `scan_and_dispatch`).
     Wilson picks it up, decides whether the proposal is salvageable,
     and either removes `needs-wilson` to retry or moves it elsewhere.
+
+    **Comment is idempotent** (2026-11-08 fix): tags every post with a
+    hidden HTML-comment marker and skips the post if any existing
+    comment on the issue carries that marker. Belt-and-braces guard
+    for the case where the needs-wilson label-filter fails to exclude
+    an already-flagged ticket (which caused the 2026-11-06–08 comment
+    storm on AFX-50/52/73). The label-add path stays unconditional —
+    `_add_label` is idempotent on its own and is also the contract
+    that Wilson's "remove the label to retry" workflow depends on.
     """
     ok, reason = _linear_enabled()
     if not ok:
@@ -307,23 +341,63 @@ def file_for_attention(
         return False
 
     client = _build_client(settings.LINEAR_API_KEY)
-    body = (
-        "**PE dispatch keeps failing with the same error — needs your eyes.**\n\n"
-        "The last two workspace attempts failed with matching signatures. "
-        "The proposal probably has a problem the session can't resolve on "
-        "its own (SDK schema, missing config, wrong permissions). "
-        "I've stopped auto-retrying. Remove the `needs-wilson` label to "
-        "resume, or move the issue to decide its fate.\n\n"
-        + "\n".join(
-            f"- Attempt {i + 1}: `{sig[:400]}`" for i, sig in enumerate(signatures)
+
+    if _has_file_for_attention_marker(client, issue_id=issue_id):
+        logger.info(
+            "linear_pe_queue: file_for_attention comment already present on "
+            "%s — skipping comment, ensuring label.",
+            issue_id,
         )
-    )
-    _comment(client, issue_id=issue_id, body=body)
+    else:
+        body = (
+            _FILE_FOR_ATTENTION_MARKER
+            + "\n**PE dispatch keeps failing with the same error — "
+            "needs your eyes.**\n\n"
+            "The last two workspace attempts failed with matching "
+            "signatures. The proposal probably has a problem the session "
+            "can't resolve on its own (SDK schema, missing config, wrong "
+            "permissions). I've stopped auto-retrying. Remove the "
+            "`needs-wilson` label to resume, or move the issue to decide "
+            "its fate.\n\n"
+            + "\n".join(
+                f"- Attempt {i + 1}: `{sig[:400]}`" for i, sig in enumerate(signatures)
+            )
+        )
+        _comment(client, issue_id=issue_id, body=body)
+
     return _add_label(
         client,
         issue_id=issue_id,
         label_id=settings.PE_LINEAR_NEEDS_WILSON_LABEL_ID,
     )
+
+
+def _has_file_for_attention_marker(client: requests.Session, *, issue_id: str) -> bool:
+    """Return True if the issue already carries a file_for_attention
+    comment (identified by the marker). On Linear read failure returns
+    False so we don't silently suppress the first legit post.
+
+    Fetches up to 50 comments — a single issue hit by a long storm
+    may exceed this, but any one marker proves prior filing.
+    """
+    query = """
+    query ReadIssueComments($id: String!) {
+      issue(id: $id) {
+        id
+        comments(first: 50) {
+          nodes { id body }
+        }
+      }
+    }
+    """
+    try:
+        data = _gql(client, query, {"id": issue_id})
+    except Exception:
+        logger.exception("linear_pe_queue: comment-marker read failed for %s", issue_id)
+        return False
+    issue = data.get("issue") or {}
+    nodes = ((issue.get("comments") or {}).get("nodes")) or []
+    return any(_FILE_FOR_ATTENTION_MARKER in (n.get("body") or "") for n in nodes)
 
 
 def flag_needs_design(issue_id_or_identifier: str, *, pr_url: str) -> bool:

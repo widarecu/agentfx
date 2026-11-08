@@ -406,6 +406,38 @@ class TestRetryGate:
         _, attempted = platform_engineer.scan_and_dispatch(db=db)
         assert attempted == 1
 
+    def test_failures_older_than_7d_do_not_gate(self, db, monkeypatch, linear_recorder):
+        """Autonomous recovery when a global condition (Anthropic
+        usage cap, Linear outage, GitHub token rotation) marks every
+        attempt failed for days: once the condition clears and Wilson
+        removes `needs-wilson`, the issue gets a FRESH two-attempt
+        budget. Old matching failures past the 7-day window don't
+        inherit forward."""
+        issue = _issue(identifier="AFX-403")
+        # Two matching failures from 10 and 11 days ago — would normally
+        # trip the gate, but both are outside the 7-day retry window.
+        self._seed_failed(
+            db,
+            identifier="AFX-403",
+            summary="ManagedAgentsAdapter: sessions.create failed — BadRequestError",
+            minutes_ago=60 * 24 * 11,
+        )
+        self._seed_failed(
+            db,
+            identifier="AFX-403",
+            summary="ManagedAgentsAdapter: sessions.create failed — BadRequestError",
+            minutes_ago=60 * 24 * 10,
+        )
+        _patch_list_candidates(monkeypatch, [issue])
+        adapter = _RecordingAdapter(
+            _StubAdapterResult(row_status=AgentWorkspaceRunStatus.RUNNING)
+        )
+        _patch_adapter(monkeypatch, adapter)
+
+        _, attempted = platform_engineer.scan_and_dispatch(db=db)
+        assert attempted == 1, "stale failures must not gate a fresh retry"
+        assert linear_recorder["attention_filings"] == []
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Daily cap
