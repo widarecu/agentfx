@@ -26,6 +26,7 @@ import pytest
 from agentfx.agents.fleet import linear_pe_queue
 from agentfx.agents.fleet.linear_pe_queue import (
     failure_signature,
+    file_for_attention,
     list_ready_dispatch_candidates,
     should_file_for_attention,
     transition_to_in_progress,
@@ -244,6 +245,64 @@ class TestListReadyDispatchCandidates:
             issues = list_ready_dispatch_candidates(limit=5)
         assert [i.identifier for i in issues] == ["AFX-LOW", "AFX-NOP"]
 
+    def test_needs_wilson_label_excludes_candidate(self, monkeypatch):
+        """Issues carrying the needs-wilson label MUST NOT be returned —
+        the GraphQL filter proved unreliable (2026-11-06–08 comment
+        storm on AFX-50/52/73 traced to Linear's nested `nin` matching
+        the opposite of what we wanted). Fix is a Python post-filter
+        that compares label ids. This test pins that behaviour."""
+        monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
+        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
+        monkeypatch.setattr(
+            linear_pe_queue.settings,
+            "PE_LINEAR_NEEDS_WILSON_LABEL_ID",
+            "lbl-needs-wilson",
+        )
+        fake_response = {
+            "issues": {
+                "nodes": [
+                    {
+                        "id": "uuid-ok",
+                        "identifier": "AFX-OK",
+                        "title": "proceed",
+                        "description": "",
+                        "url": "u",
+                        "priority": 2,
+                        "createdAt": "2026-11-01T00:00:00Z",
+                        "labels": {
+                            "nodes": [
+                                {"id": "lbl-agent-filed", "name": "agent-filed"},
+                            ]
+                        },
+                    },
+                    {
+                        "id": "uuid-blocked",
+                        "identifier": "AFX-BLOCKED",
+                        "title": "flagged, must not dispatch",
+                        "description": "",
+                        "url": "u",
+                        "priority": 1,
+                        "createdAt": "2026-11-01T00:00:00Z",
+                        "labels": {
+                            "nodes": [
+                                {"id": "lbl-agent-filed", "name": "agent-filed"},
+                                {
+                                    "id": "lbl-needs-wilson",
+                                    "name": "needs-wilson",
+                                },
+                            ]
+                        },
+                    },
+                ]
+            }
+        }
+        with patch(
+            "agentfx.agents.fleet.linear_pe_queue._gql",
+            return_value=fake_response,
+        ):
+            issues = list_ready_dispatch_candidates(limit=5)
+        assert [i.identifier for i in issues] == ["AFX-OK"]
+
     def test_gql_failure_returns_empty(self, monkeypatch):
         """Linear outage must never raise into the orchestrator loop."""
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
@@ -258,6 +317,161 @@ class TestListReadyDispatchCandidates:
 # ─────────────────────────────────────────────────────────────────────
 # transition_to_in_progress
 # ─────────────────────────────────────────────────────────────────────
+
+
+class TestFileForAttentionIdempotency:
+    """Fingerprint-dedup for the file_for_attention comment (2026-11-08).
+    The label-add is already idempotent via _add_label's label-read
+    check; the comment wasn't, which caused the AFX-50/52/73 comment
+    storm when the Ready-list exclusion filter failed for 48 hours.
+    """
+
+    def _enable(self, monkeypatch):
+        monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
+        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
+        monkeypatch.setattr(
+            linear_pe_queue.settings,
+            "PE_LINEAR_NEEDS_WILSON_LABEL_ID",
+            "lbl-needs-wilson",
+        )
+
+    @staticmethod
+    def _tag(query: str) -> str:
+        """Classify an outgoing GraphQL payload by the operation it
+        performs. Works on both queries and mutations; matches on the
+        operation name so the first line of a `\"\"\"` triple-quoted
+        string (the leading blank) doesn't obscure the signal."""
+        if "comments(first: 50)" in query:
+            return "read_comments"
+        if "commentCreate" in query:
+            return "mutate_commentCreate"
+        if "labels(first: 50)" in query:
+            return "read_labels"
+        if "issueUpdate" in query:
+            return "mutate_issueUpdate"
+        return "unknown"
+
+    def test_first_call_posts_comment_and_adds_label(self, monkeypatch):
+        self._enable(monkeypatch)
+        tags: list[str] = []
+        comment_bodies: list[str] = []
+
+        def _mock_gql(client, query, variables):
+            tag = self._tag(query)
+            tags.append(tag)
+            if tag == "read_comments":
+                return {"issue": {"id": variables["id"], "comments": {"nodes": []}}}
+            if tag == "mutate_commentCreate":
+                comment_bodies.append(variables["body"])
+                return {"commentCreate": {"success": True}}
+            if tag == "read_labels":
+                return {
+                    "issue": {
+                        "id": variables["id"],
+                        "labels": {"nodes": [{"id": "lbl-agent-filed"}]},
+                    }
+                }
+            if tag == "mutate_issueUpdate":
+                return {"issueUpdate": {"success": True}}
+            return {}
+
+        with patch("agentfx.agents.fleet.linear_pe_queue._gql", side_effect=_mock_gql):
+            ok = file_for_attention(
+                "uuid-afx-500", signatures=["BadRequest", "BadRequest"]
+            )
+        assert ok is True
+        assert tags.count("mutate_commentCreate") == 1, (
+            "first call must post exactly one comment"
+        )
+        assert linear_pe_queue._FILE_FOR_ATTENTION_MARKER in comment_bodies[0], (
+            "marker must be embedded so subsequent calls can detect it"
+        )
+
+    def test_second_call_skips_comment_but_still_ensures_label(self, monkeypatch):
+        """If a prior file_for_attention comment is already present
+        on the issue, a repeat call MUST NOT post another comment.
+        It must still call the label-add path (idempotent itself)
+        so the Ready-exclusion contract holds even if someone peeled
+        the label by hand."""
+        self._enable(monkeypatch)
+        tags: list[str] = []
+
+        existing_comment = {
+            "id": "cmt-existing",
+            "body": (
+                linear_pe_queue._FILE_FOR_ATTENTION_MARKER
+                + "\n**PE dispatch keeps failing...** posted an hour ago"
+            ),
+        }
+
+        def _mock_gql(client, query, variables):
+            tag = self._tag(query)
+            tags.append(tag)
+            if tag == "read_comments":
+                return {
+                    "issue": {
+                        "id": variables["id"],
+                        "comments": {"nodes": [existing_comment]},
+                    }
+                }
+            if tag == "mutate_commentCreate":
+                raise AssertionError("duplicate comment MUST NOT be posted")
+            if tag == "read_labels":
+                # Label not present (simulating a Wilson-initiated peel).
+                return {
+                    "issue": {
+                        "id": variables["id"],
+                        "labels": {"nodes": [{"id": "lbl-agent-filed"}]},
+                    }
+                }
+            if tag == "mutate_issueUpdate":
+                return {"issueUpdate": {"success": True}}
+            return {}
+
+        with patch("agentfx.agents.fleet.linear_pe_queue._gql", side_effect=_mock_gql):
+            ok = file_for_attention(
+                "uuid-afx-501", signatures=["BadRequest", "BadRequest"]
+            )
+        assert ok is True
+        assert "mutate_commentCreate" not in tags
+        assert "mutate_issueUpdate" in tags, (
+            "label-add path must still fire so the Ready filter stays correct"
+        )
+
+    def test_marker_read_failure_falls_back_to_posting(self, monkeypatch):
+        """If Linear 500s on the marker read, we don't know whether a
+        prior comment exists — degrade to posting (one extra comment
+        on a transient outage is fine; silencing a real file-for-
+        attention on a true first failure is not). Must not raise."""
+        self._enable(monkeypatch)
+        tags: list[str] = []
+
+        def _mock_gql(client, query, variables):
+            tag = self._tag(query)
+            tags.append(tag)
+            if tag == "read_comments":
+                raise RuntimeError("linear 500")
+            if tag == "mutate_commentCreate":
+                return {"commentCreate": {"success": True}}
+            if tag == "read_labels":
+                return {
+                    "issue": {
+                        "id": variables["id"],
+                        "labels": {"nodes": []},
+                    }
+                }
+            if tag == "mutate_issueUpdate":
+                return {"issueUpdate": {"success": True}}
+            return {}
+
+        with patch("agentfx.agents.fleet.linear_pe_queue._gql", side_effect=_mock_gql):
+            ok = file_for_attention(
+                "uuid-afx-502", signatures=["BadRequest", "BadRequest"]
+            )
+        assert ok is True
+        assert "mutate_commentCreate" in tags, (
+            "unknown prior-comment state must degrade to posting, not silence"
+        )
 
 
 class TestTransitionToInProgress:
