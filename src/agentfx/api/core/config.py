@@ -568,6 +568,75 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Pluggable PE worker backend (AFX-79). Lets us route PE dispatches
+    # to Claude Managed Agents (default) or Devin (devin.ai / Cognition
+    # Labs) without changing call sites. Ships dark: without
+    # AGENT_PE_BACKEND=devin AND DEVIN_API_KEY set, behaviour is
+    # identical to pre-adapter-split.
+    AGENT_PE_BACKEND: str = Field(
+        default="managed_agents",
+        env="AGENT_PE_BACKEND",
+        description=(
+            "Which worker backend PE dispatches to. One of: "
+            "`managed_agents` (Anthropic Managed Agents, default) or "
+            "`devin` (Cognition Labs). Unknown value → falls back to "
+            "`managed_agents` with a warning."
+        ),
+    )
+    AGENT_PE_BACKEND_ROUTE: str = Field(
+        default="",
+        env="AGENT_PE_BACKEND_ROUTE",
+        description=(
+            "Optional per-label backend routing, comma-separated "
+            "`label:backend` pairs — e.g. `UX:devin,Portal:devin,"
+            "Validator:managed_agents`. When a dispatch's spec carries "
+            "a matching label, that backend wins over "
+            "AGENT_PE_BACKEND. Unlisted labels fall through to the "
+            "default."
+        ),
+    )
+    DEVIN_API_KEY: str = Field(
+        default="",
+        env="DEVIN_API_KEY",
+        description=(
+            "Cognition Labs API credential for Devin. Service Key "
+            "(prefix `cog_...`) is preferred over a Personal Access "
+            "Token for programmatic clients. Required when "
+            "AGENT_PE_BACKEND=devin OR any route points at devin — "
+            "empty disables the Devin adapter (stub falls through). "
+            "Never logged; never echoed in error messages."
+        ),
+    )
+    DEVIN_ORG_ID: str = Field(
+        default="",
+        env="DEVIN_ORG_ID",
+        description=(
+            "Devin organization id (from the Cognition dashboard URL) "
+            "used in the `/v3/organizations/{org_id}/sessions` endpoint. "
+            "Required when AGENT_PE_BACKEND=devin."
+        ),
+    )
+    DEVIN_MAX_ACU_PER_SESSION: int = Field(
+        default=10,
+        env="DEVIN_MAX_ACU_PER_SESSION",
+        description=(
+            "Per-session ACU cap sent on sessions.create. 1 ACU ≈ "
+            "15 min of active Devin work; 10 ACU ≈ 2.5h of wall-clock. "
+            "Belt-and-braces alongside the per-day USD cap."
+        ),
+    )
+    DEVIN_ACU_USD_RATE: float = Field(
+        default=2.25,
+        env="DEVIN_ACU_USD_RATE",
+        description=(
+            "USD per ACU, used to convert `acu_consumed` from Devin's "
+            "session payload into the `llm_usd` column on "
+            "`agent_workspace_runs` for budget bookkeeping. Verify "
+            "against Devin's actual PAYG rate at purchase; the "
+            "default is the Nov-2026 third-party figure."
+        ),
+    )
+
     # Linear filing (AFX-11) — fleet files findings as Triage issues
     # instead of (or in addition to) emails. Dark by default: with
     # the flag off, agents keep their email path untouched.
