@@ -68,6 +68,32 @@ _DEVIN_API_BASE = "https://api.devin.ai"
 _DEVIN_HTTP_TIMEOUT_SECONDS = 30.0
 _DEVIN_TERMINAL_STATUSES = {"finished", "expired", "stopped", "failed"}
 
+# Managed Agents mounts this repo into every PE session as a
+# `github_repository` resource. Its `authorization_token` is what the
+# sandbox's git credential helper uses for clone + `git push`. Vault
+# `environment_variable` credentials are egress-substituted placeholders
+# that work for `gh` but not for git over HTTPS (AFX-73).
+_TARGET_REPO_URL = "https://github.com/widarecu/agentfx"
+_SANDBOX_REPO_PATH = "/workspace/agentfx"
+
+_REDACTED = "[REDACTED]"
+_GITHUB_TOKEN_RE = re.compile(
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"
+)
+_URL_CREDENTIAL_RE = re.compile(r"(https?://)[^/\s:@]+:[^/\s@]+@")
+
+
+def _redact_secrets(text: str) -> str:
+    """Strip GitHub tokens from text bound for DB summaries, logs, or
+    Linear comments. The PAT must never be logged (AFX-73)."""
+    if not text:
+        return text
+    pat = getattr(settings, "GITHUB_TOKEN", "") or ""
+    if pat:
+        text = text.replace(pat, _REDACTED)
+    text = _GITHUB_TOKEN_RE.sub(_REDACTED, text)
+    return _URL_CREDENTIAL_RE.sub(rf"\1{_REDACTED}@", text)
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Adapter contract
@@ -358,8 +384,10 @@ class ManagedAgentsAdapter:
       the PAT or tune the agent without a redeploy.
 
     - **Per-dispatch (what this adapter does)**: create a session
-      against those IDs, send the user message with the task
-      narrative, persist `provider_run_id = session_id`, flip the
+      against those IDs with `widarecu/agentfx` mounted as a
+      `github_repository` resource (authorized by `GITHUB_TOKEN`, so
+      `git push` works in the sandbox), send the user message with the
+      task narrative, persist `provider_run_id = session_id`, flip the
       row to RUNNING. The outer polling loop
       (`agent_orchestrator._pe_workspace_poll_loop`) then
       transitions RUNNING → PR_OPEN / TESTS_FAILED /
@@ -412,12 +440,14 @@ class ManagedAgentsAdapter:
         agent_id = getattr(settings, "AGENT_PE_WORKSPACE_AGENT_ID", "") or ""
         env_id = getattr(settings, "AGENT_PE_WORKSPACE_ENVIRONMENT_ID", "") or ""
         vault_id = getattr(settings, "AGENT_PE_WORKSPACE_VAULT_ID", "") or ""
+        github_token = getattr(settings, "GITHUB_TOKEN", "") or ""
         missing = [
             name
             for name, val in [
                 ("AGENT_PE_WORKSPACE_AGENT_ID", agent_id),
                 ("AGENT_PE_WORKSPACE_ENVIRONMENT_ID", env_id),
                 ("AGENT_PE_WORKSPACE_VAULT_ID", vault_id),
+                ("GITHUB_TOKEN", github_token),
             ]
             if not val
         ]
@@ -478,6 +508,15 @@ class ManagedAgentsAdapter:
                 agent={"type": "agent", "id": agent_id},
                 environment_id=env_id,
                 vault_ids=[vault_id],
+                resources=[
+                    {
+                        "type": "github_repository",
+                        "url": _TARGET_REPO_URL,
+                        "authorization_token": settings.GITHUB_TOKEN,
+                        "mount_path": _SANDBOX_REPO_PATH,
+                        "checkout": {"type": "branch", "name": spec.target_branch},
+                    }
+                ],
                 # Title is operator-facing in the Managed Agents console;
                 # the task slug keeps sessions correlated with the
                 # agent/<slug> branch they produce.
@@ -491,16 +530,17 @@ class ManagedAgentsAdapter:
             )
         except Exception as exc:
             row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
-            row.summary = (
-                f"ManagedAgentsAdapter: sessions.create failed — "
-                f"{type(exc).__name__}: {str(exc)[:400]}"
-            )
+            # The request carried the PAT; never let it reach the row
+            # summary (copied into Linear comments) or a traceback.
+            error_text = _redact_secrets(f"{type(exc).__name__}: {exc}")[:400]
+            row.summary = f"ManagedAgentsAdapter: sessions.create failed — {error_text}"
             row.started_at = now
             row.ended_at = now
             db.commit()
-            logger.exception(
-                "pe_workspace[managed]: sessions.create failed for proposal=%s",
+            logger.error(
+                "pe_workspace[managed]: sessions.create failed for proposal=%s — %s",
                 spec.pe_proposal_decision_key,
+                error_text,
             )
             return WorkspaceDispatchResult(
                 accepted=True,
@@ -541,7 +581,12 @@ class ManagedAgentsAdapter:
                     {
                         "type": "user.message",
                         "content": [
-                            {"type": "text", "text": spec.narrative},
+                            {
+                                "type": "text",
+                                "text": _build_managed_kickoff(
+                                    spec=spec, agent_branch=row.agent_branch or ""
+                                ),
+                            },
                         ],
                     }
                 ],
@@ -552,7 +597,7 @@ class ManagedAgentsAdapter:
             # cost container-time; operator can inspect in console).
             row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
             row.provider_run_id = session_id
-            row.summary = (
+            row.summary = _redact_secrets(
                 f"ManagedAgentsAdapter: events.send failed — "
                 f"{type(exc).__name__}: {str(exc)[:400]}"
             )
@@ -810,6 +855,30 @@ class DevinWorkspaceAdapter:
             agent_branch=row.agent_branch,
             reason="dispatched",
         )
+
+
+def _build_managed_kickoff(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str:
+    """Kickoff message for a Managed Agents session: the PE narrative
+    plus sandbox-specific publish instructions. The repo is pre-mounted
+    with push credentials (see `_dispatch_managed`), so `git push`
+    is the primary publish path."""
+    branch = agent_branch or f"agent/{spec.task_slug}"
+    lines = [
+        spec.narrative or "(no narrative provided)",
+        "",
+        "## Repository + publishing (sandbox)",
+        "",
+        f"- `widarecu/agentfx` is already cloned at `{_SANDBOX_REPO_PATH}` "
+        f"(checked out on `{spec.target_branch}`) with git push credentials "
+        "configured. Work in that checkout.",
+        "- Do NOT `git clone` the repo again or change the `origin` remote — "
+        "a fresh clone has no push credentials.",
+        f"- Publish with `git push -u origin {branch}`, then open the PR with "
+        f"`gh pr create --base {spec.target_branch}`.",
+        "- Never print, echo, or commit tokens or credential files "
+        "(e.g. `env`, `git config --list --show-origin`, `~/.git-credentials`).",
+    ]
+    return "\n".join(lines)
 
 
 def _build_devin_prompt(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str:
@@ -1227,7 +1296,9 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
         # Keep a tail of the events text in the summary so Wilson
         # can see what happened without logging into the Managed
         # Agents console.
-        summary_tail = (events_text or "(no event text extracted)")[-2000:]
+        summary_tail = _redact_secrets(events_text or "(no event text extracted)")[
+            -2000:
+        ]
         row.summary = (row.summary or "") + "\n[poll] " + summary_tail
         if pr_url is not None:
             row.pr_url = pr_url

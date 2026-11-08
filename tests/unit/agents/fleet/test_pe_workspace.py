@@ -41,6 +41,9 @@ def db(engine):
         yield sess
 
 
+_FAKE_PAT = "github_pat_11TESTONLY0000000000_fakefakefakefakefakefakefakefake"
+
+
 def _spec(**overrides) -> pe_workspace.WorkspaceTaskSpec:
     defaults = dict(
         task_slug="2026-10-15-fix-order-dedup",
@@ -730,6 +733,18 @@ class TestManagedAgentsAdapterSDK:
         monkeypatch.setattr(
             pe_workspace.settings, "AGENT_PE_WORKSPACE_VAULT_ID", "vault_123"
         )
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", _FAKE_PAT)
+
+    def test_missing_github_token_degrades_without_sdk_call(self, db, monkeypatch):
+        """No PAT → the sandbox couldn't push, so don't burn a session."""
+        self._configure_settings(monkeypatch)
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "")
+        result = pe_workspace.ManagedAgentsAdapter().dispatch(db, spec=_spec())
+        assert result.accepted is True
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert "GITHUB_TOKEN" in (row.summary or "")
+        assert row.provider_run_id is None
 
     def test_missing_agent_id_degrades_without_sdk_call(self, db, monkeypatch):
         """Any missing ID → row persisted as WORKSPACE_FAILED with an
@@ -773,6 +788,18 @@ class TestManagedAgentsAdapterSDK:
         assert kwargs["environment_id"] == "env_xyz"
         assert kwargs["vault_ids"] == ["vault_123"]
         assert kwargs["title"] == "2026-10-15-fix-order-dedup"
+        # AFX-73: the repo must be mounted as a github_repository
+        # resource with the PAT — that's what makes `git push` work
+        # inside the sandbox.
+        assert kwargs["resources"] == [
+            {
+                "type": "github_repository",
+                "url": "https://github.com/widarecu/agentfx",
+                "authorization_token": _FAKE_PAT,
+                "mount_path": "/workspace/agentfx",
+                "checkout": {"type": "branch", "name": "feat/agent-fleet"},
+            }
+        ]
 
         fake_client.beta.sessions.events.send.assert_called_once()
         events_kwargs = fake_client.beta.sessions.events.send.call_args.kwargs
@@ -782,6 +809,12 @@ class TestManagedAgentsAdapterSDK:
         # 400 on every live dispatch, which is why no session ever
         # received its kickoff + no PR was ever opened.
         assert events_kwargs["events"][0]["type"] == "user.message"
+        kickoff = events_kwargs["events"][0]["content"][0]["text"]
+        assert kickoff.startswith("# Task: ...")
+        assert "/workspace/agentfx" in kickoff
+        assert "git push -u origin" in kickoff
+        assert "Do NOT `git clone`" in kickoff
+        assert _FAKE_PAT not in kickoff
 
         row = db.query(AgentWorkspaceRun).one()
         assert row.status == AgentWorkspaceRunStatus.RUNNING
@@ -808,6 +841,34 @@ class TestManagedAgentsAdapterSDK:
         assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
         assert row.provider_run_id is None
         assert "sessions.create failed" in (row.summary or "")
+
+    def test_sessions_create_exception_never_leaks_pat(self, db, monkeypatch, caplog):
+        """AFX-73: the PAT rides on the sessions.create request. If the
+        SDK error echoes it, it must not reach the row summary (copied
+        into Linear comments) or the logs."""
+        import logging
+        from unittest.mock import MagicMock
+
+        self._configure_settings(monkeypatch)
+        fake_client = MagicMock()
+        fake_client.beta.sessions.create.side_effect = RuntimeError(
+            f"400 invalid resources[0].authorization_token={_FAKE_PAT} "
+            "other=ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        )
+
+        import anthropic as _anth
+
+        monkeypatch.setattr(_anth, "Anthropic", lambda **_kw: fake_client, raising=True)
+
+        with caplog.at_level(logging.DEBUG):
+            pe_workspace.ManagedAgentsAdapter().dispatch(db, spec=_spec())
+
+        row = db.query(AgentWorkspaceRun).one()
+        assert _FAKE_PAT not in (row.summary or "")
+        assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in (row.summary or "")
+        assert "[REDACTED]" in (row.summary or "")
+        assert _FAKE_PAT not in caplog.text
+        assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in caplog.text
 
     def test_events_send_exception_preserves_session_id(self, db, monkeypatch):
         """If the kickoff message fails, the row keeps the session id
@@ -941,6 +1002,32 @@ class TestPollRunningDispatches:
         row = db.query(AgentWorkspaceRun).one()
         assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
 
+    def test_summary_tail_redacts_tokens(self, db, monkeypatch):
+        """AFX-73: event text is copied into the row summary (and from
+        there into Linear comments) — a token the agent echoed must not
+        survive."""
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        self._seed_running(db)
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", _FAKE_PAT)
+        fake_client = MagicMock()
+        fake_client.beta.sessions.retrieve.return_value = SimpleNamespace(
+            status="terminated"
+        )
+        fake_client.beta.sessions.events.list.return_value = SimpleNamespace(
+            data=[SimpleNamespace(content=f"GITHUB_TOKEN={_FAKE_PAT}")]
+        )
+
+        import anthropic as _anth
+
+        monkeypatch.setattr(_anth, "Anthropic", lambda **_kw: fake_client, raising=True)
+
+        pe_workspace.poll_running_dispatches(db)
+        row = db.query(AgentWorkspaceRun).one()
+        assert _FAKE_PAT not in (row.summary or "")
+        assert "GITHUB_TOKEN=[REDACTED]" in (row.summary or "")
+
     def test_retrieve_exception_leaves_row_untouched(self, db, monkeypatch):
         from unittest.mock import MagicMock
 
@@ -1059,6 +1146,42 @@ class TestPollRunningDispatches:
 
         pe_workspace.poll_running_dispatches(db)
         assert flag_calls == []
+
+
+class TestRedactSecrets:
+    def test_redacts_configured_pat(self, monkeypatch):
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "plain-secret-value")
+        assert (
+            pe_workspace._redact_secrets("token=plain-secret-value end")
+            == "token=[REDACTED] end"
+        )
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            "ghs_abcdefghijklmnopqrstuvwxyz0123456789",
+            "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
+        ],
+    )
+    def test_redacts_github_token_shapes(self, monkeypatch, token):
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "")
+        out = pe_workspace._redact_secrets(f"saw {token} here")
+        assert token not in out
+        assert out == "saw [REDACTED] here"
+
+    def test_redacts_credentials_in_urls(self, monkeypatch):
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "")
+        out = pe_workspace._redact_secrets(
+            "remote https://x-access-token:s3cr3t@github.com/widarecu/agentfx"
+        )
+        assert "s3cr3t" not in out
+        assert "https://[REDACTED]@github.com/widarecu/agentfx" in out
+
+    def test_leaves_normal_text_alone(self, monkeypatch):
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "")
+        text = "PR opened: https://github.com/widarecu/agentfx/pull/42"
+        assert pe_workspace._redact_secrets(text) == text
 
 
 class TestClassifySessionOutcome:
