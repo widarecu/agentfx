@@ -525,13 +525,13 @@ class Settings(BaseSettings):
         default="",
         env="GITHUB_TOKEN",
         description=(
-            "GitHub Personal Access Token used by the PE Managed Agents "
-            "workspace to push the agent sub-branch and open the PR "
-            "against `feat/agent-fleet`. Empty string disables the "
-            "real adapter (stub falls through). Prefer putting the PAT "
-            "in a Managed Agents vault credential — this setting only "
-            "controls whether the adapter is enabled, it is not sent "
-            "to the sandbox."
+            "Fine-grained GitHub PAT scoped to `widarecu/agentfx` only "
+            "(Contents: write, Pull requests: write, Metadata: read). "
+            "Sent on every Managed Agents `sessions.create` as the "
+            "`github_repository` resource's `authorization_token`, which "
+            "is what lets `git push` work inside the sandbox (AFX-73). "
+            "Empty string disables the real adapter (stub falls "
+            "through). Never logged; redacted from run summaries."
         ),
     )
     # Managed Agents (Beta) resource IDs — created once by the operator
