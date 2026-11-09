@@ -327,9 +327,7 @@ class StubWorkspaceAdapter:
         now: datetime | None = None,
     ) -> WorkspaceDispatchResult:
         now = now or datetime.now(UTC)
-        # getattr guards cross-branch shape drift: `trigger` doesn't
-        # exist on main's WorkspaceTaskSpec yet.
-        trigger = getattr(spec, "trigger", "scan")
+        trigger = spec.trigger
         ok, reason = check_budget_before_dispatch(db, now=now, trigger=trigger)
         if not ok:
             logger.info("pe_workspace[stub]: budget refusal — %s", reason)
@@ -416,7 +414,7 @@ class ManagedAgentsAdapter:
         now: datetime | None = None,
     ) -> WorkspaceDispatchResult:
         now = now or datetime.now(UTC)
-        trigger = getattr(spec, "trigger", "scan")
+        trigger = spec.trigger
         ok, reason = check_budget_before_dispatch(db, now=now, trigger=trigger)
         if not ok:
             return WorkspaceDispatchResult(accepted=False, reason=reason)
@@ -686,9 +684,7 @@ class DevinWorkspaceAdapter:
         now: datetime | None = None,
     ) -> WorkspaceDispatchResult:
         now = now or datetime.now(UTC)
-        # getattr guards cross-branch shape drift: `trigger` doesn't
-        # exist on main's WorkspaceTaskSpec yet (AFX-81).
-        trigger = getattr(spec, "trigger", "scan")
+        trigger = spec.trigger
         ok, reason = check_budget_before_dispatch(db, now=now, trigger=trigger)
         if not ok:
             return WorkspaceDispatchResult(accepted=False, reason=reason)
@@ -914,7 +910,7 @@ def _build_devin_prompt(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str:
             "row. If Cognition's branch policy overrides this, proceed "
             "with Devin's chosen name — the poller falls back to PR URL."
         )
-    identifier = getattr(spec, "linear_issue_identifier", "") or ""
+    identifier = spec.linear_issue_identifier
     if identifier:
         lines.append(
             f"- Prefix the PR title with `{identifier}:` so Linear's "
