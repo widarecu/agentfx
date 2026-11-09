@@ -41,10 +41,14 @@ def db(engine):
         yield sess
 
 
+_FAKE_PAT = "github_pat_11TESTONLY0000000000_fakefakefakefakefakefakefakefake"
+
+
 def _spec(**overrides) -> pe_workspace.WorkspaceTaskSpec:
     defaults = dict(
         task_slug="2026-10-15-fix-order-dedup",
-        pe_proposal_decision_key="pe_proposal_qa123_abcdef",
+        pe_proposal_decision_key="AFX-999",
+        linear_issue_identifier="AFX-999",
         title="Order dedup idempotency guard",
         narrative="# Task: ...",
         target_files=["src/execution/order_manager.py"],
@@ -708,188 +712,6 @@ class TestSweepStuckRuns:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# platform_engineer.scan_and_dispatch — orchestration integration
-# ─────────────────────────────────────────────────────────────────────
-
-
-class TestScanAndDispatch:
-    """Exercises the Phase-2 orchestration against a real in-memory DB.
-
-    The actual Opus call inside `scan_and_propose` is patched to a
-    no-op so we isolate the dispatch logic from the LLM path (Phase 1
-    tests already cover `scan_and_propose`)."""
-
-    def _seed_pe_proposal(
-        self,
-        db,
-        *,
-        decision_id: str,
-        decision_key: str,
-        confidence: str,
-        target_file: str = "src/execution/order_manager.py",
-    ):
-        from agentfx.api.models.agent_decision import AgentDecision
-
-        now = datetime.now(UTC)
-        db.add(
-            AgentDecision(
-                id=decision_id,
-                agent_role="PE",
-                action="proposed_fix",
-                decision_key=decision_key,
-                inputs_json={
-                    "qa_decision_id": "qa_abc",
-                    "work_order_title": "Order dedup idempotency",
-                    "target_file": target_file,
-                    "file_was_readable": True,
-                },
-                outputs_json={
-                    "proposal": {
-                        "investigation_summary": "Found race in order submit.",
-                        "proposed_changes": [
-                            {
-                                "file_path": target_file,
-                                "change_type": "modify",
-                                "rationale": "Add idempotency key.",
-                                "diff": "+ idempotency_key = ...",
-                            }
-                        ],
-                        "new_tests": [
-                            {
-                                "file_path": "tests/unit/execution/test_dedup.py",
-                                "name": "test_dedup_blocks_duplicate_signals",
-                                "purpose": "Catch the race.",
-                            }
-                        ],
-                        "risk_assessment": "Low.",
-                        "estimated_profit_impact": "$1,087/wk saved.",
-                        "confidence": confidence,
-                    }
-                },
-                created_at=now,
-            )
-        )
-        db.commit()
-
-    def test_high_confidence_dispatches_through_stub(self, db, monkeypatch):
-        from agentfx.agents.fleet import platform_engineer
-
-        # Short-circuit scan_and_propose — we only care about dispatch.
-        monkeypatch.setattr(platform_engineer, "scan_and_propose", lambda **_: 0)
-        self._seed_pe_proposal(
-            db,
-            decision_id="dec_high",
-            decision_key="pe_proposal_qa_abc_111111",
-            confidence="high",
-        )
-
-        proposals, attempted = platform_engineer.scan_and_dispatch(db=db)
-        assert proposals == 0  # scan patched to no-op
-        assert attempted == 1
-
-        rows = db.query(AgentWorkspaceRun).all()
-        assert len(rows) == 1
-        assert rows[0].pe_proposal_decision_key == "pe_proposal_qa_abc_111111"
-        assert rows[0].agent_branch.startswith("agent/")
-
-    def test_medium_confidence_is_skipped(self, db, monkeypatch):
-        from agentfx.agents.fleet import platform_engineer
-
-        monkeypatch.setattr(platform_engineer, "scan_and_propose", lambda **_: 0)
-        self._seed_pe_proposal(
-            db,
-            decision_id="dec_med",
-            decision_key="pe_proposal_qa_abc_222222",
-            confidence="medium",
-        )
-
-        _, attempted = platform_engineer.scan_and_dispatch(db=db)
-        assert attempted == 0
-        assert db.query(AgentWorkspaceRun).count() == 0
-
-    def test_already_dispatched_proposal_is_skipped(self, db, monkeypatch):
-        from agentfx.agents.fleet import platform_engineer
-
-        monkeypatch.setattr(platform_engineer, "scan_and_propose", lambda **_: 0)
-        key = "pe_proposal_qa_abc_333333"
-        self._seed_pe_proposal(
-            db, decision_id="dec_dup", decision_key=key, confidence="high"
-        )
-        # Pre-existing workspace row for this proposal.
-        db.add(
-            AgentWorkspaceRun(
-                id="ws_existing",
-                pe_proposal_decision_key=key,
-                adapter="stub",
-                status=AgentWorkspaceRunStatus.WORKSPACE_FAILED,
-                created_at=datetime.now(UTC),
-            )
-        )
-        db.commit()
-
-        _, attempted = platform_engineer.scan_and_dispatch(db=db)
-        assert attempted == 0
-        # Still only the one pre-existing row.
-        assert db.query(AgentWorkspaceRun).count() == 1
-
-
-class TestRenderDispatchNarrative:
-    """The workspace prompt — must call out the branch gate explicitly
-    + include the test the workspace needs to add."""
-
-    def test_narrative_includes_branch_gate(self):
-        from agentfx.agents.fleet.platform_engineer import (
-            _render_dispatch_narrative,
-        )
-
-        md = _render_dispatch_narrative(
-            proposal_dict={
-                "investigation_summary": "Problem.",
-                "proposed_changes": [],
-                "new_tests": [],
-                "risk_assessment": "",
-                "estimated_profit_impact": "",
-            },
-            work_order={"title": "Fix thing", "target_file": "x.py"},
-        )
-        assert "feat/agent-fleet" in md
-        assert "NEVER push to `main`" in md
-        assert "# Task: Fix thing" in md
-
-    def test_narrative_includes_proposed_changes_and_tests(self):
-        from agentfx.agents.fleet.platform_engineer import (
-            _render_dispatch_narrative,
-        )
-
-        md = _render_dispatch_narrative(
-            proposal_dict={
-                "investigation_summary": "",
-                "proposed_changes": [
-                    {
-                        "file_path": "src/foo.py",
-                        "change_type": "modify",
-                        "rationale": "Add guard",
-                        "diff": "- old\n+ new",
-                    }
-                ],
-                "new_tests": [
-                    {
-                        "file_path": "tests/unit/test_foo.py",
-                        "name": "test_guard_blocks_bad_input",
-                        "purpose": "Covers the regression.",
-                    }
-                ],
-                "risk_assessment": "",
-                "estimated_profit_impact": "",
-            },
-            work_order={"title": "T", "target_file": ""},
-        )
-        assert "src/foo.py" in md
-        assert "- old\n+ new" in md
-        assert "test_guard_blocks_bad_input" in md
-
-
-# ─────────────────────────────────────────────────────────────────────
 # ManagedAgentsAdapter — real SDK path (v0.8.1 C.2 Phase 2b)
 # ─────────────────────────────────────────────────────────────────────
 
@@ -911,6 +733,18 @@ class TestManagedAgentsAdapterSDK:
         monkeypatch.setattr(
             pe_workspace.settings, "AGENT_PE_WORKSPACE_VAULT_ID", "vault_123"
         )
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", _FAKE_PAT)
+
+    def test_missing_github_token_degrades_without_sdk_call(self, db, monkeypatch):
+        """No PAT → the sandbox couldn't push, so don't burn a session."""
+        self._configure_settings(monkeypatch)
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "")
+        result = pe_workspace.ManagedAgentsAdapter().dispatch(db, spec=_spec())
+        assert result.accepted is True
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert "GITHUB_TOKEN" in (row.summary or "")
+        assert row.provider_run_id is None
 
     def test_missing_agent_id_degrades_without_sdk_call(self, db, monkeypatch):
         """Any missing ID → row persisted as WORKSPACE_FAILED with an
@@ -947,15 +781,40 @@ class TestManagedAgentsAdapterSDK:
         # SDK was called with the expected args
         fake_client.beta.sessions.create.assert_called_once()
         kwargs = fake_client.beta.sessions.create.call_args.kwargs
-        assert kwargs["agent"] == {"id": "agent_abc"}
+        # 2026-11-01 fix: agent discriminated union needs `type`.
+        # The staging deploy of this adapter without `type` returned
+        # 400 `agent.selector.type: Field required` from the API.
+        assert kwargs["agent"] == {"type": "agent", "id": "agent_abc"}
         assert kwargs["environment_id"] == "env_xyz"
         assert kwargs["vault_ids"] == ["vault_123"]
         assert kwargs["title"] == "2026-10-15-fix-order-dedup"
+        # AFX-73: the repo must be mounted as a github_repository
+        # resource with the PAT — that's what makes `git push` work
+        # inside the sandbox.
+        assert kwargs["resources"] == [
+            {
+                "type": "github_repository",
+                "url": "https://github.com/widarecu/agentfx",
+                "authorization_token": _FAKE_PAT,
+                "mount_path": "/workspace/agentfx",
+                "checkout": {"type": "branch", "name": "feat/agent-fleet"},
+            }
+        ]
 
         fake_client.beta.sessions.events.send.assert_called_once()
         events_kwargs = fake_client.beta.sessions.events.send.call_args.kwargs
         assert events_kwargs["session_id"] == "sess_opus5_xyz"
-        assert events_kwargs["events"][0]["type"] == "user_message"
+        # 2026-11-02 fix: Managed Agents events API wants
+        # dot-separated event type names. `user_message` returned
+        # 400 on every live dispatch, which is why no session ever
+        # received its kickoff + no PR was ever opened.
+        assert events_kwargs["events"][0]["type"] == "user.message"
+        kickoff = events_kwargs["events"][0]["content"][0]["text"]
+        assert kickoff.startswith("# Task: ...")
+        assert "/workspace/agentfx" in kickoff
+        assert "git push -u origin" in kickoff
+        assert "Do NOT `git clone`" in kickoff
+        assert _FAKE_PAT not in kickoff
 
         row = db.query(AgentWorkspaceRun).one()
         assert row.status == AgentWorkspaceRunStatus.RUNNING
@@ -982,6 +841,34 @@ class TestManagedAgentsAdapterSDK:
         assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
         assert row.provider_run_id is None
         assert "sessions.create failed" in (row.summary or "")
+
+    def test_sessions_create_exception_never_leaks_pat(self, db, monkeypatch, caplog):
+        """AFX-73: the PAT rides on the sessions.create request. If the
+        SDK error echoes it, it must not reach the row summary (copied
+        into Linear comments) or the logs."""
+        import logging
+        from unittest.mock import MagicMock
+
+        self._configure_settings(monkeypatch)
+        fake_client = MagicMock()
+        fake_client.beta.sessions.create.side_effect = RuntimeError(
+            f"400 invalid resources[0].authorization_token={_FAKE_PAT} "
+            "other=ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        )
+
+        import anthropic as _anth
+
+        monkeypatch.setattr(_anth, "Anthropic", lambda **_kw: fake_client, raising=True)
+
+        with caplog.at_level(logging.DEBUG):
+            pe_workspace.ManagedAgentsAdapter().dispatch(db, spec=_spec())
+
+        row = db.query(AgentWorkspaceRun).one()
+        assert _FAKE_PAT not in (row.summary or "")
+        assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in (row.summary or "")
+        assert "[REDACTED]" in (row.summary or "")
+        assert _FAKE_PAT not in caplog.text
+        assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in caplog.text
 
     def test_events_send_exception_preserves_session_id(self, db, monkeypatch):
         """If the kickoff message fails, the row keeps the session id
@@ -1115,6 +1002,32 @@ class TestPollRunningDispatches:
         row = db.query(AgentWorkspaceRun).one()
         assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
 
+    def test_summary_tail_redacts_tokens(self, db, monkeypatch):
+        """AFX-73: event text is copied into the row summary (and from
+        there into Linear comments) — a token the agent echoed must not
+        survive."""
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        self._seed_running(db)
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", _FAKE_PAT)
+        fake_client = MagicMock()
+        fake_client.beta.sessions.retrieve.return_value = SimpleNamespace(
+            status="terminated"
+        )
+        fake_client.beta.sessions.events.list.return_value = SimpleNamespace(
+            data=[SimpleNamespace(content=f"GITHUB_TOKEN={_FAKE_PAT}")]
+        )
+
+        import anthropic as _anth
+
+        monkeypatch.setattr(_anth, "Anthropic", lambda **_kw: fake_client, raising=True)
+
+        pe_workspace.poll_running_dispatches(db)
+        row = db.query(AgentWorkspaceRun).one()
+        assert _FAKE_PAT not in (row.summary or "")
+        assert "GITHUB_TOKEN=[REDACTED]" in (row.summary or "")
+
     def test_retrieve_exception_leaves_row_untouched(self, db, monkeypatch):
         from unittest.mock import MagicMock
 
@@ -1132,6 +1045,143 @@ class TestPollRunningDispatches:
         row = db.query(AgentWorkspaceRun).one()
         # Transient retrieve failure → leave as RUNNING for next tick.
         assert row.status == AgentWorkspaceRunStatus.RUNNING
+
+    def test_needs_design_pr_flags_linear(self, db, monkeypatch):
+        """When the session opens a `[NEEDS DESIGN]` PR, the poll
+        loop must call `flag_needs_design` with the Linear
+        identifier + PR URL — so Wilson sees the question in his
+        Linear needs-wilson queue, not just in GitHub."""
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        row = self._seed_running(db, session_id="sess_design")
+        row.linear_issue_identifier = "AFX-888"
+        db.commit()
+
+        session_resp = SimpleNamespace(status="terminated")
+        # The events text includes both the `gh pr create` title echo
+        # (with [NEEDS DESIGN]) and a PR URL. The poll loop should
+        # detect the prefix and call flag_needs_design.
+        events_resp = SimpleNamespace(
+            data=[
+                SimpleNamespace(
+                    content=[
+                        SimpleNamespace(
+                            text=(
+                                "gh pr create --title '[NEEDS DESIGN] AFX-888: "
+                                "which fee model should the simulator use?' ...\n"
+                                "PR opened: https://github.com/widarecu/agentfx/pull/99"
+                            )
+                        )
+                    ]
+                )
+            ]
+        )
+        fake_client = MagicMock()
+        fake_client.beta.sessions.retrieve.return_value = session_resp
+        fake_client.beta.sessions.events.list.return_value = events_resp
+
+        import anthropic as _anth
+
+        monkeypatch.setattr(_anth, "Anthropic", lambda **_kw: fake_client, raising=True)
+
+        flag_calls = []
+
+        def _spy_flag(issue_id, *, pr_url):
+            flag_calls.append({"issue_id": issue_id, "pr_url": pr_url})
+            return True
+
+        monkeypatch.setattr(
+            "agentfx.agents.fleet.linear_pe_queue.flag_needs_design", _spy_flag
+        )
+
+        counts = pe_workspace.poll_running_dispatches(db)
+        assert counts["pr_open"] == 1
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.PR_OPEN
+        assert row.pr_url == "https://github.com/widarecu/agentfx/pull/99"
+
+        assert len(flag_calls) == 1
+        assert flag_calls[0]["issue_id"] == "AFX-888"
+        assert "/pull/99" in flag_calls[0]["pr_url"]
+
+    def test_normal_pr_does_not_flag_linear(self, db, monkeypatch):
+        """A plain PR without `[NEEDS DESIGN]` must NOT fire the
+        needs-design handoff — otherwise every PR would get labeled
+        `needs-wilson` and auto-merge would stall."""
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        row = self._seed_running(db, session_id="sess_normal")
+        row.linear_issue_identifier = "AFX-889"
+        db.commit()
+
+        session_resp = SimpleNamespace(status="terminated")
+        events_resp = SimpleNamespace(
+            data=[
+                SimpleNamespace(
+                    content=[
+                        SimpleNamespace(
+                            text=(
+                                "PR opened: https://github.com/widarecu/agentfx/pull/100"
+                            )
+                        )
+                    ]
+                )
+            ]
+        )
+        fake_client = MagicMock()
+        fake_client.beta.sessions.retrieve.return_value = session_resp
+        fake_client.beta.sessions.events.list.return_value = events_resp
+
+        import anthropic as _anth
+
+        monkeypatch.setattr(_anth, "Anthropic", lambda **_kw: fake_client, raising=True)
+
+        flag_calls = []
+        monkeypatch.setattr(
+            "agentfx.agents.fleet.linear_pe_queue.flag_needs_design",
+            lambda issue_id, *, pr_url: flag_calls.append(issue_id) or True,
+        )
+
+        pe_workspace.poll_running_dispatches(db)
+        assert flag_calls == []
+
+
+class TestRedactSecrets:
+    def test_redacts_configured_pat(self, monkeypatch):
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "plain-secret-value")
+        assert (
+            pe_workspace._redact_secrets("token=plain-secret-value end")
+            == "token=[REDACTED] end"
+        )
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            "ghs_abcdefghijklmnopqrstuvwxyz0123456789",
+            "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
+        ],
+    )
+    def test_redacts_github_token_shapes(self, monkeypatch, token):
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "")
+        out = pe_workspace._redact_secrets(f"saw {token} here")
+        assert token not in out
+        assert out == "saw [REDACTED] here"
+
+    def test_redacts_credentials_in_urls(self, monkeypatch):
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "")
+        out = pe_workspace._redact_secrets(
+            "remote https://x-access-token:s3cr3t@github.com/widarecu/agentfx"
+        )
+        assert "s3cr3t" not in out
+        assert "https://[REDACTED]@github.com/widarecu/agentfx" in out
+
+    def test_leaves_normal_text_alone(self, monkeypatch):
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", "")
+        text = "PR opened: https://github.com/widarecu/agentfx/pull/42"
+        assert pe_workspace._redact_secrets(text) == text
 
 
 class TestClassifySessionOutcome:

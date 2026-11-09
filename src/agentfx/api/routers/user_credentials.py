@@ -336,6 +336,24 @@ def list_my_accounts(
     # modal can warn on account collisions BEFORE submit. Uses the
     # same query as `approve_and_deploy`'s exclusivity guard.
 
+    # AFX-7 (2026-11-01 collapse residue): the pre-collapse
+    # `release_slot` used to flip IN_USE → COOLING_DOWN with a 1h
+    # gate. The new release path goes straight to FREE, but legacy
+    # rows left over from before the collapse are stuck in
+    # cooling_down because nothing in the live path calls
+    # allocate_slot (which is the only caller of the cooldown
+    # sweeper). Lazy-sweep on list so the Settings page shows the
+    # truthful state without needing a fleet-dispatch call first.
+    from agentfx.agents.fleet.account_pool import _sweep_leftover_cooldowns
+
+    swept = _sweep_leftover_cooldowns(db)
+    if swept:
+        db.commit()
+        # Reload the credentials row so `row.accounts` reflects
+        # the post-sweep pool_status (otherwise the response goes
+        # out with the stale cached pool_status until the next refresh).
+        db.refresh(row)
+
     return schemas.UserOandaAccountsList(
         items=[
             _account_view(

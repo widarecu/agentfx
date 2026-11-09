@@ -193,11 +193,16 @@ async def _evolution_filler_loop() -> None:
         await asyncio.sleep(_EVOLUTION_FILLER_SECONDS)
 
 
-# PE scan cadence — daily is enough since Opus 5 is the pricey model
-# and QA work orders don't accumulate faster than once per day in
-# practice. One PE scan per day with a hard 3-proposal cap keeps
-# Opus 5 spend bounded (~$0.75/day worst case).
-_PE_SCAN_SECONDS = 60 * 60 * 24
+# PE scan cadence — 15 min, so Wilson's "promote to Ready" expectations
+# match reality (end-to-end latency: Opus 5 forms proposal → scan →
+# dispatch, all inside ~15 min). Spend stays bounded because
+# `is_within_daily_budget` gates the scan body and `_proposal_key_for`
+# dedupes repeat work orders, so a 15-min scan does zero LLM work
+# unless there's genuinely new QA output. The earlier 24h cadence
+# combined with Railway's frequent deploys (which restart the sleep
+# clock) meant the only scan that EVER fired was the one on boot;
+# fine when the fleet idled for days, bug when the fleet is active.
+_PE_SCAN_SECONDS = 60 * 15
 
 # PE workspace poll cadence — managed-agents sessions typically take
 # minutes to tens of minutes to terminate. 10 min keeps the status
@@ -237,14 +242,21 @@ async def _pe_workspace_poll_loop() -> None:
 
 
 async def _pe_scan_loop() -> None:
-    """Daily scan: find unprocessed QA work orders → generate PE
-    fix proposals via Opus 5. When the workspace flag is on, also
-    hand HIGH-confidence proposals to the Managed Agents adapter
-    for autonomous PR creation. Never raises."""
-    from agentfx.agents.fleet.platform_engineer import (
-        scan_and_dispatch,
-        scan_and_propose,
-    )
+    """15-min scan: Linear-driven PE dispatch. Lists Ready AFX
+    issues the fleet filed, applies the retry gate, dispatches
+    eligible ones to the Managed Agents workspace. Never raises.
+
+    2026-11-01: Phase 1 (`scan_and_propose`) is removed — the
+    Managed Agents session now does its own code reasoning inside
+    the sandbox from the Linear ticket description, so there is no
+    Opus-generated proposal step.
+
+    When `AGENT_PE_WORKSPACE_ENABLED=false`, the dispatch call is a
+    no-op (the adapter resolver returns a stub that records intent
+    but never dispatches), so this loop is safe to run with the
+    flag off.
+    """
+    from agentfx.agents.fleet.platform_engineer import scan_and_dispatch
 
     logger.info(
         "agent_orchestrator: PE scan loop armed (cadence=%ds, workspace=%s)",
@@ -260,21 +272,13 @@ async def _pe_scan_loop() -> None:
                         "budget exceeded for %s",
                         datetime.now(UTC).date(),
                     )
-                elif getattr(settings, "AGENT_PE_WORKSPACE_ENABLED", False):
-                    produced, attempted = scan_and_dispatch(db=db)
-                    if produced or attempted:
-                        logger.info(
-                            "agent_orchestrator: PE produced %d proposal(s), "
-                            "attempted %d workspace dispatch(es)",
-                            produced,
-                            attempted,
-                        )
                 else:
-                    produced = scan_and_propose(db=db)
-                    if produced:
+                    _, attempted = scan_and_dispatch(db=db)
+                    if attempted:
                         logger.info(
-                            "agent_orchestrator: PE produced %d proposal(s)",
-                            produced,
+                            "agent_orchestrator: PE attempted %d workspace "
+                            "dispatch(es)",
+                            attempted,
                         )
         except Exception:
             logger.exception("agent_orchestrator: PE scan iteration failed")

@@ -1,413 +1,533 @@
-"""Unit tests for `agents.fleet.platform_engineer`.
+"""Unit tests for the Linear-driven PE dispatch (2026-11-01 rewrite).
 
-v0.8.1 Phase C.2 Phase 1 — PE as a diff-proposing analyst. Tests
-cover:
-- Work-order dedup via `decision_key` so the same QA report
-  processed twice doesn't produce duplicate proposals.
-- Daily rate limit (max 3 proposals/day) enforced via decision log.
-- `_read_file_safely` path-escape guard (no `../../etc/passwd`).
-- Never-raises contract — scan loop can't crash the orchestrator.
-- Fallback body shape when LLM is unreachable.
+Covers `platform_engineer.scan_and_dispatch` with its external
+dependencies monkey-patched: Linear queries/mutations stub out via
+`agentfx.agents.fleet.linear_pe_queue`, and the Managed Agents
+adapter is replaced with a recording stub.
+
+What's being pinned:
+
+- Happy path: a Ready Linear issue → transition In Progress →
+  dispatch to the stub → AgentWorkspaceRun exists with the Linear
+  identifier.
+- Transition-fails: next scan still has the issue in Ready, no row.
+- Adapter.dispatch returns rejected → Linear rolled back to Ready.
+- Adapter.dispatch creates a WORKSPACE_FAILED row → Linear rolled
+  back to Ready (so the next tick retries if the retry gate allows).
+- Retry gate: 2 WORKSPACE_FAILED rows with the same signature on the
+  SAME Linear identifier → `file_for_attention` fires, dispatch
+  skipped.
+- Retry gate: 2 WORKSPACE_FAILED rows with DIFFERENT signatures →
+  dispatch proceeds (new error = new 2-attempt budget).
+- Daily dispatch cap: hitting `_MAX_PE_DISPATCHES_PER_DAY` stops
+  further dispatches that tick.
+- Narrative rendering: Money-path risk + no-description + Feature
+  type all surface in the prompt.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
-from agentfx.agents.fleet import platform_engineer as pe
+from agentfx.agents.fleet import platform_engineer
+from agentfx.agents.fleet.linear_pe_queue import ReadyIssue
+from agentfx.api.core.database import Base
+from agentfx.api.models.agent_workspace_run import (
+    AgentWorkspaceRun,
+    AgentWorkspaceRunStatus,
+)
 
 pytestmark = pytest.mark.unit
 
 
-class TestWorkOrderHash:
-    """Hash must be stable across runs so dedup works."""
-
-    def test_stable_for_same_title_and_target(self):
-        wo = {"title": "Add idempotency", "target_file": "src/order.py"}
-        assert pe._work_order_hash(wo) == pe._work_order_hash(wo)
-
-    def test_differs_for_different_title(self):
-        a = {"title": "Add idempotency", "target_file": "src/order.py"}
-        b = {"title": "Different", "target_file": "src/order.py"}
-        assert pe._work_order_hash(a) != pe._work_order_hash(b)
-
-    def test_proposal_key_includes_qa_id(self):
-        wo = {"title": "x", "target_file": "y"}
-        k1 = pe._proposal_key_for("qa_abc", wo)
-        k2 = pe._proposal_key_for("qa_xyz", wo)
-        assert k1 != k2
-        assert k1.startswith("pe_proposal_qa_abc_")
+# ─────────────────────────────────────────────────────────────────────
+# Fixtures + helpers
+# ─────────────────────────────────────────────────────────────────────
 
 
-class TestReadFileSafely:
-    """Read must bound I/O and refuse to escape the repo root."""
-
-    def test_empty_path_returns_empty(self):
-        assert pe._read_file_safely("") == ""
-
-    def test_missing_file_returns_empty(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("AGENTFX_REPO_ROOT", str(tmp_path))
-        assert pe._read_file_safely("does/not/exist.py") == ""
-
-    def test_reads_existing_file(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("AGENTFX_REPO_ROOT", str(tmp_path))
-        f = tmp_path / "src" / "x.py"
-        f.parent.mkdir(parents=True)
-        f.write_text("def foo():\n    return 1\n")
-        content = pe._read_file_safely("src/x.py")
-        assert "def foo():" in content
-
-    def test_truncates_long_files(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("AGENTFX_REPO_ROOT", str(tmp_path))
-        f = tmp_path / "big.py"
-        f.write_text("\n".join(f"line_{i}" for i in range(5000)))
-        content = pe._read_file_safely("big.py")
-        assert "truncated at 2000 lines" in content
-
-    def test_refuses_path_escape(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("AGENTFX_REPO_ROOT", str(tmp_path))
-        # Attempt to escape the repo root via `..`.
-        assert pe._read_file_safely("../../etc/passwd") == ""
+@pytest.fixture
+def engine():
+    eng = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(eng)
+    yield eng
+    Base.metadata.drop_all(eng)
 
 
-class TestFallback:
-    def test_fallback_marks_confidence_low(self):
-        wo = {
-            "title": "x",
-            "target_file": "y",
-            "expected_profit_impact": "savings",
-        }
-        p = pe._deterministic_fallback(wo)
-        assert p.confidence == "low"
-        assert p.proposed_changes == []
-        assert "LLM analysis unavailable" in p.investigation_summary
-        assert p.estimated_profit_impact == "savings"
+@pytest.fixture
+def db(engine):
+    with Session(engine) as sess:
+        yield sess
 
 
-class TestScanDedup:
-    """Candidate scan must skip work orders that already have a
-    PE proposal row — otherwise every daily scan re-proposes the
-    same fixes."""
+def _issue(
+    *,
+    identifier: str = "AFX-100",
+    title: str = "Fix cost model",
+    description: str = "The cost model mis-prices spread on EUR_USD M1.",
+    labels: list[str] | None = None,
+    priority: int = 3,
+) -> ReadyIssue:
+    return ReadyIssue(
+        id=f"uuid-{identifier.lower()}",
+        identifier=identifier,
+        title=title,
+        description=description,
+        url=f"https://linear.app/agentfx/issue/{identifier}",
+        priority=priority,
+        labels=labels or ["agent-filed", "Bug", "QA agent"],
+        created_at="2026-11-01T10:00:00Z",
+    )
 
-    def _db(self, qa_rows, pe_rows):
-        """Build a stub DB. `qa_rows` is the QA decision list, `pe_rows`
-        the existing PE proposals (keyed by `decision_key`)."""
-        db = MagicMock()
-        qa_q = MagicMock()
-        qa_q.all.return_value = qa_rows
-        db.query.return_value.filter.return_value.filter.return_value.filter.return_value.order_by.return_value.limit.return_value = qa_q
 
-        pe_q = MagicMock()
-        pe_q.all.return_value = pe_rows
-        # Second db.query() call for PE rows — the test sets a
-        # side_effect so distinct queries return the right thing.
-        return db, qa_q, pe_q
+@dataclass
+class _StubAdapterResult:
+    """Captures what scan_and_dispatch passed to the adapter and
+    lets each test control what the adapter returned (so we can
+    pin the rollback/retry/success branches independently of real
+    SDK or DB side-effects)."""
 
-    def test_skips_already_proposed_work_orders(self):
-        qa_row = MagicMock(
-            id="qa_123",
-            outputs_json={
-                "report": {
-                    "work_orders": [
-                        {"title": "Fix A", "target_file": "a.py"},
-                        {"title": "Fix B", "target_file": "b.py"},
-                    ]
-                }
-            },
+    accepted: bool = True
+    row_status: AgentWorkspaceRunStatus = AgentWorkspaceRunStatus.RUNNING
+    reason: str = "dispatched"
+    summary: str | None = None
+
+
+class _RecordingAdapter:
+    """Minimal adapter stub that writes the AgentWorkspaceRun row
+    with the status the test specified, so scan_and_dispatch's
+    rollback-on-WORKSPACE_FAILED path can be exercised deterministically."""
+
+    def __init__(self, result: _StubAdapterResult):
+        self.result = result
+        self.calls: list[Any] = []  # type: ignore[name-defined]
+
+    def dispatch(self, db, *, spec, now):
+        from agentfx.agents.fleet.pe_workspace import WorkspaceDispatchResult
+
+        self.calls.append({"spec": spec, "now": now})
+        # Create the row the real adapters create.
+        row = AgentWorkspaceRun(
+            id=f"row-{len(self.calls)}",
+            pe_proposal_decision_key=spec.pe_proposal_decision_key,
+            linear_issue_identifier=spec.linear_issue_identifier,
+            target_branch=spec.target_branch,
+            agent_branch=f"agent/{spec.task_slug}",
+            adapter="recording",
+            status=self.result.row_status,
+            summary=self.result.summary,
+            created_at=now,
         )
-        # One of them has already been proposed; the other hasn't.
-        already_key = pe._proposal_key_for(
-            "qa_123", {"title": "Fix A", "target_file": "a.py"}
+        db.add(row)
+        db.commit()
+        return WorkspaceDispatchResult(
+            accepted=self.result.accepted,
+            workspace_run_id=row.id,
+            agent_branch=row.agent_branch,
+            reason=self.result.reason,
         )
-        pe_row = MagicMock(decision_key=already_key)
-
-        db = MagicMock()
-        # Simulate two chained queries — QA rows then PE rows. Use
-        # side_effect on query() so each distinct call gets its own
-        # mock chain.
-        qa_chain = MagicMock()
-        qa_chain.all.return_value = [qa_row]
-        pe_chain = MagicMock()
-        pe_chain.all.return_value = [pe_row]
-
-        # The order of query calls in `_collect_candidate_work_orders`:
-        # 1. QA decisions (filtered on role + action + date)
-        # 2. PE proposals (filtered on role + action + date)
-        qa_mock = MagicMock()
-        qa_mock.filter.return_value.filter.return_value.filter.return_value.order_by.return_value.limit.return_value = qa_chain
-
-        pe_mock = MagicMock()
-        pe_mock.filter.return_value.filter.return_value.filter.return_value = pe_chain
-
-        db.query.side_effect = [qa_mock, pe_mock]
-
-        results = pe._collect_candidate_work_orders(db)
-        titles = {wo.get("title") for _, wo in results}
-        assert titles == {"Fix B"}
 
 
-class TestScanNeverRaises:
-    def test_candidate_scan_exception_returns_zero(self):
-        db = MagicMock()
-        with patch.object(
-            pe, "_collect_candidate_work_orders", side_effect=RuntimeError("boom")
-        ):
-            assert pe.scan_and_propose(db=db) == 0
+# A dict of what the Linear helpers recorded; the scan_and_dispatch
+# flow calls into them and we assert what landed here.
+@pytest.fixture
+def linear_recorder(monkeypatch):
+    recorded = {
+        "transitions_to_in_progress": [],
+        "rollbacks_to_ready": [],
+        "attention_filings": [],
+    }
 
-    def test_proposal_failure_doesnt_stop_subsequent(self):
-        db = MagicMock()
-        # Rate-limit count: 0.
-        db.query.return_value.filter.return_value.filter.return_value.filter.return_value.count.return_value = 0
-        with patch.object(
-            pe,
-            "_collect_candidate_work_orders",
-            return_value=[
-                ("qa1", {"title": "A"}),
-                ("qa2", {"title": "B"}),
-                ("qa3", {"title": "C"}),
-            ],
-        ):
-            with patch.object(
-                pe,
-                "_generate_proposal",
-                side_effect=[RuntimeError("x"), None, RuntimeError("z")],
-            ):
-                # Must not raise. One succeeded in the middle.
-                produced = pe.scan_and_propose(db=db)
-        assert produced == 1
+    def _transition(issue_id):
+        recorded["transitions_to_in_progress"].append(issue_id)
+        return True
 
-
-class TestEmailProposal:
-    """`_email_proposal` must never raise. Covers both the happy
-    path (HTML render + send) and the failure path (import or send
-    raises)."""
-
-    def test_sends_tagged_email_with_html(self):
-        wo = {"title": "Fix dup", "target_file": "src/x.py"}
-        proposal = pe.PEProposal(
-            investigation_summary="x",
-            confidence="high",
+    def _rollback(issue_id, *, reason_summary):
+        recorded["rollbacks_to_ready"].append(
+            {"issue_id": issue_id, "reason": reason_summary}
         )
-        with (
-            patch(
-                "agentfx.notifications.email.render_pe_proposal_html",
-                return_value="<html>...</html>",
-            ) as render,
-            patch("agentfx.notifications.email.send_agent_message") as send,
-        ):
-            pe._email_proposal(work_order=wo, proposal=proposal, body="plain body")
-        render.assert_called_once()
-        send.assert_called_once()
-        kwargs = send.call_args.kwargs
-        assert kwargs["agent_role"] == "PE"
-        assert "confidence=high" in kwargs["subject"]
-        assert "Fix dup" in kwargs["subject"]
+        return True
 
-    def test_send_failure_does_not_raise(self):
-        wo = {"title": "x", "target_file": "y"}
-        proposal = pe.PEProposal(investigation_summary="x", confidence="medium")
-        with patch(
-            "agentfx.notifications.email.send_agent_message",
-            side_effect=RuntimeError("smtp dead"),
-        ):
-            # Must not raise — proposal already in DB.
-            pe._email_proposal(work_order=wo, proposal=proposal, body="x")
-
-
-class TestPromptShape:
-    """Prompt builder packs the work order + file excerpt into a
-    JSON blob the LLM can parse. Covers the fallback path when
-    the file wasn't readable."""
-
-    def test_includes_work_order_and_file_content(self):
-        wo = {"title": "Fix dup", "target_file": "src/x.py"}
-        text = pe._render_user_prompt(
-            work_order=wo, target_file_content="def foo(): pass"
+    def _attention(issue_id, *, signatures):
+        recorded["attention_filings"].append(
+            {"issue_id": issue_id, "signatures": list(signatures)}
         )
-        assert "Fix dup" in text
-        assert "src/x.py" in text
-        assert "def foo(): pass" in text
-        assert "PEProposal" in text
+        return True
 
-    def test_notes_missing_file_content(self):
-        wo = {"title": "Fix", "target_file": "unknown.py"}
-        text = pe._render_user_prompt(work_order=wo, target_file_content="")
-        assert "not readable or path unresolved" in text
+    monkeypatch.setattr(platform_engineer, "transition_to_in_progress", _transition)
+    monkeypatch.setattr(platform_engineer, "rollback_to_ready", _rollback)
+    monkeypatch.setattr(platform_engineer, "file_for_attention", _attention)
+    return recorded
 
 
-class TestMarkdownRendering:
-    """`_render_markdown` is pure and shapes the inbox + scoreboard
-    body. Covers both filled proposal and no-changes case."""
-
-    def test_renders_full_proposal(self):
-        wo = {"title": "Fix duplication", "target_file": "src/x.py"}
-        proposal = pe.PEProposal(
-            investigation_summary="Found a race condition.",
-            proposed_changes=[
-                pe.PEProposedChange(
-                    file_path="src/x.py",
-                    change_type="modify",
-                    rationale="Add dedup key.",
-                    diff="- old\n+ new",
-                )
-            ],
-            new_tests=[
-                pe.PENewTest(
-                    file_path="tests/x.py",
-                    name="test_dedup_blocks",
-                    purpose="Covers the race.",
-                )
-            ],
-            risk_assessment="Low — single file.",
-            estimated_profit_impact="Saves $1.1k/week.",
-            confidence="high",
-        )
-        md = pe._render_markdown(proposal, wo)
-        assert "Fix duplication" in md
-        assert "## Proposed changes" in md
-        assert "test_dedup_blocks" in md
-        assert "## Risk" in md
-        assert "high" in md
-
-    def test_renders_cleanly_when_no_changes_proposed(self):
-        wo = {"title": "x", "target_file": "y"}
-        proposal = pe.PEProposal(
-            investigation_summary="Not actionable.",
-            proposed_changes=[],
-            new_tests=[],
-            risk_assessment="n/a",
-            estimated_profit_impact="n/a",
-            confidence="low",
-        )
-        md = pe._render_markdown(proposal, wo)
-        assert "## Proposed changes" not in md
-        assert "## New tests" not in md
-        assert "Not actionable" in md
+def _patch_list_candidates(monkeypatch, issues: list[ReadyIssue]) -> None:
+    monkeypatch.setattr(
+        platform_engineer,
+        "list_ready_dispatch_candidates",
+        lambda limit: issues[:limit],
+    )
 
 
-class TestGenerateProposal:
-    """`_generate_proposal` is the end-to-end orchestration for one
-    work order — reads file, calls LLM, writes markdown + decision
-    row + conditionally emails. Tests the LLM-success and LLM-skip
-    paths without hitting Anthropic."""
+def _patch_adapter(monkeypatch, adapter: _RecordingAdapter) -> None:
+    import agentfx.agents.fleet.pe_workspace as pw
 
-    def test_llm_success_writes_decision_and_emails(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("AGENT_MEMORY_ROOT", str(tmp_path))
-        wo = {
-            "title": "Fix dup",
-            "target_file": "",  # unresolved — PE still runs
-            "expected_profit_impact": "x",
-        }
-        db = MagicMock()
-        fake = pe.PEProposal(
-            investigation_summary="Found it.",
-            confidence="high",
-            risk_assessment="low",
-            estimated_profit_impact="x",
-        )
-        llm_result = MagicMock(
-            output=fake,
-            model="claude-opus-5",
-            reasoning="r",
-            usd_cost=0.12,
-            input_tokens=100,
-            output_tokens=50,
-            cache_read_tokens=0,
-            skipped_reason=None,
-        )
-        with (
-            patch.object(pe, "_call_opus", return_value=llm_result),
-            patch.object(pe, "record_decision") as rec,
-            patch.object(pe, "_email_proposal") as email,
-        ):
-            pe._generate_proposal(db=db, qa_decision_id="qa_abc", work_order=wo)
-        rec.assert_called_once()
-        email.assert_called_once()
-        db.commit.assert_called_once()
+    monkeypatch.setattr(pw, "resolve_adapter", lambda: adapter)
+    monkeypatch.setattr(pw, "sweep_stuck_runs", lambda db, now=None: 0)
 
-    def test_low_confidence_proposal_is_logged_but_not_emailed(
-        self, tmp_path, monkeypatch
+
+# Any = used in _RecordingAdapter annotation; declared here to keep
+# the typing import out of the hot path.
+from typing import Any  # noqa: E402
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Happy path
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestHappyPath:
+    def test_ready_issue_dispatches_and_persists_row(
+        self, db, monkeypatch, linear_recorder
     ):
-        monkeypatch.setenv("AGENT_MEMORY_ROOT", str(tmp_path))
-        wo = {"title": "x", "target_file": "", "expected_profit_impact": ""}
-        db = MagicMock()
-        fake = pe.PEProposal(
-            investigation_summary="not sure",
-            confidence="low",
+        issue = _issue(identifier="AFX-200")
+        _patch_list_candidates(monkeypatch, [issue])
+        adapter = _RecordingAdapter(
+            _StubAdapterResult(row_status=AgentWorkspaceRunStatus.RUNNING)
         )
-        llm_result = MagicMock(
-            output=fake,
-            model="claude-opus-5",
-            reasoning="",
-            usd_cost=0.05,
-            input_tokens=50,
-            output_tokens=20,
-            cache_read_tokens=0,
-            skipped_reason=None,
+        _patch_adapter(monkeypatch, adapter)
+
+        _, attempted = platform_engineer.scan_and_dispatch(db=db)
+        assert attempted == 1
+        assert linear_recorder["transitions_to_in_progress"] == ["uuid-afx-200"]
+        assert linear_recorder["rollbacks_to_ready"] == []
+        assert linear_recorder["attention_filings"] == []
+
+        rows = db.query(AgentWorkspaceRun).all()
+        assert len(rows) == 1
+        assert rows[0].linear_issue_identifier == "AFX-200"
+        assert rows[0].status == AgentWorkspaceRunStatus.RUNNING
+
+    def test_scan_returns_zero_when_no_ready_issues(
+        self, db, monkeypatch, linear_recorder
+    ):
+        _patch_list_candidates(monkeypatch, [])
+        adapter = _RecordingAdapter(_StubAdapterResult())
+        _patch_adapter(monkeypatch, adapter)
+
+        _, attempted = platform_engineer.scan_and_dispatch(db=db)
+        assert attempted == 0
+        assert adapter.calls == []
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Failure branches
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestFailureBranches:
+    def test_transition_fails_skips_issue_no_row(
+        self, db, monkeypatch, linear_recorder
+    ):
+        """If Linear's state-transition mutation reports failure
+        (409, network, race), skip the issue and leave no DB row —
+        the next tick picks it up fresh."""
+        issue = _issue(identifier="AFX-300")
+        _patch_list_candidates(monkeypatch, [issue])
+        monkeypatch.setattr(
+            platform_engineer, "transition_to_in_progress", lambda _id: False
         )
-        with (
-            patch.object(pe, "_call_opus", return_value=llm_result),
-            patch.object(pe, "record_decision") as rec,
-            patch.object(pe, "_email_proposal") as email,
-        ):
-            pe._generate_proposal(db=db, qa_decision_id="qa_abc", work_order=wo)
-        rec.assert_called_once()
-        email.assert_not_called()  # low-confidence stays silent
+        adapter = _RecordingAdapter(_StubAdapterResult())
+        _patch_adapter(monkeypatch, adapter)
 
-    def test_llm_skipped_uses_fallback_and_still_logs(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("AGENT_MEMORY_ROOT", str(tmp_path))
-        wo = {"title": "x", "target_file": "", "expected_profit_impact": ""}
-        db = MagicMock()
-        llm_result = MagicMock(
-            output=None,
-            skipped_reason="api_failure",
-            model="claude-opus-5",
+        _, attempted = platform_engineer.scan_and_dispatch(db=db)
+        assert attempted == 0
+        assert adapter.calls == []
+        assert db.query(AgentWorkspaceRun).count() == 0
+
+    def test_adapter_refused_rolls_back_to_ready(
+        self, db, monkeypatch, linear_recorder
+    ):
+        """When the adapter refuses (budget, config missing), the
+        Linear issue must go back to Ready so the next tick retries
+        once the config is fixed."""
+        issue = _issue(identifier="AFX-301")
+        _patch_list_candidates(monkeypatch, [issue])
+        adapter = _RecordingAdapter(
+            _StubAdapterResult(accepted=False, reason="config_missing")
         )
-        with (
-            patch.object(pe, "_call_opus", return_value=llm_result),
-            patch.object(pe, "record_decision") as rec,
-            patch.object(pe, "_email_proposal") as email,
-        ):
-            pe._generate_proposal(db=db, qa_decision_id="qa_abc", work_order=wo)
-        rec.assert_called_once()
-        # Fallback is confidence='low' → no email.
-        email.assert_not_called()
+        _patch_adapter(monkeypatch, adapter)
+
+        _, attempted = platform_engineer.scan_and_dispatch(db=db)
+        assert attempted == 1
+        assert len(linear_recorder["rollbacks_to_ready"]) == 1
+        assert linear_recorder["rollbacks_to_ready"][0]["issue_id"] == "uuid-afx-301"
+        assert "config_missing" in linear_recorder["rollbacks_to_ready"][0]["reason"]
+
+    def test_workspace_failed_row_rolls_back_to_ready(
+        self, db, monkeypatch, linear_recorder
+    ):
+        """Today's live failure mode: adapter returned accepted=True
+        but the row ended up WORKSPACE_FAILED (sessions.create 400
+        et al). Linear must still go back to Ready."""
+        issue = _issue(identifier="AFX-302")
+        _patch_list_candidates(monkeypatch, [issue])
+        adapter = _RecordingAdapter(
+            _StubAdapterResult(
+                accepted=True,
+                row_status=AgentWorkspaceRunStatus.WORKSPACE_FAILED,
+                reason="sessions_create_failed:BadRequestError",
+                summary="BadRequestError: Error code: 400 — Field required",
+            )
+        )
+        _patch_adapter(monkeypatch, adapter)
+
+        _, attempted = platform_engineer.scan_and_dispatch(db=db)
+        assert attempted == 1
+        assert len(linear_recorder["rollbacks_to_ready"]) == 1
+        rb = linear_recorder["rollbacks_to_ready"][0]
+        assert rb["issue_id"] == "uuid-afx-302"
+        assert "Field required" in rb["reason"]
 
 
-class TestRateLimit:
-    def test_skips_when_daily_cap_reached(self):
-        db = MagicMock()
-        # Already-today count is at the cap.
-        db.query.return_value.filter.return_value.filter.return_value.filter.return_value.count.return_value = pe._MAX_PE_PROPOSALS_PER_DAY
-        with patch.object(
-            pe,
-            "_collect_candidate_work_orders",
-            return_value=[("qa1", {"title": "A"})],
-        ):
-            with patch.object(pe, "_generate_proposal") as gen:
-                produced = pe.scan_and_propose(db=db)
-        assert produced == 0
-        gen.assert_not_called()
+# ─────────────────────────────────────────────────────────────────────
+# Retry gate
+# ─────────────────────────────────────────────────────────────────────
 
-    def test_processes_up_to_remaining_budget(self):
-        db = MagicMock()
-        # 1 already proposed today; cap is 3 → budget_left = 2.
-        db.query.return_value.filter.return_value.filter.return_value.filter.return_value.count.return_value = 1
-        with patch.object(
-            pe,
-            "_collect_candidate_work_orders",
-            return_value=[
-                ("q1", {"title": "A"}),
-                ("q2", {"title": "B"}),
-                ("q3", {"title": "C"}),
-                ("q4", {"title": "D"}),
-            ],
-        ):
-            with patch.object(pe, "_generate_proposal") as gen:
-                produced = pe.scan_and_propose(db=db)
-        assert produced == 2
-        assert gen.call_count == 2
+
+class TestRetryGate:
+    @pytest.fixture(autouse=True)
+    def _lift_adapter_cap(self, monkeypatch):
+        """These tests seed prior WORKSPACE_FAILED rows that would
+        trip the adapter's default cap=2. Raise it so the budget
+        pre-flight doesn't short-circuit the gate under test."""
+        import agentfx.agents.fleet.pe_workspace as pw
+
+        monkeypatch.setattr(pw.settings, "AGENT_PE_WORKSPACE_MAX_PER_DAY", 50)
+
+    def _seed_failed(
+        self, db, *, identifier: str, summary: str, minutes_ago: int
+    ) -> None:
+        db.add(
+            AgentWorkspaceRun(
+                id=f"ws-{identifier}-{minutes_ago}",
+                pe_proposal_decision_key=identifier,
+                linear_issue_identifier=identifier,
+                target_branch="feat/agent-fleet",
+                adapter="managed_agents",
+                status=AgentWorkspaceRunStatus.WORKSPACE_FAILED,
+                summary=summary,
+                created_at=datetime.now(UTC) - timedelta(minutes=minutes_ago),
+            )
+        )
+        db.commit()
+
+    def test_two_same_signature_failures_file_for_attention(
+        self, db, monkeypatch, linear_recorder
+    ):
+        """Wilson's rule: try twice, same error → file for attention."""
+        issue = _issue(identifier="AFX-400")
+        self._seed_failed(
+            db,
+            identifier="AFX-400",
+            summary="ManagedAgentsAdapter: sessions.create failed — BadRequestError",
+            minutes_ago=30,
+        )
+        self._seed_failed(
+            db,
+            identifier="AFX-400",
+            summary="ManagedAgentsAdapter: sessions.create failed — BadRequestError",
+            minutes_ago=15,
+        )
+        _patch_list_candidates(monkeypatch, [issue])
+        adapter = _RecordingAdapter(_StubAdapterResult())
+        _patch_adapter(monkeypatch, adapter)
+
+        _, attempted = platform_engineer.scan_and_dispatch(db=db)
+        assert attempted == 0, "retry gate must stop the dispatch"
+        assert adapter.calls == []
+        assert linear_recorder["transitions_to_in_progress"] == []
+        assert len(linear_recorder["attention_filings"]) == 1
+        filing = linear_recorder["attention_filings"][0]
+        assert filing["issue_id"] == "uuid-afx-400"
+        assert len(filing["signatures"]) == 2
+
+    def test_two_different_signature_failures_dispatch_proceeds(
+        self, db, monkeypatch, linear_recorder
+    ):
+        """A NEW failure signature isn't the same error — it starts
+        its own 2-attempt budget."""
+        issue = _issue(identifier="AFX-401")
+        self._seed_failed(
+            db,
+            identifier="AFX-401",
+            summary="ManagedAgentsAdapter: sessions.create failed — BadRequestError",
+            minutes_ago=30,
+        )
+        self._seed_failed(
+            db,
+            identifier="AFX-401",
+            summary="ManagedAgentsAdapter: events.send failed — ConnectionError",
+            minutes_ago=15,
+        )
+        _patch_list_candidates(monkeypatch, [issue])
+        adapter = _RecordingAdapter(
+            _StubAdapterResult(row_status=AgentWorkspaceRunStatus.RUNNING)
+        )
+        _patch_adapter(monkeypatch, adapter)
+
+        _, attempted = platform_engineer.scan_and_dispatch(db=db)
+        assert attempted == 1, (
+            "a different-signature failure history must not block retry"
+        )
+        assert linear_recorder["attention_filings"] == []
+
+    def test_single_prior_failure_still_dispatches(
+        self, db, monkeypatch, linear_recorder
+    ):
+        """< 2 failures = always retry; this is just the first retry."""
+        issue = _issue(identifier="AFX-402")
+        self._seed_failed(
+            db,
+            identifier="AFX-402",
+            summary="ManagedAgentsAdapter: sessions.create failed — BadRequestError",
+            minutes_ago=15,
+        )
+        _patch_list_candidates(monkeypatch, [issue])
+        adapter = _RecordingAdapter(
+            _StubAdapterResult(row_status=AgentWorkspaceRunStatus.RUNNING)
+        )
+        _patch_adapter(monkeypatch, adapter)
+
+        _, attempted = platform_engineer.scan_and_dispatch(db=db)
+        assert attempted == 1
+
+    def test_failures_older_than_7d_do_not_gate(self, db, monkeypatch, linear_recorder):
+        """Autonomous recovery when a global condition (Anthropic
+        usage cap, Linear outage, GitHub token rotation) marks every
+        attempt failed for days: once the condition clears and Wilson
+        removes `needs-wilson`, the issue gets a FRESH two-attempt
+        budget. Old matching failures past the 7-day window don't
+        inherit forward."""
+        issue = _issue(identifier="AFX-403")
+        # Two matching failures from 10 and 11 days ago — would normally
+        # trip the gate, but both are outside the 7-day retry window.
+        self._seed_failed(
+            db,
+            identifier="AFX-403",
+            summary="ManagedAgentsAdapter: sessions.create failed — BadRequestError",
+            minutes_ago=60 * 24 * 11,
+        )
+        self._seed_failed(
+            db,
+            identifier="AFX-403",
+            summary="ManagedAgentsAdapter: sessions.create failed — BadRequestError",
+            minutes_ago=60 * 24 * 10,
+        )
+        _patch_list_candidates(monkeypatch, [issue])
+        adapter = _RecordingAdapter(
+            _StubAdapterResult(row_status=AgentWorkspaceRunStatus.RUNNING)
+        )
+        _patch_adapter(monkeypatch, adapter)
+
+        _, attempted = platform_engineer.scan_and_dispatch(db=db)
+        assert attempted == 1, "stale failures must not gate a fresh retry"
+        assert linear_recorder["attention_filings"] == []
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Daily cap
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestDailyDispatchCap:
+    def test_cap_prevents_further_dispatches_this_tick(
+        self, db, monkeypatch, linear_recorder
+    ):
+        """Fill the adapter's daily cap with pre-existing rows → scan
+        pre-flight check refuses, no Linear transitions happen.
+
+        Regression for 2026-11-02 loop: with cap=2 already hit, every
+        scan tick was transitioning Ready → In Progress → rollback
+        → comment, in a 15-minute loop. Fix: `scan_and_dispatch` now
+        calls `check_budget_before_dispatch` upfront and exits
+        cleanly, touching no Linear state.
+        """
+        import agentfx.agents.fleet.pe_workspace as pw
+
+        monkeypatch.setattr(pw.settings, "AGENT_PE_WORKSPACE_MAX_PER_DAY", 2)
+        now = datetime.now(UTC)
+        # Pre-seed exactly cap=2 rows so the adapter's budget check
+        # returns False on the first pre-flight call.
+        for i in range(2):
+            db.add(
+                AgentWorkspaceRun(
+                    id=f"cap-filler-{i}",
+                    pe_proposal_decision_key=f"AFX-999{i}",
+                    linear_issue_identifier=f"AFX-999{i}",
+                    target_branch="feat/agent-fleet",
+                    adapter="managed_agents",
+                    status=AgentWorkspaceRunStatus.PR_OPEN,
+                    created_at=now,
+                )
+            )
+        db.commit()
+
+        _patch_list_candidates(monkeypatch, [_issue()])
+        adapter = _RecordingAdapter(_StubAdapterResult())
+        _patch_adapter(monkeypatch, adapter)
+
+        _, attempted = platform_engineer.scan_and_dispatch(db=db)
+        assert attempted == 0
+        assert adapter.calls == []
+        # Critical: no Linear state touched (no transition, no
+        # rollback, no attention filing). That's what breaks the loop.
+        assert linear_recorder["transitions_to_in_progress"] == []
+        assert linear_recorder["rollbacks_to_ready"] == []
+        assert linear_recorder["attention_filings"] == []
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Prompt rendering
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestDispatchNarrative:
+    def test_includes_identifier_title_and_url(self):
+        iss = _issue(
+            identifier="AFX-500",
+            title="Fix cost model",
+            description="The cost model is wrong.",
+        )
+        narrative = platform_engineer._render_dispatch_narrative(issue=iss)
+        assert "AFX-500: Fix cost model" in narrative
+        assert "The cost model is wrong." in narrative
+        assert iss.url in narrative
+
+    def test_calls_out_money_path_risk(self):
+        iss = _issue(labels=["agent-filed", "Bug", "Money-path"])
+        narrative = platform_engineer._render_dispatch_narrative(issue=iss)
+        assert "Money-path" in narrative
+        assert "needs-wilson" in narrative
+
+    def test_notes_missing_description(self):
+        iss = _issue(description="")
+        narrative = platform_engineer._render_dispatch_narrative(issue=iss)
+        assert "no description" in narrative.lower()
+        assert "escape hatch" in narrative.lower()
+
+    def test_always_mentions_needs_design_escape_hatch(self):
+        iss = _issue(labels=["agent-filed", "Feature"])
+        narrative = platform_engineer._render_dispatch_narrative(issue=iss)
+        assert "[NEEDS DESIGN]" in narrative
+        assert "ambiguous" in narrative.lower()
+
+    def test_branch_gate_is_in_the_prompt(self):
+        iss = _issue()
+        narrative = platform_engineer._render_dispatch_narrative(issue=iss)
+        assert "Never push to `main`" in narrative
+        assert "feat/agent-fleet" in narrative
