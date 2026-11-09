@@ -26,6 +26,8 @@ const ACTION_STYLES: Record<string, string> = {
     'bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300',
   USER_SIGNAL_SKIPPED_STALE:
     'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
+  USER_SIGNAL_INDICATOR_DIVERGENCE:
+    'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
   USER_ENTRY_MISSED:
     'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
   USER_KILL_PAPER:
