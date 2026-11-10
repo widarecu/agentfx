@@ -870,7 +870,9 @@ def _build_managed_kickoff(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str
         "- Do NOT `git clone` the repo again or change the `origin` remote — "
         "a fresh clone has no push credentials.",
         f"- Publish with `git push -u origin {branch}`, then open the PR with "
-        f"`gh pr create --base {spec.target_branch}`.",
+        f"`gh pr create --base {spec.target_branch}`. If the push is refused, "
+        "follow the Publishing fallback sequence above (gh api git/commits + "
+        "git/refs, then a `[NEEDS WILSON]` PR) — never stop silently.",
         "- Never print, echo, or commit tokens or credential files "
         "(e.g. `env`, `git config --list --show-origin`, `~/.git-credentials`).",
     ]
@@ -1031,15 +1033,205 @@ def resolve_adapter(spec: WorkspaceTaskSpec | None = None) -> WorkspaceAdapter:
 # ─────────────────────────────────────────────────────────────────────
 
 
+_STUCK_RUN_TTL_HOURS = 4
+
+
+def _max_tokens_per_session() -> int:
+    """Per-session cap, applied separately to input and output
+    tokens. `0` disables the cap."""
+    val = getattr(settings, "AGENT_PE_WORKSPACE_MAX_TOKENS_PER_SESSION", 100_000)
+    return int(val if val is not None else 100_000)
+
+
+def _cancel_managed_session(client: object, session_id: str) -> bool:
+    """Stop a Managed Agents session without deleting it. Never raises.
+
+    The SDK (`anthropic` 2.x, beta `managed-agents-2026-04-01`) has no
+    `sessions.cancel`; the equivalent is a `user.interrupt` event
+    (stops the agent mid-turn) followed by `sessions.archive` (no new
+    work). `sessions.cancel` is used if a later SDK adds it. Never
+    `sessions.delete` — that drops the event log, which is where the
+    agent leaves its recovery instructions (AFX-40 lost a commit that
+    way).
+    """
+    if not session_id:
+        return False
+    sessions = client.beta.sessions  # type: ignore[attr-defined]
+    cancel = getattr(sessions, "cancel", None)
+    if callable(cancel):
+        try:
+            cancel(session_id=session_id)
+            return True
+        except Exception:
+            logger.warning(
+                "pe_workspace: sessions.cancel failed session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return False
+    ok = True
+    try:
+        sessions.events.send(session_id=session_id, events=[{"type": "user.interrupt"}])
+    except Exception:
+        ok = False
+        logger.warning(
+            "pe_workspace: user.interrupt failed session=%s (already terminated?)",
+            session_id,
+            exc_info=True,
+        )
+    try:
+        sessions.archive(session_id=session_id)
+    except Exception:
+        ok = False
+        logger.warning(
+            "pe_workspace: sessions.archive failed session=%s",
+            session_id,
+            exc_info=True,
+        )
+    return ok
+
+
+def _managed_client_or_none() -> object | None:
+    try:
+        import anthropic
+
+        return anthropic.Anthropic(max_retries=2)
+    except Exception:
+        logger.warning("pe_workspace: no Anthropic client for cancel", exc_info=True)
+        return None
+
+
+def _is_repeat_stuck_failure(db: Session, row: AgentWorkspaceRun) -> bool:
+    """True when the dispatch immediately before `row` on the same
+    Linear issue was also a stuck-session failure."""
+    from agentfx.agents.fleet.linear_pe_queue import stuck_session_signature
+
+    prior = (
+        db.query(AgentWorkspaceRun)
+        .filter(
+            AgentWorkspaceRun.linear_issue_identifier == row.linear_issue_identifier
+        )
+        .filter(AgentWorkspaceRun.id != row.id)
+        .filter(AgentWorkspaceRun.created_at <= row.created_at)
+        .order_by(AgentWorkspaceRun.created_at.desc())
+        .first()
+    )
+    return (
+        prior is not None
+        and prior.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        and bool(stuck_session_signature(prior.summary))
+    )
+
+
+def _render_stuck_session_comment(
+    row: AgentWorkspaceRun,
+    *,
+    reason: str,
+    now: datetime,
+    escalate: bool,
+    cancelled: bool,
+) -> str:
+    started = row.started_at or row.created_at
+    if started is not None and started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    if started is not None:
+        minutes = int((now - started).total_seconds() // 60)
+        duration = f"{minutes // 60}h {minutes % 60:02d}m"
+        dispatched = started.strftime("%Y-%m-%d %H:%M UTC")
+    else:
+        duration = dispatched = "unknown"
+    session_id = row.provider_run_id or "(none)"
+    if row.adapter == "devin" and row.provider_run_id:
+        recover = f"https://app.devin.ai/sessions/{row.provider_run_id}"
+    elif row.provider_run_id:
+        recover = f"Managed Agents console, session `{session_id}` " + (
+            "(interrupted + archived, not deleted — the event log and "
+            "the agent's final message are still there)"
+            if cancelled
+            else "(cancel failed — check whether it is still running)"
+        )
+    else:
+        recover = "n/a"
+    if escalate:
+        next_step = (
+            "**Second consecutive stuck session on this ticket — not "
+            "retrying.** Left In Progress and labelled `needs-wilson`. "
+            "Remove the label and move it to Ready to retry."
+        )
+    else:
+        next_step = "Moved back to **Ready**; the next PE scan retries automatically."
+    lines = [
+        "**PE session reclaimed.**",
+        "",
+        f"- Reason: {reason}",
+        f"- Dispatched: {dispatched}",
+        f"- Duration: {duration}",
+        f"- Session: `{session_id}` ({row.adapter})",
+        f"- Recover: {recover}",
+    ]
+    if row.pr_url:
+        lines.append(f"- PR: {row.pr_url}")
+    lines += ["", next_step]
+    return _redact_secrets("\n".join(lines))
+
+
+def _reclaim_stuck_session(
+    db: Session,
+    row: AgentWorkspaceRun,
+    *,
+    reason: str,
+    summary_line: str,
+    now: datetime,
+    client: object | None = None,
+) -> None:
+    """Shared path for sweeper TTL, per-session cost cap and
+    publish-failed: cancel the provider session (managed_agents only),
+    flip the row to WORKSPACE_FAILED, then Linear hygiene. Never
+    raises; caller commits."""
+    cancelled = False
+    if row.adapter == "managed_agents" and row.provider_run_id and client is not None:
+        try:
+            cancelled = _cancel_managed_session(client, row.provider_run_id)
+        except Exception:
+            logger.exception(
+                "pe_workspace: cancel failed session=%s", row.provider_run_id
+            )
+
+    row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+    row.summary = ((row.summary or "") + "\n" + summary_line).strip()
+    row.ended_at = now
+
+    if not row.linear_issue_identifier:
+        return
+    try:
+        from agentfx.agents.fleet.linear_pe_queue import handle_stuck_session_failure
+
+        escalate = _is_repeat_stuck_failure(db, row)
+        body = _render_stuck_session_comment(
+            row, reason=reason, now=now, escalate=escalate, cancelled=cancelled
+        )
+        handle_stuck_session_failure(
+            row.linear_issue_identifier, comment_body=body, escalate=escalate
+        )
+    except Exception:
+        logger.exception(
+            "pe_workspace: Linear hygiene failed for row=%s issue=%s",
+            row.id,
+            row.linear_issue_identifier,
+        )
+
+
 def sweep_stuck_runs(db: Session, *, now: datetime | None = None) -> int:
-    """Mark RUNNING workspace rows that have aged past the global
-    TTL as WORKSPACE_FAILED. Called by the orchestrator before any
-    new dispatch so a crashed workspace doesn't pin the daily cap.
+    """Reclaim RUNNING workspace rows that have aged past the global
+    TTL: cancel the provider session, mark the row WORKSPACE_FAILED,
+    and roll the Linear issue back (or escalate on a repeat). Called
+    by the orchestrator before any new dispatch so a crashed
+    workspace doesn't pin the daily cap.
 
     Returns the number of rows reclaimed. Never raises.
     """
     now = now or datetime.now(UTC)
-    cutoff = now - timedelta(hours=4)
+    cutoff = now - timedelta(hours=_STUCK_RUN_TTL_HOURS)
     try:
         rows = (
             db.query(AgentWorkspaceRun)
@@ -1048,24 +1240,47 @@ def sweep_stuck_runs(db: Session, *, now: datetime | None = None) -> int:
             .filter(AgentWorkspaceRun.started_at <= cutoff)
             .all()
         )
+        client = None
+        if any(r.adapter == "managed_agents" and r.provider_run_id for r in rows):
+            client = _managed_client_or_none()
         for row in rows:
             logger.warning(
                 "pe_workspace: reclaiming stuck RUNNING row id=%s started_at=%s",
                 row.id,
                 row.started_at,
             )
-            row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
-            row.summary = (
-                (row.summary or "")
-                + "\n[sweeper] exceeded 4h TTL, marked WORKSPACE_FAILED"
-            ).strip()
-            row.ended_at = now
+            _reclaim_stuck_session(
+                db,
+                row,
+                reason=f"TTL — exceeded {_STUCK_RUN_TTL_HOURS}h without terminating",
+                summary_line=(
+                    f"[sweeper] exceeded {_STUCK_RUN_TTL_HOURS}h TTL, "
+                    "marked WORKSPACE_FAILED"
+                ),
+                now=now,
+                client=client,
+            )
         if rows:
             db.commit()
         return len(rows)
     except Exception:
         logger.exception("pe_workspace: sweep_stuck_runs failed")
         return 0
+
+
+def _session_token_usage(session: object) -> tuple[int, int]:
+    """(input_tokens, output_tokens) from `sessions.retrieve(...).usage`
+    (`BetaManagedAgentsSessionUsage`; cumulative across turns). Missing
+    fields count as 0."""
+    usage = getattr(session, "usage", None)
+    if usage is None:
+        return 0, 0
+    in_tok = getattr(usage, "input_tokens", None)
+    out_tok = getattr(usage, "output_tokens", None)
+    return (
+        in_tok if isinstance(in_tok, int) else 0,
+        out_tok if isinstance(out_tok, int) else 0,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1091,6 +1306,17 @@ _TESTS_FAILED_PATTERNS = (
     "tests still fail",
     "pytest exit code 1",
 )
+
+
+# The narrative tells the agent to end its final message with this
+# line when every publish fallback failed. Line-anchored so the
+# instruction text itself (mid-sentence in the kickoff prompt, which
+# also shows up in the event tail) doesn't match.
+_PUBLISH_FAILED_RE = re.compile(r"^\s*PUBLISH FAILED AFTER FALLBACKS\b", re.MULTILINE)
+
+
+def _detect_publish_failed(events_text: str) -> bool:
+    return bool(events_text) and bool(_PUBLISH_FAILED_RE.search(events_text))
 
 
 def _detect_needs_design(events_text: str) -> bool:
@@ -1283,10 +1509,57 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
             continue
         status = getattr(session, "status", "") or ""
         if status != _SESSION_TERMINAL_STATUS:
+            cap = _max_tokens_per_session()
+            in_tok, out_tok = _session_token_usage(session)
+            if cap > 0 and (in_tok > cap or out_tok > cap):
+                logger.warning(
+                    "pe_workspace[poll]: cost cap hit session=%s input=%d "
+                    "output=%d cap=%d",
+                    session_id,
+                    in_tok,
+                    out_tok,
+                    cap,
+                )
+                _reclaim_stuck_session(
+                    db,
+                    row,
+                    reason=(
+                        f"cost-cap — exceeded {cap} tokens "
+                        f"(input={in_tok}, output={out_tok})"
+                    ),
+                    summary_line=(
+                        f"[cost-cap] exceeded {cap} tokens "
+                        f"(input={in_tok}, output={out_tok})"
+                    ),
+                    now=now,
+                    client=client,
+                )
+                counts["failed"] += 1
             continue  # Still running — leave the row alone.
 
         events_text = _fetch_events_text(client, session_id)
         target_status, pr_url = _classify_session_outcome(events_text)
+        if (
+            target_status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+            and _detect_publish_failed(events_text)
+        ):
+            row.summary = (
+                (row.summary or "") + "\n[poll] " + _redact_secrets(events_text)[-2000:]
+            )
+            _reclaim_stuck_session(
+                db,
+                row,
+                reason=(
+                    "explicit failure signature — publish failed after "
+                    "fallbacks (git push, gh api, [NEEDS WILSON] PR). The "
+                    "diff + apply commands are in the session's final "
+                    "message."
+                ),
+                summary_line="[publish-failed] publish failed after fallbacks",
+                now=now,
+            )
+            counts["failed"] += 1
+            continue
         row.status = target_status
         row.ended_at = now
         # Keep a tail of the events text in the summary so Wilson

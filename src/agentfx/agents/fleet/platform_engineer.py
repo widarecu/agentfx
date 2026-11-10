@@ -383,6 +383,8 @@ def _render_dispatch_narrative(*, issue: ReadyIssue) -> str:
     )
     lines.append("")
 
+    lines.extend(_render_publishing_section(issue.identifier))
+
     lines.append("## Escape hatch — `[NEEDS DESIGN]`")
     lines.append("")
     lines.append(
@@ -401,6 +403,85 @@ def _render_dispatch_narrative(*, issue: ReadyIssue) -> str:
     lines.append("")
 
     return "\n".join(lines)
+
+
+# Worked example of the AFX-39 / PR #65 publish path: create blobs +
+# tree + commit + ref through the GitHub REST API when `git push` is
+# refused (Managed Agents sandbox has no git-over-HTTPS creds, AFX-73).
+_GH_API_PUBLISH_EXAMPLE = """```bash
+REPO=repos/widarecu/agentfx
+BRANCH="agent/<task-slug>"          # same branch name you tried to push
+BASE_SHA=$(git merge-base HEAD origin/feat/agent-fleet)
+BASE_TREE=$(gh api "$REPO/git/commits/$BASE_SHA" --jq .tree.sha)
+
+# One blob per added/modified file, one null-sha entry per deleted file.
+echo '[]' > /tmp/tree.json
+for f in $(git diff --name-only --diff-filter=AM "$BASE_SHA" HEAD); do
+  sha=$(jq -n --arg c "$(base64 -w0 "$f")" '{content: $c, encoding: "base64"}' \\
+        | gh api "$REPO/git/blobs" --input - --jq .sha)
+  jq --arg p "$f" --arg s "$sha" \\
+     '. + [{path: $p, mode: "100644", type: "blob", sha: $s}]' \\
+     /tmp/tree.json > /tmp/tree.next && mv /tmp/tree.next /tmp/tree.json
+done
+for f in $(git diff --name-only --diff-filter=D "$BASE_SHA" HEAD); do
+  jq --arg p "$f" '. + [{path: $p, mode: "100644", type: "blob", sha: null}]' \\
+     /tmp/tree.json > /tmp/tree.next && mv /tmp/tree.next /tmp/tree.json
+done
+
+TREE_SHA=$(jq -n --arg b "$BASE_TREE" --slurpfile t /tmp/tree.json \\
+             '{base_tree: $b, tree: $t[0]}' \\
+           | gh api "$REPO/git/trees" --input - --jq .sha)
+COMMIT_SHA=$(jq -n --arg m "$(git log -1 --format=%B)" --arg t "$TREE_SHA" \\
+               --arg p "$BASE_SHA" '{message: $m, tree: $t, parents: [$p]}' \\
+             | gh api "$REPO/git/commits" --input - --jq .sha)
+
+# Create the branch ref (if it already exists, PATCH it instead:
+#   gh api -X PATCH "$REPO/git/refs/heads/$BRANCH" -f sha="$COMMIT_SHA" -F force=true)
+gh api "$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$COMMIT_SHA"
+
+gh pr create --repo widarecu/agentfx --base feat/agent-fleet --head "$BRANCH" ...
+```"""
+
+
+def _render_publishing_section(identifier: str) -> list[str]:
+    """Mandatory publish sequence (AFX-72). AFX-40's agent finished
+    the work but couldn't `git push` from the sandbox and gave up
+    silently; the commit was lost."""
+    return [
+        "## Publishing (MANDATORY sequence — do not skip steps)",
+        "",
+        "The sandbox's git credentials are not reliable. Publish in this "
+        "exact order and only move to the next step if the previous one "
+        "failed (for any reason):",
+        "",
+        "1. **First try:** `git push -u origin <branch>`.",
+        "2. **On failure:** fall back to the GitHub REST API — "
+        "`gh api repos/widarecu/agentfx/git/commits` + "
+        "`gh api repos/widarecu/agentfx/git/refs` — to create the commit "
+        "and branch ref directly (the pattern AFX-39's agent used in "
+        "PR #65), then open the PR with `gh pr create`. Worked example:",
+        "",
+        _GH_API_PUBLISH_EXAMPLE,
+        "",
+        "3. **If both fail: do NOT die silently.** Open a `[NEEDS WILSON]` "
+        "PR against the current HEAD of `feat/agent-fleet` (an empty-commit "
+        "branch off it is fine) titled "
+        f"`[NEEDS WILSON] {identifier}: publish failed — <short summary>` "
+        f"(keep `{identifier}` in the title so the Linear link survives). "
+        "Label it `needs-wilson`, NOT `agent-authored`. The PR body must "
+        "contain the full diff (`git format-patch --stdout "
+        "origin/feat/agent-fleet..HEAD`) and the commands Wilson needs to "
+        "apply it from a normal clone, e.g. `git fetch origin && git "
+        "checkout -b <branch> origin/feat/agent-fleet && git am < "
+        "change.patch && git push -u origin <branch>`.",
+        "4. If even that PR cannot be opened, end your final message with "
+        "a line that reads exactly `PUBLISH FAILED AFTER FALLBACKS`, "
+        "followed by the full patch and the apply commands, so the PE "
+        "poll loop flags the Linear ticket for Wilson.",
+        "",
+        "Never print, echo, or commit tokens or credential files.",
+        "",
+    ]
 
 
 # ─────────────────────────────────────────────────────────────────────

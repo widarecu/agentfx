@@ -1222,6 +1222,19 @@ def _signal_tick(
             run.parameters = {**params, "last_evaluated_bar_ts": latest_iso}
             db.commit()
 
+    _run_entry_diagnostic(
+        db=db,
+        run=run,
+        strategy=strategy,
+        candle_fetch_fn=candle_fetch_fn,
+        instrument=instrument,
+        granularity=granularity,
+        live_df=df,
+        fold_anchored=from_time is not None,
+        raw_entries=raw_entries,
+        bookmark_ts=bookmark_ts,
+    )
+
     # ── Execute the walk's decision(s) ───────────────────────────
     exit_rules_full = spec  # for _open_position_and_persist's sig
     risk_cfg = run.risk_config or {}
@@ -1239,6 +1252,54 @@ def _signal_tick(
         exit_rules=exit_rules_full,
         risk_cfg=risk_cfg,
     )
+
+
+def _run_entry_diagnostic(
+    *,
+    db,
+    run,
+    strategy,
+    candle_fetch_fn,
+    instrument: str,
+    granularity: str,
+    live_df: pd.DataFrame,
+    fold_anchored: bool,
+    raw_entries: pd.Series,
+    bookmark_ts: datetime | None,
+) -> None:
+    """AFX-48: log live entry-condition values for every walked bar and
+    diff them against the backtest-path reference. The fold-anchored
+    live window is compared against a warm last-N-bars window so
+    warm-up starvation shows up; in last-N mode the live window is the
+    reference. Best-effort — never breaks the tick."""
+    import pandas as pd
+
+    from agentfx.services import paper_indicator_diag
+
+    try:
+        if bookmark_ts is not None:
+            bar_index = raw_entries.index[raw_entries.index > pd.Timestamp(bookmark_ts)]
+        else:
+            bar_index = raw_entries.index[-1:]
+        if len(bar_index) == 0:
+            return
+        reference_df = (
+            candle_fetch_fn(instrument, granularity, DEFAULT_LOOKBACK_BARS)
+            if fold_anchored
+            else live_df
+        )
+        paper_indicator_diag.emit_tick_diagnostic(
+            db=db,
+            run=run,
+            strategy=strategy,
+            live_df=live_df,
+            reference_df=reference_df,
+            raw_entries=raw_entries,
+            bar_index=bar_index,
+            write_decision=_write_decision,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("paper runner: entry diagnostic failed on %s", run.id)
 
 
 def _open_position_and_persist(

@@ -512,6 +512,17 @@ class Settings(BaseSettings):
             "proposal can't chew the daily budget."
         ),
     )
+    AGENT_PE_WORKSPACE_MAX_TOKENS_PER_SESSION: int = Field(
+        default=100_000,
+        env="AGENT_PE_WORKSPACE_MAX_TOKENS_PER_SESSION",
+        description=(
+            "Per-session token cap, applied separately to cumulative "
+            "input and output tokens (`sessions.retrieve().usage`). A "
+            "running Managed Agents session over either cap is "
+            "interrupted + archived, marked WORKSPACE_FAILED, and its "
+            "Linear issue recovered. 0 disables."
+        ),
+    )
     AGENT_PE_WORKSPACE_DAILY_USD_CAP: float = Field(
         default=3.00,
         env="AGENT_PE_WORKSPACE_DAILY_USD_CAP",

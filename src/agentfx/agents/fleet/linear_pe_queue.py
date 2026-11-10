@@ -484,6 +484,9 @@ def failure_signature(summary: str | None) -> str:
     """
     if not summary:
         return ""
+    stuck = stuck_session_signature(summary)
+    if stuck:
+        return stuck
     s = summary[:200].lower()
     # Strip Anthropic/Linear id tokens: req_01abc..., sess_xyz..., etc.
     s = re.sub(
@@ -499,6 +502,84 @@ def failure_signature(summary: str | None) -> str:
     s = re.sub(r"\b\d{4,}\b", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+# Tags the PE workspace writes into a row summary when a session is
+# reclaimed rather than terminating on its own (AFX-72). Matched
+# anywhere in the summary: the tag is appended after whatever the
+# row already carried, so a `summary[:200]` prefix would miss it.
+_STUCK_SESSION_SIGNATURES = (
+    ("[publish-failed]", "stuck-session: publish failed after fallbacks"),
+    ("[cost-cap] exceeded", "stuck-session: cost-cap exceeded n tokens"),
+    ("exceeded 4h ttl", "stuck-session: exceeded 4h ttl"),
+)
+
+
+def stuck_session_signature(summary: str | None) -> str:
+    """Canonical signature for a stuck-session failure (sweeper TTL,
+    per-session cost cap, or publish failed after all fallbacks), or
+    "" when the summary isn't one. Token counts and event tails are
+    dropped so two consecutive stuck sessions compare equal."""
+    lower = (summary or "").lower()
+    for tag, signature in _STUCK_SESSION_SIGNATURES:
+        if tag in lower:
+            return signature
+    return ""
+
+
+def handle_stuck_session_failure(
+    issue_identifier: str,
+    *,
+    comment_body: str,
+    escalate: bool,
+) -> bool:
+    """Linear hygiene for a reclaimed PE session (AFX-72).
+
+    `escalate=False` (first stuck failure): move the issue back to
+    Ready so the next scan tick retries, and post `comment_body`.
+    `escalate=True` (second consecutive stuck failure): leave it In
+    Progress, add `needs-wilson`, and post `comment_body`.
+
+    Accepts the identifier ("AFX-40") the workspace row carries.
+    Never raises; returns True when the state/label change succeeded.
+    """
+    ok, reason = _linear_enabled()
+    if not ok:
+        logger.info(
+            "linear_pe_queue: handle_stuck_session_failure skipped — %s", reason
+        )
+        return False
+
+    try:
+        client = _build_client(settings.LINEAR_API_KEY)
+        issue_uuid = _resolve_issue_uuid(client, issue_identifier)
+        if issue_uuid is None:
+            logger.warning(
+                "linear_pe_queue: handle_stuck_session_failure — can't resolve "
+                "%s to a Linear uuid",
+                issue_identifier,
+            )
+            return False
+        if escalate:
+            changed = _add_label(
+                client,
+                issue_id=issue_uuid,
+                label_id=settings.PE_LINEAR_NEEDS_WILSON_LABEL_ID,
+            )
+        else:
+            changed = _issue_update(
+                client,
+                issue_id=issue_uuid,
+                state_id=settings.PE_LINEAR_READY_STATE_ID,
+            )
+        _comment(client, issue_id=issue_uuid, body=comment_body)
+        return changed
+    except Exception:
+        logger.exception(
+            "linear_pe_queue: handle_stuck_session_failure failed for %s",
+            issue_identifier,
+        )
+        return False
 
 
 def should_file_for_attention(prior_failed_summaries: list[str]) -> bool:
@@ -605,9 +686,11 @@ __all__ = [
     "failure_signature",
     "file_for_attention",
     "flag_needs_design",
+    "handle_stuck_session_failure",
     "list_ready_dispatch_candidates",
     "rollback_to_ready",
     "should_file_for_attention",
+    "stuck_session_signature",
     "transition_to_in_progress",
 ]
 
