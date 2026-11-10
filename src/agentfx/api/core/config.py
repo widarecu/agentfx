@@ -512,6 +512,17 @@ class Settings(BaseSettings):
             "proposal can't chew the daily budget."
         ),
     )
+    AGENT_PE_WORKSPACE_MAX_TOKENS_PER_SESSION: int = Field(
+        default=100_000,
+        env="AGENT_PE_WORKSPACE_MAX_TOKENS_PER_SESSION",
+        description=(
+            "Per-session token cap, applied separately to cumulative "
+            "input and output tokens (`sessions.retrieve().usage`). A "
+            "running Managed Agents session over either cap is "
+            "interrupted + archived, marked WORKSPACE_FAILED, and its "
+            "Linear issue recovered. 0 disables."
+        ),
+    )
     AGENT_PE_WORKSPACE_DAILY_USD_CAP: float = Field(
         default=3.00,
         env="AGENT_PE_WORKSPACE_DAILY_USD_CAP",
@@ -525,13 +536,13 @@ class Settings(BaseSettings):
         default="",
         env="GITHUB_TOKEN",
         description=(
-            "GitHub Personal Access Token used by the PE Managed Agents "
-            "workspace to push the agent sub-branch and open the PR "
-            "against `feat/agent-fleet`. Empty string disables the "
-            "real adapter (stub falls through). Prefer putting the PAT "
-            "in a Managed Agents vault credential — this setting only "
-            "controls whether the adapter is enabled, it is not sent "
-            "to the sandbox."
+            "Fine-grained GitHub PAT scoped to `widarecu/agentfx` only "
+            "(Contents: write, Pull requests: write, Metadata: read). "
+            "Sent on every Managed Agents `sessions.create` as the "
+            "`github_repository` resource's `authorization_token`, which "
+            "is what lets `git push` work inside the sandbox (AFX-73). "
+            "Empty string disables the real adapter (stub falls "
+            "through). Never logged; redacted from run summaries."
         ),
     )
     # Managed Agents (Beta) resource IDs — created once by the operator
@@ -675,6 +686,51 @@ class Settings(BaseSettings):
             "Hard daily cap on new Triage issues each agent (QA / PE "
             "/ PM / Research) can file per UTC day. Comments on "
             "existing dedupe matches do not count toward the cap."
+        ),
+    )
+
+    # PE dispatch gates — Linear is the source of truth for what PE
+    # picks up. These IDs come from the AFX team; mapping was pinned
+    # on 2026-11-01 when the PE loop was rewritten to be Linear-driven
+    # instead of DB-driven (see
+    # `src/agentfx/agents/fleet/linear_pe_queue.py`).
+    PE_LINEAR_READY_STATE_ID: str = Field(
+        default="6e478120-c29c-4c74-948b-a57f3225793f",
+        env="PE_LINEAR_READY_STATE_ID",
+        description="Linear state id (type=unstarted) that PE reads from",
+    )
+    PE_LINEAR_IN_PROGRESS_STATE_ID: str = Field(
+        default="7fcc84dc-1f85-44db-982a-03f6f89f3647",
+        env="PE_LINEAR_IN_PROGRESS_STATE_ID",
+        description=(
+            "Linear state id PE transitions to on dispatch — acts as "
+            "the atomic lock so parallel scans don't double-dispatch"
+        ),
+    )
+    PE_LINEAR_AGENT_FILED_LABEL_ID: str = Field(
+        default="2383c4d2-dc76-41d7-8e12-f903a37ce5cd",
+        env="PE_LINEAR_AGENT_FILED_LABEL_ID",
+        description=(
+            "Linear label id for `agent-filed` — PE only picks up "
+            "issues carrying this label, so human-filed work is "
+            "left alone"
+        ),
+    )
+    PE_LINEAR_NEEDS_WILSON_LABEL_ID: str = Field(
+        default="28c066e1-70f6-41e5-8a64-8b0c7a9055d9",
+        env="PE_LINEAR_NEEDS_WILSON_LABEL_ID",
+        description=(
+            "Linear label id for `needs-wilson` — PE applies this + "
+            "comments when a dispatch keeps failing with the same "
+            "signature, or a session opens a `[NEEDS DESIGN]` PR"
+        ),
+    )
+    PE_LINEAR_MAX_DISPATCH_PER_SCAN: int = Field(
+        default=3,
+        env="PE_LINEAR_MAX_DISPATCH_PER_SCAN",
+        description=(
+            "Max new dispatches per PE scan tick. Keeps a backlog "
+            "spike from fanning out all at once to Managed Agents."
         ),
     )
 

@@ -68,6 +68,32 @@ _DEVIN_API_BASE = "https://api.devin.ai"
 _DEVIN_HTTP_TIMEOUT_SECONDS = 30.0
 _DEVIN_TERMINAL_STATUSES = {"finished", "expired", "stopped", "failed"}
 
+# Managed Agents mounts this repo into every PE session as a
+# `github_repository` resource. Its `authorization_token` is what the
+# sandbox's git credential helper uses for clone + `git push`. Vault
+# `environment_variable` credentials are egress-substituted placeholders
+# that work for `gh` but not for git over HTTPS (AFX-73).
+_TARGET_REPO_URL = "https://github.com/widarecu/agentfx"
+_SANDBOX_REPO_PATH = "/workspace/agentfx"
+
+_REDACTED = "[REDACTED]"
+_GITHUB_TOKEN_RE = re.compile(
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"
+)
+_URL_CREDENTIAL_RE = re.compile(r"(https?://)[^/\s:@]+:[^/\s@]+@")
+
+
+def _redact_secrets(text: str) -> str:
+    """Strip GitHub tokens from text bound for DB summaries, logs, or
+    Linear comments. The PAT must never be logged (AFX-73)."""
+    if not text:
+        return text
+    pat = getattr(settings, "GITHUB_TOKEN", "") or ""
+    if pat:
+        text = text.replace(pat, _REDACTED)
+    text = _GITHUB_TOKEN_RE.sub(_REDACTED, text)
+    return _URL_CREDENTIAL_RE.sub(rf"\1{_REDACTED}@", text)
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Adapter contract
@@ -78,18 +104,26 @@ _DEVIN_TERMINAL_STATUSES = {"finished", "expired", "stopped", "failed"}
 class WorkspaceTaskSpec:
     """What PE hands to the adapter.
 
-    Everything the workspace needs to know to attempt the fix in
-    isolation — the human-readable task narrative (from the QA work
-    order + PE proposal), the files PE expects to touch, and the
-    tests PE wants added. The adapter is free to adjust these inside
-    the workspace; the record keeps them for Reflexion.
+    2026-11-01 Linear-driven rewrite: `linear_issue_identifier`
+    (e.g. "AFX-56") now identifies the dispatch. The legacy
+    `pe_proposal_decision_key` field is kept populated with the
+    same identifier so historical queries on that column still
+    work; both are equal for every post-rewrite dispatch.
+
+    `target_files`/`new_test_paths`/`estimated_profit_impact` are
+    retained for the stub-adapter + reflexion path but are empty
+    for Linear-driven dispatches — the session discovers all of it
+    inside the sandbox.
     """
 
-    task_slug: str  # "cost-model-eur-usd-m1-2026-10-15"
+    task_slug: str  # "afx-56-fix-balance-pnl-ledger-disconnect"
     pe_proposal_decision_key: str
+    linear_issue_identifier: str  # "AFX-56" — same string as the key, named for clarity
     title: str
     narrative: str  # Full markdown — becomes the workspace's prompt.
-    target_files: list[str]  # Repo-relative paths PE expects to edit.
+    target_files: list[
+        str
+    ]  # Repo-relative paths PE expects to edit (empty under Linear-driven).
     new_test_paths: list[str]
     estimated_profit_impact: str
     target_branch: str = "feat/agent-fleet"
@@ -252,6 +286,7 @@ def _persist_dispatch_row(
     row = AgentWorkspaceRun(
         id=uuid.uuid4().hex,
         pe_proposal_decision_key=spec.pe_proposal_decision_key,
+        linear_issue_identifier=spec.linear_issue_identifier,
         target_branch=spec.target_branch,
         agent_branch=f"agent/{spec.task_slug}",
         adapter=adapter_name,
@@ -292,9 +327,7 @@ class StubWorkspaceAdapter:
         now: datetime | None = None,
     ) -> WorkspaceDispatchResult:
         now = now or datetime.now(UTC)
-        # getattr guards cross-branch shape drift: `trigger` doesn't
-        # exist on main's WorkspaceTaskSpec yet.
-        trigger = getattr(spec, "trigger", "scan")
+        trigger = spec.trigger
         ok, reason = check_budget_before_dispatch(db, now=now, trigger=trigger)
         if not ok:
             logger.info("pe_workspace[stub]: budget refusal — %s", reason)
@@ -349,8 +382,10 @@ class ManagedAgentsAdapter:
       the PAT or tune the agent without a redeploy.
 
     - **Per-dispatch (what this adapter does)**: create a session
-      against those IDs, send the user message with the task
-      narrative, persist `provider_run_id = session_id`, flip the
+      against those IDs with `widarecu/agentfx` mounted as a
+      `github_repository` resource (authorized by `GITHUB_TOKEN`, so
+      `git push` works in the sandbox), send the user message with the
+      task narrative, persist `provider_run_id = session_id`, flip the
       row to RUNNING. The outer polling loop
       (`agent_orchestrator._pe_workspace_poll_loop`) then
       transitions RUNNING → PR_OPEN / TESTS_FAILED /
@@ -379,7 +414,7 @@ class ManagedAgentsAdapter:
         now: datetime | None = None,
     ) -> WorkspaceDispatchResult:
         now = now or datetime.now(UTC)
-        trigger = getattr(spec, "trigger", "scan")
+        trigger = spec.trigger
         ok, reason = check_budget_before_dispatch(db, now=now, trigger=trigger)
         if not ok:
             return WorkspaceDispatchResult(accepted=False, reason=reason)
@@ -403,12 +438,14 @@ class ManagedAgentsAdapter:
         agent_id = getattr(settings, "AGENT_PE_WORKSPACE_AGENT_ID", "") or ""
         env_id = getattr(settings, "AGENT_PE_WORKSPACE_ENVIRONMENT_ID", "") or ""
         vault_id = getattr(settings, "AGENT_PE_WORKSPACE_VAULT_ID", "") or ""
+        github_token = getattr(settings, "GITHUB_TOKEN", "") or ""
         missing = [
             name
             for name, val in [
                 ("AGENT_PE_WORKSPACE_AGENT_ID", agent_id),
                 ("AGENT_PE_WORKSPACE_ENVIRONMENT_ID", env_id),
                 ("AGENT_PE_WORKSPACE_VAULT_ID", vault_id),
+                ("GITHUB_TOKEN", github_token),
             ]
             if not val
         ]
@@ -459,31 +496,49 @@ class ManagedAgentsAdapter:
 
         try:
             session = client.beta.sessions.create(
-                agent={"id": agent_id},
+                # 2026-11-01 fix: the SDK requires a selector `type`
+                # on the agent discriminated union — without it the
+                # Anthropic API returns
+                # `agent.selector.type: Field required` (400).
+                # Pinned-form object with just `type` + `id` is the
+                # documented shape; omitting `version` picks the
+                # latest.
+                agent={"type": "agent", "id": agent_id},
                 environment_id=env_id,
                 vault_ids=[vault_id],
+                resources=[
+                    {
+                        "type": "github_repository",
+                        "url": _TARGET_REPO_URL,
+                        "authorization_token": settings.GITHUB_TOKEN,
+                        "mount_path": _SANDBOX_REPO_PATH,
+                        "checkout": {"type": "branch", "name": spec.target_branch},
+                    }
+                ],
                 # Title is operator-facing in the Managed Agents console;
                 # the task slug keeps sessions correlated with the
                 # agent/<slug> branch they produce.
                 title=spec.task_slug,
                 metadata={
                     "pe_proposal_decision_key": spec.pe_proposal_decision_key,
+                    "linear_issue_identifier": spec.linear_issue_identifier,
                     "agent_branch": row.agent_branch or "",
                     "target_branch": spec.target_branch,
                 },
             )
         except Exception as exc:
             row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
-            row.summary = (
-                f"ManagedAgentsAdapter: sessions.create failed — "
-                f"{type(exc).__name__}: {str(exc)[:400]}"
-            )
+            # The request carried the PAT; never let it reach the row
+            # summary (copied into Linear comments) or a traceback.
+            error_text = _redact_secrets(f"{type(exc).__name__}: {exc}")[:400]
+            row.summary = f"ManagedAgentsAdapter: sessions.create failed — {error_text}"
             row.started_at = now
             row.ended_at = now
             db.commit()
-            logger.exception(
-                "pe_workspace[managed]: sessions.create failed for proposal=%s",
+            logger.error(
+                "pe_workspace[managed]: sessions.create failed for proposal=%s — %s",
                 spec.pe_proposal_decision_key,
+                error_text,
             )
             return WorkspaceDispatchResult(
                 accepted=True,
@@ -508,14 +563,28 @@ class ManagedAgentsAdapter:
 
         # Send the kickoff user message — the narrative explicitly
         # calls out the three-tier branch gate.
+        #
+        # 2026-11-02 fix: the Managed Agents events API wants
+        # dot-separated event type names (`user.message`,
+        # `user.define_outcome`, …). We were sending `user_message`
+        # (underscore) and every call returned
+        # `events[0].type: "user_message" is not a valid value`,
+        # which is why no session has ever received its kickoff
+        # since AFX-9 shipped — session was created, immediately
+        # abandoned, no code work done, no PR opened.
         try:
             client.beta.sessions.events.send(
                 session_id=session_id,
                 events=[
                     {
-                        "type": "user_message",
+                        "type": "user.message",
                         "content": [
-                            {"type": "text", "text": spec.narrative},
+                            {
+                                "type": "text",
+                                "text": _build_managed_kickoff(
+                                    spec=spec, agent_branch=row.agent_branch or ""
+                                ),
+                            },
                         ],
                     }
                 ],
@@ -526,7 +595,7 @@ class ManagedAgentsAdapter:
             # cost container-time; operator can inspect in console).
             row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
             row.provider_run_id = session_id
-            row.summary = (
+            row.summary = _redact_secrets(
                 f"ManagedAgentsAdapter: events.send failed — "
                 f"{type(exc).__name__}: {str(exc)[:400]}"
             )
@@ -615,9 +684,7 @@ class DevinWorkspaceAdapter:
         now: datetime | None = None,
     ) -> WorkspaceDispatchResult:
         now = now or datetime.now(UTC)
-        # getattr guards cross-branch shape drift: `trigger` doesn't
-        # exist on main's WorkspaceTaskSpec yet (AFX-81).
-        trigger = getattr(spec, "trigger", "scan")
+        trigger = spec.trigger
         ok, reason = check_budget_before_dispatch(db, now=now, trigger=trigger)
         if not ok:
             return WorkspaceDispatchResult(accepted=False, reason=reason)
@@ -786,6 +853,32 @@ class DevinWorkspaceAdapter:
         )
 
 
+def _build_managed_kickoff(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str:
+    """Kickoff message for a Managed Agents session: the PE narrative
+    plus sandbox-specific publish instructions. The repo is pre-mounted
+    with push credentials (see `_dispatch_managed`), so `git push`
+    is the primary publish path."""
+    branch = agent_branch or f"agent/{spec.task_slug}"
+    lines = [
+        spec.narrative or "(no narrative provided)",
+        "",
+        "## Repository + publishing (sandbox)",
+        "",
+        f"- `widarecu/agentfx` is already cloned at `{_SANDBOX_REPO_PATH}` "
+        f"(checked out on `{spec.target_branch}`) with git push credentials "
+        "configured. Work in that checkout.",
+        "- Do NOT `git clone` the repo again or change the `origin` remote — "
+        "a fresh clone has no push credentials.",
+        f"- Publish with `git push -u origin {branch}`, then open the PR with "
+        f"`gh pr create --base {spec.target_branch}`. If the push is refused, "
+        "follow the Publishing fallback sequence above (gh api git/commits + "
+        "git/refs, then a `[NEEDS WILSON]` PR) — never stop silently.",
+        "- Never print, echo, or commit tokens or credential files "
+        "(e.g. `env`, `git config --list --show-origin`, `~/.git-credentials`).",
+    ]
+    return "\n".join(lines)
+
+
 def _build_devin_prompt(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str:
     """Build the single-string prompt Devin takes on sessions.create.
 
@@ -819,7 +912,7 @@ def _build_devin_prompt(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str:
             "row. If Cognition's branch policy overrides this, proceed "
             "with Devin's chosen name — the poller falls back to PR URL."
         )
-    identifier = getattr(spec, "linear_issue_identifier", "") or ""
+    identifier = spec.linear_issue_identifier
     if identifier:
         lines.append(
             f"- Prefix the PR title with `{identifier}:` so Linear's "
@@ -940,15 +1033,205 @@ def resolve_adapter(spec: WorkspaceTaskSpec | None = None) -> WorkspaceAdapter:
 # ─────────────────────────────────────────────────────────────────────
 
 
+_STUCK_RUN_TTL_HOURS = 4
+
+
+def _max_tokens_per_session() -> int:
+    """Per-session cap, applied separately to input and output
+    tokens. `0` disables the cap."""
+    val = getattr(settings, "AGENT_PE_WORKSPACE_MAX_TOKENS_PER_SESSION", 100_000)
+    return int(val if val is not None else 100_000)
+
+
+def _cancel_managed_session(client: object, session_id: str) -> bool:
+    """Stop a Managed Agents session without deleting it. Never raises.
+
+    The SDK (`anthropic` 2.x, beta `managed-agents-2026-04-01`) has no
+    `sessions.cancel`; the equivalent is a `user.interrupt` event
+    (stops the agent mid-turn) followed by `sessions.archive` (no new
+    work). `sessions.cancel` is used if a later SDK adds it. Never
+    `sessions.delete` — that drops the event log, which is where the
+    agent leaves its recovery instructions (AFX-40 lost a commit that
+    way).
+    """
+    if not session_id:
+        return False
+    sessions = client.beta.sessions  # type: ignore[attr-defined]
+    cancel = getattr(sessions, "cancel", None)
+    if callable(cancel):
+        try:
+            cancel(session_id=session_id)
+            return True
+        except Exception:
+            logger.warning(
+                "pe_workspace: sessions.cancel failed session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return False
+    ok = True
+    try:
+        sessions.events.send(session_id=session_id, events=[{"type": "user.interrupt"}])
+    except Exception:
+        ok = False
+        logger.warning(
+            "pe_workspace: user.interrupt failed session=%s (already terminated?)",
+            session_id,
+            exc_info=True,
+        )
+    try:
+        sessions.archive(session_id=session_id)
+    except Exception:
+        ok = False
+        logger.warning(
+            "pe_workspace: sessions.archive failed session=%s",
+            session_id,
+            exc_info=True,
+        )
+    return ok
+
+
+def _managed_client_or_none() -> object | None:
+    try:
+        import anthropic
+
+        return anthropic.Anthropic(max_retries=2)
+    except Exception:
+        logger.warning("pe_workspace: no Anthropic client for cancel", exc_info=True)
+        return None
+
+
+def _is_repeat_stuck_failure(db: Session, row: AgentWorkspaceRun) -> bool:
+    """True when the dispatch immediately before `row` on the same
+    Linear issue was also a stuck-session failure."""
+    from agentfx.agents.fleet.linear_pe_queue import stuck_session_signature
+
+    prior = (
+        db.query(AgentWorkspaceRun)
+        .filter(
+            AgentWorkspaceRun.linear_issue_identifier == row.linear_issue_identifier
+        )
+        .filter(AgentWorkspaceRun.id != row.id)
+        .filter(AgentWorkspaceRun.created_at <= row.created_at)
+        .order_by(AgentWorkspaceRun.created_at.desc())
+        .first()
+    )
+    return (
+        prior is not None
+        and prior.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        and bool(stuck_session_signature(prior.summary))
+    )
+
+
+def _render_stuck_session_comment(
+    row: AgentWorkspaceRun,
+    *,
+    reason: str,
+    now: datetime,
+    escalate: bool,
+    cancelled: bool,
+) -> str:
+    started = row.started_at or row.created_at
+    if started is not None and started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    if started is not None:
+        minutes = int((now - started).total_seconds() // 60)
+        duration = f"{minutes // 60}h {minutes % 60:02d}m"
+        dispatched = started.strftime("%Y-%m-%d %H:%M UTC")
+    else:
+        duration = dispatched = "unknown"
+    session_id = row.provider_run_id or "(none)"
+    if row.adapter == "devin" and row.provider_run_id:
+        recover = f"https://app.devin.ai/sessions/{row.provider_run_id}"
+    elif row.provider_run_id:
+        recover = f"Managed Agents console, session `{session_id}` " + (
+            "(interrupted + archived, not deleted — the event log and "
+            "the agent's final message are still there)"
+            if cancelled
+            else "(cancel failed — check whether it is still running)"
+        )
+    else:
+        recover = "n/a"
+    if escalate:
+        next_step = (
+            "**Second consecutive stuck session on this ticket — not "
+            "retrying.** Left In Progress and labelled `needs-wilson`. "
+            "Remove the label and move it to Ready to retry."
+        )
+    else:
+        next_step = "Moved back to **Ready**; the next PE scan retries automatically."
+    lines = [
+        "**PE session reclaimed.**",
+        "",
+        f"- Reason: {reason}",
+        f"- Dispatched: {dispatched}",
+        f"- Duration: {duration}",
+        f"- Session: `{session_id}` ({row.adapter})",
+        f"- Recover: {recover}",
+    ]
+    if row.pr_url:
+        lines.append(f"- PR: {row.pr_url}")
+    lines += ["", next_step]
+    return _redact_secrets("\n".join(lines))
+
+
+def _reclaim_stuck_session(
+    db: Session,
+    row: AgentWorkspaceRun,
+    *,
+    reason: str,
+    summary_line: str,
+    now: datetime,
+    client: object | None = None,
+) -> None:
+    """Shared path for sweeper TTL, per-session cost cap and
+    publish-failed: cancel the provider session (managed_agents only),
+    flip the row to WORKSPACE_FAILED, then Linear hygiene. Never
+    raises; caller commits."""
+    cancelled = False
+    if row.adapter == "managed_agents" and row.provider_run_id and client is not None:
+        try:
+            cancelled = _cancel_managed_session(client, row.provider_run_id)
+        except Exception:
+            logger.exception(
+                "pe_workspace: cancel failed session=%s", row.provider_run_id
+            )
+
+    row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+    row.summary = ((row.summary or "") + "\n" + summary_line).strip()
+    row.ended_at = now
+
+    if not row.linear_issue_identifier:
+        return
+    try:
+        from agentfx.agents.fleet.linear_pe_queue import handle_stuck_session_failure
+
+        escalate = _is_repeat_stuck_failure(db, row)
+        body = _render_stuck_session_comment(
+            row, reason=reason, now=now, escalate=escalate, cancelled=cancelled
+        )
+        handle_stuck_session_failure(
+            row.linear_issue_identifier, comment_body=body, escalate=escalate
+        )
+    except Exception:
+        logger.exception(
+            "pe_workspace: Linear hygiene failed for row=%s issue=%s",
+            row.id,
+            row.linear_issue_identifier,
+        )
+
+
 def sweep_stuck_runs(db: Session, *, now: datetime | None = None) -> int:
-    """Mark RUNNING workspace rows that have aged past the global
-    TTL as WORKSPACE_FAILED. Called by the orchestrator before any
-    new dispatch so a crashed workspace doesn't pin the daily cap.
+    """Reclaim RUNNING workspace rows that have aged past the global
+    TTL: cancel the provider session, mark the row WORKSPACE_FAILED,
+    and roll the Linear issue back (or escalate on a repeat). Called
+    by the orchestrator before any new dispatch so a crashed
+    workspace doesn't pin the daily cap.
 
     Returns the number of rows reclaimed. Never raises.
     """
     now = now or datetime.now(UTC)
-    cutoff = now - timedelta(hours=4)
+    cutoff = now - timedelta(hours=_STUCK_RUN_TTL_HOURS)
     try:
         rows = (
             db.query(AgentWorkspaceRun)
@@ -957,24 +1240,47 @@ def sweep_stuck_runs(db: Session, *, now: datetime | None = None) -> int:
             .filter(AgentWorkspaceRun.started_at <= cutoff)
             .all()
         )
+        client = None
+        if any(r.adapter == "managed_agents" and r.provider_run_id for r in rows):
+            client = _managed_client_or_none()
         for row in rows:
             logger.warning(
                 "pe_workspace: reclaiming stuck RUNNING row id=%s started_at=%s",
                 row.id,
                 row.started_at,
             )
-            row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
-            row.summary = (
-                (row.summary or "")
-                + "\n[sweeper] exceeded 4h TTL, marked WORKSPACE_FAILED"
-            ).strip()
-            row.ended_at = now
+            _reclaim_stuck_session(
+                db,
+                row,
+                reason=f"TTL — exceeded {_STUCK_RUN_TTL_HOURS}h without terminating",
+                summary_line=(
+                    f"[sweeper] exceeded {_STUCK_RUN_TTL_HOURS}h TTL, "
+                    "marked WORKSPACE_FAILED"
+                ),
+                now=now,
+                client=client,
+            )
         if rows:
             db.commit()
         return len(rows)
     except Exception:
         logger.exception("pe_workspace: sweep_stuck_runs failed")
         return 0
+
+
+def _session_token_usage(session: object) -> tuple[int, int]:
+    """(input_tokens, output_tokens) from `sessions.retrieve(...).usage`
+    (`BetaManagedAgentsSessionUsage`; cumulative across turns). Missing
+    fields count as 0."""
+    usage = getattr(session, "usage", None)
+    if usage is None:
+        return 0, 0
+    in_tok = getattr(usage, "input_tokens", None)
+    out_tok = getattr(usage, "output_tokens", None)
+    return (
+        in_tok if isinstance(in_tok, int) else 0,
+        out_tok if isinstance(out_tok, int) else 0,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1000,6 +1306,53 @@ _TESTS_FAILED_PATTERNS = (
     "tests still fail",
     "pytest exit code 1",
 )
+
+
+# The narrative tells the agent to end its final message with this
+# line when every publish fallback failed. Line-anchored so the
+# instruction text itself (mid-sentence in the kickoff prompt, which
+# also shows up in the event tail) doesn't match.
+_PUBLISH_FAILED_RE = re.compile(r"^\s*PUBLISH FAILED AFTER FALLBACKS\b", re.MULTILINE)
+
+
+def _detect_publish_failed(events_text: str) -> bool:
+    return bool(events_text) and bool(_PUBLISH_FAILED_RE.search(events_text))
+
+
+def _detect_needs_design(events_text: str) -> bool:
+    """True if the session opened a `[NEEDS DESIGN]` PR instead of
+    a normal one. Case-insensitive substring match on the final-
+    events tail, where `gh pr create` echoes the title back.
+    """
+    if not events_text:
+        return False
+    return "[NEEDS DESIGN]" in events_text.upper().replace(
+        "[NEEDSDESIGN]", "[NEEDS DESIGN]"
+    )
+
+
+def _flag_needs_design_on_linear(row: AgentWorkspaceRun, pr_url: str) -> None:
+    """Side-effect only: comment on the Linear issue + add
+    `needs-wilson`. Never raises — a Linear failure must not
+    stop the poll loop from committing the row."""
+    try:
+        from agentfx.agents.fleet.linear_pe_queue import flag_needs_design
+
+        issue_identifier = row.linear_issue_identifier or ""
+        if not issue_identifier:
+            return
+        # The flag_needs_design helper takes the Linear uuid, but the
+        # row only stores the identifier. We resolve via a lookup
+        # inside the helper when it executes GraphQL — the helper
+        # just needs the identifier for its narrative, and the
+        # uuid lookup is a one-liner on Linear's side. For now,
+        # pass the identifier as `issue_id`; `flag_needs_design`
+        # accepts either shape and resolves if needed.
+        flag_needs_design(issue_identifier, pr_url=pr_url)
+    except Exception:
+        logger.exception(
+            "pe_workspace[poll]: flag_needs_design failed for row=%s", row.id
+        )
 
 
 def _classify_session_outcome(
@@ -1156,16 +1509,65 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
             continue
         status = getattr(session, "status", "") or ""
         if status != _SESSION_TERMINAL_STATUS:
+            cap = _max_tokens_per_session()
+            in_tok, out_tok = _session_token_usage(session)
+            if cap > 0 and (in_tok > cap or out_tok > cap):
+                logger.warning(
+                    "pe_workspace[poll]: cost cap hit session=%s input=%d "
+                    "output=%d cap=%d",
+                    session_id,
+                    in_tok,
+                    out_tok,
+                    cap,
+                )
+                _reclaim_stuck_session(
+                    db,
+                    row,
+                    reason=(
+                        f"cost-cap — exceeded {cap} tokens "
+                        f"(input={in_tok}, output={out_tok})"
+                    ),
+                    summary_line=(
+                        f"[cost-cap] exceeded {cap} tokens "
+                        f"(input={in_tok}, output={out_tok})"
+                    ),
+                    now=now,
+                    client=client,
+                )
+                counts["failed"] += 1
             continue  # Still running — leave the row alone.
 
         events_text = _fetch_events_text(client, session_id)
         target_status, pr_url = _classify_session_outcome(events_text)
+        if (
+            target_status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+            and _detect_publish_failed(events_text)
+        ):
+            row.summary = (
+                (row.summary or "") + "\n[poll] " + _redact_secrets(events_text)[-2000:]
+            )
+            _reclaim_stuck_session(
+                db,
+                row,
+                reason=(
+                    "explicit failure signature — publish failed after "
+                    "fallbacks (git push, gh api, [NEEDS WILSON] PR). The "
+                    "diff + apply commands are in the session's final "
+                    "message."
+                ),
+                summary_line="[publish-failed] publish failed after fallbacks",
+                now=now,
+            )
+            counts["failed"] += 1
+            continue
         row.status = target_status
         row.ended_at = now
         # Keep a tail of the events text in the summary so Wilson
         # can see what happened without logging into the Managed
         # Agents console.
-        summary_tail = (events_text or "(no event text extracted)")[-2000:]
+        summary_tail = _redact_secrets(events_text or "(no event text extracted)")[
+            -2000:
+        ]
         row.summary = (row.summary or "") + "\n[poll] " + summary_tail
         if pr_url is not None:
             row.pr_url = pr_url
@@ -1175,6 +1577,13 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
             if m:
                 row.pr_number = int(m.group(1))
             counts["pr_open"] += 1
+            # 2026-11-01 Linear-driven handoff: if the PR title
+            # starts with `[NEEDS DESIGN]`, the session is kicking
+            # back a design question. Flag the Linear issue so
+            # Wilson sees it in his `needs-wilson` queue instead of
+            # the auto-merge CI thinking everything is normal.
+            if _detect_needs_design(events_text) and row.linear_issue_identifier:
+                _flag_needs_design_on_linear(row, pr_url)
         elif target_status == AgentWorkspaceRunStatus.TESTS_FAILED:
             counts["tests_failed"] += 1
         else:
