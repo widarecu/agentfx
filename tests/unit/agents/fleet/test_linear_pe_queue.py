@@ -521,3 +521,124 @@ class TestTransitionToInProgress:
             side_effect=RuntimeError("linear 500"),
         ):
             assert transition_to_in_progress("uuid-x") is False
+
+
+# ─────────────────────────────────────────────────────────────────────
+# AFX-72 — stuck-session signatures + Linear recovery
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestStuckSessionSignatures:
+    def test_ttl_signature_ignores_prior_summary(self):
+        a = failure_signature("[sweeper] exceeded 4h TTL, marked WORKSPACE_FAILED")
+        b = failure_signature(
+            "dispatched session=sesn_abc\n[sweeper] exceeded 4h TTL, marked "
+            "WORKSPACE_FAILED"
+        )
+        assert a == b == "stuck-session: exceeded 4h ttl"
+
+    def test_cost_cap_signature_ignores_token_counts(self):
+        a = failure_signature(
+            "[cost-cap] exceeded 100000 tokens (input=150000, output=9)"
+        )
+        b = failure_signature(
+            "[cost-cap] exceeded 200000 tokens (input=10, output=250000)"
+        )
+        assert a == b == "stuck-session: cost-cap exceeded n tokens"
+
+    def test_publish_failed_signature_ignores_event_tail(self):
+        a = failure_signature(
+            "[poll] blah 1\n[publish-failed] publish failed after fallbacks"
+        )
+        b = failure_signature(
+            "[poll] other\n[publish-failed] publish failed after fallbacks"
+        )
+        assert a == b == "stuck-session: publish failed after fallbacks"
+
+    def test_two_ttl_failures_file_for_attention(self):
+        long_prefix = "[poll] " + "x " * 200
+        assert should_file_for_attention(
+            [
+                long_prefix + "\n[sweeper] exceeded 4h TTL, marked WORKSPACE_FAILED",
+                "[sweeper] exceeded 4h TTL, marked WORKSPACE_FAILED",
+            ]
+        )
+
+    def test_non_stuck_summary_unchanged(self):
+        assert linear_pe_queue.stuck_session_signature("BadRequestError") == ""
+
+
+class TestHandleStuckSessionFailure:
+    @pytest.fixture(autouse=True)
+    def _enable(self, monkeypatch):
+        monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
+        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "lin_test")
+
+    def _record(self, monkeypatch):
+        calls: list[tuple[str, dict]] = []
+        monkeypatch.setattr(linear_pe_queue, "_build_client", lambda _k: object())
+        monkeypatch.setattr(
+            linear_pe_queue, "_resolve_issue_uuid", lambda _c, ident: f"uuid-{ident}"
+        )
+        monkeypatch.setattr(
+            linear_pe_queue,
+            "_issue_update",
+            lambda _c, **kw: calls.append(("state", kw)) or True,
+        )
+        monkeypatch.setattr(
+            linear_pe_queue,
+            "_add_label",
+            lambda _c, **kw: calls.append(("label", kw)) or True,
+        )
+        monkeypatch.setattr(
+            linear_pe_queue,
+            "_comment",
+            lambda _c, **kw: calls.append(("comment", kw)) or True,
+        )
+        return calls
+
+    def test_first_failure_rolls_back_to_ready_and_comments(self, monkeypatch):
+        calls = self._record(monkeypatch)
+        ok = linear_pe_queue.handle_stuck_session_failure(
+            "AFX-40", comment_body="reclaimed", escalate=False
+        )
+        assert ok is True
+        kinds = [k for k, _ in calls]
+        assert kinds == ["state", "comment"]
+        assert (
+            calls[0][1]["state_id"] == linear_pe_queue.settings.PE_LINEAR_READY_STATE_ID
+        )
+        assert calls[1][1] == {"issue_id": "uuid-AFX-40", "body": "reclaimed"}
+
+    def test_escalation_adds_needs_wilson_and_keeps_state(self, monkeypatch):
+        calls = self._record(monkeypatch)
+        linear_pe_queue.handle_stuck_session_failure(
+            "AFX-40", comment_body="second", escalate=True
+        )
+        kinds = [k for k, _ in calls]
+        assert "state" not in kinds
+        assert kinds == ["label", "comment"]
+        assert calls[0][1]["label_id"] == (
+            linear_pe_queue.settings.PE_LINEAR_NEEDS_WILSON_LABEL_ID
+        )
+
+    def test_never_raises(self, monkeypatch):
+        def _boom(_k):
+            raise RuntimeError("down")
+
+        monkeypatch.setattr(linear_pe_queue, "_build_client", _boom)
+        assert (
+            linear_pe_queue.handle_stuck_session_failure(
+                "AFX-40", comment_body="x", escalate=False
+            )
+            is False
+        )
+
+    def test_disabled_is_noop(self, monkeypatch):
+        monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", False)
+        assert (
+            linear_pe_queue.handle_stuck_session_failure(
+                "AFX-40", comment_body="x", escalate=False
+            )
+            is False
+        )

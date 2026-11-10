@@ -526,6 +526,30 @@ class TestDispatchNarrative:
         assert "[NEEDS DESIGN]" in narrative
         assert "ambiguous" in narrative.lower()
 
+    def test_publishing_fallback_block_is_mandated(self):
+        """AFX-72: git push → gh api git/commits + git/refs →
+        `[NEEDS WILSON]` PR, with a worked example."""
+        iss = _issue(identifier="AFX-72")
+        narrative = platform_engineer._render_dispatch_narrative(issue=iss)
+        assert "## Publishing" in narrative
+        assert "git push -u origin <branch>" in narrative
+        assert "gh api repos/widarecu/agentfx/git/commits" in narrative
+        assert "gh api repos/widarecu/agentfx/git/refs" in narrative
+        push = narrative.index("git push -u origin <branch>")
+        api = narrative.index("gh api repos/widarecu/agentfx/git/commits")
+        needs_wilson = narrative.index("[NEEDS WILSON]")
+        assert push < api < needs_wilson
+        # Worked example
+        assert '"$REPO/git/blobs"' in narrative
+        assert '"$REPO/git/trees"' in narrative
+        assert '"$REPO/git/commits"' in narrative
+        assert 'gh api "$REPO/git/refs" -f ref="refs/heads/$BRANCH"' in narrative
+        # Both-fail path keeps the Linear link + ships the diff
+        assert "[NEEDS WILSON] AFX-72:" in narrative
+        assert "full diff" in narrative
+        assert "git am" in narrative
+        assert "do NOT die silently" in narrative
+
     def test_branch_gate_is_in_the_prompt(self):
         iss = _issue()
         narrative = platform_engineer._render_dispatch_narrative(issue=iss)
