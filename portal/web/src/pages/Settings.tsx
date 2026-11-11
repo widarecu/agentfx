@@ -11,6 +11,10 @@
  *   empty     → CredentialsForm alone
  *   unverified→ verified badge (amber), CredentialsForm + Verify CTA
  *   verified  → verified badge (emerald), OandaAccountsTable, Edit / Delete
+ *
+ * Every label/branch decision comes from the pure selectors in
+ * `./settingsView` (pinned by tests/unit/settingsView.test.ts, AFX-55).
+ * Add new state-dependent UI there, not inline in the JSX.
  */
 
 import React, { useCallback, useEffect, useState } from 'react';
@@ -30,6 +34,13 @@ import type {
   CredentialsState,
   UserOandaCredentialsUpsert,
 } from '../types/credentials';
+import {
+  selectFleetPoolOptInView,
+  selectSettingsView,
+  selectVerifyOutcome,
+  type SettingsView,
+  type VerifyResult,
+} from './settingsView';
 
 export default function Settings() {
   const [state, setState] = useState<CredentialsState>({ kind: 'loading' });
@@ -81,28 +92,33 @@ export default function Settings() {
   async function handleVerify() {
     setVerifying(true);
     setPageError(null);
+    let result: VerifyResult;
     try {
-      const response = await verifyMyCredentials();
-      // Verify success returns fresh accounts — hydrate state without
-      // a follow-up round-trip. The `verified` flag alone tells us
-      // which state to render.
-      if (response.verified) {
+      result = { ok: true, response: await verifyMyCredentials() };
+    } catch (err) {
+      // Verify failures come back as 400 with the sanitised reason.
+      result = { ok: false, error: err };
+    }
+    try {
+      const outcome = selectVerifyOutcome(result);
+      if (outcome.kind === 'verified') {
         // Re-fetch credentials for the freshest verified_at / masked
-        // view; the accounts payload came back on this call.
+        // view; the accounts payload came back on the verify call.
         const creds = await getMyCredentials();
         if (creds) {
           setState({
             kind: 'verified',
             credentials: creds,
-            accounts: response.accounts,
+            accounts: outcome.accounts,
           });
         }
+      } else {
+        // Reload so `verify_failure_reason` shows in the badge.
+        setPageError(outcome.pageError);
+        await load();
       }
     } catch (err) {
-      // Verify failures come back as 400 with the sanitised reason;
-      // reload the row so `verify_failure_reason` shows in the badge.
       setPageError(err instanceof Error ? err.message : String(err));
-      await load();
     } finally {
       setVerifying(false);
     }
@@ -128,6 +144,8 @@ export default function Settings() {
     }
   }
 
+  const view = selectSettingsView(state, { editing, verifying });
+
   return (
     <div className="container mx-auto px-4 py-8 max-w-4xl">
       <h1 className="text-2xl font-bold mb-1">Settings</h1>
@@ -148,7 +166,7 @@ export default function Settings() {
         </div>
       )}
 
-      {state.kind === 'loading' && (
+      {view.showSpinner && (
         <div className="flex items-center justify-center h-40">
           <Loader2 className="w-8 h-8 text-emerald-500 animate-spin" />
         </div>
@@ -156,13 +174,9 @@ export default function Settings() {
 
       {state.kind === 'empty' && (
         <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-6">
-          <div className="text-sm font-semibold mb-1">
-            Add your OANDA API key
-          </div>
+          <div className="text-sm font-semibold mb-1">{view.heading}</div>
           <p className="text-xs text-slate-500 dark:text-slate-400 mb-4">
-            You haven't set OANDA credentials yet. Paper runs execute
-            against your own OANDA Practice account — add your API key
-            below to continue.
+            {view.subheading}
           </p>
           <CredentialsForm
             onSubmit={handleSave}
@@ -180,15 +194,13 @@ export default function Settings() {
                   ⏸
                 </div>
                 <div>
-                  <div className="font-semibold">
-                    OANDA credentials set — verification pending
-                  </div>
+                  <div className="font-semibold">{view.heading}</div>
                   <div className="text-xs text-slate-500 dark:text-slate-400">
-                    Click Test connection to fetch your sub-accounts from OANDA.
+                    {view.subheading}
                   </div>
-                  {state.credentials.verify_failure_reason && (
+                  {view.lastError && (
                     <div className="mt-2 text-xs text-rose-700 dark:text-rose-400">
-                      Last error: {state.credentials.verify_failure_reason}
+                      {view.lastError}
                     </div>
                   )}
                 </div>
@@ -196,38 +208,36 @@ export default function Settings() {
               <div className="flex gap-2">
                 <button
                   onClick={handleVerify}
-                  disabled={verifying}
+                  disabled={view.verifyBusy}
                   className="inline-flex items-center gap-2 text-sm px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-semibold disabled:opacity-50"
                 >
-                  {verifying && <Loader2 className="w-4 h-4 animate-spin" />}
-                  Test connection
+                  {view.verifyBusy && <Loader2 className="w-4 h-4 animate-spin" />}
+                  {view.actions?.verify}
                 </button>
                 <button
                   onClick={() => setEditing(true)}
                   className="text-sm px-3 py-1.5 border border-slate-200 dark:border-slate-700 rounded hover:bg-slate-50 dark:hover:bg-slate-700 inline-flex items-center gap-1.5"
                 >
                   <Pencil className="w-3.5 h-3.5" />
-                  Edit
+                  {view.actions?.edit}
                 </button>
                 <button
                   onClick={handleDelete}
                   className="text-sm px-3 py-1.5 border border-rose-200 dark:border-rose-800 text-rose-700 dark:text-rose-400 rounded hover:bg-rose-50 dark:hover:bg-rose-900/20 inline-flex items-center gap-1.5"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
-                  Delete
+                  {view.actions?.remove}
                 </button>
               </div>
             </div>
           </div>
-          {editing && (
-            <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-6">
-              <div className="text-sm font-semibold mb-3">Edit API key</div>
-              <CredentialsForm
-                onSubmit={handleSave}
-                onCancel={() => setEditing(false)}
-                submitting={submitting}
-              />
-            </div>
+          {view.form && (
+            <EditKeyCard
+              form={view.form}
+              onSubmit={handleSave}
+              onCancel={() => setEditing(false)}
+              submitting={submitting}
+            />
           )}
         </div>
       )}
@@ -235,8 +245,7 @@ export default function Settings() {
       {state.kind === 'verified' && (
         <div className="space-y-4">
           <VerifiedBadgeCard
-            verifiedAt={state.credentials.verified_at}
-            keyVersion={state.credentials.key_version}
+            view={view}
             onEdit={() => setEditing(true)}
             onReverify={handleVerify}
             onDelete={handleDelete}
@@ -269,21 +278,13 @@ export default function Settings() {
             allowFleetPoolUse={state.credentials.allow_fleet_pool_use}
           />
 
-          {editing && (
-            <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-6">
-              <div className="text-sm font-semibold mb-3">
-                Rotate API key
-              </div>
-              <p className="text-xs text-slate-500 dark:text-slate-400 mb-3">
-                Saving a new key invalidates the verified badge —
-                you'll need to re-verify after saving.
-              </p>
-              <CredentialsForm
-                onSubmit={handleSave}
-                onCancel={() => setEditing(false)}
-                submitting={submitting}
-              />
-            </div>
+          {view.form && (
+            <EditKeyCard
+              form={view.form}
+              onSubmit={handleSave}
+              onCancel={() => setEditing(false)}
+              submitting={submitting}
+            />
           )}
         </div>
       )}
@@ -313,16 +314,42 @@ function TabStrip() {
   );
 }
 
+function EditKeyCard({
+  form,
+  onSubmit,
+  onCancel,
+  submitting,
+}: {
+  form: NonNullable<SettingsView['form']>;
+  onSubmit: (payload: UserOandaCredentialsUpsert) => Promise<void>;
+  onCancel: () => void;
+  submitting: boolean;
+}) {
+  return (
+    <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg p-6">
+      <div className="text-sm font-semibold mb-3">{form.title}</div>
+      {form.note && (
+        <p className="text-xs text-slate-500 dark:text-slate-400 mb-3">
+          {form.note}
+        </p>
+      )}
+      <CredentialsForm
+        onSubmit={onSubmit}
+        onCancel={form.cancellable ? onCancel : undefined}
+        submitting={submitting}
+      />
+    </div>
+  );
+}
+
 function VerifiedBadgeCard({
-  verifiedAt,
-  keyVersion,
+  view,
   onEdit,
   onReverify,
   onDelete,
   reverifying,
 }: {
-  verifiedAt: string | null;
-  keyVersion: number;
+  view: SettingsView;
   onEdit: () => void;
   onReverify: () => void;
   onDelete: () => void;
@@ -336,14 +363,9 @@ function VerifiedBadgeCard({
             <CheckCircle2 className="w-6 h-6" />
           </div>
           <div>
-            <div className="font-semibold">
-              OANDA API key verified · PRACTICE
-            </div>
+            <div className="font-semibold">{view.heading}</div>
             <div className="text-xs text-slate-500 dark:text-slate-400">
-              {verifiedAt
-                ? `Last verified ${new Date(verifiedAt).toLocaleString()}`
-                : 'Verified'}
-              {' · '}key v{keyVersion}
+              {view.subheading}
             </div>
           </div>
         </div>
@@ -354,21 +376,21 @@ function VerifiedBadgeCard({
             className="text-sm px-3 py-1.5 border border-slate-200 dark:border-slate-700 rounded hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-50 inline-flex items-center gap-1.5"
           >
             {reverifying && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-            Re-verify
+            {view.actions?.verify}
           </button>
           <button
             onClick={onEdit}
             className="text-sm px-3 py-1.5 border border-slate-200 dark:border-slate-700 rounded hover:bg-slate-50 dark:hover:bg-slate-700 inline-flex items-center gap-1.5"
           >
             <Pencil className="w-3.5 h-3.5" />
-            Rotate key
+            {view.actions?.edit}
           </button>
           <button
             onClick={onDelete}
             className="text-sm px-3 py-1.5 border border-rose-200 dark:border-rose-800 text-rose-700 dark:text-rose-400 rounded hover:bg-rose-50 dark:hover:bg-rose-900/20 inline-flex items-center gap-1.5"
           >
             <Trash2 className="w-3.5 h-3.5" />
-            Delete
+            {view.actions?.remove}
           </button>
         </div>
       </div>
@@ -384,6 +406,7 @@ function FleetPoolOptInCard({
   onToggle: (next: boolean) => void | Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
+  const toggle = selectFleetPoolOptInView(allowFleetPoolUse);
   const handleClick = async () => {
     setBusy(true);
     try {
@@ -413,21 +436,15 @@ function FleetPoolOptInCard({
           type="button"
           onClick={handleClick}
           disabled={busy}
-          aria-pressed={allowFleetPoolUse}
-          className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 disabled:opacity-50 ${
-            allowFleetPoolUse
-              ? 'bg-emerald-500'
-              : 'bg-slate-300 dark:bg-slate-600'
-          }`}
+          aria-pressed={toggle.pressed}
+          className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 disabled:opacity-50 ${toggle.trackTone}`}
         >
           <span className="sr-only">
-            {allowFleetPoolUse ? 'Disable fleet pool use' : 'Enable fleet pool use'}
+            {toggle.srLabel}
           </span>
           <span
             aria-hidden="true"
-            className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition ${
-              allowFleetPoolUse ? 'translate-x-5' : 'translate-x-0'
-            }`}
+            className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition ${toggle.knobOffset}`}
           />
         </button>
       </div>
