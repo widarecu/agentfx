@@ -1210,3 +1210,361 @@ class TestClassifySessionOutcome:
         s, url = pe_workspace._classify_session_outcome("some random tail text")
         assert s == AgentWorkspaceRunStatus.WORKSPACE_FAILED
         assert url is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# AFX-72 — session hygiene: cancel on sweep, cost cap, Linear recovery
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestSessionHygiene:
+    """Sweeper TTL and per-session cost cap share one path: cancel the
+    Managed Agents session, flip the row to WORKSPACE_FAILED, and run
+    Linear hygiene (Ready + comment, or needs-wilson on a repeat)."""
+
+    @staticmethod
+    def _sessions_without_cancel():
+        """SDK 2.x shape: no `sessions.cancel`; interrupt + archive."""
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.beta.sessions = MagicMock(
+            spec=["retrieve", "events", "archive", "delete", "create"]
+        )
+        return client
+
+    @staticmethod
+    def _patch_client(monkeypatch, client):
+        import anthropic as _anth
+
+        monkeypatch.setattr(_anth, "Anthropic", lambda **_kw: client, raising=True)
+
+    @staticmethod
+    def _patch_linear(monkeypatch):
+        from agentfx.agents.fleet import linear_pe_queue
+
+        calls: list[dict] = []
+
+        def _fake(identifier, *, comment_body, escalate):
+            calls.append(
+                {"identifier": identifier, "body": comment_body, "escalate": escalate}
+            )
+            return True
+
+        monkeypatch.setattr(linear_pe_queue, "handle_stuck_session_failure", _fake)
+        return calls
+
+    @staticmethod
+    def _seed(
+        db,
+        *,
+        row_id,
+        started_at,
+        status=AgentWorkspaceRunStatus.RUNNING,
+        summary=None,
+        identifier="AFX-40",
+        session_id=None,
+    ):
+        row = AgentWorkspaceRun(
+            id=row_id,
+            pe_proposal_decision_key=identifier or f"k_{row_id}",
+            linear_issue_identifier=identifier,
+            adapter="managed_agents",
+            status=status,
+            provider_run_id=session_id or f"sesn_{row_id}",
+            summary=summary,
+            started_at=started_at,
+            created_at=started_at,
+        )
+        db.add(row)
+        db.commit()
+        return row
+
+    def _run_cost_cap(self, db, monkeypatch, client, *, input_tokens=150_000):
+        from types import SimpleNamespace
+
+        client.beta.sessions.retrieve.return_value = SimpleNamespace(
+            status="running",
+            usage=SimpleNamespace(input_tokens=input_tokens, output_tokens=2_000),
+        )
+        self._patch_client(monkeypatch, client)
+        return pe_workspace.poll_running_dispatches(db)
+
+    # ── C: sweeper cancels ──────────────────────────────────────────
+
+    def test_sweep_cancels_session_and_runs_linear_hygiene(self, db, monkeypatch):
+        client = self._sessions_without_cancel()
+        self._patch_client(monkeypatch, client)
+        calls = self._patch_linear(monkeypatch)
+        self._seed(
+            db,
+            row_id="stuck",
+            session_id="sesn_01Gu",
+            started_at=datetime.now(UTC) - timedelta(hours=5),
+        )
+
+        assert pe_workspace.sweep_stuck_runs(db) == 1
+
+        client.beta.sessions.events.send.assert_called_once_with(
+            session_id="sesn_01Gu", events=[{"type": "user.interrupt"}]
+        )
+        client.beta.sessions.archive.assert_called_once_with(session_id="sesn_01Gu")
+        client.beta.sessions.delete.assert_not_called()
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert "exceeded 4h TTL" in row.summary
+        assert len(calls) == 1
+        assert calls[0]["identifier"] == "AFX-40"
+        assert calls[0]["escalate"] is False
+        body = calls[0]["body"]
+        assert "sesn_01Gu" in body
+        assert "TTL" in body
+        assert "Dispatched:" in body and "Duration: 5h" in body
+        assert "retries automatically" in body
+
+    def test_sweep_prefers_sessions_cancel_when_sdk_has_it(self, db, monkeypatch):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        self._patch_client(monkeypatch, client)
+        self._patch_linear(monkeypatch)
+        self._seed(
+            db,
+            row_id="stuck",
+            session_id="sesn_x",
+            started_at=datetime.now(UTC) - timedelta(hours=5),
+        )
+
+        pe_workspace.sweep_stuck_runs(db)
+
+        client.beta.sessions.cancel.assert_called_once_with(session_id="sesn_x")
+
+    def test_sweep_cancel_failure_still_flips_row(self, db, monkeypatch):
+        client = self._sessions_without_cancel()
+        client.beta.sessions.events.send.side_effect = RuntimeError(
+            "already terminated"
+        )
+        client.beta.sessions.archive.side_effect = ConnectionError("network")
+        self._patch_client(monkeypatch, client)
+        calls = self._patch_linear(monkeypatch)
+        self._seed(
+            db, row_id="stuck", started_at=datetime.now(UTC) - timedelta(hours=5)
+        )
+
+        assert pe_workspace.sweep_stuck_runs(db) == 1
+
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert len(calls) == 1
+        assert "cancel failed" in calls[0]["body"]
+
+    def test_sweep_linear_failure_never_raises(self, db, monkeypatch):
+        from agentfx.agents.fleet import linear_pe_queue
+
+        client = self._sessions_without_cancel()
+        self._patch_client(monkeypatch, client)
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError("linear down")
+
+        monkeypatch.setattr(linear_pe_queue, "handle_stuck_session_failure", _boom)
+        self._seed(
+            db, row_id="stuck", started_at=datetime.now(UTC) - timedelta(hours=5)
+        )
+
+        assert pe_workspace.sweep_stuck_runs(db) == 1
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+
+    def test_sweep_skips_linear_without_identifier(self, db, monkeypatch):
+        client = self._sessions_without_cancel()
+        self._patch_client(monkeypatch, client)
+        calls = self._patch_linear(monkeypatch)
+        self._seed(
+            db,
+            row_id="stuck",
+            identifier=None,
+            started_at=datetime.now(UTC) - timedelta(hours=5),
+        )
+
+        assert pe_workspace.sweep_stuck_runs(db) == 1
+        assert calls == []
+
+    # ── B: cost cap ─────────────────────────────────────────────────
+
+    def test_cost_cap_behaves_like_ttl(self, db, monkeypatch):
+        client = self._sessions_without_cancel()
+        calls = self._patch_linear(monkeypatch)
+        self._seed(
+            db,
+            row_id="spender",
+            session_id="sesn_spend",
+            started_at=datetime.now(UTC) - timedelta(minutes=30),
+        )
+
+        counts = self._run_cost_cap(db, monkeypatch, client)
+
+        assert counts["failed"] == 1
+        client.beta.sessions.events.send.assert_called_once_with(
+            session_id="sesn_spend", events=[{"type": "user.interrupt"}]
+        )
+        client.beta.sessions.archive.assert_called_once_with(session_id="sesn_spend")
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert "[cost-cap] exceeded 100000 tokens" in row.summary
+        assert row.ended_at is not None
+        assert len(calls) == 1
+        assert calls[0]["escalate"] is False
+        assert "cost-cap" in calls[0]["body"]
+        assert "sesn_spend" in calls[0]["body"]
+
+    def test_output_tokens_over_cap_also_trips(self, db, monkeypatch):
+        from types import SimpleNamespace
+
+        client = self._sessions_without_cancel()
+        self._patch_linear(monkeypatch)
+        self._seed(db, row_id="spender", started_at=datetime.now(UTC))
+        client.beta.sessions.retrieve.return_value = SimpleNamespace(
+            status="idle",
+            usage=SimpleNamespace(input_tokens=10, output_tokens=100_001),
+        )
+        self._patch_client(monkeypatch, client)
+
+        pe_workspace.poll_running_dispatches(db)
+
+        assert db.query(AgentWorkspaceRun).one().status == (
+            AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        )
+
+    def test_under_cap_leaves_row_running(self, db, monkeypatch):
+        client = self._sessions_without_cancel()
+        calls = self._patch_linear(monkeypatch)
+        self._seed(db, row_id="ok", started_at=datetime.now(UTC))
+
+        self._run_cost_cap(db, monkeypatch, client, input_tokens=99_000)
+
+        assert (
+            db.query(AgentWorkspaceRun).one().status == AgentWorkspaceRunStatus.RUNNING
+        )
+        client.beta.sessions.archive.assert_not_called()
+        assert calls == []
+
+    def test_cap_is_settings_driven(self, db, monkeypatch):
+        from agentfx.api.core.config import settings
+
+        monkeypatch.setattr(settings, "AGENT_PE_WORKSPACE_MAX_TOKENS_PER_SESSION", 0)
+        client = self._sessions_without_cancel()
+        self._patch_linear(monkeypatch)
+        self._seed(db, row_id="ok", started_at=datetime.now(UTC))
+
+        self._run_cost_cap(db, monkeypatch, client, input_tokens=10_000_000)
+
+        assert (
+            db.query(AgentWorkspaceRun).one().status == AgentWorkspaceRunStatus.RUNNING
+        )
+
+    # ── D: second consecutive stuck session escalates ───────────────
+
+    def test_second_consecutive_stuck_session_escalates(self, db, monkeypatch):
+        client = self._sessions_without_cancel()
+        self._patch_client(monkeypatch, client)
+        calls = self._patch_linear(monkeypatch)
+        now = datetime.now(UTC)
+        self._seed(
+            db,
+            row_id="first",
+            status=AgentWorkspaceRunStatus.WORKSPACE_FAILED,
+            summary="[cost-cap] exceeded 100000 tokens (input=150000, output=10)",
+            started_at=now - timedelta(hours=10),
+        )
+        self._seed(db, row_id="second", started_at=now - timedelta(hours=5))
+
+        pe_workspace.sweep_stuck_runs(db, now=now)
+
+        assert len(calls) == 1
+        assert calls[0]["escalate"] is True
+        assert "needs-wilson" in calls[0]["body"]
+        assert "not retrying" in calls[0]["body"].lower()
+
+    def test_prior_success_does_not_escalate(self, db, monkeypatch):
+        client = self._sessions_without_cancel()
+        self._patch_client(monkeypatch, client)
+        calls = self._patch_linear(monkeypatch)
+        now = datetime.now(UTC)
+        self._seed(
+            db,
+            row_id="first",
+            status=AgentWorkspaceRunStatus.PR_OPEN,
+            started_at=now - timedelta(hours=10),
+        )
+        self._seed(db, row_id="second", started_at=now - timedelta(hours=5))
+
+        pe_workspace.sweep_stuck_runs(db, now=now)
+
+        assert calls[0]["escalate"] is False
+
+    def test_other_ticket_failure_does_not_escalate(self, db, monkeypatch):
+        client = self._sessions_without_cancel()
+        self._patch_client(monkeypatch, client)
+        calls = self._patch_linear(monkeypatch)
+        now = datetime.now(UTC)
+        self._seed(
+            db,
+            row_id="other",
+            identifier="AFX-41",
+            status=AgentWorkspaceRunStatus.WORKSPACE_FAILED,
+            summary="[sweeper] exceeded 4h TTL, marked WORKSPACE_FAILED",
+            started_at=now - timedelta(hours=10),
+        )
+        self._seed(db, row_id="mine", started_at=now - timedelta(hours=5))
+
+        pe_workspace.sweep_stuck_runs(db, now=now)
+
+        assert calls[0]["identifier"] == "AFX-40"
+        assert calls[0]["escalate"] is False
+
+    # ── Publish failed after fallbacks ──────────────────────────────
+
+    def test_publish_failed_marker_runs_linear_hygiene(self, db, monkeypatch):
+        from types import SimpleNamespace
+
+        client = self._sessions_without_cancel()
+        calls = self._patch_linear(monkeypatch)
+        self._seed(db, row_id="pub", started_at=datetime.now(UTC))
+        client.beta.sessions.retrieve.return_value = SimpleNamespace(
+            status="terminated"
+        )
+        client.beta.sessions.events.list.return_value = SimpleNamespace(
+            data=[
+                SimpleNamespace(
+                    content=[
+                        SimpleNamespace(
+                            text="git push rejected.\nPUBLISH FAILED AFTER FALLBACKS\n<patch>"
+                        )
+                    ]
+                )
+            ]
+        )
+        self._patch_client(monkeypatch, client)
+
+        counts = pe_workspace.poll_running_dispatches(db)
+
+        assert counts["failed"] == 1
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert "[publish-failed] publish failed after fallbacks" in row.summary
+        assert len(calls) == 1
+        assert "publish failed after fallbacks" in calls[0]["body"]
+
+    def test_publish_failed_instruction_text_does_not_trigger(self):
+        narrative = (
+            "4. If even that PR cannot be opened, end your final message with "
+            "a line that reads exactly `PUBLISH FAILED AFTER FALLBACKS`, ..."
+        )
+        assert pe_workspace._detect_publish_failed(narrative) is False
+        assert (
+            pe_workspace._detect_publish_failed(
+                "done\nPUBLISH FAILED AFTER FALLBACKS\n"
+            )
+            is True
+        )

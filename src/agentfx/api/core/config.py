@@ -436,6 +436,14 @@ class Settings(BaseSettings):
         env="AGENT_QA_MODEL",
         description="Quant Analyst Agent model (divergence reports).",
     )
+    AGENT_QA_POOL_COOLING_DOWN_THRESHOLD: int = Field(
+        default=3,
+        env="AGENT_QA_POOL_COOLING_DOWN_THRESHOLD",
+        description=(
+            "QA tech-health flags the OANDA pool when more than this many "
+            "sub-accounts are COOLING_DOWN (AFX-8)."
+        ),
+    )
     AGENT_PE_MODEL: str = Field(
         default="claude-opus-5",
         env="AGENT_PE_MODEL",
@@ -510,6 +518,17 @@ class Settings(BaseSettings):
             "Hard cap on PE workspace dispatches per UTC day. Counts "
             "every attempt (success / failure / stub) so a looping "
             "proposal can't chew the daily budget."
+        ),
+    )
+    AGENT_PE_WORKSPACE_MAX_TOKENS_PER_SESSION: int = Field(
+        default=100_000,
+        env="AGENT_PE_WORKSPACE_MAX_TOKENS_PER_SESSION",
+        description=(
+            "Per-session token cap, applied separately to cumulative "
+            "input and output tokens (`sessions.retrieve().usage`). A "
+            "running Managed Agents session over either cap is "
+            "interrupted + archived, marked WORKSPACE_FAILED, and its "
+            "Linear issue recovered. 0 disables."
         ),
     )
     AGENT_PE_WORKSPACE_DAILY_USD_CAP: float = Field(

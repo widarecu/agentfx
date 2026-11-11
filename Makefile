@@ -132,7 +132,7 @@ format:
 	$(VENV)/bin/black .
 
 # --- .env workflow and smoke run ---
-.PHONY: dotenv run-backfill smoke check-env-example
+.PHONY: dotenv run-backfill smoke check-env-example check-settings-vitest
 
 dotenv:
 	@test -f .env.development || cp .env.example .env.development
@@ -143,6 +143,10 @@ dotenv:
 # (tests/unit/scripts/test_check_env_example.py).
 check-env-example:
 	$(PY) scripts/check_env_example.py
+
+# AFX-55: advisory — warns when Settings UI changed with no Vitest change.
+check-settings-vitest:
+	$(PY) scripts/check_settings_vitest.py
 
 # Usage: make run-backfill PAIRS="AUDUSD,EURUSD" DAYS=2
 run-backfill: dev dotenv

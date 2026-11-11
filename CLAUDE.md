@@ -121,6 +121,22 @@ Two different test categories that both touch "fake" data — be careful which o
 
 **The `seed_test_candles` fixture remains forbidden** for integration testing — fake market-shaped candles cannot stand in for OANDA data. That rule is about integration realism, not about all synthetic data; parity fixtures (above) are a separate category.
 
+### UI testing bar: state-dependent portal UI
+
+**The bar (AFX-55):** any PR that touches a Settings component — or any portal page rendering state-dependent UI driven by a backend-opt-in flag — must include a Vitest for the pure selector that drives rendering, covering every branch the user can land on.
+
+Build + types do not catch a component that stops branching (AFX-7 shipped a Pool column that read "Free" whenever opt-in was off; the DB column and types were right). Testing one state is not enough either: pin **every** visible-label delta.
+
+**Pattern — pure selector, node Vitest, no DOM:**
+
+1. Move the branching out of the JSX into a pure function `selectX(state, props) → { kind, label, ... }` that returns everything the user sees (labels, which cards render, tone classes, disabled flags). The component only renders what the selector returns.
+2. Add `portal/web/tests/unit/<x>.test.ts` with one `it` per branch, asserting the label delta.
+3. Do **not** pull in `@testing-library/react` / jsdom for this. Full-page E2E of every branch is Playwright territory, not this bar.
+
+Templates: `selectPoolColumnView` in [OandaAccountsTable.tsx](portal/web/src/components/OandaAccountsTable.tsx) (pinned by `tests/unit/poolColumnView.test.ts`), and `selectSettingsView` / `selectFleetPoolOptInView` / `selectVerifyOutcome` in [settingsView.ts](portal/web/src/pages/settingsView.ts) (pinned by `tests/unit/settingsView.test.ts`: loading / empty / unverified / verified, opt-in on / off, verify success / failure).
+
+**CI gate:** [scripts/check_settings_vitest.py](scripts/check_settings_vitest.py) (`settings-ui-test-bar` job in `ci.yml` and `agent-fleet-ci.yml`; locally `make check-settings-vitest`) flags a PR that changes a `SETTINGS_SURFACE` file without adding or changing a `portal/web/tests/unit/**/*.test.ts`. It is **advisory** (warning annotation) for now; add `--strict` in both workflows once the pattern has held for a month. When Settings starts rendering a new local component, add it to `SETTINGS_SURFACE` (the unit suite fails until you do).
+
 ### Prerequisites
 
 **Docker Desktop (or Colima/OrbStack) must be running.** That is the only dependency for Integration and E2E tests.
@@ -498,6 +514,20 @@ States: `Triage` → `Backlog` → `Ready` → `In Progress` → `In Review` →
 10. All other rules in this file still apply: `test` profile only, practice OANDA keys only, never push to `main`.
 
 A bug found anywhere other than CI means a test was missing. File a **Test gap** issue alongside the fix.
+
+## Branch flow
+
+```
+agent/AFX-<n>-<slug>  --squash-->  feat/agent-fleet  --merge commit-->  main
+                                          ^                              |
+                                          +-- auto back-merge (bot) -----+
+```
+
+- Agent PRs go into `feat/agent-fleet` and are **squash** merged. Never target `main`.
+- Promotes `feat/agent-fleet` → `main` are **merge commits**. Cut `promote/*` from the tip of `feat/agent-fleet`. Never cherry-pick onto a branch cut from `main`. Wilson approves every promote.
+- Every push to `main` (promotes and hotfixes) triggers [main-to-fleet-backmerge.yml](.github/workflows/main-to-fleet-backmerge.yml). It opens a `main` → `feat/agent-fleet` PR as `agentfx-fleet-bot`, which auto-merges as a merge commit once the fast-gate is green. On conflict it adds `needs-wilson` and is never auto-resolved.
+- Unpromoted work is `git log origin/main..origin/feat/agent-fleet`. Whether a promote is needed depends on `git diff origin/main origin/feat/agent-fleet`, not on commit counts, because back-merge commits show up in the log without changing content.
+- Never squash a back-merge or a promote PR. Squashing breaks the shared history and the drift returns.
 
 ## Planning System
 
