@@ -585,6 +585,21 @@ class TestGetPosition:
         assert p["avg_long_price"] == 1.09342
         assert p["avg_short_price"] == 1.10012
 
+    def test_404_never_traded_instrument_is_flat(self, client, mock_session):
+        mock_session.request.return_value = _http_error(
+            404, '{"errorMessage":"The requested position does not exist"}'
+        )
+        p = client.get_position("AUD_USD")
+        assert p["long_units"] == 0
+        assert p["short_units"] == 0
+        assert p["net_units"] == 0
+        assert p["unrealized_pnl"] == 0.0
+
+    def test_other_client_errors_still_raise(self, client, mock_session):
+        mock_session.request.return_value = _http_error(400, "bad request")
+        with pytest.raises(OandaError):
+            client.get_position("AUD_USD")
+
 
 class TestGetAccountBalance:
     def test_shape(self, client, mock_session):

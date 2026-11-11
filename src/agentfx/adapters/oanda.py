@@ -862,10 +862,24 @@ class OandaClient:
         """
         aid = self._resolve_account_id(account_id)
         instrument_norm = to_oanda_instrument(instrument)
-        resp = self._request(
-            "GET",
-            f"/accounts/{aid}/positions/{instrument_norm}",
-        )
+        try:
+            resp = self._request(
+                "GET",
+                f"/accounts/{aid}/positions/{instrument_norm}",
+            )
+        except OandaError as exc:
+            # AFX-48: an account that has never traded the instrument
+            # has no position record; OANDA answers 404 rather than a
+            # zeroed position. That is "flat", not a failure.
+            if not str(exc).startswith("404 ") or isinstance(exc, OandaCircuitOpen):
+                raise
+            _oanda_log.info(
+                "OANDA get_position %s on %s: 404, treating as flat (%s)",
+                instrument_norm,
+                aid,
+                str(exc)[:200],
+            )
+            resp = {}
         position = resp.get("position") or {}
         long_side = position.get("long") or {}
         short_side = position.get("short") or {}

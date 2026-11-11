@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import time
+import traceback
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -812,7 +813,7 @@ def _execute_loop(
                     granularity_seconds=granularity_seconds,
                     now_utc=datetime.fromtimestamp(now, tz=UTC),
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 # Signal work is best-effort — a compilation failure /
                 # arithmetic overflow / OANDA network blip mustn't take
                 # the whole runner down. Log and continue; the health
@@ -821,6 +822,9 @@ def _execute_loop(
                     "paper runner: signal tick failed on %s; skipping this bar",
                     run.id,
                 )
+                _record_tick_failure(db=db, run=run, exc=exc)
+            else:
+                _clear_tick_failure(db=db, run=run)
             # Advance to the NEXT boundary strictly after `now`.
             # `align_to_granularity` handles both cases: if `now` is
             # exactly on a boundary it returns `now + granularity` (so
@@ -911,6 +915,55 @@ def _clear_stale_state(*, db, run, latest_candle_at: str) -> None:
             "latest_candle_at": latest_candle_at,
         },
     )
+
+
+def _tick_failure_signature(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {str(exc)[:200]}"
+
+
+def _record_tick_failure(*, db, run, exc: Exception) -> None:
+    """AFX-48: surface signal-tick exceptions in the decision log.
+
+    Railway logs were the only place a failing tick showed up, so a run
+    whose every tick raised looked identical to a run with no signals.
+    Deduped like the stale guard: one row per distinct error signature,
+    re-armed by `_clear_tick_failure` on the next successful tick.
+    """
+    try:
+        db.rollback()
+        sig = _tick_failure_signature(exc)
+        params = dict(run.parameters or {})
+        if params.get("tick_failure_sig") == sig:
+            return
+        params["tick_failure_sig"] = sig
+        run.parameters = params
+        tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
+        _write_decision(
+            db,
+            run,
+            action="USER_SIGNAL_TICK_FAILED",
+            reason=f"signal tick failed — {sig}; skipping this bar",
+            outputs={
+                "paper_run_id": run.id,
+                "exc_type": type(exc).__name__,
+                "exc_message": str(exc)[:500],
+                "traceback_tail": "".join(tb)[-2000:],
+            },
+        )
+    except Exception:  # noqa: BLE001 — diagnostics must never crash the loop
+        logger.exception("paper runner: recording tick failure failed on %s", run.id)
+
+
+def _clear_tick_failure(*, db, run) -> None:
+    params = dict(run.parameters or {})
+    if "tick_failure_sig" not in params:
+        return
+    params.pop("tick_failure_sig")
+    run.parameters = params
+    try:
+        db.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("paper runner: clearing tick failure failed on %s", run.id)
 
 
 def _count_bars_since(
@@ -1043,6 +1096,12 @@ def _signal_tick(
     # once, exit-stale once, tracked via
     # `run.parameters['stale_state']`.
     if df.empty:
+        logger.info(
+            "paper runner: %s signal tick skipped: no %s %s candles",
+            run.id,
+            instrument,
+            granularity,
+        )
         _emit_stale_transition(
             db=db,
             run=run,
@@ -1067,6 +1126,15 @@ def _signal_tick(
     # length. See UAT observation 2026-07-13 (Wilson).
     stale_threshold_seconds = granularity_seconds + INGEST_LAG_TOLERANCE_SECONDS
     if (now_utc - latest_dt).total_seconds() > stale_threshold_seconds:
+        logger.info(
+            "paper runner: %s signal tick skipped: stale candles "
+            "(latest %s %s bar %s, now %s)",
+            run.id,
+            instrument,
+            granularity,
+            latest_dt.isoformat(),
+            now_utc.isoformat(),
+        )
         _emit_stale_transition(
             db=db,
             run=run,
@@ -1099,7 +1167,34 @@ def _signal_tick(
     # (b) the max_hold check below.
     raw_entries = strategy.raw_entry_signals(df)
     if len(raw_entries) < 1:
+        logger.info(
+            "paper runner: %s signal tick skipped: no entry signals computed",
+            run.id,
+        )
         return
+
+    params = getattr(run, "parameters", None) or {}
+    last_eval_iso = params.get("last_evaluated_bar_ts")
+    bookmark_ts: datetime | None = (
+        datetime.fromisoformat(last_eval_iso) if last_eval_iso else None
+    )
+    if bookmark_ts is not None and bookmark_ts.tzinfo is None:
+        bookmark_ts = bookmark_ts.replace(tzinfo=UTC)
+
+    # Before any broker call, so a failing get_position / order can't
+    # hide the live-vs-reference indicator comparison.
+    _run_entry_diagnostic(
+        db=db,
+        run=run,
+        strategy=strategy,
+        candle_fetch_fn=candle_fetch_fn,
+        instrument=instrument,
+        granularity=granularity,
+        live_df=df,
+        fold_anchored=from_time is not None,
+        raw_entries=raw_entries,
+        bookmark_ts=bookmark_ts,
+    )
 
     # ── Load state ────────────────────────────────────────────────
     # Open trade (for entry price + entry timestamp).
@@ -1142,13 +1237,8 @@ def _signal_tick(
         )
 
     # ── Build walk state ─────────────────────────────────────────
+    # Re-read: the broker-side reconcile above may have rewritten it.
     params = getattr(run, "parameters", None) or {}
-    last_eval_iso = params.get("last_evaluated_bar_ts")
-    bookmark_ts: datetime | None = (
-        datetime.fromisoformat(last_eval_iso) if last_eval_iso else None
-    )
-    if bookmark_ts is not None and bookmark_ts.tzinfo is None:
-        bookmark_ts = bookmark_ts.replace(tzinfo=UTC)
 
     in_position_start = 1 if net_units > 0 else (-1 if net_units < 0 else 0)
     entry_close_start: float | None = None
@@ -1222,17 +1312,13 @@ def _signal_tick(
             run.parameters = {**params, "last_evaluated_bar_ts": latest_iso}
             db.commit()
 
-    _run_entry_diagnostic(
-        db=db,
-        run=run,
-        strategy=strategy,
-        candle_fetch_fn=candle_fetch_fn,
-        instrument=instrument,
-        granularity=granularity,
-        live_df=df,
-        fold_anchored=from_time is not None,
-        raw_entries=raw_entries,
-        bookmark_ts=bookmark_ts,
+    logger.info(
+        "paper runner: %s signal tick evaluated: latest bar %s, "
+        "broker net_units=%d, walk transitions=%d",
+        run.id,
+        latest_dt.isoformat(),
+        net_units,
+        len(result.transitions),
     )
 
     # ── Execute the walk's decision(s) ───────────────────────────
