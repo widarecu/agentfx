@@ -1279,3 +1279,139 @@ class TestExecuteLoopSignalIntegration:
             f"expected 0 ticks fired (offset guards :00-:10 window), "
             f"got {len(snapshots)} — runner is racing the ingester"
         )
+
+
+class TestSignalTickFailureVisibility:
+    """AFX-48: a run whose every tick raised looked identical to a run
+    with no signals — the exception only reached Railway logs."""
+
+    def _loop_run(self):
+        from agentfx.api.models import RunStatus
+
+        return SimpleNamespace(
+            id="run_test",
+            pair="EUR_USD",
+            user_id=1,
+            snapshot_balance=10_000.0,
+            current_balance=10_000.0,
+            pnl=0.0,
+            kill_requested_at=None,
+            last_transaction_id=None,
+            risk_config={"loss_cap_pct": 2.0, "kill_switch_dd_pct": 5.0},
+            parameters={},
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+        )
+
+    def _run_loop(self, *, run, client, db, ticks: int):
+        clock_values = [110.0]
+        for i in range(ticks):
+            t = 130.0 + 60.0 * i
+            clock_values += [t, t]
+        clock = iter(clock_values)
+        _execute_loop(
+            db=db,
+            run=run,
+            client=client,
+            strategy=_make_strategy(signals=[0, 0, 0]),
+            candle_fetch_fn=MagicMock(
+                return_value=_mk_candles_df(3, datetime.now(UTC))
+            ),
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_fn=lambda: next(clock),
+            sleep_fn=MagicMock(),
+            max_iterations=ticks,
+        )
+
+    @staticmethod
+    def _decisions(db, action):
+        return [
+            c.args[0]
+            for c in db.add.call_args_list
+            if type(c.args[0]).__name__ == "DecisionLog" and c.args[0].action == action
+        ]
+
+    def test_failing_ticks_write_one_deduped_decision(self):
+        from agentfx.adapters.oanda import OandaError
+
+        run = self._loop_run()
+        client = MagicMock()
+        client.get_account_balance.return_value = {"balance": 10_000.0}
+        client.get_position.side_effect = OandaError("400 bad things")
+        db = _make_db()
+
+        self._run_loop(run=run, client=client, db=db, ticks=3)
+
+        failed = self._decisions(db, "USER_SIGNAL_TICK_FAILED")
+        assert len(failed) == 1
+        assert failed[0].outputs_json["exc_type"] == "OandaError"
+        assert "400 bad things" in failed[0].reasoning_text
+        assert "OandaError" in failed[0].outputs_json["traceback_tail"]
+        assert run.parameters["tick_failure_sig"] == "OandaError: 400 bad things"
+
+    def test_successful_tick_rearms_failure_logging(self):
+        from agentfx.adapters.oanda import OandaError
+
+        run = self._loop_run()
+        client = MagicMock()
+        client.get_account_balance.return_value = {"balance": 10_000.0}
+        flat = {"long_units": 0, "short_units": 0}
+        client.get_position.side_effect = [
+            OandaError("400 bad things"),
+            flat,
+            OandaError("400 bad things"),
+        ]
+        db = _make_db()
+
+        self._run_loop(run=run, client=client, db=db, ticks=3)
+
+        assert len(self._decisions(db, "USER_SIGNAL_TICK_FAILED")) == 2
+
+    def test_entry_diagnostic_runs_before_broker_calls(self, monkeypatch):
+        from agentfx.adapters.oanda import OandaError
+        from agentfx.services import paper_runner
+
+        diag = MagicMock()
+        monkeypatch.setattr(paper_runner, "_run_entry_diagnostic", diag)
+        client = MagicMock()
+        client.get_position.side_effect = OandaError("400 bad things")
+        now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+
+        with pytest.raises(OandaError):
+            _signal_tick(
+                db=_make_db(),
+                run=_make_run(),
+                client=client,
+                strategy=_make_strategy(signals=[0, 0, 1]),
+                candle_fetch_fn=MagicMock(
+                    return_value=_mk_candles_df(3, now - timedelta(seconds=30))
+                ),
+                instrument="EUR_USD",
+                granularity_seconds=60,
+                now_utc=now,
+            )
+
+        diag.assert_called_once()
+
+    def test_stale_skip_is_logged_every_tick(self, caplog):
+        import logging
+
+        now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+        run = _make_run()
+        run.parameters = {"stale_active": True}
+        with caplog.at_level(logging.INFO, logger="agentfx.services.paper_runner"):
+            _signal_tick(
+                db=_make_db(),
+                run=run,
+                client=MagicMock(),
+                strategy=_make_strategy(signals=[0, 0, 0]),
+                candle_fetch_fn=MagicMock(
+                    return_value=_mk_candles_df(3, now - timedelta(minutes=5))
+                ),
+                instrument="EUR_USD",
+                granularity_seconds=60,
+                now_utc=now,
+            )
+        assert "signal tick skipped: stale candles" in caplog.text

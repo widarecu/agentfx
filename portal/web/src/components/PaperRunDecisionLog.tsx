@@ -26,6 +26,12 @@ const ACTION_STYLES: Record<string, string> = {
     'bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300',
   USER_SIGNAL_SKIPPED_STALE:
     'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
+  USER_SIGNAL_RESUMED:
+    'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300',
+  USER_SIGNAL_TICK_FAILED:
+    'bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300',
+  USER_INTERMEDIATE_TRANSITION_SKIPPED:
+    'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
   USER_SIGNAL_INDICATOR_DIVERGENCE:
     'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
   USER_ENTRY_MISSED:

@@ -585,6 +585,42 @@ class TestGetPosition:
         assert p["avg_long_price"] == 1.09342
         assert p["avg_short_price"] == 1.10012
 
+    def test_404_never_traded_instrument_is_flat(self, client, mock_session):
+        mock_session.request.return_value = _http_error(
+            404, '{"errorMessage":"The requested position does not exist"}'
+        )
+        p = client.get_position("AUD_USD")
+        assert p["long_units"] == 0
+        assert p["short_units"] == 0
+        assert p["net_units"] == 0
+        assert p["unrealized_pnl"] == 0.0
+
+    def test_other_client_errors_still_raise(self, client, mock_session):
+        mock_session.request.return_value = _http_error(400, "bad request")
+        with pytest.raises(OandaError):
+            client.get_position("AUD_USD")
+
+    def test_repeated_flat_404s_do_not_trip_breaker(self, client, mock_session):
+        mock_session.request.return_value = _http_error(
+            404, '{"errorMessage":"The requested position does not exist"}'
+        )
+        for _ in range(client.circuit_breaker.threshold + 2):
+            client.get_position("AUD_USD")
+        assert client.circuit_breaker.should_reject() is False
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            '{"errorMessage":"The specified account does not exist"}',
+            '{"errorMessage":"Invalid value specified for \'instrument\'"}',
+            "not json",
+        ],
+    )
+    def test_unrelated_404_still_raises(self, client, mock_session, body):
+        mock_session.request.return_value = _http_error(404, body)
+        with pytest.raises(OandaError):
+            client.get_position("AUD_USD")
+
 
 class TestGetAccountBalance:
     def test_shape(self, client, mock_session):
