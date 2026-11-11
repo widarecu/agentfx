@@ -38,16 +38,13 @@ on:
       - 'LICENSE'
       - '.gitignore'
       - 'portal/web/wireframes/**'
+  # No paths-ignore on PRs: "Fast gate" is a required check on
+  # feat/agent-fleet, and a skipped workflow never reports it, leaving
+  # docs-only and no-diff PRs (e.g. back-merges) stuck on "Expected".
   pull_request:
     branches:
       - "feat/agent-fleet"
     types: [opened, synchronize, reopened, labeled]
-    paths-ignore:
-      - 'planning/**'
-      - '**/*.md'
-      - 'LICENSE'
-      - '.gitignore'
-      - 'portal/web/wireframes/**'
 
 # Agent sub-branches may push rapid-fire during the PE inner loop;
 # cancel in-flight runs for the same ref so cost + runner time stay
