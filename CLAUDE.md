@@ -515,6 +515,20 @@ States: `Triage` → `Backlog` → `Ready` → `In Progress` → `In Review` →
 
 A bug found anywhere other than CI means a test was missing. File a **Test gap** issue alongside the fix.
 
+## Branch flow
+
+```
+agent/AFX-<n>-<slug>  --squash-->  feat/agent-fleet  --merge commit-->  main
+                                          ^                              |
+                                          +-- auto back-merge (bot) -----+
+```
+
+- Agent PRs go into `feat/agent-fleet` and are **squash** merged. Never target `main`.
+- Promotes `feat/agent-fleet` → `main` are **merge commits**. Cut `promote/*` from the tip of `feat/agent-fleet`. Never cherry-pick onto a branch cut from `main`. Wilson approves every promote.
+- Every push to `main` (promotes and hotfixes) triggers [main-to-fleet-backmerge.yml](.github/workflows/main-to-fleet-backmerge.yml). It opens a `main` → `feat/agent-fleet` PR as `agentfx-fleet-bot`, which auto-merges as a merge commit once the fast-gate is green. On conflict it adds `needs-wilson` and is never auto-resolved.
+- Unpromoted work is `git log origin/main..origin/feat/agent-fleet`. Whether a promote is needed depends on `git diff origin/main origin/feat/agent-fleet`, not on commit counts, because back-merge commits show up in the log without changing content.
+- Never squash a back-merge or a promote PR. Squashing breaks the shared history and the drift returns.
+
 ## Planning System
 
 `planning/BACKLOG.md` is a **frozen snapshot** as of 2026-10-22. Open items were imported to Linear. Don't add new items there. ROADMAP.md stays the narrative of milestones; Linear projects mirror its releases.

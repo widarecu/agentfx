@@ -1,0 +1,133 @@
+name: Back-merge main → feat/agent-fleet
+
+# Keeps feat/agent-fleet a superset of main (AFX-83).
+#
+#   agent/*  --squash-->  feat/agent-fleet  --merge commit-->  main
+#                               ^                               |
+#                               +------ this workflow ----------+
+#
+# On every push to main, open (or reuse) a PR with head=main and
+# base=feat/agent-fleet. Opening the PR from main itself means no branch
+# is pushed, so the bot never writes workflow files.
+#   - Clean merge: enable auto-merge with a MERGE COMMIT. GitHub merges
+#     once the fast-gate (agent-fleet-ci.yml) is green.
+#   - Conflict: label `needs-wilson` and comment the conflicted files.
+#     Never auto-resolved.
+#
+# Auth: short-lived token from the `agentfx-fleet-bot` GitHub App. The
+# built-in GITHUB_TOKEN can't be used because PRs it opens don't trigger
+# other workflows, so the fast-gate would never run. The App credentials
+# live in the `fleet-bot` environment, which only `main` can use.
+#
+# Never add the `agent-authored` label here: agent-fleet-ci.yml squash-
+# merges PRs carrying it, which would break the shared history.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: main-to-fleet-backmerge
+  cancel-in-progress: true
+
+env:
+  BASE: feat/agent-fleet
+  HEAD: main
+
+jobs:
+  backmerge:
+    name: Open / update back-merge PR
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: fleet-bot
+    timeout-minutes: 10
+    steps:
+      - name: Mint fleet-bot token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.FLEET_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.FLEET_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check whether back-merge is needed
+        id: check
+        run: |
+          if git merge-base --is-ancestor "origin/$HEAD" "origin/$BASE"; then
+            echo "$BASE already contains $HEAD; nothing to do."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+
+          git config user.name "agentfx-fleet-bot[bot]"
+          git config user.email "agentfx-fleet-bot[bot]@users.noreply.github.com"
+          git checkout --quiet --detach "origin/$BASE"
+          if git merge --no-commit --no-ff "origin/$HEAD" > /dev/null 2>&1; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "files<<EOF"
+              git diff --name-only --diff-filter=U
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+          git merge --abort 2>/dev/null || true
+
+      - name: Open or reuse back-merge PR
+        id: pr
+        if: steps.check.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          url=$(gh pr list --head "$HEAD" --base "$BASE" --state open --json url --jq '.[0].url // empty')
+          if [ -z "$url" ]; then
+            url=$(gh pr create --head "$HEAD" --base "$BASE" \
+              --title "Back-merge main → $BASE" \
+              --body "Automated back-merge (AFX-83) so \`$BASE\` keeps containing everything on \`main\`. Merges as a **merge commit**. Never squash this PR.")
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "Back-merge PR: $url"
+
+      - name: Enable auto-merge (merge commit)
+        if: steps.check.outputs.needed == 'true' && steps.check.outputs.conflict == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+        run: |
+          gh pr edit "$PR_URL" --remove-label needs-wilson > /dev/null 2>&1 || true
+          if ! gh pr merge --merge --auto "$PR_URL"; then
+            echo "::warning ::Could not enable auto-merge on $PR_URL. Merge it manually with 'Create a merge commit'."
+          fi
+
+      - name: Flag conflict for Wilson
+        if: steps.check.outputs.needed == 'true' && steps.check.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          FILES: ${{ steps.check.outputs.files }}
+        run: |
+          gh pr edit "$PR_URL" --add-label needs-wilson
+          {
+            echo "@widarecu \`main\` (${GITHUB_SHA::7}) conflicts with \`$BASE\`. Not auto-merging."
+            echo
+            echo "Conflicted files:"
+            echo "$FILES" | sed 's/^/- `/; s/$/`/'
+            echo
+            echo "To resolve: branch from \`$BASE\`, run \`git merge origin/main\`, fix the conflicts, and open a PR into \`$BASE\`."
+            echo "Merge it with **Create a merge commit**. This PR then closes as merged automatically."
+          } > comment.md
+          gh pr comment "$PR_URL" --body-file comment.md
+          echo "::warning ::Back-merge conflict in: $(echo "$FILES" | tr '\n' ' ')"
