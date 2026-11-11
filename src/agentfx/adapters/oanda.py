@@ -5,6 +5,7 @@ import logging
 import random
 import time
 from collections import deque
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 import requests  # type: ignore[import-untyped]
@@ -173,6 +174,19 @@ def _backoff_delay_seconds(
     base = min(cap_ms, base_ms * (2**attempt))
     jitter = random.uniform(0, base * 0.25)
     return (base + jitter) / 1000.0
+
+
+def _is_no_such_position(body: str) -> bool:
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("errorCode") == "NO_SUCH_POSITION":
+        return True
+    message = str(payload.get("errorMessage", "")).lower()
+    return "position" in message and "does not exist" in message
 
 
 def to_oanda_instrument(symbol: str) -> str:
@@ -350,6 +364,7 @@ class OandaClient:
         path: str,
         params: dict[str, str] | None = None,
         json_body: dict | None = None,
+        not_found_ok: Callable[[str], bool] | None = None,
     ) -> dict:
         """Issue a v20 REST call with retry + circuit-breaker semantics.
 
@@ -369,7 +384,9 @@ class OandaClient:
         and the user can rotate the token.
 
         Other 4xx failures (400, 403, 404, 422, ...) still fail
-        immediately — those genuinely won't get better.
+        immediately — those genuinely won't get better. A 404 whose
+        body satisfies `not_found_ok` is an answer, not a failure:
+        it returns `{}` and counts as a success for the breaker.
 
         The circuit breaker is checked BEFORE each attempt. Any
         failure that reaches the retry cap records to the breaker;
@@ -472,6 +489,21 @@ class OandaClient:
                     continue
                 self.circuit_breaker.record_failure()
                 raise last_error
+
+            if (
+                resp.status_code == 404
+                and not_found_ok is not None
+                and not_found_ok(resp.text)
+            ):
+                _log_call_result(
+                    method,
+                    path,
+                    status=resp.status_code,
+                    elapsed_ms=elapsed_ms,
+                    attempt=attempt,
+                )
+                self.circuit_breaker.record_success()
+                return {}
 
             # Non-retryable client errors — surface immediately.
             if resp.status_code >= 400:
@@ -862,24 +894,15 @@ class OandaClient:
         """
         aid = self._resolve_account_id(account_id)
         instrument_norm = to_oanda_instrument(instrument)
-        try:
-            resp = self._request(
-                "GET",
-                f"/accounts/{aid}/positions/{instrument_norm}",
-            )
-        except OandaError as exc:
-            # AFX-48: an account that has never traded the instrument
-            # has no position record; OANDA answers 404 rather than a
-            # zeroed position. That is "flat", not a failure.
-            if not str(exc).startswith("404 ") or isinstance(exc, OandaCircuitOpen):
-                raise
-            _oanda_log.info(
-                "OANDA get_position %s on %s: 404, treating as flat (%s)",
-                instrument_norm,
-                aid,
-                str(exc)[:200],
-            )
-            resp = {}
+        # AFX-48: an account that has never traded the instrument has
+        # no position record; OANDA answers 404 rather than a zeroed
+        # position. That is "flat". Any other 404 (unknown account,
+        # bad instrument) still raises.
+        resp = self._request(
+            "GET",
+            f"/accounts/{aid}/positions/{instrument_norm}",
+            not_found_ok=_is_no_such_position,
+        )
         position = resp.get("position") or {}
         long_side = position.get("long") or {}
         short_side = position.get("short") or {}
