@@ -524,7 +524,8 @@ agent/AFX-<n>-<slug>  --squash-->  feat/agent-fleet  --merge commit-->  main
 ```
 
 - Agent PRs go into `feat/agent-fleet` and are **squash** merged. Never target `main`.
-- Promotes `feat/agent-fleet` → `main` are **merge commits**. Cut `promote/*` from the tip of `feat/agent-fleet`. Never cherry-pick onto a branch cut from `main`. Wilson approves every promote.
+- Promotes `feat/agent-fleet` → `main` are **merge commits**. Wilson approves every promote. Never cherry-pick onto a branch cut from `main`.
+- [agent-fleet-promote.yml](.github/workflows/agent-fleet-promote.yml) keeps one promote PR open (head `feat/agent-fleet`, labels `promote` + `needs-wilson`) whenever the fleet branch has content `main` lacks. It lists every unpromoted PR with risk and files, Money-path first, and comments the link on each `AFX-<n>` issue. It runs on merges by a person or App, and every 30 min for agent PRs (GITHUB_TOKEN auto-merges don't start workflows). Don't open a second promote PR. To freeze a promote at a specific SHA, cut `promote/*` from `feat/agent-fleet` instead; the workflow won't open its own while that one is open.
 - Every push to `main` (promotes and hotfixes) triggers [main-to-fleet-backmerge.yml](.github/workflows/main-to-fleet-backmerge.yml). It opens a `main` → `feat/agent-fleet` PR as `agentfx-fleet-bot`, which auto-merges as a merge commit once the fast-gate is green. On conflict it adds `needs-wilson` and is never auto-resolved.
 - Unpromoted work is `git log origin/main..origin/feat/agent-fleet`. Whether a promote is needed depends on `git diff origin/main origin/feat/agent-fleet`, not on commit counts, because back-merge commits show up in the log without changing content.
 - Never squash a back-merge or a promote PR. Squashing breaks the shared history and the drift returns.

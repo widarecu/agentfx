@@ -1,0 +1,6 @@
+# Agent PRs auto-merge into feat/agent-fleet. Anything that controls CI,
+# merging, or runs with the agentfx-fleet-bot App token needs Wilson's
+# review. Enforced by "Require review from Code Owners" in the branch
+# rulesets for feat/agent-fleet and main.
+/.github/                    @widarecu
+/scripts/fleet_promote_pr.py @widarecu
