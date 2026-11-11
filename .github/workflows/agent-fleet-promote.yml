@@ -1,0 +1,99 @@
+name: Promote feat/agent-fleet → main
+
+# Keeps a promote PR open whenever feat/agent-fleet has content main lacks
+# (AFX-69). Pairs with main-to-fleet-backmerge.yml (AFX-83):
+#
+#   agent/*  --squash-->  feat/agent-fleet  --merge commit-->  main
+#                               |                               ^
+#                               +------ this workflow ----------+
+#                                 (opens the PR; Wilson merges)
+#
+# scripts/fleet_promote_pr.py does the work: content-diff no-op check, PR
+# list with risk + files (Money-path first), open or refresh the PR
+# (head=feat/agent-fleet, labels promote + needs-wilson), one Linear
+# comment per AFX issue. It never enables auto-merge.
+#
+# Triggers:
+#   - push / pull_request closed: merges into feat/agent-fleet by a person
+#     or an App.
+#   - schedule: the catch-all. Agent PRs are auto-merged by GITHUB_TOKEN
+#     (agent-fleet-ci.yml), and events caused by GITHUB_TOKEN don't start
+#     workflows, so neither trigger above fires for them. Scheduled runs use
+#     main's copy of this file.
+#
+# Auth: the `fleet-bot` environment (agentfx-fleet-bot App) for the job that
+# opens the PR, so ci.yml runs on it. A PR opened by GITHUB_TOKEN would get
+# no CI. The environment allows main and feat/agent-fleet only, so the
+# pull_request job (ref refs/pull/N/merge) uses GITHUB_TOKEN and only
+# refreshes an already-open PR.
+
+on:
+  push:
+    branches:
+      - feat/agent-fleet
+  pull_request:
+    branches:
+      - feat/agent-fleet
+    types: [closed]
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+# Push and pull_request fire for the same merge. Every run is idempotent,
+# so queue rather than cancel.
+concurrency:
+  group: agent-fleet-promote
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Open / refresh promote PR
+    if: >-
+      github.event_name != 'pull_request'
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/agent-fleet')
+    runs-on: ubuntu-latest
+    environment: fleet-bot
+    timeout-minutes: 10
+    steps:
+      - name: Mint fleet-bot token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.FLEET_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.FLEET_BOT_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: write
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Open or refresh promote PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        run: python3 scripts/fleet_promote_pr.py
+
+  refresh-on-merge:
+    name: Refresh open promote PR
+    if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: feat/agent-fleet
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Refresh promote PR body
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        run: python3 scripts/fleet_promote_pr.py --no-create
