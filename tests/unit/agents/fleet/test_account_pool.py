@@ -324,6 +324,88 @@ class TestPoolSummary:
         assert summary["cooling_down_accounts"][0]["seconds_until_free"] > 0
 
 
+class TestPoolHealthFlags:
+    """AFX-8 — QA tech-health surfaces stuck pool state."""
+
+    def test_in_use_past_lease_expiry_is_flagged(self, db):
+        creds = _mk_creds(db)
+        now = datetime.now(UTC)
+        _mk_account(
+            db,
+            creds,
+            oanda_account_id="STUCK",
+            pool_status=UserOandaAccountPoolStatus.IN_USE,
+            current_run_id="crashed_run",
+            lease_expires_at=now - timedelta(hours=2),
+        )
+        _mk_account(
+            db,
+            creds,
+            oanda_account_id="HEALTHY",
+            pool_status=UserOandaAccountPoolStatus.IN_USE,
+            current_run_id="live_run",
+            lease_expires_at=now + timedelta(days=30),
+        )
+        flags = account_pool.pool_health_flags(db, now=now)
+        assert [f.kind for f in flags] == ["in_use_past_lease"]
+        assert flags[0].account_ids == ["STUCK"]
+        assert "crashed_run" in flags[0].detail
+
+    def test_in_use_within_lease_not_flagged(self, db):
+        creds = _mk_creds(db)
+        now = datetime.now(UTC)
+        _mk_account(
+            db,
+            creds,
+            pool_status=UserOandaAccountPoolStatus.IN_USE,
+            current_run_id="live_run",
+            lease_expires_at=now + timedelta(minutes=1),
+        )
+        assert account_pool.pool_health_flags(db, now=now) == []
+
+    def test_cooling_down_above_default_threshold_is_flagged(self, db):
+        creds = _mk_creds(db)
+        for i in range(4):
+            _mk_account(
+                db,
+                creds,
+                oanda_account_id=f"C{i}",
+                pool_status=UserOandaAccountPoolStatus.COOLING_DOWN,
+            )
+        flags = account_pool.pool_health_flags(db)
+        assert [f.kind for f in flags] == ["cooling_down_backlog"]
+        assert sorted(flags[0].account_ids) == ["C0", "C1", "C2", "C3"]
+
+    def test_cooling_down_at_default_threshold_not_flagged(self, db):
+        creds = _mk_creds(db)
+        for i in range(3):
+            _mk_account(
+                db,
+                creds,
+                oanda_account_id=f"C{i}",
+                pool_status=UserOandaAccountPoolStatus.COOLING_DOWN,
+            )
+        assert account_pool.pool_health_flags(db) == []
+
+    def test_cooling_down_threshold_is_configurable(self, db):
+        creds = _mk_creds(db)
+        for i in range(2):
+            _mk_account(
+                db,
+                creds,
+                oanda_account_id=f"C{i}",
+                pool_status=UserOandaAccountPoolStatus.COOLING_DOWN,
+            )
+        assert account_pool.pool_health_flags(db, cooling_down_threshold=2) == []
+        flags = account_pool.pool_health_flags(db, cooling_down_threshold=1)
+        assert [f.kind for f in flags] == ["cooling_down_backlog"]
+
+    def test_healthy_pool_has_no_flags(self, db):
+        creds = _mk_creds(db)
+        _mk_account(db, creds)
+        assert account_pool.pool_health_flags(db) == []
+
+
 class TestCredentialKeyNeverLogged:
     """Regression — decrypted api_keys must never show up in logs
     emitted by allocate/release/sweep paths."""
