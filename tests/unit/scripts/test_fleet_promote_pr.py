@@ -9,9 +9,12 @@ replacement, open-PR selection and the Linear comment dedupe marker.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 _REPO = Path(__file__).resolve().parents[3]
 _SCRIPT = _REPO / "scripts" / "fleet_promote_pr.py"
@@ -182,8 +185,15 @@ def test_block_appended_when_markers_missing():
 
 
 def test_fleet_headed_pr_is_managed():
-    prs = [{"headRefName": "promote/x"}, {"headRefName": "feat/agent-fleet"}]
+    prs = [{"headRefName": "devin/hotfix"}, {"headRefName": "feat/agent-fleet"}]
     assert fp.select_open_promote(prs) == (prs[1], "auto")
+
+
+def test_frozen_promote_takes_over_from_the_live_pr():
+    auto = {"headRefName": "feat/agent-fleet", "labels": [{"name": "promote"}]}
+    frozen = {"headRefName": "promote/release", "labels": []}
+    assert fp.select_open_promote([auto, frozen]) == (frozen, "manual")
+    assert fp.find_auto_promote([auto, frozen]) is auto
 
 
 def test_hand_cut_promote_pr_blocks_a_duplicate():
@@ -222,15 +232,46 @@ def test_linear_comment_links_promote_pr_and_carries_marker():
 def test_linear_comment_posted_once_per_promote_pr():
     calls: list[dict] = []
     linear = fp.Linear("key")
-    linear._issues["AFX-8"] = {
-        "id": "uuid",
-        "labels": {"nodes": []},
-        "comments": {"nodes": []},
-    }
-    linear._gql = lambda q, v: calls.append(v) or {}
+    linear._issues["AFX-8"] = {"id": "uuid", "labels": {"nodes": []}}
+
+    def gql(q, v):
+        calls.append(v)
+        if "commentCreate" in q:
+            return {}
+        return {
+            "issue": {"comments": {"nodes": [], "pageInfo": {"hasNextPage": False}}}
+        }
+
+    linear._gql = gql
     assert linear.comment_once("AFX-8", "hi <!-- m -->", "<!-- m -->") is True
     assert linear.comment_once("AFX-8", "hi <!-- m -->", "<!-- m -->") is False
-    assert len(calls) == 1 and calls[0]["id"] == "uuid"
+    assert [c["id"] for c in calls] == ["uuid", "uuid"]  # one page read, one post
+
+
+def test_linear_marker_found_on_a_later_comment_page():
+    pages = {
+        None: {
+            "nodes": [{"body": "x"}] * 100,
+            "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+        },
+        "c1": {
+            "nodes": [{"body": "old <!-- m -->"}],
+            "pageInfo": {"hasNextPage": False},
+        },
+    }
+    posted: list[dict] = []
+    linear = fp.Linear("key")
+    linear._issues["AFX-8"] = {"id": "uuid", "labels": {"nodes": []}}
+
+    def gql(q, v):
+        if "commentCreate" in q:
+            posted.append(v)
+            return {}
+        return {"issue": {"comments": pages[v["after"]]}}
+
+    linear._gql = gql
+    assert linear.comment_once("AFX-8", "hi <!-- m -->", "<!-- m -->") is False
+    assert posted == []
 
 
 def test_linear_risk_reads_risk_label():
@@ -238,6 +279,76 @@ def test_linear_risk_reads_risk_label():
     linear._issues["AFX-9"] = {
         "id": "u",
         "labels": {"nodes": [{"name": "Feature"}, {"name": "Money-path"}]},
-        "comments": {"nodes": []},
     }
     assert linear.risk("AFX-9") == "Money-path"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Is there anything to promote? (real git repo)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+@pytest.fixture
+def repo(tmp_path, monkeypatch):
+    _git(tmp_path, "init", "-q", "-b", "main")
+    _git(tmp_path, "config", "user.email", "t@t")
+    _git(tmp_path, "config", "user.name", "t")
+    (tmp_path / "a").write_text("1\n")
+    _git(tmp_path, "add", "a")
+    _git(tmp_path, "commit", "-qm", "init")
+    _git(tmp_path, "branch", "feat/agent-fleet")
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def _commit(repo: Path, branch: str, name: str, text: str) -> None:
+    _git(repo, "checkout", "-q", branch)
+    (repo / name).write_text(text)
+    _git(repo, "add", name)
+    _git(repo, "commit", "-qm", name)
+
+
+def _publish(repo: Path) -> None:
+    for b in ("main", "feat/agent-fleet"):
+        _git(repo, "update-ref", f"refs/remotes/origin/{b}", b)
+
+
+def test_identical_branches_have_nothing_to_promote(repo):
+    _publish(repo)
+    assert fp.fleet_has_new_content() is False
+
+
+def test_agent_work_on_fleet_is_promotable(repo):
+    _commit(repo, "feat/agent-fleet", "b", "agent\n")
+    _publish(repo)
+    assert fp.fleet_has_new_content() is True
+
+
+def test_hotfix_on_main_alone_is_not_promotable(repo):
+    _commit(repo, "main", "hotfix", "fix\n")
+    _publish(repo)
+    assert fp.fleet_has_new_content() is False
+
+
+def test_hotfix_after_a_back_merge_is_not_promotable(repo):
+    _commit(repo, "feat/agent-fleet", "b", "agent\n")
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "merge", "-q", "--no-ff", "-m", "promote", "feat/agent-fleet")
+    _git(repo, "checkout", "-q", "feat/agent-fleet")
+    _git(repo, "merge", "-q", "--no-ff", "-m", "back-merge", "main")
+    _commit(repo, "main", "hotfix", "fix\n")
+    _publish(repo)
+    assert fp.fleet_has_new_content() is False
+
+
+def test_conflicting_fleet_work_is_promotable(repo):
+    _commit(repo, "main", "a", "main\n")
+    _commit(repo, "feat/agent-fleet", "a", "fleet\n")
+    _publish(repo)
+    assert fp.fleet_has_new_content() is True

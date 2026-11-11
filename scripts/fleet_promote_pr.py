@@ -3,14 +3,18 @@
 
 Run by `.github/workflows/agent-fleet-promote.yml`. Each run:
 
-1. Exits if `main` and `feat/agent-fleet` have the same content. A content
-   diff, not ancestry: back-merge commits make the fleet branch look ahead
-   with nothing to promote (CLAUDE.md -> Branch flow).
+1. Exits unless `feat/agent-fleet` has content `main` lacks: merging it into
+   `main` would leave `main`'s tree unchanged. Not ancestry or a plain tip
+   diff: back-merge commits make the fleet branch look ahead with nothing to
+   promote, and a hotfix on `main` that hasn't been back-merged yet makes the
+   tips differ (CLAUDE.md -> Branch flow).
 2. Lists every PR merged into `feat/agent-fleet` that is not on `main` yet
    (first-parent `git log main..feat/agent-fleet`, back-merge PRs skipped),
    with risk and touched files. Money-path PRs go first.
 3. Opens the promote PR (head `feat/agent-fleet`, labels `promote` +
-   `needs-wilson`) or re-renders the body of the open one. Only the block
+   `needs-wilson`) or re-renders the body of the open one. A hand-cut
+   `promote/*` PR (a frozen promote) wins: the script closes its own PR
+   and stands down until the frozen one is merged or closed. Only the block
    between the markers is rewritten; anything Wilson adds outside it stays.
    It never enables auto-merge.
 4. Comments once per Linear issue (`AFX-<n>` in a listed PR title) with a
@@ -186,21 +190,27 @@ def merge_body(existing: str | None, section: str) -> str:
     return existing.rstrip() + "\n\n" + section
 
 
+def find_auto_promote(open_prs: list[dict]) -> dict | None:
+    """The open PR headed by `feat/agent-fleet`, i.e. the one this script manages."""
+    return next((pr for pr in open_prs if pr.get("headRefName") == HEAD), None)
+
+
 def select_open_promote(open_prs: list[dict]) -> tuple[dict | None, str]:
     """Pick the open promote PR into `main`, if any.
 
-    Returns `(pr, "auto")` for one headed by `feat/agent-fleet` (the one this
-    script manages), `(pr, "manual")` for a hand-cut `promote/*` or
-    `promote`-labelled PR, else `(None, "")`.
+    A hand-cut `promote/*` or `promote`-labelled PR (`"manual"`) wins over
+    the `feat/agent-fleet`-headed one (`"auto"`): cutting `promote/*` is how
+    Wilson freezes a promote, so it must take over from the live PR.
+    Returns `(None, "")` when neither is open.
     """
     for pr in open_prs:
         if pr.get("headRefName") == HEAD:
-            return pr, "auto"
-    for pr in open_prs:
+            continue
         labels = {lbl.get("name") for lbl in pr.get("labels") or []}
         if pr.get("headRefName", "").startswith("promote/") or PROMOTE_LABEL in labels:
             return pr, "manual"
-    return None, ""
+    auto = find_auto_promote(open_prs)
+    return (auto, "auto") if auto else (None, "")
 
 
 def promote_title(now: datetime) -> str:
@@ -254,13 +264,22 @@ def warn(msg: str) -> None:
     print(f"::warning ::{msg}")
 
 
-def branches_differ() -> bool:
-    return (
-        _run(
-            "git", "diff", "--quiet", f"origin/{BASE}", f"origin/{HEAD}", check=False
-        ).returncode
-        != 0
-    )
+def fleet_has_new_content() -> bool:
+    """True when merging `feat/agent-fleet` into `main` would change `main`."""
+    base, head = f"origin/{BASE}", f"origin/{HEAD}"
+    if (
+        _run("git", "merge-base", "--is-ancestor", head, base, check=False).returncode
+        == 0
+    ):
+        return False
+    res = _run("git", "merge-tree", "--write-tree", base, head, check=False)
+    if res.returncode == 1:
+        return True  # conflicts: the fleet branch carries changes main lacks
+    if res.returncode == 0:
+        merged = res.stdout.split()[0]
+        return merged != _run("git", "rev-parse", f"{base}^{{tree}}").stdout.strip()
+    warn(f"git merge-tree failed ({res.stderr.strip()}); falling back to a tip diff")
+    return _run("git", "diff", "--quiet", base, head, check=False).returncode != 0
 
 
 def unpromoted_commits() -> list[tuple[str, str]]:
@@ -332,13 +351,32 @@ class Linear:
             try:
                 self._issues[ident] = self._gql(
                     "query($id: String!) { issue(id: $id) { id identifier "
-                    "labels { nodes { name } } comments(first: 100) { nodes { body } } } }",
+                    "labels { nodes { name } } } }",
                     {"id": ident},
                 )["issue"]
             except Exception as exc:  # noqa: BLE001 - Linear must never fail the run
                 warn(f"Linear lookup failed for {ident}: {exc}")
                 self._issues[ident] = None
         return self._issues[ident]
+
+    def comment_bodies(self, issue: dict) -> list[str]:
+        """Every comment body on the issue, following pagination."""
+        if "comment_bodies" not in issue:
+            bodies: list[str] = []
+            cursor = None
+            while True:
+                page = self._gql(
+                    "query($id: String!, $after: String) { issue(id: $id) { "
+                    "comments(first: 100, after: $after) { nodes { body } "
+                    "pageInfo { hasNextPage endCursor } } } }",
+                    {"id": issue["id"], "after": cursor},
+                )["issue"]["comments"]
+                bodies += [n.get("body") or "" for n in page["nodes"]]
+                if not page["pageInfo"]["hasNextPage"]:
+                    break
+                cursor = page["pageInfo"]["endCursor"]
+            issue["comment_bodies"] = bodies
+        return issue["comment_bodies"]
 
     def risk(self, ident: str) -> str | None:
         issue = self.issue(ident)
@@ -351,7 +389,11 @@ class Linear:
         issue = self.issue(ident)
         if not issue:
             return False
-        if any(marker in (c.get("body") or "") for c in issue["comments"]["nodes"]):
+        try:
+            if any(marker in b for b in self.comment_bodies(issue)):
+                return False
+        except Exception as exc:  # noqa: BLE001
+            warn(f"Linear comment lookup failed for {ident}: {exc}")
             return False
         try:
             self._gql(
@@ -362,7 +404,7 @@ class Linear:
         except Exception as exc:  # noqa: BLE001
             warn(f"Linear comment failed for {ident}: {exc}")
             return False
-        issue["comments"]["nodes"].append({"body": body})
+        issue["comment_bodies"].append(body)
         return True
 
 
@@ -380,8 +422,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     now = datetime.now(UTC)
 
-    if not branches_differ():
-        print(f"`{BASE}` and `{HEAD}` have the same content; nothing to promote.")
+    if not fleet_has_new_content():
+        print(f"`{HEAD}` has no content `{BASE}` lacks; nothing to promote.")
         return 0
 
     open_prs = (
@@ -394,6 +436,8 @@ def main(argv: list[str] | None = None) -> int:
             BASE,
             "--state",
             "open",
+            "--limit",
+            "1000",
             "--json",
             "number,url,title,body,headRefName,labels",
         )
@@ -404,6 +448,24 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"::notice ::Hand-cut promote PR is open ({existing['url']}); not opening another."
         )
+        stale = find_auto_promote(open_prs)
+        if stale and not args.dry_run:
+            res = _run(
+                "gh",
+                "pr",
+                "close",
+                stale["url"],
+                "--comment",
+                f"Superseded by frozen promote {existing['url']}. The promote "
+                "workflow opens a fresh one once that is merged or closed.",
+                check=False,
+            )
+            if res.returncode == 0:
+                print(
+                    f"Closed live promote PR {stale['url']} in favour of the frozen one."
+                )
+            else:
+                warn(f"Could not close {stale['url']}: {res.stderr.strip()}")
         return 0
     if existing is None and args.no_create:
         print("No open promote PR and --no-create set; the push/schedule run opens it.")
