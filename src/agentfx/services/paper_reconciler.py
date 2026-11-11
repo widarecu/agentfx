@@ -345,12 +345,15 @@ def _check_position_mismatch(*, db, run, client) -> str | None:
     # double-negated shorts, producing positive when broker held short.
     try:
         pos = client.get_position(run.pair)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         # Broker call failed — can't verify. Skip this tick.
         logger.warning(
-            "reconciler: get_position failed for %s (%s) — skipping mismatch check",
+            "reconciler: get_position failed for %s (%s) — skipping mismatch check: "
+            "%s: %s",
             run.id,
             run.pair,
+            type(exc).__name__,
+            str(exc)[:300],
         )
         return None
     long_units = int(pos.get("long_units", 0) or 0)
