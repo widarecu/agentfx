@@ -121,6 +121,22 @@ Two different test categories that both touch "fake" data — be careful which o
 
 **The `seed_test_candles` fixture remains forbidden** for integration testing — fake market-shaped candles cannot stand in for OANDA data. That rule is about integration realism, not about all synthetic data; parity fixtures (above) are a separate category.
 
+### UI testing bar: state-dependent portal UI
+
+**The bar (AFX-55):** any PR that touches a Settings component — or any portal page rendering state-dependent UI driven by a backend-opt-in flag — must include a Vitest for the pure selector that drives rendering, covering every branch the user can land on.
+
+Build + types do not catch a component that stops branching (AFX-7 shipped a Pool column that read "Free" whenever opt-in was off; the DB column and types were right). Testing one state is not enough either: pin **every** visible-label delta.
+
+**Pattern — pure selector, node Vitest, no DOM:**
+
+1. Move the branching out of the JSX into a pure function `selectX(state, props) → { kind, label, ... }` that returns everything the user sees (labels, which cards render, tone classes, disabled flags). The component only renders what the selector returns.
+2. Add `portal/web/tests/unit/<x>.test.ts` with one `it` per branch, asserting the label delta.
+3. Do **not** pull in `@testing-library/react` / jsdom for this. Full-page E2E of every branch is Playwright territory, not this bar.
+
+Templates: `selectPoolColumnView` in [OandaAccountsTable.tsx](portal/web/src/components/OandaAccountsTable.tsx) (pinned by `tests/unit/poolColumnView.test.ts`), and `selectSettingsView` / `selectFleetPoolOptInView` / `selectVerifyOutcome` in [settingsView.ts](portal/web/src/pages/settingsView.ts) (pinned by `tests/unit/settingsView.test.ts`: loading / empty / unverified / verified, opt-in on / off, verify success / failure).
+
+**CI gate:** [scripts/check_settings_vitest.py](scripts/check_settings_vitest.py) (`settings-ui-test-bar` job in `ci.yml` and `agent-fleet-ci.yml`; locally `make check-settings-vitest`) flags a PR that changes a `SETTINGS_SURFACE` file without adding or changing a `portal/web/tests/unit/**/*.test.ts`. It is **advisory** (warning annotation) for now; add `--strict` in both workflows once the pattern has held for a month. When Settings starts rendering a new local component, add it to `SETTINGS_SURFACE` (the unit suite fails until you do).
+
 ### Prerequisites
 
 **Docker Desktop (or Colima/OrbStack) must be running.** That is the only dependency for Integration and E2E tests.

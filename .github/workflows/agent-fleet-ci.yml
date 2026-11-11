@@ -99,6 +99,27 @@ jobs:
         run: ENVIRONMENT=test PYTHONPATH=src pytest tests/unit/ -v -m unit --no-cov
 
   # ---------------------------------------------------------------------------
+  # AFX-55 UI testing bar: a PR touching the Settings page surface must add
+  # or change a Vitest under portal/web/tests/unit/. Advisory (warning
+  # annotation only) until the pattern has held for a month; then add
+  # `--strict` to make it fail the PR. fetch-depth 2 gives the PR merge
+  # commit plus its base parent, so HEAD^1..HEAD is exactly the PR's diff.
+  # ---------------------------------------------------------------------------
+  settings-ui-test-bar:
+    name: Settings UI testing bar (advisory)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Settings PRs must ship a Vitest (AFX-55)
+        run: python3 scripts/check_settings_vitest.py --range HEAD^1..HEAD
+
+  # ---------------------------------------------------------------------------
   # Auto-merge: for PRs opened by the PE workspace into `feat/agent-fleet`,
   # once fast-gate is green and the `agent-authored` label is set, enable
   # GitHub's auto-merge (squash). Human-authored PRs stay manual.
