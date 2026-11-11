@@ -187,6 +187,144 @@ class TestTechHealthScan:
         assert produced is False
 
 
+def _pool_anomaly() -> qa.TechnicalAnomaly:
+    return qa.TechnicalAnomaly(
+        category="oanda_pool",
+        severity="degraded",
+        headline="1 OANDA account IN_USE past lease expiry",
+        occurrences=1,
+        sample_log="account_id=STUCK run_id=crashed_run",
+        recommended_action="investigate",
+    )
+
+
+class TestTechHealthPoolFlags:
+    """AFX-8 — OANDA pool-health flags ride along on the tech-health
+    report and its email, even when the log window is quiet."""
+
+    def _quiet_buffer(self):
+        from agentfx.agents.fleet.log_buffer import LogBuffer
+
+        return LogBuffer()
+
+    def test_pool_flags_fire_report_even_when_logs_quiet(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_MEMORY_ROOT", str(tmp_path))
+        db = MagicMock()
+        db.query.return_value.filter.return_value.filter.return_value.first.return_value = None  # noqa: E501
+        pool = [_pool_anomaly()]
+        with (
+            patch.object(qa, "get_global_buffer", return_value=self._quiet_buffer()),
+            patch.object(qa, "_pool_health_anomalies", return_value=pool),
+            patch.object(qa, "_write_tech_report") as writer,
+        ):
+            produced = qa.scan_for_technical_anomalies(db=db)
+        assert produced is True
+        writer.assert_called_once()
+        assert writer.call_args.kwargs["pool_anomalies"] == pool
+
+    def test_pool_anomalies_built_from_account_pool_flags(self):
+        from agentfx.agents.fleet.account_pool import PoolHealthFlag
+
+        flags = [
+            PoolHealthFlag(
+                kind="in_use_past_lease",
+                headline="1 OANDA account IN_USE past lease expiry",
+                account_ids=["STUCK"],
+                detail="account_id=STUCK run_id=r lease_expires_at=x",
+            ),
+            PoolHealthFlag(
+                kind="cooling_down_backlog",
+                headline="4 OANDA accounts COOLING_DOWN (threshold 3)",
+                account_ids=["C0", "C1", "C2", "C3"],
+                detail="C0, C1, C2, C3",
+            ),
+        ]
+        with (
+            patch.object(qa.settings, "AGENT_QA_POOL_COOLING_DOWN_THRESHOLD", 3),
+            patch(
+                "agentfx.agents.fleet.account_pool.pool_health_flags",
+                return_value=flags,
+            ) as checker,
+        ):
+            anomalies = qa._pool_health_anomalies(MagicMock(), now=datetime.now())
+        assert checker.call_args.kwargs["cooling_down_threshold"] == 3
+        assert [a.category for a in anomalies] == ["oanda_pool", "oanda_pool"]
+        assert anomalies[0].occurrences == 1
+        assert anomalies[1].occurrences == 4
+        assert "IN_USE past lease" in anomalies[0].headline
+
+    def test_pool_anomaly_check_never_raises(self):
+        with patch(
+            "agentfx.agents.fleet.account_pool.pool_health_flags",
+            side_effect=RuntimeError("db down"),
+        ):
+            assert qa._pool_health_anomalies(MagicMock(), now=datetime.now()) == []
+
+    def test_pool_flags_only_skip_llm_and_reach_email(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_MEMORY_ROOT", str(tmp_path))
+        snapshot = {"window_hours": 24, "record_count": 0, "records": []}
+        with (
+            patch.object(qa, "_call_sonnet_tech") as llm,
+            patch.object(qa, "record_decision"),
+            patch.object(qa, "_email_tech_report") as emailer,
+        ):
+            qa._write_tech_report(
+                db=MagicMock(),
+                today=date(2026, 11, 11),
+                snapshot=snapshot,
+                pool_anomalies=[_pool_anomaly()],
+            )
+        llm.assert_not_called()
+        emailer.assert_called_once()
+        report = emailer.call_args.kwargs["report"]
+        body = emailer.call_args.kwargs["body"]
+        assert [a.category for a in report.anomalies] == ["oanda_pool"]
+        assert "OANDA" in report.headline
+        assert "IN_USE past lease expiry" in body
+
+    def test_pool_flags_merged_with_llm_anomalies(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_MEMORY_ROOT", str(tmp_path))
+        from agentfx.agents.fleet.llm import LLMCallResult
+
+        llm_report = qa.TechnicalHealthReport(
+            headline="No anomalies in window", summary="Quiet.", anomalies=[]
+        )
+        llm_result = MagicMock(spec=LLMCallResult)
+        llm_result.output = llm_report
+        llm_result.model = "m"
+        llm_result.reasoning = "r"
+        llm_result.usd_cost = 0.0
+        llm_result.input_tokens = llm_result.output_tokens = 0
+        llm_result.cache_read_tokens = 0
+        snapshot = {"window_hours": 24, "record_count": 15, "records": []}
+        with (
+            patch.object(qa, "_call_sonnet_tech", return_value=llm_result) as llm,
+            patch.object(qa, "record_decision"),
+            patch.object(qa, "_email_tech_report") as emailer,
+        ):
+            qa._write_tech_report(
+                db=MagicMock(),
+                today=date(2026, 11, 11),
+                snapshot=snapshot,
+                pool_anomalies=[_pool_anomaly()],
+            )
+        llm.assert_called_once()
+        emailer.assert_called_once()
+        report = emailer.call_args.kwargs["report"]
+        assert [a.category for a in report.anomalies] == ["oanda_pool"]
+        assert "OANDA" in report.headline
+
+    def test_pool_flag_rendered_in_email_html(self):
+        from agentfx.notifications.email import render_qa_tech_health_html
+
+        report = qa.TechnicalHealthReport(
+            headline="h", summary="s", anomalies=[_pool_anomaly()]
+        )
+        html = render_qa_tech_health_html(report, "body")
+        assert "oanda_pool" in html
+        assert "IN_USE past lease expiry" in html
+
+
 class TestMarkdownRender:
     def test_renders_sections_present_in_report(self):
         report = qa.QADivergenceReport(

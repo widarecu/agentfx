@@ -636,7 +636,7 @@ def _write_divergence_report(*, db: Session, run_id: str, today: date) -> None:
             run_id,
         )
         report = _deterministic_fallback(snapshot, run_id)
-        model_used: str | None = None
+        model_used = None
         reasoning = f"deterministic fallback — llm {llm.skipped_reason}"
         usd = 0.0
         input_tokens = output_tokens = cache_read = 0
@@ -1030,54 +1030,115 @@ def scan_for_technical_anomalies(*, db: Session, now: datetime | None = None) ->
         return False
 
     snapshot = _snapshot_logs(hours_back=24)
-    if snapshot["record_count"] < _MIN_LOGS_FOR_TECH_HEALTH:
+    pool_anomalies = _pool_health_anomalies(db, now=now)
+    if snapshot["record_count"] < _MIN_LOGS_FOR_TECH_HEALTH and not pool_anomalies:
         logger.info(
             "qa_agent: skipping tech-health report (only %d WARNING+ records "
-            "in last 24h; threshold=%d)",
+            "in last 24h; threshold=%d; no pool flags)",
             snapshot["record_count"],
             _MIN_LOGS_FOR_TECH_HEALTH,
         )
         return False
 
     try:
-        _write_tech_report(db=db, today=today, snapshot=snapshot)
+        _write_tech_report(
+            db=db, today=today, snapshot=snapshot, pool_anomalies=pool_anomalies
+        )
         return True
     except Exception:
         logger.exception("qa_agent: tech-health report failed")
         return False
 
 
-def _write_tech_report(*, db: Session, today: date, snapshot: dict[str, Any]) -> None:
-    llm = _call_sonnet_tech(snapshot)
-    if llm.output is None:
-        logger.info(
-            "qa_agent: tech-health LLM skipped (%s); using fallback",
-            llm.skipped_reason,
+def _pool_health_anomalies(db: Session, *, now: datetime) -> list[TechnicalAnomaly]:
+    """OANDA pool-health flags (AFX-8) as tech-health anomalies.
+
+    Deterministic — no LLM. Never raises; a failed check yields [].
+    """
+    try:
+        from agentfx.agents.fleet.account_pool import pool_health_flags
+
+        flags = pool_health_flags(
+            db,
+            now=now,
+            cooling_down_threshold=settings.AGENT_QA_POOL_COOLING_DOWN_THRESHOLD,
         )
-        report = TechnicalHealthReport(
-            headline=(
-                f"Tech-health scan — {snapshot['record_count']} WARNING+ records "
-                "in last 24h; LLM classification unavailable"
+    except Exception:
+        logger.exception("qa_agent: OANDA pool-health check failed")
+        return []
+    return [
+        TechnicalAnomaly(
+            category="oanda_pool",
+            severity="degraded",
+            headline=f.headline,
+            occurrences=len(f.account_ids),
+            first_seen=now.isoformat(),
+            sample_log=f.detail,
+            recommended_action=(
+                "investigate stuck paper run / release the account"
+                if f.kind == "in_use_past_lease"
+                else "investigate why accounts are not returning to FREE"
             ),
+        )
+        for f in flags
+    ]
+
+
+def _write_tech_report(
+    *,
+    db: Session,
+    today: date,
+    snapshot: dict[str, Any],
+    pool_anomalies: list[TechnicalAnomaly] | None = None,
+) -> None:
+    pool_anomalies = pool_anomalies or []
+    model_used: str | None = None
+    usd = 0.0
+    input_tokens = output_tokens = cache_read = 0
+    if snapshot["record_count"] < _MIN_LOGS_FOR_TECH_HEALTH:
+        # Only pool flags warranted this report; skip the LLM spend.
+        report = TechnicalHealthReport(
+            headline="OANDA pool health needs attention",
             summary=(
-                "LLM analysis skipped. Record count exceeded threshold so "
-                "a scan was warranted, but Sonnet was unreachable. "
-                "Raw records logged in agent_memory/tech_health/."
+                f"Log window quiet ({snapshot['record_count']} WARNING+ records "
+                "in last 24h, below the LLM threshold); deterministic OANDA "
+                "pool-health checks raised the flags below."
             ),
             anomalies=[],
         )
-        model_used: str | None = None
-        reasoning = f"deterministic fallback — llm {llm.skipped_reason}"
-        usd = 0.0
-        input_tokens = output_tokens = cache_read = 0
+        reasoning = "deterministic — OANDA pool-health flags only"
     else:
-        report = llm.output
-        model_used = llm.model
-        reasoning = llm.reasoning or "Sonnet structured output; no prose."
-        usd = llm.usd_cost
-        input_tokens = llm.input_tokens
-        output_tokens = llm.output_tokens
-        cache_read = llm.cache_read_tokens
+        llm = _call_sonnet_tech(snapshot)
+        if llm.output is None:
+            logger.info(
+                "qa_agent: tech-health LLM skipped (%s); using fallback",
+                llm.skipped_reason,
+            )
+            report = TechnicalHealthReport(
+                headline=(
+                    f"Tech-health scan — {snapshot['record_count']} WARNING+ "
+                    "records in last 24h; LLM classification unavailable"
+                ),
+                summary=(
+                    "LLM analysis skipped. Record count exceeded threshold so "
+                    "a scan was warranted, but Sonnet was unreachable. "
+                    "Raw records logged in agent_memory/tech_health/."
+                ),
+                anomalies=[],
+            )
+            reasoning = f"deterministic fallback — llm {llm.skipped_reason}"
+        else:
+            report = llm.output
+            model_used = llm.model
+            reasoning = llm.reasoning or "Sonnet structured output; no prose."
+            usd = llm.usd_cost
+            input_tokens = llm.input_tokens
+            output_tokens = llm.output_tokens
+            cache_read = llm.cache_read_tokens
+        if pool_anomalies:
+            report.headline = f"OANDA pool health needs attention · {report.headline}"
+
+    report.anomalies = [*pool_anomalies, *report.anomalies]
 
     body_md = _render_tech_markdown(report, today, snapshot["record_count"])
 
@@ -1094,6 +1155,7 @@ def _write_tech_report(*, db: Session, today: date, snapshot: dict[str, Any]) ->
             inputs={
                 "window_hours": snapshot["window_hours"],
                 "record_count": snapshot["record_count"],
+                "pool_flag_count": len(pool_anomalies),
             },
             outputs={"report": report.model_dump()},
             reasoning=reasoning,

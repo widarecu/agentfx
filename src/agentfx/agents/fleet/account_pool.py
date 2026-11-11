@@ -39,7 +39,7 @@ when consented, are refused — pool allocation returns
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.orm import Session
@@ -65,6 +65,11 @@ _DEFAULT_LEASE_DAYS = 365
 # runs across the entire pool. Prevents runaway even if the operator
 # consents a huge number of sub-accounts.
 _MAX_CONCURRENT_PAPER_RUNS = 10
+
+# AFX-8: QA tech-health flags the pool when more than this many
+# sub-accounts sit in COOLING_DOWN. Overridable via
+# `settings.AGENT_QA_POOL_COOLING_DOWN_THRESHOLD`.
+_DEFAULT_COOLING_DOWN_ALERT_THRESHOLD = 3
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -424,9 +429,96 @@ def pool_summary(db: Session, *, now: datetime | None = None) -> dict:
     }
 
 
+@dataclass
+class PoolHealthFlag:
+    """One pool-health problem surfaced to the QA tech-health report.
+
+    `kind` is `in_use_past_lease` or `cooling_down_backlog`.
+    """
+
+    kind: str
+    headline: str
+    account_ids: list[str] = field(default_factory=list)
+    detail: str = ""
+
+
+def _as_utc(value: datetime) -> datetime:
+    # SQLite drops tz-info on stored DateTime columns; Postgres keeps it.
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
+def _plural(n: int) -> str:
+    return "account" if n == 1 else "accounts"
+
+
+def pool_health_flags(
+    db: Session,
+    *,
+    now: datetime | None = None,
+    cooling_down_threshold: int = _DEFAULT_COOLING_DOWN_ALERT_THRESHOLD,
+) -> list[PoolHealthFlag]:
+    """Read-only pool health check for QA tech-health (AFX-8).
+
+    Flags (a) IN_USE rows whose `lease_expires_at` has passed — a
+    paper run crashed or was never released, and the row stays stuck
+    until the next allocation sweeps it — and (b) more than
+    `cooling_down_threshold` rows in COOLING_DOWN.
+
+    Never mutates rows; the allocator owns the sweeps.
+    """
+    now = _as_utc(now or datetime.now(UTC))
+    flags: list[PoolHealthFlag] = []
+
+    in_use_rows = (
+        db.query(UserOandaAccount)
+        .filter(UserOandaAccount.pool_status == UserOandaAccountPoolStatus.IN_USE)
+        .filter(UserOandaAccount.lease_expires_at.isnot(None))
+        .all()
+    )
+    expired = [r for r in in_use_rows if _as_utc(r.lease_expires_at) <= now]
+    if expired:
+        flags.append(
+            PoolHealthFlag(
+                kind="in_use_past_lease",
+                headline=(
+                    f"{len(expired)} OANDA {_plural(len(expired))} "
+                    "IN_USE past lease expiry"
+                ),
+                account_ids=[r.oanda_account_id for r in expired],
+                detail="; ".join(
+                    f"account_id={r.oanda_account_id} run_id={r.current_run_id} "
+                    f"lease_expires_at={_as_utc(r.lease_expires_at).isoformat()}"
+                    for r in expired
+                ),
+            )
+        )
+
+    cooling_rows = (
+        db.query(UserOandaAccount)
+        .filter(UserOandaAccount.pool_status == UserOandaAccountPoolStatus.COOLING_DOWN)
+        .all()
+    )
+    if len(cooling_rows) > cooling_down_threshold:
+        flags.append(
+            PoolHealthFlag(
+                kind="cooling_down_backlog",
+                headline=(
+                    f"{len(cooling_rows)} OANDA {_plural(len(cooling_rows))} "
+                    f"COOLING_DOWN (threshold {cooling_down_threshold})"
+                ),
+                account_ids=[r.oanda_account_id for r in cooling_rows],
+                detail="account_ids="
+                + ", ".join(r.oanda_account_id for r in cooling_rows),
+            )
+        )
+    return flags
+
+
 __all__ = [
+    "PoolHealthFlag",
     "SlotAllocation",
     "allocate_slot",
     "release_slot",
     "pool_summary",
+    "pool_health_flags",
 ]

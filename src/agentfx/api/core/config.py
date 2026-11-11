@@ -436,6 +436,14 @@ class Settings(BaseSettings):
         env="AGENT_QA_MODEL",
         description="Quant Analyst Agent model (divergence reports).",
     )
+    AGENT_QA_POOL_COOLING_DOWN_THRESHOLD: int = Field(
+        default=3,
+        env="AGENT_QA_POOL_COOLING_DOWN_THRESHOLD",
+        description=(
+            "QA tech-health flags the OANDA pool when more than this many "
+            "sub-accounts are COOLING_DOWN (AFX-8)."
+        ),
+    )
     AGENT_PE_MODEL: str = Field(
         default="claude-opus-5",
         env="AGENT_PE_MODEL",
