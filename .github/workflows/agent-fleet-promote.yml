@@ -36,7 +36,8 @@ on:
       - feat/agent-fleet
     types: [closed]
   schedule:
-    - cron: "*/30 * * * *"
+    # Off the :00/:30 peak; GitHub delays or drops scheduled runs at busy minutes.
+    - cron: "17,47 * * * *"
   workflow_dispatch:
 
 permissions: {}
