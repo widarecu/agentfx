@@ -300,7 +300,9 @@ class MarketDataService:
 
         result = []
         created_count = 0
-        updated_count = 0
+        created_incomplete_count = 0
+        completed_count = 0  # incomplete row → complete (bar closed)
+        updated_incomplete_count = 0  # incomplete row, still incomplete
         skipped_count = 0
 
         # Normalise all timestamps to datetime objects so comparisons
@@ -377,7 +379,10 @@ class MarketDataService:
                     existing.run_id = run_id
                 db.add(existing)
                 result.append(existing)
-                updated_count += 1
+                if existing.complete:
+                    completed_count += 1
+                else:
+                    updated_incomplete_count += 1
             else:
                 # Create new candle
                 db_candle = models.Candle(
@@ -390,6 +395,8 @@ class MarketDataService:
                 db.add(db_candle)
                 result.append(db_candle)
                 created_count += 1
+                if not candle_data.get("complete", True):
+                    created_incomplete_count += 1
 
         try:
             db.commit()
@@ -398,13 +405,22 @@ class MarketDataService:
                 logger.debug(
                     f"Skipped {skipped_count} complete candles for {instrument}:{timeframe}"
                 )
+            # Counts reflect the state just written, not the prior DB row
+            # (AFX-87: a bar closing used to log as "Updated incomplete").
             if created_count > 0:
                 logger.info(
-                    f"Created {created_count} candles for {instrument}:{timeframe}"
+                    f"Created {created_count} candles for {instrument}:{timeframe} "
+                    f"({created_count - created_incomplete_count} complete, "
+                    f"{created_incomplete_count} incomplete)"
                 )
-            if updated_count > 0:
+            if completed_count > 0:
                 logger.info(
-                    f"Updated {updated_count} incomplete candles for {instrument}:{timeframe}"
+                    f"Completed {completed_count} candles for {instrument}:{timeframe}"
+                )
+            if updated_incomplete_count > 0:
+                logger.info(
+                    f"Updated {updated_incomplete_count} incomplete candles "
+                    f"for {instrument}:{timeframe}"
                 )
         except Exception as e:
             db.rollback()

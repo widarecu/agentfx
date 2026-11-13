@@ -1,6 +1,7 @@
 """Unit tests for the market data service."""
 
-from datetime import datetime
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -149,6 +150,56 @@ class TestMarketDataService:
         assert len(result) == 2
         mock_db.add.assert_called()
         mock_db.commit.assert_called()
+
+    @patch("agentfx.api.schemas.market_data.CandlePublic")
+    def test_create_candles_mixed_complete_persists_new_state(
+        self, mock_candle_public, mock_db, caplog
+    ):
+        """AFX-87: the just-closed bar's row flips to complete=True and is
+        logged as completed, not as an "updated incomplete" candle."""
+        import logging
+
+        from src.agentfx.api.services import market_data as md
+
+        closed_ts = datetime(2026, 11, 13, 10, 0, tzinfo=UTC)
+        forming_ts = datetime(2026, 11, 13, 10, 30, tzinfo=UTC)
+        existing = SimpleNamespace(timestamp=closed_ts, complete=False, run_id=None)
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.all.return_value = [existing]
+
+        def _bar(ts, complete):
+            return {
+                "timestamp": ts,
+                "open": 1.1,
+                "high": 1.2,
+                "low": 1.0,
+                "close": 1.15,
+                "volume": 10,
+                "complete": complete,
+            }
+
+        with caplog.at_level(logging.INFO, logger=md.logger.name):
+            MarketDataService.create_candles(
+                mock_db,
+                exchange="oanda",
+                instrument="EUR_USD",
+                timeframe="M30",
+                candles_data=[_bar(closed_ts, True), _bar(forming_ts, False)],
+            )
+
+        assert existing.complete is True
+        added = [c.args[0] for c in mock_db.add.call_args_list]
+        created = [r for r in added if r is not existing]
+        assert len(created) == 1
+        assert created[0].complete is False
+        messages = [r.getMessage() for r in caplog.records]
+        assert "Completed 1 candles for EUR_USD:M30" in messages
+        assert (
+            "Created 1 candles for EUR_USD:M30 (0 complete, 1 incomplete)" in messages
+        )
+        assert not any(m.startswith("Updated") for m in messages)
 
     def test_create_candles_validation_failure(self, mock_db):
         """Test candle creation with invalid data."""

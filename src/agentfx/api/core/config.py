@@ -278,11 +278,21 @@ class Settings(BaseSettings):
         env="INGESTION_ALIGNMENT_BUFFER_SECONDS",
         description=(
             "Seconds after each minute boundary to wake the ingestion "
-            "loop. OANDA typically has closed bars available within "
-            "~1s of bar close; 3s gives comfortable margin without "
-            "wasted latency. Bump if OANDA's post-close latency ever "
-            "grows. Must be < SIGNAL_TICK_OFFSET_SECONDS or the paper "
-            "runner will race the ingester."
+            "loop. OANDA usually has the closed bar within ~1s, but a "
+            "bar is only in the DB once its combination has been "
+            "polled, so close-to-complete latency is this buffer plus "
+            "the bar's position in the poll cycle (just-closed "
+            "combinations go first)."
+        ),
+    )
+
+    INGESTION_POLL_CONCURRENCY: int = Field(
+        default=4,
+        env="INGESTION_POLL_CONCURRENCY",
+        description=(
+            "Max OANDA candle requests in flight per ingestion poll "
+            "cycle. Higher shortens the cycle; keep well under OANDA's "
+            "REST rate limit (the health check runs its own 4 workers)."
         ),
     )
 
@@ -291,11 +301,12 @@ class Settings(BaseSettings):
         env="SIGNAL_TICK_OFFSET_SECONDS",
         description=(
             "Seconds after each granularity boundary to fire paper-run "
-            "signal ticks. Must be > INGESTION_ALIGNMENT_BUFFER_SECONDS "
-            "+ typical ingestion cycle duration (observed 2-6s), so the "
-            "just-closed bar is guaranteed to be in the DB when the "
-            "runner evaluates. Default 10s: ingester finishes by ~:09, "
-            "runner ticks at :10, order placement lands ~:10-:11."
+            "signal ticks. Should exceed INGESTION_ALIGNMENT_BUFFER_SECONDS "
+            "+ the time to poll the just-closed combinations, so the bar "
+            "is usually in the DB at the tick. It is not guaranteed: when "
+            "the just-closed bar is still missing, the runner re-checks "
+            "every 5s for up to 300s (AFX-87) before treating the tick as "
+            "stale."
         ),
     )
 

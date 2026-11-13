@@ -15,6 +15,7 @@ from src.agentfx.api.workers.candle_ingestion import (
     _get_backfill_start_time,
     _merge_nearby_gaps,
     _next_poll_wake_time,
+    _poll_order,
     backfill_instrument,
     detect_and_heal_gaps,
     fetch_and_store_recent,
@@ -1292,3 +1293,130 @@ class TestNextPollWakeTime:
         # "~3s post bar close before ingestion completes" depends on
         # this value.
         assert INGESTION_ALIGNMENT_BUFFER_SECONDS == 3
+
+
+@pytest.mark.unit
+class TestPollOrder:
+    """AFX-87: just-closed combinations are polled first."""
+
+    INSTRUMENTS = ["EUR_USD", "AUD_USD"]
+    GRANULARITIES = ["M1", "M5", "M30", "H1", "H4", "D"]
+
+    def test_half_hour_polls_m30_before_m5_and_m1(self):
+        now = datetime(2026, 11, 13, 10, 30, 3, tzinfo=UTC)
+        combos, just_closed = _poll_order(self.INSTRUMENTS, self.GRANULARITIES, now)
+
+        assert just_closed == 6
+        assert combos[:6] == [
+            ("EUR_USD", "M30"),
+            ("AUD_USD", "M30"),
+            ("EUR_USD", "M5"),
+            ("AUD_USD", "M5"),
+            ("EUR_USD", "M1"),
+            ("AUD_USD", "M1"),
+        ]
+        assert sorted(combos) == sorted(
+            (i, g) for i in self.INSTRUMENTS for g in self.GRANULARITIES
+        )
+
+    def test_top_of_hour_puts_h1_first(self):
+        now = datetime(2026, 11, 13, 11, 0, 3, tzinfo=UTC)
+        combos, just_closed = _poll_order(self.INSTRUMENTS, self.GRANULARITIES, now)
+
+        assert just_closed == 8
+        assert combos[0] == ("EUR_USD", "H1")
+        # H4/D are NY-aligned on OANDA (AFX-88); never "just closed".
+        assert {g for _, g in combos[just_closed:]} == {"H4", "D"}
+
+    def test_mid_bar_minute_only_m1_just_closed(self):
+        now = datetime(2026, 11, 13, 10, 31, 3, tzinfo=UTC)
+        combos, just_closed = _poll_order(self.INSTRUMENTS, self.GRANULARITIES, now)
+
+        assert just_closed == 2
+        assert combos[:2] == [("EUR_USD", "M1"), ("AUD_USD", "M1")]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestPollCycle:
+    async def test_bounded_concurrency_in_priority_order(self):
+        import asyncio
+        import concurrent.futures
+        import threading
+        import time as _time
+
+        from src.agentfx.api.workers import candle_ingestion as ci
+
+        started: list[tuple[str, str]] = []
+        lock = threading.Lock()
+        state = {"in_flight": 0, "peak": 0}
+
+        def fake_fetch(instrument, granularity, count):
+            with lock:
+                started.append((instrument, granularity))
+                state["in_flight"] += 1
+                state["peak"] = max(state["peak"], state["in_flight"])
+            _time.sleep(0.02)
+            with lock:
+                state["in_flight"] -= 1
+            if instrument == "USD_CAD" and granularity == "M5":
+                raise RuntimeError("boom")
+            return 1
+
+        instruments = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CHF", "USD_CAD"]
+        with (
+            patch.object(ci, "_fetch_and_store_recent_pooled", fake_fetch),
+            patch.object(ci, "settings") as mock_settings,
+        ):
+            mock_settings.instruments_list = instruments
+            mock_settings.granularities_list = ["M1", "M5", "M30", "D"]
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+            try:
+                combos, just_closed, stored, failed = await ci._poll_cycle(
+                    executor, datetime(2026, 11, 13, 10, 30, 3, tzinfo=UTC)
+                )
+            finally:
+                executor.shutdown(wait=True)
+
+        assert (combos, just_closed, stored, failed) == (24, 18, 23, 1)
+        assert 1 < state["peak"] <= 3
+        assert {g for _, g in started[:3]} == {"M30"}
+        assert {g for _, g in started[-6:]} == {"D"}
+
+    async def test_health_check_runs_in_background(self):
+        """AFX-87: a slow health check must not delay the poll."""
+        import asyncio
+
+        from src.agentfx.api.workers import candle_ingestion as ci
+
+        shutdown = asyncio.Event()
+        health_started = asyncio.Event()
+        health_release = asyncio.Event()
+        polls: list[bool] = []
+
+        async def slow_health_check():
+            health_started.set()
+            await health_release.wait()
+            return 0, False
+
+        async def fake_poll(_executor, _now):
+            await asyncio.sleep(0)
+            polls.append(health_started.is_set() and not health_release.is_set())
+            shutdown.set()
+            return 0, 0, 0, 0
+
+        with (
+            patch.object(ci, "startup_backfill", MagicMock(side_effect=_async_none)),
+            patch.object(ci, "run_health_check", slow_health_check),
+            patch.object(ci, "_poll_cycle", fake_poll),
+            patch.object(ci, "_shutdown_event", shutdown),
+        ):
+            await asyncio.wait_for(ci.ingestion_loop(), timeout=5)
+
+        # The poll ran while the health check was still in flight, and
+        # shutdown cancelled the pending check cleanly.
+        assert polls == [True]
+
+
+async def _async_none():
+    return 0

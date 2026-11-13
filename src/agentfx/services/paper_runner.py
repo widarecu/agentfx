@@ -86,6 +86,19 @@ DEFAULT_LOOKBACK_BARS = 500
 # outages. 150s tolerance → M1 threshold 210s = 3.5 bar lengths.
 INGEST_LAG_TOLERANCE_SECONDS = 150
 
+# AFX-87: on late-polled pairs the just-closed bar can land in the DB
+# after the signal tick. Instead of rejecting the tick as stale and
+# waiting a full period for the next one, re-check every few seconds
+# until the bar arrives or the cap runs out. Observed close-to-complete
+# tails reach ~240s on M30, so cap at 300s (and never past the next
+# boundary on short granularities).
+JUST_CLOSED_BAR_RETRY_SECONDS = 5.0
+JUST_CLOSED_BAR_MAX_WAIT_SECONDS = 300.0
+# OANDA aligns H4/D bars to 17:00 America/New_York, not the UTC epoch
+# grid the scheduler uses (AFX-88), so `boundary - g` is never an
+# OANDA bar there. Only wait on granularities up to H1.
+JUST_CLOSED_BAR_WAIT_MAX_GRANULARITY_SECONDS = 3600
+
 # Consecutive non-auth OANDA failures on the balance refresh before we
 # give up and halt with `BROKER_NETWORK`.
 #
@@ -226,6 +239,59 @@ def align_to_granularity(now_ts: float, granularity_seconds: int) -> float:
         return now_ts
     remainder = now_ts % granularity_seconds
     return now_ts + (granularity_seconds - remainder)
+
+
+def _due_boundary(now_ts: float, tick_offset: float, granularity_seconds: int) -> float:
+    """Latest granularity boundary whose signal tick (boundary + offset)
+    is at or before `now_ts`."""
+    if granularity_seconds <= 0:
+        return now_ts
+    shifted = now_ts - tick_offset
+    return shifted - (shifted % granularity_seconds)
+
+
+def _bar_wait_cap_seconds(granularity_seconds: int, tick_offset: float) -> float:
+    """How long past the tick to wait for the just-closed bar (AFX-87)."""
+    if granularity_seconds > JUST_CLOSED_BAR_WAIT_MAX_GRANULARITY_SECONDS:
+        return 0.0
+    return max(
+        0.0,
+        min(JUST_CLOSED_BAR_MAX_WAIT_SECONDS, granularity_seconds - tick_offset),
+    )
+
+
+def _just_closed_bar_missing(
+    *,
+    candle_fetch_fn,
+    instrument: str,
+    granularity_seconds: int,
+    expected_bar_ts: datetime,
+) -> bool:
+    """True when the newest complete bar is exactly one bar behind
+    `expected_bar_ts`, i.e. the ingester hasn't marked the just-closed
+    bar complete yet.
+
+    Bigger gaps (weekend, outage, sparse M1 minutes) return False so
+    the stale guard in `_signal_tick` handles them exactly as before.
+    Uses the cheap last-N-bars fetch, not the fold-anchored range.
+    """
+    granularity = _seconds_to_granularity(granularity_seconds)
+    try:
+        df = candle_fetch_fn(instrument, granularity, 3)
+    except Exception:  # noqa: BLE001 — fall through to the real tick
+        logger.debug("paper runner: just-closed bar probe failed", exc_info=True)
+        return False
+    if df is None or len(df) == 0:
+        return False
+    latest = df.index[-1]
+    if hasattr(latest, "to_pydatetime"):
+        latest = latest.to_pydatetime()
+    if not isinstance(latest, datetime):
+        return False
+    if latest.tzinfo is None:
+        latest = latest.replace(tzinfo=UTC)
+    previous_bar_ts = expected_bar_ts - timedelta(seconds=granularity_seconds)
+    return previous_bar_ts <= latest < expected_bar_ts
 
 
 def pip_size_for_pair(pair: str) -> float:
@@ -591,6 +657,9 @@ def _execute_loop(
     from agentfx.api.core.config import settings
 
     _tick_offset = float(settings.SIGNAL_TICK_OFFSET_SECONDS)
+    _bar_wait_cap = _bar_wait_cap_seconds(granularity_seconds, _tick_offset)
+    # AFX-87: boundary whose tick is waiting for its just-closed bar.
+    pending_boundary: float | None = None
     next_signal_at = (
         align_to_granularity(now_fn(), granularity_seconds) + _tick_offset
         if signal_enabled
@@ -802,45 +871,76 @@ def _execute_loop(
         # ─── Signal tick (only when past the boundary) ───────────────
         now = now_fn()
         if signal_enabled and now >= next_signal_at:
-            try:
-                _signal_tick(
-                    db=db,
-                    run=run,
-                    client=client,
-                    strategy=strategy,
-                    candle_fetch_fn=candle_fetch_fn,
-                    instrument=instrument,
-                    granularity_seconds=granularity_seconds,
-                    now_utc=datetime.fromtimestamp(now, tz=UTC),
-                )
-            except Exception as exc:  # noqa: BLE001
-                # Signal work is best-effort — a compilation failure /
-                # arithmetic overflow / OANDA network blip mustn't take
-                # the whole runner down. Log and continue; the health
-                # tick keeps the kill switch responsive.
-                logger.exception(
-                    "paper runner: signal tick failed on %s; skipping this bar",
-                    run.id,
-                )
-                _record_tick_failure(db=db, run=run, exc=exc)
-            else:
-                _clear_tick_failure(db=db, run=run)
-            # Advance to the NEXT boundary strictly after `now`.
-            # `align_to_granularity` handles both cases: if `now` is
-            # exactly on a boundary it returns `now + granularity` (so
-            # we don't re-fire the current tick); otherwise it rounds
-            # up to the next boundary.
-            #
-            # BUG FIXED 2026-07-15 (Wilson UAT): previously we did
-            # `align(now + granularity, granularity)` — that overshoots
-            # by one bar. If tick fires at 12:47:00.230, `now + 60` is
-            # 12:48:00.230 which rounds up to 12:49:00 — skipping the
-            # 12:48 boundary. Result: every M1 tick was on 2-minute
-            # cadence, missing half the signals. Wilson lost the 13:03
-            # MACD cross_up because the 13:06 catch-up tick was skipped.
-            next_signal_at = (
-                align_to_granularity(now, granularity_seconds) + _tick_offset
+            if pending_boundary is None:
+                pending_boundary = _due_boundary(now, _tick_offset, granularity_seconds)
+            boundary = pending_boundary
+            wait_deadline = boundary + _tick_offset + _bar_wait_cap
+            expected_bar_ts = datetime.fromtimestamp(
+                boundary - granularity_seconds, tz=UTC
             )
+            if now < wait_deadline and _just_closed_bar_missing(
+                candle_fetch_fn=candle_fetch_fn,
+                instrument=instrument,
+                granularity_seconds=granularity_seconds,
+                expected_bar_ts=expected_bar_ts,
+            ):
+                if now - boundary - _tick_offset < JUST_CLOSED_BAR_RETRY_SECONDS:
+                    logger.info(
+                        "paper runner: %s waiting for just-closed %s bar %s "
+                        "(retry every %.0fs, up to %.0fs)",
+                        run.id,
+                        instrument,
+                        expected_bar_ts.isoformat(),
+                        JUST_CLOSED_BAR_RETRY_SECONDS,
+                        _bar_wait_cap,
+                    )
+                next_signal_at = min(now + JUST_CLOSED_BAR_RETRY_SECONDS, wait_deadline)
+            else:
+                waited = now - boundary - _tick_offset
+                if waited >= JUST_CLOSED_BAR_RETRY_SECONDS:
+                    logger.info(
+                        "paper runner: %s just-closed %s bar %s %s after %.1fs "
+                        "(%.1fs after bar close)",
+                        run.id,
+                        instrument,
+                        expected_bar_ts.isoformat(),
+                        "still missing, giving up"
+                        if now >= wait_deadline
+                        else "arrived",
+                        waited,
+                        now - boundary,
+                    )
+                try:
+                    _signal_tick(
+                        db=db,
+                        run=run,
+                        client=client,
+                        strategy=strategy,
+                        candle_fetch_fn=candle_fetch_fn,
+                        instrument=instrument,
+                        granularity_seconds=granularity_seconds,
+                        now_utc=datetime.fromtimestamp(now, tz=UTC),
+                        expected_bar_ts=expected_bar_ts,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # Signal work is best-effort — a compilation failure /
+                    # arithmetic overflow / OANDA network blip mustn't take
+                    # the whole runner down. Log and continue; the health
+                    # tick keeps the kill switch responsive.
+                    logger.exception(
+                        "paper runner: signal tick failed on %s; skipping this bar",
+                        run.id,
+                    )
+                    _record_tick_failure(db=db, run=run, exc=exc)
+                else:
+                    _clear_tick_failure(db=db, run=run)
+                # Advance from the boundary just processed, not from `now`:
+                # a tick that waited for its bar (AFX-87) must not skip the
+                # next boundary's own tick, and `boundary + g` never
+                # overshoots by a bar (the 2026-07-15 every-other-M1-tick
+                # bug from `align(now + g)`).
+                pending_boundary = None
+                next_signal_at = boundary + granularity_seconds + _tick_offset
 
         # Cadence — health tick every 5s, or sooner if the next signal
         # tick is closer. Injectable `sleep_fn` so tests skip the wait
@@ -1014,6 +1114,7 @@ def _signal_tick(
     instrument: str,
     granularity_seconds: int,
     now_utc: datetime,
+    expected_bar_ts: datetime | None = None,
 ) -> None:
     """One granularity-boundary tick: fetch → walk → act.
 
@@ -1124,8 +1225,15 @@ def _signal_tick(
     # OANDA/ingester lag. Uniform tolerance across granularities
     # since the lag is set by the ingester's poll cadence, not by bar
     # length. See UAT observation 2026-07-13 (Wilson).
+    #
+    # AFX-87: a tick that waited for its just-closed bar can run past
+    # that threshold; the bar it waited for is fresh by definition.
     stale_threshold_seconds = granularity_seconds + INGEST_LAG_TOLERANCE_SECONDS
-    if (now_utc - latest_dt).total_seconds() > stale_threshold_seconds:
+    has_expected_bar = expected_bar_ts is not None and latest_dt >= expected_bar_ts
+    if (
+        not has_expected_bar
+        and (now_utc - latest_dt).total_seconds() > stale_threshold_seconds
+    ):
         logger.info(
             "paper runner: %s signal tick skipped: stale candles "
             "(latest %s %s bar %s, now %s)",
