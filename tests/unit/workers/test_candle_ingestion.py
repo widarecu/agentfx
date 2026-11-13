@@ -368,6 +368,26 @@ class TestBackfillInstrument:
             mock_dependencies["fetch"].assert_called_once()
             mock_dependencies["store"].assert_called_once()
 
+    def test_full_history_ignores_recently_polled_candles(self, mock_dependencies):
+        """Re-backfill after a delete must restore history even when the
+        background-concurrent poll has already re-inserted recent bars."""
+        start = datetime.now(UTC) - timedelta(hours=2)
+        recent = MagicMock()
+        recent.timestamp = datetime.now(UTC) - timedelta(minutes=1)
+        mock_dependencies["service"].get_latest_candle.return_value = recent
+        mock_dependencies["fetch"].return_value = [{"time": "2023-01-01T12:00:00Z"}]
+        mock_dependencies["store"].return_value = 120
+
+        with patch(
+            "src.agentfx.api.workers.candle_ingestion._get_backfill_start_time",
+            return_value=start,
+        ):
+            result = backfill_instrument("EUR_USD", "M1", full_history=True)
+
+        assert result == 120
+        mock_dependencies["service"].get_latest_candle.assert_not_called()
+        mock_dependencies["fetch"].assert_called_once_with("EUR_USD", "M1", start)
+
     def test_backfill_with_existing_data_gap(self, mock_dependencies):
         """Test backfill when there's a gap (data exists but outdated)."""
         # Latest candle is 2 hours ago
@@ -1420,3 +1440,19 @@ class TestPollCycle:
 
 async def _async_none():
     return 0
+
+
+@pytest.mark.unit
+def test_health_check_rebackfill_uses_full_history():
+    from src.agentfx.api.workers import candle_ingestion as ci
+
+    with (
+        patch("src.agentfx.api.core.database.SessionLocal"),
+        patch("src.agentfx.api.services.market_data.MarketDataService") as svc,
+        patch.object(ci, "validate_backfill_completeness", return_value=False),
+        patch.object(ci, "backfill_instrument", return_value=7) as backfill,
+    ):
+        assert ci._health_check_one("EUR_USD", "M30") == (7, False)
+
+    svc.delete_candles.assert_called_once()
+    assert backfill.call_args.kwargs["full_history"] is True

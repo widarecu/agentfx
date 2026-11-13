@@ -286,6 +286,9 @@ def store_candles(
         granularity: The candle granularity
         candles: List of candle dictionaries from OANDA
         db: Optional database session for testing. If None, creates a new session.
+        full_history: Backfill from BACKFILL_DAYS ago regardless of the
+            latest stored candle. Used after a re-backfill delete, where
+            the concurrent poll may already have re-inserted recent bars.
 
     Returns:
         Number of candles stored
@@ -529,7 +532,9 @@ def heal_large_gap(
     return total_stored
 
 
-def backfill_instrument(instrument: str, granularity: str, db=None) -> int:
+def backfill_instrument(
+    instrument: str, granularity: str, db=None, *, full_history: bool = False
+) -> int:
     """Backfill candles for a single instrument/granularity.
 
     Detects gaps and fills appropriately:
@@ -555,11 +560,15 @@ def backfill_instrument(instrument: str, granularity: str, db=None) -> int:
         db = SessionLocal()
 
     try:
-        latest = MarketDataService.get_latest_candle(
-            db=db,
-            exchange="oanda",
-            instrument=instrument,
-            timeframe=granularity,
+        latest = (
+            None
+            if full_history
+            else MarketDataService.get_latest_candle(
+                db=db,
+                exchange="oanda",
+                instrument=instrument,
+                timeframe=granularity,
+            )
         )
 
         if latest is None:
@@ -1006,7 +1015,9 @@ def _health_check_one(instrument: str, granularity: str) -> tuple[int, bool]:
             MarketDataService.delete_candles(db, "oanda", instrument, granularity)
             # Pass the same db session so backfill uses the same connection
             # and the delete + insert are visible within the same session
-            stored = backfill_instrument(instrument, granularity, db=db)
+            stored = backfill_instrument(
+                instrument, granularity, db=db, full_history=True
+            )
             return stored, False
 
         # Step 2: Detect and heal gaps
