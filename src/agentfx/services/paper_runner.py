@@ -871,8 +871,23 @@ def _execute_loop(
         # ─── Signal tick (only when past the boundary) ───────────────
         now = now_fn()
         if signal_enabled and now >= next_signal_at:
+            due_boundary = _due_boundary(now, _tick_offset, granularity_seconds)
+            if pending_boundary is not None and due_boundary > pending_boundary:
+                # The loop stalled (e.g. balance retries) past the next
+                # boundary's tick; the old wait's freshness exemption no
+                # longer applies, so start over on the current boundary.
+                logger.info(
+                    "paper runner: %s dropping wait for %s bar %s; "
+                    "loop resumed past the next boundary",
+                    run.id,
+                    instrument,
+                    datetime.fromtimestamp(
+                        pending_boundary - granularity_seconds, tz=UTC
+                    ).isoformat(),
+                )
+                pending_boundary = None
             if pending_boundary is None:
-                pending_boundary = _due_boundary(now, _tick_offset, granularity_seconds)
+                pending_boundary = due_boundary
             boundary = pending_boundary
             wait_deadline = boundary + _tick_offset + _bar_wait_cap
             expected_bar_ts = datetime.fromtimestamp(

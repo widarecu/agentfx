@@ -1493,6 +1493,7 @@ class TestJustClosedBarWait:
         until: float,
         signals=(0, 0, 0),
         start: float | None = None,
+        stall: tuple[float, float] | None = None,
     ):
         """Run `_execute_loop` on a fake clock that `sleep_fn` advances.
 
@@ -1511,6 +1512,8 @@ class TestJustClosedBarWait:
 
         def sleep(seconds: float) -> None:
             clock["t"] += seconds
+            if stall is not None and stall[0] <= clock["t"] < stall[1]:
+                clock["t"] = stall[1]
             if clock["t"] >= until:
                 raise _Done
 
@@ -1598,6 +1601,34 @@ class TestJustClosedBarWait:
             max(r.fetch_times)
             < boundary + offset + JUST_CLOSED_BAR_MAX_WAIT_SECONDS + 5
         )
+
+    def test_stalled_loop_drops_old_wait_instead_of_trading_stale_data(self):
+        # The tick starts waiting for the 10:00 bar, then the loop stalls
+        # (e.g. balance retries) for an hour while ingestion also stops
+        # after that bar. Resuming must not treat the hour-old bar as the
+        # fresh just-closed bar: the stale guard applies to the current
+        # boundary instead.
+        g = 1800
+        boundary = self.BOUNDARY
+        just_closed = datetime.fromtimestamp(boundary - g, tz=UTC)
+
+        def latest_bar_at(t: float) -> datetime:
+            if t >= boundary + 20:
+                return just_closed
+            return just_closed - timedelta(seconds=g)
+
+        r = self._drive(
+            granularity_seconds=g,
+            latest_bar_at=latest_bar_at,
+            until=boundary + 3800,
+            signals=(0, 0, 1),
+            stall=(boundary + 11, boundary + 3700),
+        )
+
+        assert len(r.stale) == 1
+        assert r.snapshots == []
+        assert r.client.place_market_order.call_count == 0
+        assert "last_evaluated_bar_ts" not in r.run.parameters
 
     def test_bar_landing_late_in_wait_window_is_not_stale(self):
         # Bar lands at +250s: past the generic g+150s threshold measured
