@@ -14,6 +14,7 @@ This worker handles ALL candle data operations.
 
 import asyncio
 import logging
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 
@@ -58,6 +59,15 @@ CATCH_UP_HEALTH_CHECK_INTERVAL = 300  # 5 minutes
 # name pointing at `settings.INGESTION_ALIGNMENT_BUFFER_SECONDS` so
 # existing test imports keep working.
 INGESTION_ALIGNMENT_BUFFER_SECONDS = settings.INGESTION_ALIGNMENT_BUFFER_SECONDS
+
+# AFX-87: granularities above H1 align to 17:00 America/New_York on
+# OANDA, so "did this bar just close" can't be read off the UTC minute.
+# They're polled after the just-closed group.
+_JUST_CLOSED_MAX_GRANULARITY_SECONDS = 3600
+
+# One OandaClient per poll worker thread (reuses the HTTP session
+# instead of a fresh TLS handshake per combination every minute).
+_poll_client_local = threading.local()
 
 
 def _next_poll_wake_time(
@@ -276,6 +286,9 @@ def store_candles(
         granularity: The candle granularity
         candles: List of candle dictionaries from OANDA
         db: Optional database session for testing. If None, creates a new session.
+        full_history: Backfill from BACKFILL_DAYS ago regardless of the
+            latest stored candle. Used after a re-backfill delete, where
+            the concurrent poll may already have re-inserted recent bars.
 
     Returns:
         Number of candles stored
@@ -519,7 +532,9 @@ def heal_large_gap(
     return total_stored
 
 
-def backfill_instrument(instrument: str, granularity: str, db=None) -> int:
+def backfill_instrument(
+    instrument: str, granularity: str, db=None, *, full_history: bool = False
+) -> int:
     """Backfill candles for a single instrument/granularity.
 
     Detects gaps and fills appropriately:
@@ -545,11 +560,15 @@ def backfill_instrument(instrument: str, granularity: str, db=None) -> int:
         db = SessionLocal()
 
     try:
-        latest = MarketDataService.get_latest_candle(
-            db=db,
-            exchange="oanda",
-            instrument=instrument,
-            timeframe=granularity,
+        latest = (
+            None
+            if full_history
+            else MarketDataService.get_latest_candle(
+                db=db,
+                exchange="oanda",
+                instrument=instrument,
+                timeframe=granularity,
+            )
         )
 
         if latest is None:
@@ -996,7 +1015,9 @@ def _health_check_one(instrument: str, granularity: str) -> tuple[int, bool]:
             MarketDataService.delete_candles(db, "oanda", instrument, granularity)
             # Pass the same db session so backfill uses the same connection
             # and the delete + insert are visible within the same session
-            stored = backfill_instrument(instrument, granularity, db=db)
+            stored = backfill_instrument(
+                instrument, granularity, db=db, full_history=True
+            )
             return stored, False
 
         # Step 2: Detect and heal gaps
@@ -1130,7 +1151,9 @@ async def startup_backfill() -> int:
     return total_stored
 
 
-def fetch_and_store_recent(instrument: str, granularity: str, count: int = 10) -> int:
+def fetch_and_store_recent(
+    instrument: str, granularity: str, count: int = 10, client=None
+) -> int:
     """Fetch recent candles for continuous polling.
 
     This is used in the main ingestion loop to keep data current.
@@ -1139,6 +1162,7 @@ def fetch_and_store_recent(instrument: str, granularity: str, count: int = 10) -
         instrument: The instrument symbol
         granularity: The candle granularity
         count: Number of recent candles to fetch
+        client: OandaClient to reuse; a new one is built when omitted
 
     Returns:
         Number of candles stored
@@ -1146,10 +1170,11 @@ def fetch_and_store_recent(instrument: str, granularity: str, count: int = 10) -
     from agentfx.adapters.oanda import OandaClient, OandaError
 
     try:
-        client = OandaClient(
-            api_key=settings.OANDA_API_KEY,
-            host=settings.OANDA_API_HOST,
-        )
+        if client is None:
+            client = OandaClient(
+                api_key=settings.OANDA_API_KEY,
+                host=settings.OANDA_API_HOST,
+            )
         candles = client.get_candles(
             instrument=instrument,
             granularity=granularity,
@@ -1161,15 +1186,117 @@ def fetch_and_store_recent(instrument: str, granularity: str, count: int = 10) -
         raise
 
 
+def _fetch_and_store_recent_pooled(
+    instrument: str, granularity: str, count: int
+) -> int:
+    """`fetch_and_store_recent` with this worker thread's cached client."""
+    from agentfx.adapters.oanda import OandaClient
+
+    client = getattr(_poll_client_local, "client", None)
+    if client is None:
+        client = OandaClient(
+            api_key=settings.OANDA_API_KEY,
+            host=settings.OANDA_API_HOST,
+        )
+        _poll_client_local.client = client
+    return fetch_and_store_recent(instrument, granularity, count, client=client)
+
+
+def _poll_order(
+    instruments: list[str], granularities: list[str], now: datetime
+) -> tuple[list[tuple[str, str]], int]:
+    """Order poll combinations so bars that just closed are fetched first.
+
+    AFX-87: polling was serial in config order, so a late pair's M30
+    bar could land 70-240s after close — after the paper runner's
+    signal tick. A combination "just closed" when the current minute
+    boundary is a multiple of its granularity. Longer granularities
+    lead the group (they wait longest for their next chance).
+
+    Returns (ordered combinations, number of just-closed ones).
+    """
+    minute_ts = int(now.timestamp()) // 60 * 60
+    just_closed: list[tuple[int, str]] = []
+    rest: list[str] = []
+    for granularity in granularities:
+        g = GRANULARITY_SECONDS.get(granularity)
+        if g and g <= _JUST_CLOSED_MAX_GRANULARITY_SECONDS and minute_ts % g == 0:
+            just_closed.append((g, granularity))
+        else:
+            rest.append(granularity)
+    just_closed.sort(key=lambda item: -item[0])
+    first = [
+        (instrument, granularity)
+        for _, granularity in just_closed
+        for instrument in instruments
+    ]
+    later = [
+        (instrument, granularity) for instrument in instruments for granularity in rest
+    ]
+    return first + later, len(first)
+
+
+async def _poll_cycle(executor, now: datetime) -> tuple[int, int, int, int]:
+    """Fetch the last 30 candles for every combination, just-closed first.
+
+    The executor bounds in-flight OANDA requests; its FIFO queue keeps
+    the priority order. Returns (combinations, just_closed, stored,
+    failed).
+    """
+    combos, just_closed = _poll_order(
+        settings.instruments_list, settings.granularities_list, now
+    )
+    loop = asyncio.get_running_loop()
+    futures = [
+        loop.run_in_executor(
+            executor,
+            _fetch_and_store_recent_pooled,
+            instrument,
+            granularity,
+            30,  # Fetch last 30 candles to recover from missed polls
+        )
+        for instrument, granularity in combos
+    ]
+    results = await asyncio.gather(*futures, return_exceptions=True)
+
+    stored = 0
+    failed = 0
+    for (instrument, granularity), result in zip(combos, results):
+        if isinstance(result, BaseException):
+            failed += 1
+            logger.warning(f"Failed to ingest {instrument}/{granularity}: {result}")
+        elif isinstance(result, int):
+            stored += result
+    return len(combos), just_closed, stored, failed
+
+
+def _reap_health_check(task: asyncio.Task) -> bool:
+    """Return `needs_catchup` from a finished health-check task."""
+    if task.cancelled():
+        return False
+    exc = task.exception()
+    if exc is not None:
+        logger.error(f"Candle health check failed: {exc}")
+        return False
+    _, needs_catchup = task.result()
+    return needs_catchup
+
+
 async def ingestion_loop():
     """Main ingestion loop with resilient retry logic and periodic health checks.
 
     Flow:
     1. Run startup_backfill() to fill any gaps
-    2. Run initial health check (validate completeness + heal gaps)
-    3. Enter continuous polling mode
-    4. Fetch recent candles at INGESTION_POLL_INTERVAL
-    5. Run health check every CANDLE_HEALTH_CHECK_INTERVAL seconds
+    2. Enter continuous polling mode, aligned to each minute boundary
+    3. Fetch recent candles, just-closed bars first, with bounded
+       concurrency (INGESTION_POLL_CONCURRENCY)
+    4. Run the health check (validate completeness + heal gaps) as a
+       background task every CANDLE_HEALTH_CHECK_INTERVAL seconds,
+       never more than one at a time
+
+    AFX-87: the health check used to run inline before the poll; on
+    staging it took ~44s, delaying that minute's just-closed bars past
+    the paper runner's signal tick.
     """
     import concurrent.futures
 
@@ -1178,93 +1305,71 @@ async def ingestion_loop():
     # Run initial backfill first
     await startup_backfill()
 
-    # Run initial health check
-    _, needs_catchup = await run_health_check()
-    _last_health_check = datetime.now(UTC)
-    # Adaptive interval: use short interval when gaps remain, normal otherwise
-    current_health_interval = (
-        CATCH_UP_HEALTH_CHECK_INTERVAL
-        if needs_catchup
-        else settings.CANDLE_HEALTH_CHECK_INTERVAL
-    )
+    current_health_interval = settings.CANDLE_HEALTH_CHECK_INTERVAL
+    health_task: asyncio.Task | None = asyncio.create_task(run_health_check())
 
     logger.info(
         f"Entering continuous polling mode "
         f"(poll: {settings.INGESTION_POLL_INTERVAL}s, "
+        f"concurrency: {settings.INGESTION_POLL_CONCURRENCY}, "
         f"health check: {current_health_interval}s)"
     )
 
     consecutive_failures = 0
     backoff_seconds = INITIAL_BACKOFF_SECONDS
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-    loop = asyncio.get_event_loop()
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, settings.INGESTION_POLL_CONCURRENCY),
+        thread_name_prefix="candle-poll",
+    )
 
     while not _shutdown_event.is_set():
         try:
             cycle_start = datetime.now(UTC)
 
-            # Check if health check is due (uses adaptive interval)
-            if current_health_interval > 0 and _last_health_check:
-                time_since_check = (cycle_start - _last_health_check).total_seconds()
-                if time_since_check >= current_health_interval:
-                    _, needs_catchup = await run_health_check()
-                    _last_health_check = datetime.now(UTC)
-                    # Adapt interval based on whether gaps remain
-                    current_health_interval = (
-                        CATCH_UP_HEALTH_CHECK_INTERVAL
-                        if needs_catchup
-                        else settings.CANDLE_HEALTH_CHECK_INTERVAL
-                    )
-
-            total_stored = 0
-
-            for instrument in settings.instruments_list:
-                if _shutdown_event.is_set():
-                    break
-
-                for granularity in settings.granularities_list:
-                    if _shutdown_event.is_set():
-                        break
-
-                    try:
-                        stored = await loop.run_in_executor(
-                            executor,
-                            fetch_and_store_recent,
-                            instrument,
-                            granularity,
-                            30,  # Fetch last 30 candles to recover from missed polls
-                        )
-                        total_stored += stored
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to ingest {instrument}/{granularity}: {e}"
-                        )
-
-            cycle_duration = (datetime.now(UTC) - cycle_start).total_seconds()
-            logger.debug(
-                f"Ingestion cycle completed: {total_stored} candles in {cycle_duration:.1f}s"
+            combos, just_closed, total_stored, failed = await _poll_cycle(
+                executor, cycle_start
             )
+
+            cycle_end = datetime.now(UTC)
+            cycle_duration = (cycle_end - cycle_start).total_seconds()
+            logger.info(
+                f"Ingestion cycle completed: {combos} combinations "
+                f"({just_closed} just-closed first), {total_stored} candles, "
+                f"{failed} failed in {cycle_duration:.1f}s "
+                f"(started +{cycle_start.second + cycle_start.microsecond / 1e6:.1f}s "
+                f"after the minute)"
+            )
+
+            # Health check: reap a finished run, start the next when due.
+            # Started after the poll so it never competes with the
+            # just-closed fetches at the top of the minute.
+            if health_task is not None and health_task.done():
+                needs_catchup = _reap_health_check(health_task)
+                health_task = None
+                _last_health_check = datetime.now(UTC)
+                current_health_interval = (
+                    CATCH_UP_HEALTH_CHECK_INTERVAL
+                    if needs_catchup
+                    else settings.CANDLE_HEALTH_CHECK_INTERVAL
+                )
+            if (
+                health_task is None
+                and current_health_interval > 0
+                and _last_health_check is not None
+                and (cycle_end - _last_health_check).total_seconds()
+                >= current_health_interval
+            ):
+                health_task = asyncio.create_task(run_health_check())
 
             # Reset backoff on successful cycle
             consecutive_failures = 0
             backoff_seconds = INITIAL_BACKOFF_SECONDS
 
             # Wilson UAT 2026-08-02: align the next poll to the M1 bar
-            # boundary + buffer. Previously we slept for a fixed
-            # INGESTION_POLL_INTERVAL (60s) after cycle END; because
-            # each cycle takes 3-6s of work, wake-ups drifted forward
-            # ~5-19s per iteration relative to minute boundaries. That
-            # made bar-close-to-DB-complete latency uniformly random in
-            # [0, 78s] with mean ~39s. The paper runner's signal-tick
-            # would frequently fire BEFORE its own bar had been
-            # ingested and miss cross-event entries (see Fix D in
-            # paper_runner.py for the runner-side robustness).
-            #
-            # Now: sleep until (next M1 boundary + buffer), so we wake
-            # up ~3s after every :00. OANDA's closed-bar data is
-            # available within ~1s of close, so a 3s buffer gives
-            # comfortable margin without wasted latency. Worst-case
-            # ingest lag drops from 78s → ~5-10s (buffer + cycle work).
+            # boundary + buffer. A fixed sleep after cycle END drifted
+            # wake-ups 5-19s per iteration relative to minute
+            # boundaries, making bar-close-to-DB-complete latency
+            # uniformly random in [0, 78s].
             wake_at = _next_poll_wake_time(
                 datetime.now(UTC),
                 boundary_seconds=settings.INGESTION_POLL_INTERVAL,
@@ -1300,7 +1405,13 @@ async def ingestion_loop():
             except TimeoutError:
                 continue
 
-    executor.shutdown(wait=True)
+    if health_task is not None and not health_task.done():
+        health_task.cancel()
+        try:
+            await health_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+    executor.shutdown(wait=True, cancel_futures=True)
     logger.info("Candle ingestion worker stopped")
 
 
