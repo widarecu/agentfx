@@ -30,6 +30,8 @@ import pytest
 
 from agentfx.services.paper_runner import (
     DEFAULT_LOOKBACK_BARS,
+    JUST_CLOSED_BAR_MAX_WAIT_SECONDS,
+    _bar_wait_cap_seconds,
     _execute_loop,
     _signal_tick,
     align_to_granularity,
@@ -1415,3 +1417,326 @@ class TestSignalTickFailureVisibility:
                 now_utc=now,
             )
         assert "signal tick skipped: stale candles" in caplog.text
+
+
+# ─────────────────────────────────────────────────────────────────────
+# AFX-87: signal tick waits for the just-closed bar
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _mk_bars(bars: int, latest_ts: datetime, granularity_seconds: int) -> pd.DataFrame:
+    """`bars` candles spaced `granularity_seconds` apart ending at `latest_ts`."""
+    step = timedelta(seconds=granularity_seconds)
+    index = pd.DatetimeIndex(
+        [latest_ts - step * (bars - 1 - i) for i in range(bars)], tz="UTC"
+    )
+    return pd.DataFrame(
+        {
+            "open": [1.10] * bars,
+            "high": [1.1005] * bars,
+            "low": [1.0995] * bars,
+            "close": [1.10] * bars,
+            "volume": [100.0] * bars,
+        },
+        index=index,
+    )
+
+
+class TestJustClosedBarWait:
+    """AFX-87: on late-polled pairs the ingester marks the just-closed
+    bar complete AFTER the +10s signal tick. The tick used to reject the
+    one-bar-old data as stale and wait a full period, so M30 runs stayed
+    stale indefinitely. It now re-checks every 5s for the specific bar
+    (`boundary - g`) before doing anything else."""
+
+    # 2026-11-13 10:30:00 UTC — an M30/M5/M1 boundary.
+    BOUNDARY = datetime(2026, 11, 13, 10, 30, tzinfo=UTC).timestamp()
+
+    def _run(self):
+        from agentfx.api.models import RunStatus
+
+        return SimpleNamespace(
+            id="run_test",
+            pair="EUR_USD",
+            user_id=1,
+            snapshot_balance=10_000.0,
+            current_balance=10_000.0,
+            pnl=0.0,
+            kill_requested_at=None,
+            last_transaction_id=None,
+            risk_config={"loss_cap_pct": 2.0, "kill_switch_dd_pct": 5.0},
+            parameters={},
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+        )
+
+    def _client(self):
+        client = MagicMock()
+        client.get_account_balance.return_value = {
+            "balance": 10_000.0,
+            "currency": "USD",
+        }
+        client.get_position.return_value = {"long_units": 0, "short_units": 0}
+        client.place_market_order.return_value = {
+            "trade_id": "t1",
+            "fill_price": 1.10,
+            "units": 5_000,
+        }
+        return client
+
+    def _drive(
+        self,
+        *,
+        granularity_seconds: int,
+        latest_bar_at,
+        until: float,
+        signals=(0, 0, 0),
+        start: float | None = None,
+        stall: tuple[float, float] | None = None,
+    ):
+        """Run `_execute_loop` on a fake clock that `sleep_fn` advances.
+
+        `latest_bar_at(t)` returns the newest COMPLETE bar's open time
+        the DB would hold at wall-clock `t`.
+        """
+        clock = {"t": self.BOUNDARY - 100.0 if start is None else start}
+        fetch_times: list[float] = []
+
+        def fetch(_instrument, _granularity, *_args, **_kwargs):
+            fetch_times.append(clock["t"])
+            return _mk_bars(3, latest_bar_at(clock["t"]), granularity_seconds)
+
+        class _Done(Exception):
+            pass
+
+        def sleep(seconds: float) -> None:
+            clock["t"] += seconds
+            if stall is not None and stall[0] <= clock["t"] < stall[1]:
+                clock["t"] = stall[1]
+            if clock["t"] >= until:
+                raise _Done
+
+        db = _make_db()
+        run = self._run()
+        client = self._client()
+
+        with pytest.raises(_Done):
+            _execute_loop(
+                db=db,
+                run=run,
+                client=client,
+                strategy=_make_strategy(signals=list(signals)),
+                candle_fetch_fn=fetch,
+                instrument="EUR_USD",
+                granularity_seconds=granularity_seconds,
+                now_fn=lambda: clock["t"],
+                sleep_fn=sleep,
+            )
+        added = [c.args[0] for c in db.add.call_args_list]
+        return SimpleNamespace(
+            run=run,
+            client=client,
+            snapshots=[r for r in added if type(r).__name__ == "PaperEquitySnapshot"],
+            stale=[
+                r
+                for r in added
+                if type(r).__name__ == "DecisionLog"
+                and r.action == "USER_SIGNAL_SKIPPED_STALE"
+            ],
+            fetch_times=fetch_times,
+            clock=clock,
+        )
+
+    def test_m30_bar_landing_after_tick_is_evaluated_once(self):
+        # Staging pattern: tick at +10s, ingester marks the 10:00 M30
+        # bar complete at +13s. Pre-fix the tick saw only the 09:30 bar,
+        # tripped the 1800+150s stale guard and slept a full 30 minutes.
+        g = 1800
+        boundary = self.BOUNDARY
+        just_closed = datetime.fromtimestamp(boundary - g, tz=UTC)
+
+        def latest_bar_at(t: float) -> datetime:
+            if t >= boundary + 13:
+                return just_closed
+            return just_closed - timedelta(seconds=g)
+
+        r = self._drive(
+            granularity_seconds=g,
+            latest_bar_at=latest_bar_at,
+            until=boundary + 600,
+            signals=(0, 0, 1),
+        )
+
+        assert r.stale == []
+        assert len(r.snapshots) == 1
+        assert r.client.place_market_order.call_count == 1
+        assert r.run.parameters["last_evaluated_bar_ts"] == just_closed.isoformat()
+        # Evaluated on the first re-check after the bar landed (+15s),
+        # not at the next boundary.
+        assert max(r.fetch_times) < boundary + 20
+
+    def test_bar_never_arrives_writes_one_stale_row_after_cap(self):
+        g = 1800
+        boundary = self.BOUNDARY
+        stuck = datetime.fromtimestamp(boundary - 2 * g, tz=UTC)
+
+        r = self._drive(
+            granularity_seconds=g,
+            latest_bar_at=lambda _t: stuck,
+            until=boundary + 900,
+            signals=(0, 0, 1),
+        )
+
+        assert len(r.stale) == 1
+        assert r.snapshots == []
+        assert r.client.place_market_order.call_count == 0
+        assert "last_evaluated_bar_ts" not in r.run.parameters
+        # Gave up no earlier than the 300s cap, and stopped probing.
+        offset = 10
+        assert (
+            max(r.fetch_times) >= boundary + offset + JUST_CLOSED_BAR_MAX_WAIT_SECONDS
+        )
+        assert (
+            max(r.fetch_times)
+            < boundary + offset + JUST_CLOSED_BAR_MAX_WAIT_SECONDS + 5
+        )
+
+    def test_stalled_loop_drops_old_wait_instead_of_trading_stale_data(self):
+        # The tick starts waiting for the 10:00 bar, then the loop stalls
+        # (e.g. balance retries) for an hour while ingestion also stops
+        # after that bar. Resuming must not treat the hour-old bar as the
+        # fresh just-closed bar: the stale guard applies to the current
+        # boundary instead.
+        g = 1800
+        boundary = self.BOUNDARY
+        just_closed = datetime.fromtimestamp(boundary - g, tz=UTC)
+
+        def latest_bar_at(t: float) -> datetime:
+            if t >= boundary + 20:
+                return just_closed
+            return just_closed - timedelta(seconds=g)
+
+        r = self._drive(
+            granularity_seconds=g,
+            latest_bar_at=latest_bar_at,
+            until=boundary + 3800,
+            signals=(0, 0, 1),
+            stall=(boundary + 11, boundary + 3700),
+        )
+
+        assert len(r.stale) == 1
+        assert r.snapshots == []
+        assert r.client.place_market_order.call_count == 0
+        assert "last_evaluated_bar_ts" not in r.run.parameters
+
+    def test_bar_landing_late_in_wait_window_is_not_stale(self):
+        # Bar lands at +250s: past the generic g+150s threshold measured
+        # from its open time, but it IS the bar the tick waited for.
+        g = 1800
+        boundary = self.BOUNDARY
+        just_closed = datetime.fromtimestamp(boundary - g, tz=UTC)
+
+        def latest_bar_at(t: float) -> datetime:
+            if t >= boundary + 250:
+                return just_closed
+            return just_closed - timedelta(seconds=g)
+
+        r = self._drive(
+            granularity_seconds=g, latest_bar_at=latest_bar_at, until=boundary + 600
+        )
+
+        assert r.stale == []
+        assert len(r.snapshots) == 1
+        assert r.run.parameters["last_evaluated_bar_ts"] == just_closed.isoformat()
+
+    def test_m1_wait_never_skips_next_boundary(self):
+        # M1 cap is g - offset = 50s, so a missing bar gives up at the
+        # next boundary and that boundary's own tick still fires at +10.
+        g = 60
+        boundary = self.BOUNDARY
+        stuck = datetime.fromtimestamp(boundary - 2 * g, tz=UTC)
+
+        r = self._drive(
+            granularity_seconds=g,
+            latest_bar_at=lambda _t: stuck,
+            start=boundary - 40,
+            until=boundary + g + 10 + 1,
+        )
+
+        # Tick 1 gives up at boundary+60 and evaluates the 1-bar-old
+        # data (within M1's 210s threshold, as before). Tick 2 at +70
+        # sees a 2-bar gap — not a one-bar race — so it doesn't wait.
+        assert len(r.snapshots) == 2
+        assert r.stale == []
+
+    def test_multi_bar_gap_does_not_wait(self):
+        # Weekend / outage: newest bar is many bars behind. The stale
+        # guard fires on the first tick, exactly as before AFX-87.
+        g = 1800
+        boundary = self.BOUNDARY
+        old = datetime.fromtimestamp(boundary - 10 * g, tz=UTC)
+
+        r = self._drive(
+            granularity_seconds=g, latest_bar_at=lambda _t: old, until=boundary + 60
+        )
+
+        assert len(r.stale) == 1
+        assert min(t for t in r.fetch_times if t >= boundary) < boundary + 11
+        assert len([t for t in r.fetch_times if t >= boundary]) == 2  # probe + tick
+
+    def test_bar_already_present_evaluates_on_first_tick(self):
+        g = 1800
+        boundary = self.BOUNDARY
+        just_closed = datetime.fromtimestamp(boundary - g, tz=UTC)
+
+        r = self._drive(
+            granularity_seconds=g,
+            latest_bar_at=lambda _t: just_closed,
+            until=boundary + 60,
+        )
+
+        assert len(r.snapshots) == 1
+        assert all(t < boundary + 11 for t in r.fetch_times)
+
+    @pytest.mark.parametrize(
+        "granularity_seconds, expected",
+        [
+            (60, 50.0),
+            (300, 290.0),
+            (1800, 300.0),
+            (3600, 300.0),
+            # H4/D: scheduler grid doesn't match OANDA's 17:00 NY bars
+            # (AFX-88), so don't wait there.
+            (14_400, 0.0),
+            (86_400, 0.0),
+        ],
+    )
+    def test_wait_cap(self, granularity_seconds, expected):
+        assert _bar_wait_cap_seconds(granularity_seconds, 10.0) == expected
+
+    def test_signal_tick_accepts_expected_bar_past_lag_threshold(self):
+        g = 1800
+        expected = datetime(2026, 11, 13, 10, 0, tzinfo=UTC)
+        now = expected + timedelta(seconds=g + 250)
+        db = _make_db()
+        client = self._client()
+
+        _signal_tick(
+            db=db,
+            run=self._run(),
+            client=client,
+            strategy=_make_strategy(signals=[0, 0, 0]),
+            candle_fetch_fn=MagicMock(return_value=_mk_bars(3, expected, g)),
+            instrument="EUR_USD",
+            granularity_seconds=g,
+            now_utc=now,
+            expected_bar_ts=expected,
+        )
+
+        added = [c.args[0] for c in db.add.call_args_list]
+        assert not any(
+            type(r).__name__ == "DecisionLog"
+            and r.action == "USER_SIGNAL_SKIPPED_STALE"
+            for r in added
+        )
