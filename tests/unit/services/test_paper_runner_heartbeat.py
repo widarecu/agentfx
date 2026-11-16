@@ -168,3 +168,24 @@ class TestHeartbeatDuringAuthLadder:
 
         gap = _max_gap(start, heartbeats, clock.now)
         assert gap < _HEARTBEAT_STALE_SECONDS
+
+
+class TestStartupHeartbeat:
+    def test_heartbeat_persisted_before_first_broker_call(self):
+        start = datetime(2026, 11, 13, 22, 32, 25, tzinfo=UTC)
+        clock = _FakeClock(start)
+        run = _run()
+        seen_at_first_call: list[str | None] = []
+
+        def _balance():
+            if not seen_at_first_call:
+                seen_at_first_call.append(run.parameters.get("last_heartbeat_at"))
+            clock.advance(_LADDER_CALL_SECONDS)
+            raise OandaError("401 Insufficient authorization (attempt 4/4)")
+
+        client = MagicMock()
+        client.get_account_balance.side_effect = _balance
+
+        _drive(run, client, clock, max_iterations=1, recover=lambda *a: None)
+
+        assert seen_at_first_call == [start.isoformat()]

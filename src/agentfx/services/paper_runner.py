@@ -699,8 +699,6 @@ def _execute_loop(
         else float("inf")
     )
 
-    _snapshot_balance_if_needed(db=db, run=run, client=client)
-
     # Consecutive non-auth OANDA failures on the balance refresh. A
     # single 15s read-timeout no longer crashes the subprocess (Wilson
     # 2026-08-14): the tick is skipped, the loop retries next iteration,
@@ -731,7 +729,7 @@ def _execute_loop(
         now_dt = datetime.now(UTC)
         due = (
             force
-            or last_heartbeat is None
+            or iteration == 1
             or iteration % _HEARTBEAT_INTERVAL_ITERATIONS == 0
             or (now_dt - last_heartbeat).total_seconds() >= _HEARTBEAT_INTERVAL_SECONDS
         )
@@ -740,7 +738,15 @@ def _execute_loop(
         last_heartbeat = now_dt
         _persist_heartbeat(db, run, iteration, now_dt, phase=phase)
 
+    # Heartbeat before the first broker call: a freshly (re)started
+    # runner whose first balance call ladders must not look like a
+    # zombie to the supervisor before it has had a chance to beat.
     iteration = 0
+    last_heartbeat = datetime.now(UTC)
+    _persist_heartbeat(db, run, iteration, last_heartbeat, phase="startup")
+
+    _snapshot_balance_if_needed(db=db, run=run, client=client)
+
     while True:
         if max_iterations is not None and iteration >= max_iterations:
             logger.info(

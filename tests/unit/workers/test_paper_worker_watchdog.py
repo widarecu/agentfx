@@ -958,3 +958,32 @@ class TestZombieLivePid:
             assert handle.exited.wait(2.0)
             mark_failed.assert_not_called()
             assert 37 not in worker._CHILDREN
+
+    def test_replacement_runner_gets_grace_after_zombie_restart(self):
+        """A zombie restart clears `last_heartbeat_at` but keeps the
+        original `approved_at`; the replacement must still get a full
+        stale window to emit its first heartbeat."""
+        from datetime import timedelta
+
+        from agentfx.api.models import RunStatus
+        from agentfx.api.workers import paper_runner as worker
+
+        run, now = self._stale_run(793)
+        run.parameters = {
+            "auto_restart_attempts": 1,
+            "auto_restart_last_at": (now - timedelta(seconds=240)).isoformat(),
+        }
+        db = self._fake_db([run])
+        with (
+            patch.object(worker, "_ensure_prior_runner_dead") as ensure_dead,
+            patch(
+                "agentfx.api.workers.paper_runner.schedule_paper_run",
+            ) as schedule,
+            patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()),
+        ):
+            restarted = worker.scan_and_restart_zombie_running(db=db, now=now)
+
+        assert restarted == 0
+        ensure_dead.assert_not_called()
+        schedule.assert_not_called()
+        assert run.status == RunStatus.RUNNING

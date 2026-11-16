@@ -618,6 +618,21 @@ def _write_restart_decision(
         )
 
 
+def _latest_start(approved_at: datetime | None, params: dict) -> datetime | None:
+    """Most recent (re)start: `approved_at` or `auto_restart_last_at`."""
+    candidates = [approved_at] if approved_at is not None else []
+    restarted_iso = params.get("auto_restart_last_at")
+    if restarted_iso:
+        try:
+            candidates.append(datetime.fromisoformat(restarted_iso))
+        except (ValueError, TypeError):
+            pass
+    normalized = [
+        dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC) for dt in candidates
+    ]
+    return max(normalized, default=None)
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -745,8 +760,11 @@ def scan_and_restart_zombie_running(db=None, now: datetime | None = None) -> int
                 # started; give it one full stale window before
                 # declaring zombie. Non-null pid + no heartbeat + old
                 # approved_at means we ARE zombie.
-                if not pid_null and run.approved_at is not None:
-                    if _seconds_since(run.approved_at, now) < _HEARTBEAT_STALE_SECONDS:
+                # The grace window restarts with every auto-restart
+                # (AFX-92), not just the original approval.
+                started_at = _latest_start(run.approved_at, params)
+                if not pid_null and started_at is not None:
+                    if _seconds_since(started_at, now) < _HEARTBEAT_STALE_SECONDS:
                         continue
                     heartbeat_stale = True
 
