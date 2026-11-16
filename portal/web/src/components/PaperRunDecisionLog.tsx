@@ -36,6 +36,8 @@ const ACTION_STYLES: Record<string, string> = {
     'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
   USER_ENTRY_MISSED:
     'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
+  USER_AUTH_DEFERRED_MARKET_CLOSED:
+    'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
   USER_KILL_PAPER:
     'bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300',
   USER_RESUME_PAPER:
