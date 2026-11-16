@@ -115,6 +115,39 @@ _BALANCE_RETRY_LIMIT = 6
 _BALANCE_RETRY_BACKOFF_SECONDS = (15.0, 30.0, 60.0, 120.0, 240.0)
 
 
+# AFX-92: wall-clock heartbeat cadence. Must stay well under the
+# supervisor's `_HEARTBEAT_STALE_SECONDS` (900s) even when one adapter
+# call blocks for its full retry ladder (~300s).
+_HEARTBEAT_INTERVAL_SECONDS = 300.0
+
+
+def _persist_heartbeat(
+    db, run, iteration: int, now_dt: datetime, *, phase: str | None = None
+) -> None:
+    """Log + persist `run.parameters['last_heartbeat_at']`. Never raises."""
+    logger.info(
+        "paper runner heartbeat: run=%s iter=%d balance=%.2f pnl=%.2f%s",
+        run.id,
+        iteration,
+        run.current_balance or 0.0,
+        run.pnl or 0.0,
+        f" phase={phase}" if phase else "",
+    )
+    try:
+        params = dict(run.parameters or {})
+        params["last_heartbeat_at"] = now_dt.isoformat()
+        run.parameters = params
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(run, "parameters")
+        db.commit()
+    except Exception:  # noqa: BLE001 — never let heartbeat crash the loop
+        logger.exception(
+            "paper runner: heartbeat persist failed on %s (loop continues)",
+            run.id,
+        )
+
+
 def _balance_retry_sleep_seconds(consecutive_failures: int) -> float:
     """Sleep length after the Nth (1-indexed) consecutive balance
     failure. Clamped to the last defined backoff so callers can't run
@@ -684,7 +717,28 @@ def _execute_loop(
     # restart them. Also grep-able signature in Railway logs — the
     # absence of "paper runner heartbeat" lines after N minutes is
     # proof of silent death. Loop iterates every ~5s so 60 = ~5 min.
+    #
+    # AFX-92: the heartbeat also fires on elapsed wall time, and is
+    # forced between steps of the balance retry / 401 ladder. One
+    # iteration can block for minutes inside the adapter's own retries,
+    # so an iteration count alone let a live runner look stale to the
+    # supervisor, which then started a second runner.
     _HEARTBEAT_INTERVAL_ITERATIONS = 60
+    last_heartbeat: datetime | None = None
+
+    def _heartbeat(*, phase: str | None = None, force: bool = False) -> None:
+        nonlocal last_heartbeat
+        now_dt = datetime.now(UTC)
+        due = (
+            force
+            or last_heartbeat is None
+            or iteration % _HEARTBEAT_INTERVAL_ITERATIONS == 0
+            or (now_dt - last_heartbeat).total_seconds() >= _HEARTBEAT_INTERVAL_SECONDS
+        )
+        if not due:
+            return
+        last_heartbeat = now_dt
+        _persist_heartbeat(db, run, iteration, now_dt, phase=phase)
 
     iteration = 0
     while True:
@@ -738,6 +792,7 @@ def _execute_loop(
                     "paper runner: %s got 401 on balance; attempting cred refresh",
                     run.id,
                 )
+                _heartbeat(phase="auth-refresh", force=True)
                 new_client = _recover_from_auth_loss(db, run, exc)
                 if new_client is None:
                     logger.error(
@@ -747,6 +802,7 @@ def _execute_loop(
                     _flatten_and_halt(db, run, client, reason="OANDA_AUTH_LOST")
                     return
                 client = new_client
+                _heartbeat(phase="auth-refresh-recheck", force=True)
                 balance = client.get_account_balance()
             else:
                 # Non-auth OANDA failure — most commonly a read timeout
@@ -779,6 +835,7 @@ def _execute_loop(
                     _BALANCE_RETRY_LIMIT,
                     sleep_seconds,
                 )
+                _heartbeat(phase="balance-retry", force=True)
                 sleep_fn(sleep_seconds)
                 continue
         consecutive_balance_failures = 0
@@ -787,32 +844,10 @@ def _execute_loop(
         db.commit()
 
         # Heartbeat: log INFO + persist `last_heartbeat_at` every
-        # ~5 min (60 iterations at 5s cadence) of healthy iteration.
-        # Supervisor uses this to detect zombie RUNNING rows and
-        # restart them. Emitted on iteration 1 too so a fresh
-        # subprocess registers a heartbeat immediately.
-        if iteration == 1 or iteration % _HEARTBEAT_INTERVAL_ITERATIONS == 0:
-            heartbeat_iso = datetime.now(UTC).isoformat()
-            logger.info(
-                "paper runner heartbeat: run=%s iter=%d balance=%.2f pnl=%.2f",
-                run.id,
-                iteration,
-                run.current_balance or 0.0,
-                run.pnl or 0.0,
-            )
-            try:
-                params = dict(run.parameters or {})
-                params["last_heartbeat_at"] = heartbeat_iso
-                run.parameters = params
-                from sqlalchemy.orm.attributes import flag_modified as _flag_hb
-
-                _flag_hb(run, "parameters")
-                db.commit()
-            except Exception:  # noqa: BLE001 — never let heartbeat crash the loop
-                logger.exception(
-                    "paper runner: heartbeat persist failed on %s (loop continues)",
-                    run.id,
-                )
+        # ~5 min of healthy iteration. Supervisor uses this to detect
+        # zombie RUNNING rows and restart them. Emitted on iteration 1
+        # too so a fresh subprocess registers a heartbeat immediately.
+        _heartbeat()
 
         # Evaluate risk gates against the current balance. The health
         # tick only checks halt-gates (kill_switch, loss cap);

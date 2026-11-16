@@ -22,6 +22,7 @@ import multiprocessing
 import os
 import signal
 import threading
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,28 @@ _ATTEMPT_RESET_AFTER_SECONDS = 24 * 3600.0
 # and rules out normal loop backoffs.
 _HEARTBEAT_STALE_SECONDS = 15 * 60.0
 
+# AFX-92: before a zombie restart the supervisor terminates the prior
+# runner and waits for the watchdog to reap it. SIGTERM first, SIGKILL
+# if it's still alive after the grace period.
+_TERMINATE_GRACE_SECONDS = 30.0
+_KILL_GRACE_SECONDS = 10.0
+
+
+@dataclass
+class _ChildHandle:
+    """A runner subprocess spawned by this parent. `exited` is set by the
+    watchdog once the child is reaped; `superseded` marks a child the
+    supervisor terminated on purpose so the watchdog doesn't flag it as
+    a crash."""
+
+    proc: multiprocessing.Process
+    exited: threading.Event
+    superseded: bool = False
+
+
+_CHILDREN: dict[int, _ChildHandle] = {}
+_CHILDREN_LOCK = threading.Lock()
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Public entry points
@@ -99,8 +122,11 @@ def schedule_paper_run(run_id: str) -> None:
     )
     proc.start()
     logger.info("scheduled paper run %s as pid=%s", run_id, proc.pid)
+    handle = _ChildHandle(proc=proc, exited=threading.Event())
+    with _CHILDREN_LOCK:
+        _CHILDREN[proc.pid] = handle
     _record_child_pid(run_id, proc.pid)
-    _start_watchdog(run_id, proc)
+    _start_watchdog(run_id, proc, handle)
 
 
 def signal_run_stop(pid: int | None) -> bool:
@@ -182,7 +208,11 @@ def recover_orphaned_paper_runs(db=None) -> int:
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _start_watchdog(run_id: str, proc: multiprocessing.Process) -> None:
+def _start_watchdog(
+    run_id: str,
+    proc: multiprocessing.Process,
+    handle: _ChildHandle | None = None,
+) -> None:
     """Reap the child + mark the run ERROR if it exits non-zero while
     the DB still says RUNNING. Same pattern as evolution_runner.
     """
@@ -196,7 +226,22 @@ def _start_watchdog(run_id: str, proc: multiprocessing.Process) -> None:
             proc.pid,
             exit_code,
         )
+        superseded = False
+        if handle is not None:
+            with _CHILDREN_LOCK:
+                if _CHILDREN.get(proc.pid) is handle:
+                    del _CHILDREN[proc.pid]
+            superseded = handle.superseded
+            handle.exited.set()
         if exit_code == 0:
+            return
+        if superseded:
+            logger.info(
+                "watchdog: paper run %s pid=%s was terminated by the "
+                "zombie supervisor; not marking crashed",
+                run_id,
+                proc.pid,
+            )
             return
         _mark_run_failed_after_crash(run_id, exit_code)
 
@@ -521,6 +566,8 @@ def _write_restart_decision(
     attempt_number: int,
     prior_reason: str | None,
     waited_seconds: float,
+    *,
+    skipped_backoff: bool = False,
 ) -> None:
     """Append an auto-restart entry to the run's decision log so the
     operator sees the recovery attempt inline with trades and health
@@ -552,8 +599,12 @@ def _write_restart_decision(
                     f"supervisor rescheduled paper run "
                     f"(attempt {attempt_number}/{_MAX_AUTO_RESTART_ATTEMPTS}) — "
                     f"prior stop_reason={prior_reason}, "
-                    f"waited {waited_seconds:.0f}s of "
-                    f"{_RESTART_BACKOFF_SECONDS[attempt_number - 1]:.0f}s backoff"
+                    + (
+                        f"silent for {waited_seconds:.0f}s"
+                        if skipped_backoff
+                        else f"waited {waited_seconds:.0f}s of "
+                        f"{_RESTART_BACKOFF_SECONDS[attempt_number - 1]:.0f}s backoff"
+                    )
                 ),
                 user_id=getattr(run, "user_id", None),
             )
@@ -565,6 +616,70 @@ def _write_restart_decision(
             "(restart itself already happened)",
             run.id,
         )
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _ensure_prior_runner_dead(run_id: str, pid: int | None) -> bool:
+    """AFX-92: True once the runner at `pid` is confirmed gone.
+
+    A child this parent spawned is SIGTERMed (then SIGKILLed) and we
+    wait for the watchdog to reap it. A pid we didn't spawn is never
+    signalled (it could be a reused pid); if it's alive the restart is
+    refused and retried on the next supervisor tick.
+    """
+    if pid is None:
+        return True
+    with _CHILDREN_LOCK:
+        handle = _CHILDREN.get(pid)
+    if handle is None:
+        if not _pid_alive(pid):
+            return True
+        logger.error(
+            "auto-restart (zombie): run %s pid=%s is still alive but was not "
+            "spawned by this supervisor; refusing to start a second runner",
+            run_id,
+            pid,
+        )
+        return False
+
+    if handle.exited.is_set():
+        return True
+    handle.superseded = True
+    logger.warning(
+        "auto-restart (zombie): terminating prior runner pid=%s for run %s "
+        "before rescheduling",
+        pid,
+        run_id,
+    )
+    handle.proc.terminate()
+    if handle.exited.wait(_TERMINATE_GRACE_SECONDS):
+        return True
+    logger.error(
+        "auto-restart (zombie): pid=%s for run %s ignored SIGTERM for %.0fs; "
+        "sending SIGKILL",
+        pid,
+        run_id,
+        _TERMINATE_GRACE_SECONDS,
+    )
+    handle.proc.kill()
+    if handle.exited.wait(_KILL_GRACE_SECONDS):
+        return True
+    logger.error(
+        "auto-restart (zombie): pid=%s for run %s still alive after SIGKILL; "
+        "not rescheduling",
+        pid,
+        run_id,
+    )
+    return False
 
 
 def scan_and_restart_zombie_running(db=None, now: datetime | None = None) -> int:
@@ -613,6 +728,7 @@ def scan_and_restart_zombie_running(db=None, now: datetime | None = None) -> int
             pid_null = run.process_pid is None
             heartbeat_iso = params.get("last_heartbeat_at")
             heartbeat_stale = False
+            heartbeat_dt = None
             if heartbeat_iso:
                 try:
                     heartbeat_dt = datetime.fromisoformat(heartbeat_iso)
@@ -622,6 +738,7 @@ def scan_and_restart_zombie_running(db=None, now: datetime | None = None) -> int
                         _seconds_since(heartbeat_dt, now) >= _HEARTBEAT_STALE_SECONDS
                     )
                 except (ValueError, TypeError):
+                    heartbeat_dt = None
                     heartbeat_stale = True
             else:
                 # No heartbeat yet + non-null pid → subprocess just
@@ -635,6 +752,11 @@ def scan_and_restart_zombie_running(db=None, now: datetime | None = None) -> int
 
             if not (pid_null or heartbeat_stale):
                 continue
+            silent_seconds = _seconds_since(
+                heartbeat_dt if heartbeat_dt is not None else run.approved_at, now
+            )
+            if silent_seconds == float("inf"):
+                silent_seconds = 0.0
 
             # Attempts counter shared with the ERROR-path restart.
             attempts_so_far = int(params.get("auto_restart_attempts", 0))
@@ -654,11 +776,21 @@ def scan_and_restart_zombie_running(db=None, now: datetime | None = None) -> int
                 )
                 continue
 
-            # Zombie runs skip the backoff wait — the subprocess is
-            # already dead so waiting doesn't help. But we still honour
-            # the attempts counter so a persistent bug can't loop
-            # forever.
+            # Zombie runs skip the backoff wait. But we still honour the
+            # attempts counter so a persistent bug can't loop forever.
             reason_desc = "process_pid=None" if pid_null else "heartbeat stale"
+            prior_pid = run.process_pid
+            # AFX-92: never run two runners on one sub-account. The old
+            # pid must be gone (or terminated and reaped) first.
+            if not _ensure_prior_runner_dead(run.id, prior_pid):
+                continue
+            if prior_pid is not None:
+                # The prior runner may have written to the row before
+                # it exited; don't clobber that with a stale snapshot.
+                db.refresh(run)
+                if run.status != RunStatus.RUNNING:
+                    continue
+                params = dict(run.parameters or {})
             logger.warning(
                 "auto-restart (zombie): rescheduling paper run %s "
                 "(attempt %d/%d, signal=%s, heartbeat=%s)",
@@ -669,7 +801,6 @@ def scan_and_restart_zombie_running(db=None, now: datetime | None = None) -> int
                 heartbeat_iso or "never",
             )
 
-            prior_pid = run.process_pid
             run.status = RunStatus.APPROVED
             run.process_pid = None
             params["auto_restart_attempts"] = attempts_so_far + 1
@@ -687,7 +818,8 @@ def scan_and_restart_zombie_running(db=None, now: datetime | None = None) -> int
                 run,
                 attempts_so_far + 1,
                 f"zombie:{reason_desc}(pid={prior_pid})",
-                _seconds_since(approved_at, now) if approved_at else 0.0,
+                silent_seconds,
+                skipped_backoff=True,
             )
             schedule_paper_run(run.id)
             restarted += 1
