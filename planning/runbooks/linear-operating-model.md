@@ -26,7 +26,7 @@ The workspace structure is defined in `config/linear/workspace.yaml` and applied
 ```
 Triage ──Wilson accepts──▶ Backlog ──Wilson prioritises──▶ Ready ──agent picks up──▶ In Progress ──PR opened──▶ In Review ──PR merged──▶ Done
    │                                                                                                   │
-   └──Wilson declines──▶ Canceled / Duplicate                                     (money-path: Wilson approves the PR in GitHub)
+   └──Wilson declines──▶ Canceled / Duplicate                                     (money-path: Wilson reviews it on the promote PR to main)
 ```
 
 | State | Category | Who moves it here | Meaning |
@@ -79,7 +79,7 @@ Working tickets:
 5. **Pick only from Ready**, highest priority first. Make yourself the delegate (Wilson stays the assignee). Move the issue to In Progress.
 6. **Branch** `agent/AFX-123-slug`. Put `AFX-123` in the PR title so Linear links the PR.
 7. **Before opening the PR:** `make lint` and `make test-unit` green. Post a comment listing what was tested and the CI link.
-8. **Money-path issues:** the PR is never auto-merged. Add `needs-wilson`.
+8. **Money-path issues:** label the PR `agent-authored` like any other; it auto-merges into `feat/agent-fleet` on green CI. Wilson reviews Money-path changes on the promote PR to `main`, which always carries `needs-wilson` and never auto-merges.
 9. **When blocked:** comment the question, add `needs-wilson`, and stop. Don't guess on product decisions.
 10. All the existing repo rules still apply: test profile only, practice OANDA keys only, never push to `main`.
 
@@ -103,7 +103,7 @@ Phase 2 also answers the PE Phase 2b question (ticket T6). PE files issues, and 
 ## 10. Wilson's routine (on the phone)
 
 - **Daily, ~5 min:** clear the Triage inbox (accept → Backlog/Ready, or decline), and answer anything tagged `needs-wilson`.
-- **On notification:** approve money-path PRs in the GitHub app.
+- **On notification:** review the promote PR to `main` (Money-path PRs are listed first) and merge it in the GitHub app.
 - **Weekly, ~15 min:** reorder Ready, and glance at the *Found in* counts.
 
 ## 11. Costs

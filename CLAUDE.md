@@ -517,7 +517,7 @@ What each state means:
 5. Only pick up issues in **Ready**, highest priority first. Make yourself the delegate (Wilson stays assignee) and move the issue to **In Progress**.
 6. Branch `agent/AFX-<n>-<slug>`, and put `AFX-<n>` in the PR title so Linear links it.
 7. Before opening the PR, `make lint` and `make test-unit` must be green. Comment on the issue with what was tested and the CI link.
-8. **Risk: Money-path** (order execution, sizing, kill switch, credentials, deploy gates) → the PR never auto-merges. Add `needs-wilson`.
+8. **Risk: Money-path** (order execution, sizing, kill switch, credentials, deploy gates) still needs Wilson's review, but on the **promote PR to `main`**, not on `feat/agent-fleet`. Agent PRs into `feat/agent-fleet` get `agent-authored` and auto-merge on green CI regardless of risk. Don't add `needs-wilson` for risk alone: it's for promote PRs (added by `agent-fleet-promote.yml`), `[NEEDS DESIGN]` PRs and real blockers. The promote PR always carries `needs-wilson` and never auto-merges, so Money-path code can't reach staging without Wilson.
 9. When blocked on a product decision, comment the question, add `needs-wilson`, and stop. Don't guess.
 10. All other rules in this file still apply: `test` profile only, practice OANDA keys only, never push to `main`.
 
