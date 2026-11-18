@@ -173,6 +173,18 @@ def test_multi_afx_ids_from_subjects_and_lander_titles_deduped():
     assert pm.collect_ids(pr, commits, gh) == ["AFX-87", "AFX-92", "AFX-8"]
 
 
+def test_rebased_hotfix_ids_from_earlier_pr_commits():
+    pr = _main_pr(130, "hotfix: two fixes", head="wilson/hotfix")
+    commits = [("m130", "fix: second part")]
+    own = ["AFX-5: first part", "fix: second part"]
+    assert pm.collect_ids(pr, commits, FakeGitHub(), own) == ["AFX-5"]
+
+
+def test_fork_main_into_fleet_is_still_a_lander():
+    fork = _lander(131, "AFX-6: fork fix", "abc", head="main", base="main")
+    assert pm.landing_prs([fork], "abc") == [fork]
+
+
 def test_empty_merge_has_no_ids():
     pr = _main_pr(120, "chore: bump deps", head="wilson/deps")
     assert pm.collect_ids(pr, [("m120", "chore: bump deps (#120)")], FakeGitHub()) == []
@@ -257,7 +269,11 @@ def wired(monkeypatch):
     state = {"pr": _main_pr(116, "Promote"), "commits": [], "pulls": FakeGitHub()}
     state["linear"] = FakeLinear({"AFX-87": []})
     monkeypatch.setattr(pm, "fetch_pr", lambda repo, n: state["pr"])
+    state["parents"] = ["p1", "p2"]
+    state["own"] = []
     monkeypatch.setattr(pm, "landed_commits", lambda sha: state["commits"])
+    monkeypatch.setattr(pm, "parents_of", lambda sha: state["parents"])
+    monkeypatch.setattr(pm, "pr_commit_subjects", lambda repo, n: state["own"])
     monkeypatch.setattr(pm, "pulls_for_commit", lambda repo: state["pulls"])
     monkeypatch.setattr(pm, "Linear", lambda key: state["linear"])
     return state
@@ -266,6 +282,26 @@ def wired(monkeypatch):
 def test_main_posts_on_a_promote(wired, monkeypatch):
     monkeypatch.setenv("LINEAR_API_KEY", "k")
     wired["commits"] = [("c115", "Merge pull request #115 from x/agent/AFX-87-t")]
+    assert pm.main(["--pr", "116"]) == 0
+    assert [i for i, _ in wired["linear"].posted] == ["AFX-87"]
+
+
+def test_main_reads_pr_commits_only_for_squash_or_rebase(wired, monkeypatch):
+    monkeypatch.setenv("LINEAR_API_KEY", "k")
+    wired["linear"] = FakeLinear({"AFX-87": [], "AFX-5": []})
+    wired["commits"] = [("m116", "fix: tail")]
+    wired["own"] = ["AFX-5: earlier rebased commit"]
+    assert pm.main(["--pr", "116"]) == 0  # merge commit: PR commits ignored
+    assert wired["linear"].posted == []
+    wired["parents"] = ["p1"]
+    assert pm.main(["--pr", "116"]) == 0
+    assert [i for i, _ in wired["linear"].posted] == ["AFX-5"]
+
+
+def test_main_handles_hotfix_from_a_fork_main(wired, monkeypatch):
+    monkeypatch.setenv("LINEAR_API_KEY", "k")
+    wired["pr"] = {**wired["pr"], "head": {"ref": "main"}}
+    wired["commits"] = [("c1", "AFX-87: x")]
     assert pm.main(["--pr", "116"]) == 0
     assert [i for i, _ in wired["linear"].posted] == ["AFX-87"]
 

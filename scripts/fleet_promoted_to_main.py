@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fleet_promote_pr import (  # noqa: E402
     BASE,
+    HEAD,
     Linear,
     _gh_json,
     _run,
@@ -72,31 +73,38 @@ def promoted_comment(pr: dict, *, deploys_url: str = RAILWAY_DEPLOYS_URL) -> str
 
 
 def is_merged_into_main(pr: dict) -> bool:
-    return (
-        bool(pr.get("merged_at"))
-        and (pr.get("base") or {}).get("ref") == BASE
-        and (pr.get("head") or {}).get("ref") != BASE
-    )
+    return bool(pr.get("merged_at")) and (pr.get("base") or {}).get("ref") == BASE
 
 
 def landing_prs(candidates: list[dict], sha: str) -> list[dict]:
-    """PRs merged as `sha`. Back-merge PRs (head `main`) are skipped."""
+    """PRs merged as `sha`. Back-merge PRs (`main` -> fleet) are skipped."""
     return [
         pr
         for pr in candidates
         if pr.get("merged_at")
         and pr.get("merge_commit_sha") == sha
-        and (pr.get("head") or {}).get("ref") != BASE
+        and not is_back_merge(pr)
     ]
+
+
+def is_back_merge(pr: dict) -> bool:
+    return (pr.get("head") or {}).get("ref") == BASE and (pr.get("base") or {}).get(
+        "ref"
+    ) == HEAD
 
 
 def collect_ids(
     pr: dict,
     commits: list[tuple[str, str]],
     pulls_for: Callable[[str], list[dict]],
+    pr_commit_subjects: list[str] = (),
 ) -> list[str]:
-    """`AFX-<n>` ids the merge carries, first-seen order, deduplicated."""
-    texts = [pr.get("title") or ""]
+    """`AFX-<n>` ids the merge carries, first-seen order, deduplicated.
+
+    `pr_commit_subjects` covers squash and rebase merges, where only the
+    last of the PR's commits is the merge sha.
+    """
+    texts = [pr.get("title") or "", *pr_commit_subjects]
     for sha, subject in commits:
         texts.append(subject)
         texts += [p.get("title") or "" for p in landing_prs(pulls_for(sha), sha)]
@@ -142,18 +150,37 @@ def fetch_pr(repo: str, number: int) -> dict:
     return _gh_json("api", f"repos/{repo}/pulls/{number}")
 
 
+def parents_of(sha: str) -> list[str]:
+    if _run("git", "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode:
+        _run("git", "fetch", "--quiet", "origin", sha)
+    return _run("git", "rev-list", "--parents", "-n", "1", sha).stdout.split()[1:]
+
+
 def landed_commits(merge_sha: str) -> list[tuple[str, str]]:
     """`(sha, subject)` of the commits `merge_sha` brought onto `main`."""
-    if _run("git", "cat-file", "-e", f"{merge_sha}^{{commit}}", check=False).returncode:
-        _run("git", "fetch", "--quiet", "origin", merge_sha)
-    shas = _run("git", "rev-list", "--parents", "-n", "1", merge_sha).stdout.split()
-    parents = shas[1:]
+    parents = parents_of(merge_sha)
     ranges = [["-1", merge_sha]] + [[f"{parents[0]}..{p}"] for p in parents[1:]]
     out: list[tuple[str, str]] = []
     for rng in ranges:
         log = _run("git", "log", "--first-parent", "--format=%H%x09%s", *rng).stdout
         out += [tuple(ln.split("\t", 1)) for ln in log.splitlines() if "\t" in ln]
     return out
+
+
+def pr_commit_subjects(repo: str, number: int) -> list[str]:
+    try:
+        out = _run(
+            "gh",
+            "api",
+            "--paginate",
+            f"repos/{repo}/pulls/{number}/commits",
+            "--jq",
+            '.[].commit.message | split("\\n")[0]',
+        ).stdout
+    except Exception as exc:  # noqa: BLE001 - fall back to the merge sha alone
+        warn(f"Could not list commits of PR #{number}: {exc}")
+        return []
+    return out.splitlines()
 
 
 def pulls_for_commit(repo: str) -> Callable[[str], list[dict]]:
@@ -183,8 +210,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"PR #{args.pr} is not a merged PR into `{BASE}`; nothing to do.")
         return 0
 
-    commits = landed_commits(pr["merge_commit_sha"])
-    ids = collect_ids(pr, commits, pulls_for_commit(args.repo))
+    sha = pr["merge_commit_sha"]
+    commits = landed_commits(sha)
+    # Squash / rebase merge: the PR's own commits. Not for merge commits:
+    # a promote PR's commit list includes every commit inside each agent PR.
+    own = (
+        pr_commit_subjects(args.repo, pr["number"]) if len(parents_of(sha)) < 2 else []
+    )
+    ids = collect_ids(pr, commits, pulls_for_commit(args.repo), own)
     print(
         f"PR #{pr['number']} landed {len(commits)} first-parent commit(s); "
         f"ids: {', '.join(ids) or '(none)'}"
