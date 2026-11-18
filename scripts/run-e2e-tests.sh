@@ -49,7 +49,7 @@ cd "$PROJECT_ROOT"
 # startup for hermetic E2E. The `test` profile is the only safe target
 # because its data is meant to be ephemeral. Refuse to run against
 # `dev` or `uat` profiles to prevent destroying long-lived backfills
-# and user accounts. See CLAUDE.md → "Environment isolation".
+# and user accounts. See planning/runbooks/environments.md.
 #
 # History: on 2026-05-27 a `make e2e` invocation against a stack that
 # was being used for acceptance testing wiped 6 years of EUR_USD M1
@@ -61,7 +61,7 @@ if [ "$TARGET_PROFILE" != "test" ]; then
     echo "Error: run-e2e-tests.sh refuses to run against profile '$TARGET_PROFILE'."
     echo "This script wipes its target volume with 'docker compose down -v'."
     echo "Only the 'test' profile is safe — dev and uat hold long-lived data."
-    echo "See CLAUDE.md → 'Environment isolation'."
+    echo "See planning/runbooks/environments.md."
     exit 1
 fi
 COMPOSE="docker compose --profile $TARGET_PROFILE"

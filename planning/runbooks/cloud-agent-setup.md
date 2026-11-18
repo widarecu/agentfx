@@ -54,7 +54,7 @@ make test-integration    # pytest -m "integration and not slow" against Postgres
 make docker-down PROFILE=test
 ```
 
-`make test-unit` alone is the pre-PR gate the operating model requires (per CLAUDE.md section 7 rule 7). `test-integration` is needed only when the change touches DB code.
+`make test-unit` alone is the pre-PR gate the operating model requires (per CLAUDE.md hard rule 8). `test-integration` is needed only when the change touches DB code.
 
 ## 3. First trial
 

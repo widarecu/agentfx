@@ -184,7 +184,7 @@ def test_strategy_with_feature_flag():
 
 ## Running Tests
 
-> **IMPORTANT:** See `CLAUDE.md` for canonical test execution commands.
+> **IMPORTANT:** See `tests/README.md` (people) or `.claude/rules/testing.md` (agents) for canonical test execution commands.
 > Always use Makefile targets (`make test-unit`, `make test-integration`, `make e2e`)
 > to ensure proper environment configuration.
 

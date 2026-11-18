@@ -6,7 +6,7 @@ This directory contains the agentic-friendly planning system for AgentFX.
 
 ## Quick Start for AI Agents
 
-1. **Current Work**: See [BACKLOG.md](BACKLOG.md) for version-grouped tasks
+1. **Current Work**: Linear, team `AFX` (see [runbooks/linear-operating-model.md](runbooks/linear-operating-model.md)). [BACKLOG.md](BACKLOG.md) is a frozen snapshot from 2026-10-22
 2. **Requirements**: See [requirements/](requirements/) for executable user stories
 3. **Standards**: See [architecture/AGENT_PROTOCOLS.md](architecture/AGENT_PROTOCOLS.md) for development rules
 4. **Roadmap**: See [ROADMAP.md](ROADMAP.md) for release milestones
@@ -180,6 +180,6 @@ requirements/       → Executable user stories
 
 ## Links to Other Docs
 
-- Project overview: [/CLAUDE.md](/CLAUDE.md)
+- Project overview: [/README.md](/README.md); agent rules: [/CLAUDE.md](/CLAUDE.md)
 - Source structure: [/src/agentfx/](/src/agentfx/)
 - Test structure: [/tests/](/tests/)
