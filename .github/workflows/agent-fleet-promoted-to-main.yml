@@ -1,0 +1,79 @@
+name: Comment promoted-to-main on Linear
+
+# Second Linear comment of the fleet flow (AFX-68). Sibling of
+# agent-fleet-promote.yml (AFX-69):
+#
+#   agent/*  --squash-->  feat/agent-fleet  --merge commit-->  main
+#                         (AFX-69 comment:                (this workflow:
+#                          "not on main yet")              "promoted to main")
+#
+# On every PR merged into main (promotes and direct hotfixes),
+# scripts/fleet_promoted_to_main.py collects the AFX-<n> ids the merge
+# carries (first-parent commits that just landed + the PRs that landed
+# them) and posts one comment per issue with the PR link, merge time and
+# the Railway staging deploy link. A marker per PR makes re-runs no-ops.
+# A merge with no AFX ids does nothing.
+#
+# Never fails on Linear: a missing LINEAR_API_KEY or a Linear error is
+# logged and the job exits 0. deploy.yml does not depend on this workflow.
+#
+# Triggers:
+#   - pull_request_target closed into main: runs main's copy of this file
+#     with GITHUB_REF=main. It never checks out or runs PR code; it only
+#     reads git history of main and the GitHub API.
+#     Back-merges (main → feat/agent-fleet) don't match `branches: main`.
+#   - workflow_dispatch: replay one PR. dry_run defaults to true so a
+#     manual run against a historical PR only prints the comments.
+#
+# Auth: read-only GITHUB_TOKEN. This job opens nothing on GitHub, so it
+# needs no fleet-bot App token.
+
+on:
+  pull_request_target:
+    branches:
+      - main
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR merged into main to (re)comment for"
+        required: true
+        type: number
+      dry_run:
+        description: "Print the comments without posting to Linear"
+        required: false
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: agent-fleet-promoted-to-main-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  comment:
+    name: Comment on Linear issues
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event.pull_request.merged == true
+          && github.event.pull_request.head.ref != 'main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Post promoted-to-main comments
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: python3 scripts/fleet_promoted_to_main.py --pr "$PR_NUMBER" $DRY_RUN
