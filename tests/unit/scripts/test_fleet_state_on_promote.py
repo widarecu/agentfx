@@ -56,6 +56,29 @@ def test_collect_afx_ids_empty_when_no_tags():
     assert fsop.collect_afx_ids_from_commits(commits) == []
 
 
+def test_collect_afx_ids_ignores_body_only_references():
+    """Agents reference related tickets in commit BODIES as context ("split
+    out into AFX-94 and AFX-95"); those must not be treated as tickets
+    this merge closes. Subject-only scan guards against false positives.
+    This was observed live on 2026-11-18: PR #118's commit referenced
+    AFX-94/AFX-95 in the body, and the first version of the script picked
+    them up and tried to transition them — a bug caught before the
+    mutation reached Linear (because the 400 bail happened first).
+    """
+    commits = [
+        {
+            "commit": {
+                "message": (
+                    "AFX-70 Phase 1: Linear state honesty\n\n"
+                    "Phases 2 and 3 are split into AFX-94 and AFX-95 — "
+                    "this PR does not touch them."
+                )
+            }
+        },
+    ]
+    assert fsop.collect_afx_ids_from_commits(commits) == ["AFX-70"]
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Markers + comment bodies
 # ─────────────────────────────────────────────────────────────────────
@@ -201,6 +224,48 @@ def test_transition_handles_linear_api_error_gracefully():
     assert linear.transition("AFX-70", "Done", allowed_from=fsop.TRANSITIONABLE) is None
     # Cached state must not have been updated by the failed call.
     assert linear._issues["AFX-70"]["state"]["name"] == "In Staging"
+
+
+def test_gql_surfaces_linear_400_error_body(monkeypatch):
+    """Linear returns HTTP 400 with the real GraphQL error inside the
+    response body. `_gql` must read the body and raise a RuntimeError that
+    carries the actual message, so the caller's `warn()` shows what went
+    wrong instead of just 'HTTP Error 400: Bad Request'. Pattern mirrors
+    src/agentfx/integrations/linear_client.py:_gql. Observed live on
+    2026-11-18: AFX-70's first run returned 400 for every ticket and the
+    log only said 'Bad Request' — a day of guessing the cause.
+    """
+    import io
+    import json as json_mod
+
+    linear = fsop.Linear("key")
+
+    class _StubHTTPError(fsop.urllib.error.HTTPError):
+        def __init__(self, body: bytes):
+            super().__init__(
+                url=fsop.LINEAR_URL,
+                code=400,
+                msg="Bad Request",
+                hdrs=None,
+                fp=io.BytesIO(body),
+            )
+
+    canned_body = json_mod.dumps(
+        {"errors": [{"message": "Variable $stateId has no value"}]}
+    ).encode()
+
+    def fake_urlopen(req, timeout):
+        raise _StubHTTPError(canned_body)
+
+    monkeypatch.setattr(fsop.urllib.request, "urlopen", fake_urlopen)
+    try:
+        linear._gql("mutation { x }", {})
+    except RuntimeError as exc:
+        msg = str(exc)
+        assert "400" in msg
+        assert "Variable $stateId has no value" in msg
+    else:
+        raise AssertionError("expected RuntimeError")
 
 
 # ─────────────────────────────────────────────────────────────────────

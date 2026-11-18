@@ -30,6 +30,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from datetime import UTC, datetime
 
@@ -52,13 +53,18 @@ STATE_IDS = {
     "Blocked": "f7439041-9e07-49da-9da6-5c0f1ff91523",
 }
 
-# States a ticket is allowed to be in when it reaches a main merge. Anything
-# else (Done, Canceled, Duplicate) is treated as a skip — don't move
-# backwards, don't re-process a completed ticket.
+# States a ticket is allowed to be in to be moved by this workflow. Narrow
+# on purpose:
+#   * Only tickets that have been through the PR pipeline (In Review, In
+#     Staging) or that were in-flight when the deploy ran (In Progress,
+#     Needs Input, Blocked) should be affected by a deploy outcome.
+#   * Triage / Backlog / Ready tickets referenced in a commit body as
+#     context (e.g. "split out into AFX-94, AFX-95") must NOT be moved —
+#     they weren't the subject of the merge. The `collect_afx_ids_from_commits`
+#     subject-only scan is the other layer of defence.
+#   * Done, Canceled, Duplicate are skipped so a re-run can't un-Done a
+#     closed ticket.
 TRANSITIONABLE = {
-    "Triage",
-    "Backlog",
-    "Ready",
     "In Progress",
     "In Review",
     "In Staging",
@@ -118,15 +124,16 @@ def failed_comment(sha: str, *, run_url: str) -> str:
 
 
 def collect_afx_ids_from_commits(commits: list[dict]) -> list[str]:
-    """Deduplicated AFX-IDs from every commit subject in the list.
-
-    `commits` is a list of dicts shaped like `gh api repos/.../commits/{sha}`
-    responses, each with `commit.message` (we scan the full message).
+    """Deduplicated AFX-IDs from every commit **subject** (first line) in
+    the list. The body is deliberately ignored: agents reference other
+    tickets in commit bodies as context ("split out into AFX-94, AFX-95"),
+    and those references must NOT be treated as tickets this merge closes.
     """
     seen: list[str] = []
     for c in commits:
         message = ((c.get("commit") or {}).get("message")) or ""
-        for ident in afx_ids(message):
+        subject = message.split("\n", 1)[0]
+        for ident in afx_ids(subject):
             if ident not in seen:
                 seen.append(ident)
     return seen
@@ -196,6 +203,13 @@ class Linear:
         self._label_ids: dict[str, str | None] = {}
 
     def _gql(self, query: str, variables: dict) -> dict:
+        """Execute a GraphQL request. Linear returns HTTP 400 on schema
+        violations + complexity-gate rejections with the real error in the
+        response body — so parse the body on both success AND HTTPError
+        and surface the GraphQL `errors` payload. Backend's
+        `linear_client._gql` learned this the hard way (~15 min debugging
+        2026-10-27); this mirrors that pattern.
+        """
         req = urllib.request.Request(
             LINEAR_URL,
             data=json.dumps({"query": query, "variables": variables}).encode(),
@@ -204,8 +218,30 @@ class Linear:
                 "Content-Type": "application/json",
             },
         )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            payload = json.loads(resp.read())
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = resp.read()
+        except urllib.error.HTTPError as http_err:
+            # Linear's error body is JSON with a GraphQL `errors` list.
+            # Surface it so the warning tells us the real cause instead of
+            # just "HTTP Error 400: Bad Request".
+            body = http_err.read() if http_err.fp else b""
+            try:
+                payload = json.loads(body)
+            except ValueError:
+                payload = {}
+            errors = (
+                payload.get("errors")
+                or payload.get("error")
+                or body.decode("utf-8", "replace")
+            )
+            raise RuntimeError(
+                f"linear graphql {http_err.code}: {errors}"
+            ) from http_err
+        try:
+            payload = json.loads(body)
+        except ValueError as exc:
+            raise RuntimeError(f"linear non-json response: {body!r}") from exc
         if payload.get("errors"):
             raise RuntimeError(payload["errors"])
         return payload["data"]
