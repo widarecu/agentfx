@@ -1,0 +1,82 @@
+name: Transition Linear tickets on main-merge + deploy outcome
+
+# Fires when the Deploy workflow completes (AFX-70 Phase 1). The Deploy
+# workflow IS the Railway deploy, so its conclusion is what we react to:
+#   success  → transition each AFX-N carried by the merge to `Done` + post
+#              "promoted + deployed" comment with staging link.
+#   failure  → transition to `Blocked`, add `needs-wilson`, warn comment.
+#   cancelled→ log + skip.
+#
+# feat/agent-fleet → In Staging is Linear-native via branch rules (Wilson's
+# admin config, 2026-11-14). This workflow only owns the main-merge edge.
+#
+# scripts/fleet_state_on_promote.py does the actual Linear API work.
+
+on:
+  workflow_run:
+    workflows: ["Deploy"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Merge commit SHA on main"
+        required: true
+      outcome:
+        description: "Simulated deploy outcome"
+        required: true
+        default: "success"
+        type: choice
+        options:
+          - success
+          - failure
+          - cancelled
+
+permissions: {}
+
+concurrency:
+  group: agent-fleet-state-on-promote-${{ github.event.workflow_run.head_sha || inputs.sha }}
+  cancel-in-progress: false
+
+jobs:
+  transition:
+    # Only react to pushes to main. workflow_run fires for any Deploy
+    # workflow run, but Deploy itself only runs on push to main, so this is
+    # belt-and-braces: reject anything else before touching Linear.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    environment: fleet-bot
+    timeout-minutes: 10
+    steps:
+      - name: Mint fleet-bot token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.FLEET_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.FLEET_BOT_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: read
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # Pin to main, not the triggering event's ref — workflow_run uses
+          # the default branch for the workflow file lookup, but the
+          # checkout defaults to the triggering ref, which can be the
+          # workflow_run's head_sha. Pinning to main keeps the script
+          # version aligned with what the workflow_run observed.
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Transition AFX tickets
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          LINEAR_TEAM_KEY: AFX
+        run: |
+          python3 scripts/fleet_state_on_promote.py \
+            --sha '${{ github.event.workflow_run.head_sha || inputs.sha }}' \
+            --outcome '${{ github.event.workflow_run.conclusion || inputs.outcome }}' \
+            --run-url '${{ github.event.workflow_run.html_url || github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'

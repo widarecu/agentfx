@@ -497,7 +497,15 @@ Key settings:
 
 **Linear is the source of truth for work items** (workspace `agentfx`, team key `AFX`). Use the `linear-server` MCP tools. The full operating model is in [planning/runbooks/linear-operating-model.md](planning/runbooks/linear-operating-model.md). Wilson is the only human and the only approver.
 
-States: `Triage` → `Backlog` → `Ready` → `In Progress` → `In Review` → `Done` (plus `Canceled` / `Duplicate`).
+States: `Triage` → `Backlog` → `Ready` → `In Progress` → `In Review` → `In Staging` → `Done` (plus `Needs Input`, `Blocked`, `Canceled`, `Duplicate`).
+
+What each state means:
+- **In Progress** — agent is actively writing code.
+- **In Review** — PR is open, code is up for review (Linear PR automation sets this on PR open).
+- **In Staging** — PR is merged to `feat/agent-fleet`, not yet on `main`. Linear's branch-specific PR automation flips it on `feat/agent-fleet` merge.
+- **Done** — promoted to `main` AND the Railway deploy succeeded. Only `agent-fleet-state-on-promote.yml` (AFX-70) sets this — not Linear's PR automation.
+- **Blocked** — cannot proceed due to external dep: predecessor ticket unshipped, Anthropic/Devin quota, broken env, or a failed Railway deploy. Add `needs-wilson` when a human needs to unblock.
+- **Needs Input** — agent paused, waiting on Wilson (or another human) for a decision. Agents post `<!-- needs-input: wilson -->` in a comment to signal the pause.
 
 **Filing issues**
 1. Search first. If an open issue covers the same problem (or carries the same `Fingerprint:`), comment with the new evidence instead of filing.
@@ -527,6 +535,7 @@ agent/AFX-<n>-<slug>  --squash-->  feat/agent-fleet  --merge commit-->  main
 - Promotes `feat/agent-fleet` → `main` are **merge commits**. Wilson approves every promote. Never cherry-pick onto a branch cut from `main`.
 - [agent-fleet-promote.yml](.github/workflows/agent-fleet-promote.yml) keeps one promote PR open (head `feat/agent-fleet`, labels `promote` + `needs-wilson`) whenever the fleet branch has content `main` lacks. It lists every unpromoted PR with risk and files, Money-path first, and comments the link on each `AFX-<n>` issue. It runs on merges by a person or App, and every 30 min for agent PRs (GITHUB_TOKEN auto-merges don't start workflows). Don't open a second promote PR. To freeze a promote at a specific SHA, cut `promote/*` from `feat/agent-fleet` instead; the workflow then closes its live PR and won't open another until that one is merged or closed.
 - Every push to `main` (promotes and hotfixes) triggers [main-to-fleet-backmerge.yml](.github/workflows/main-to-fleet-backmerge.yml). It opens a `main` → `feat/agent-fleet` PR as `agentfx-fleet-bot`, which auto-merges as a merge commit once the fast-gate is green. On conflict it adds `needs-wilson` and is never auto-resolved.
+- When the `Deploy` workflow completes after a push to `main`, [agent-fleet-state-on-promote.yml](.github/workflows/agent-fleet-state-on-promote.yml) (AFX-70) reads its outcome: `success` → transitions each `AFX-<n>` carried by the merge to `Done` with a staging-link comment; `failure` → transitions to `Blocked`, adds `needs-wilson`, posts a warning comment. Linear's branch-specific PR automation already handles the earlier `feat/agent-fleet` merge → `In Staging`.
 - Unpromoted work is `git log origin/main..origin/feat/agent-fleet`. Whether a promote is needed depends on `git diff origin/main origin/feat/agent-fleet`, not on commit counts, because back-merge commits show up in the log without changing content.
 - Never squash a back-merge or a promote PR. Squashing breaks the shared history and the drift returns.
 
