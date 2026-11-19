@@ -20,6 +20,6 @@ Run from the repo root. All must pass before opening the PR.
    git diff --stat origin/feat/agent-fleet...HEAD
    ```
    Only files the issue needs, plus their tests. No `.env.*` files except `.env.example`.
-9. PR targets `feat/agent-fleet`, never `main`. Title names only tickets this PR closes. Money-path → `needs-wilson`.
+9. PR targets `feat/agent-fleet`, never `main`. Title names only tickets this PR closes. Label it `agent-authored`, whatever the risk; `needs-wilson` is only for real blockers.
 
 Report what you ran and the result. If something fails after three honest attempts, stop and report the failing output rather than pushing a red branch.

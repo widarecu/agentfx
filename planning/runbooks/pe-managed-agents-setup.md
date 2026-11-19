@@ -71,6 +71,7 @@ Not yet applied. What changes and why:
 |---|---|
 | New step 2: read `CLAUDE.md` and the files its "Read before changing" table lists for the paths in the kickoff | Today the agent never reads repo guidance, so it misses rules such as `.env.example` parity, single Alembic head, and the portal UI test bar. The Managed Agents sandbox does not load CLAUDE.md, rules or hooks automatically |
 | Rule 2 runs `make lint` as well as `make test-unit` | Both are required before a PR (`CLAUDE.md` rule 8); lint failures currently surface only in CI |
+| Rule 4 no longer adds `needs-wilson` to Money-path PRs | AFX-98: Money-path PRs auto-merge into `feat/agent-fleet` like any other; Wilson reviews them on the promote PR to `main`. The prompt in the Console still carries the old rule until this revision is pasted |
 | New rule 7: ticket IDs in the PR title only if the PR closes that ticket | Linear closes every ID it finds in a merged PR title |
 | Bootstrap logs in with `gh` before cloning, and clones with the plain URL | The current clone writes the token into `.git/config` inside the sandbox. `gh auth setup-git` already provides git credentials |
 | **Optional:** effort `high` instead of `max` | `max` is the most expensive setting. PE tasks are deliberately narrow (rule 5), so `high` is likely enough. Trade-off: on hard tasks, `max` may need fewer retries. Worth comparing cost and pass rate over a week of dispatches |
@@ -119,8 +120,9 @@ HARD RULES:
    This arms the Agent Fleet CI auto-merge on green tests. Without
    the label the PR waits for human review and your work stalls.
 
-4. If the kickoff says "Risk: Money-path", ALSO add
-   `needs-wilson` so auto-merge is suppressed.
+4. Add `agent-authored` whatever the risk, Money-path included.
+   Wilson reviews Money-path changes on the promote PR to `main`.
+   Use `needs-wilson` only when you cannot finish without a decision.
 
 5. Keep scope tight — only touch the files the kickoff message
    names, plus their tests. No drive-by refactors.

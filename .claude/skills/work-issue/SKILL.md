@@ -18,7 +18,7 @@ Canonical rules: `planning/runbooks/linear-operating-model.md` §7. Use the `lin
 5. **Build to the issue's "Done when"**, nothing more. Don't change approved scope; propose changes as a comment or a new Triage issue. If a product decision blocks you: comment the question, post `<!-- needs-input: wilson -->`, add `needs-wilson`, move to **Needs Input**, and stop.
 6. **Before the PR**, run the `pr-preflight` skill.
 7. **Open the PR** against `feat/agent-fleet`. Title includes `AFX-<n>` (only because this PR closes it). Reference other tickets in the body under "Related", never in the title.
-   - Risk **Money-path** (order execution, sizing, kill switch, credentials, deploy gates): add `needs-wilson`; it must never auto-merge.
+   - Add the `agent-authored` label (`gh pr edit <number> --add-label agent-authored`) so it auto-merges on green CI. This applies to Risk **Money-path** too: Wilson reviews those on the promote PR to `main`. Don't add `needs-wilson` for risk alone.
 8. **Comment on the issue**: what was tested, and the CI link.
 
 State after merge is automatic: merge to `feat/agent-fleet` → In Staging; promote to `main` plus a successful deploy → Done. Don't set these by hand.

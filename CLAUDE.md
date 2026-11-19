@@ -8,7 +8,7 @@ Success means **profitable, live-ready strategies**, not PRs merged or experimen
 
 1. **Only the `test` Docker profile may be wiped.** Never run `make e2e` or `docker compose down -v` against `dev` or `uat`; uat holds Wilson's real data. ([environments](planning/runbooks/environments.md))
 2. **Never push to `main`.** Agent PRs target `feat/agent-fleet`; Wilson promotes. When reporting a merge, name the branch: "merged to `feat/agent-fleet`" or "to `main`". Only `main` deploys. ([branch flow](planning/runbooks/branch-flow.md))
-3. **Money-path changes never auto-merge** (order execution, sizing, kill switch, credentials, deploy gates). Add `needs-wilson`.
+3. **Money-path changes** (order execution, sizing, kill switch, credentials, deploy gates) **are reviewed by Wilson on the promote PR to `main`**, not on `feat/agent-fleet`. Agent PRs into `feat/agent-fleet` get `agent-authored` and auto-merge on green CI whatever the risk. Don't add `needs-wilson` for risk alone; it is for real blockers.
 4. **OANDA practice keys only.**
 5. **Never edit `.env.development`, `.env.test`, `.env.uat`.** Any new setting in `src/agentfx/api/core/config.py` goes into `.env.example` in the same PR.
 6. **Linear is the work tracker** (team `AFX`). Work only issues in **Ready**; file new issues only into **Triage**; never set priority or change approved scope. `planning/BACKLOG.md` is frozen. Skills: `work-issue`, `file-issue`.

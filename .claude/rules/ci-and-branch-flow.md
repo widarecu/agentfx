@@ -8,7 +8,7 @@ paths:
 
 # CI, deploy and branch-flow files
 
-These files control what reaches `main` and staging. Changes here are **Risk: Money-path** when they touch deploy gates: the PR never auto-merges; add `needs-wilson`.
+These files control what reaches `main` and staging. Changes here are **Risk: Money-path** when they touch deploy gates. Like any agent PR they auto-merge into `feat/agent-fleet`; Wilson reviews them on the promote PR to `main` (CLAUDE.md rule 3).
 
 Read `planning/runbooks/branch-flow.md` before changing any of:
 - `agent-fleet-promote.yml` / `scripts/fleet_promote_pr.py`: keep exactly one live promote PR; promotes are merge commits, never squash.

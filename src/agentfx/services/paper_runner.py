@@ -115,6 +115,45 @@ _BALANCE_RETRY_LIMIT = 6
 _BALANCE_RETRY_BACKOFF_SECONDS = (15.0, 30.0, 60.0, 120.0, 240.0)
 
 
+# AFX-93: decision-log action for an OANDA 401/403 seen while the FX
+# market is closed. OANDA weekend maintenance returns transient 401s;
+# off-hours the runner retries instead of halting with OANDA_AUTH_LOST.
+_AUTH_DEFERRED_ACTION = "USER_AUTH_DEFERRED_MARKET_CLOSED"
+
+
+# AFX-92: wall-clock heartbeat cadence. Must stay well under the
+# supervisor's `_HEARTBEAT_STALE_SECONDS` (900s) even when one adapter
+# call blocks for its full retry ladder (~300s).
+_HEARTBEAT_INTERVAL_SECONDS = 300.0
+
+
+def _persist_heartbeat(
+    db, run, iteration: int, now_dt: datetime, *, phase: str | None = None
+) -> None:
+    """Log + persist `run.parameters['last_heartbeat_at']`. Never raises."""
+    logger.info(
+        "paper runner heartbeat: run=%s iter=%d balance=%.2f pnl=%.2f%s",
+        run.id,
+        iteration,
+        run.current_balance or 0.0,
+        run.pnl or 0.0,
+        f" phase={phase}" if phase else "",
+    )
+    try:
+        params = dict(run.parameters or {})
+        params["last_heartbeat_at"] = now_dt.isoformat()
+        run.parameters = params
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(run, "parameters")
+        db.commit()
+    except Exception:  # noqa: BLE001 — never let heartbeat crash the loop
+        logger.exception(
+            "paper runner: heartbeat persist failed on %s (loop continues)",
+            run.id,
+        )
+
+
 def _balance_retry_sleep_seconds(consecutive_failures: int) -> float:
     """Sleep length after the Nth (1-indexed) consecutive balance
     failure. Clamped to the last defined backoff so callers can't run
@@ -666,14 +705,14 @@ def _execute_loop(
         else float("inf")
     )
 
-    _snapshot_balance_if_needed(db=db, run=run, client=client)
-
     # Consecutive non-auth OANDA failures on the balance refresh. A
     # single 15s read-timeout no longer crashes the subprocess (Wilson
     # 2026-08-14): the tick is skipped, the loop retries next iteration,
     # and only after `_BALANCE_RETRY_LIMIT` failures in a row do we halt
     # cleanly with `BROKER_NETWORK`. Reset to 0 on any successful call.
     consecutive_balance_failures = 0
+    # AFX-93: consecutive auth failures while the market is closed.
+    closed_market_auth_failures = 0
 
     # Wilson 2026-08-24: subprocess heartbeat. Persisted to
     # `run.parameters['last_heartbeat_at']` every ~5 minutes of
@@ -684,9 +723,38 @@ def _execute_loop(
     # restart them. Also grep-able signature in Railway logs — the
     # absence of "paper runner heartbeat" lines after N minutes is
     # proof of silent death. Loop iterates every ~5s so 60 = ~5 min.
+    #
+    # AFX-92: the heartbeat also fires on elapsed wall time, and is
+    # forced between steps of the balance retry / 401 ladder. One
+    # iteration can block for minutes inside the adapter's own retries,
+    # so an iteration count alone let a live runner look stale to the
+    # supervisor, which then started a second runner.
     _HEARTBEAT_INTERVAL_ITERATIONS = 60
+    last_heartbeat: datetime | None = None
 
+    def _heartbeat(*, phase: str | None = None, force: bool = False) -> None:
+        nonlocal last_heartbeat
+        now_dt = datetime.now(UTC)
+        due = (
+            force
+            or iteration == 1
+            or iteration % _HEARTBEAT_INTERVAL_ITERATIONS == 0
+            or (now_dt - last_heartbeat).total_seconds() >= _HEARTBEAT_INTERVAL_SECONDS
+        )
+        if not due:
+            return
+        last_heartbeat = now_dt
+        _persist_heartbeat(db, run, iteration, now_dt, phase=phase)
+
+    # Heartbeat before the first broker call: a freshly (re)started
+    # runner whose first balance call ladders must not look like a
+    # zombie to the supervisor before it has had a chance to beat.
     iteration = 0
+    last_heartbeat = datetime.now(UTC)
+    _persist_heartbeat(db, run, iteration, last_heartbeat, phase="startup")
+
+    _snapshot_balance_if_needed(db=db, run=run, client=client)
+
     while True:
         if max_iterations is not None and iteration >= max_iterations:
             logger.info(
@@ -726,6 +794,7 @@ def _execute_loop(
         # can prompt the user to re-verify.
         from agentfx.adapters.oanda import OandaError
 
+        balance_exc: OandaError | None = None
         try:
             balance = client.get_account_balance()
         except OandaCircuitOpen:
@@ -733,86 +802,77 @@ def _execute_loop(
             _flatten_and_halt(db, run, client, reason="BROKER_CIRCUIT")
             return
         except OandaError as exc:
-            if _is_auth_error(exc):
-                logger.warning(
-                    "paper runner: %s got 401 on balance; attempting cred refresh",
+            balance_exc = exc
+        if balance_exc is not None and _is_auth_error(balance_exc):
+            outcome = _resolve_auth_failure(
+                db,
+                run,
+                balance_exc,
+                now=datetime.fromtimestamp(now_fn(), tz=UTC),
+                prior_closed_failures=closed_market_auth_failures,
+                heartbeat=_heartbeat,
+            )
+            if outcome.kind == "halt":
+                logger.error(
+                    "paper runner: %s auth-refresh failed; halting oanda_auth_lost",
                     run.id,
                 )
-                new_client = _recover_from_auth_loss(db, run, exc)
-                if new_client is None:
-                    logger.error(
-                        "paper runner: %s auth-refresh failed; halting oanda_auth_lost",
-                        run.id,
-                    )
-                    _flatten_and_halt(db, run, client, reason="OANDA_AUTH_LOST")
-                    return
-                client = new_client
-                balance = client.get_account_balance()
-            else:
-                # Non-auth OANDA failure — most commonly a read timeout
-                # after the adapter's own 5-retry chain gave up
-                # (`connection_error:` prefix). Wilson 2026-08-14: this
-                # used to `raise` and kill the subprocess; the runner
-                # now skips the tick and retries next iteration. If it
-                # keeps failing we halt cleanly via BROKER_NETWORK
-                # instead of leaving the position stranded on OANDA.
-                consecutive_balance_failures += 1
-                if consecutive_balance_failures >= _BALANCE_RETRY_LIMIT:
-                    logger.error(
-                        "paper runner: %s balance refresh failed %d times "
-                        "in a row (%s); halting broker_network",
-                        run.id,
-                        consecutive_balance_failures,
-                        exc,
-                    )
-                    _flatten_and_halt(db, run, client, reason="BROKER_NETWORK")
-                    return
-                sleep_seconds = _balance_retry_sleep_seconds(
-                    consecutive_balance_failures
-                )
-                logger.warning(
-                    "paper runner: %s balance refresh failed (%s); "
-                    "skipping tick (%d/%d), backing off %.0fs",
-                    run.id,
-                    exc,
-                    consecutive_balance_failures,
-                    _BALANCE_RETRY_LIMIT,
-                    sleep_seconds,
-                )
-                sleep_fn(sleep_seconds)
+                _flatten_and_halt(db, run, client, reason="OANDA_AUTH_LOST")
+                return
+            if outcome.kind == "deferred":
+                closed_market_auth_failures += 1
+                _heartbeat(phase="auth-deferred", force=True)
+                sleep_fn(_balance_retry_sleep_seconds(closed_market_auth_failures))
                 continue
+            if outcome.kind == "recovered":
+                client = outcome.client
+                balance = outcome.balance
+                balance_exc = None
+            else:
+                balance_exc = outcome.error
+        if balance_exc is not None:
+            # Non-auth OANDA failure — most commonly a read timeout
+            # after the adapter's own 5-retry chain gave up
+            # (`connection_error:` prefix). Wilson 2026-08-14: this
+            # used to `raise` and kill the subprocess; the runner
+            # now skips the tick and retries next iteration. If it
+            # keeps failing we halt cleanly via BROKER_NETWORK
+            # instead of leaving the position stranded on OANDA.
+            consecutive_balance_failures += 1
+            if consecutive_balance_failures >= _BALANCE_RETRY_LIMIT:
+                logger.error(
+                    "paper runner: %s balance refresh failed %d times "
+                    "in a row (%s); halting broker_network",
+                    run.id,
+                    consecutive_balance_failures,
+                    balance_exc,
+                )
+                _flatten_and_halt(db, run, client, reason="BROKER_NETWORK")
+                return
+            sleep_seconds = _balance_retry_sleep_seconds(consecutive_balance_failures)
+            logger.warning(
+                "paper runner: %s balance refresh failed (%s); "
+                "skipping tick (%d/%d), backing off %.0fs",
+                run.id,
+                balance_exc,
+                consecutive_balance_failures,
+                _BALANCE_RETRY_LIMIT,
+                sleep_seconds,
+            )
+            _heartbeat(phase="balance-retry", force=True)
+            sleep_fn(sleep_seconds)
+            continue
         consecutive_balance_failures = 0
+        closed_market_auth_failures = 0
         run.current_balance = balance["balance"]
         run.pnl = balance["balance"] - (run.snapshot_balance or 0.0)
         db.commit()
 
         # Heartbeat: log INFO + persist `last_heartbeat_at` every
-        # ~5 min (60 iterations at 5s cadence) of healthy iteration.
-        # Supervisor uses this to detect zombie RUNNING rows and
-        # restart them. Emitted on iteration 1 too so a fresh
-        # subprocess registers a heartbeat immediately.
-        if iteration == 1 or iteration % _HEARTBEAT_INTERVAL_ITERATIONS == 0:
-            heartbeat_iso = datetime.now(UTC).isoformat()
-            logger.info(
-                "paper runner heartbeat: run=%s iter=%d balance=%.2f pnl=%.2f",
-                run.id,
-                iteration,
-                run.current_balance or 0.0,
-                run.pnl or 0.0,
-            )
-            try:
-                params = dict(run.parameters or {})
-                params["last_heartbeat_at"] = heartbeat_iso
-                run.parameters = params
-                from sqlalchemy.orm.attributes import flag_modified as _flag_hb
-
-                _flag_hb(run, "parameters")
-                db.commit()
-            except Exception:  # noqa: BLE001 — never let heartbeat crash the loop
-                logger.exception(
-                    "paper runner: heartbeat persist failed on %s (loop continues)",
-                    run.id,
-                )
+        # ~5 min of healthy iteration. Supervisor uses this to detect
+        # zombie RUNNING rows and restart them. Emitted on iteration 1
+        # too so a fresh subprocess registers a heartbeat immediately.
+        _heartbeat()
 
         # Evaluate risk gates against the current balance. The health
         # tick only checks halt-gates (kill_switch, loss cap);
@@ -2487,6 +2547,114 @@ def _safe_txn_id(raw) -> str | None:
 # ─────────────────────────────────────────────────────────────────────
 # Credential recovery (T0.2 — Wilson UAT 2026-07-15)
 # ─────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class _AuthOutcome:
+    """What the health tick should do after a 401/403 (AFX-93)."""
+
+    kind: Literal["recovered", "deferred", "halt", "broker_error"]
+    client: object | None = None
+    balance: dict | None = None
+    error: Exception | None = None
+
+
+def _resolve_auth_failure(
+    db,
+    run,
+    exc: Exception,
+    *,
+    now: datetime,
+    prior_closed_failures: int,
+    heartbeat: Callable[..., None],
+) -> _AuthOutcome:
+    """Classify a 401/403 on the health-tick balance call.
+
+    Market open: refresh creds once and re-read the balance on the
+    fresh client; an auth error on either step halts (OANDA_AUTH_LOST).
+
+    Market closed (AFX-93): never halt, since no fill is possible. The
+    first failure of a closed-market streak logs a decision and tries
+    one refresh; later ones just defer, because the adapter already
+    rebuilds its session on every 401. A 401 that outlives the reopen
+    takes the market-open path on the next tick.
+
+    Every broker call here is preceded by a forced heartbeat so the
+    AFX-92 supervisor never sees a live runner as stale. Nothing in
+    here raises an `OandaError`: a non-auth error during the refresh
+    comes back as `broker_error` for the caller's retry budget.
+    """
+    from agentfx.adapters.oanda import OandaError
+    from agentfx.api.workers.market_calendar import market_closure_at
+
+    market_closed, closure = market_closure_at(now)
+    if market_closed:
+        logger.warning(
+            "paper runner: %s got auth error on balance while market closed "
+            "(%s, attempt %d): %s; deferring, not halting",
+            run.id,
+            closure,
+            prior_closed_failures + 1,
+            exc,
+        )
+        if prior_closed_failures > 0:
+            return _AuthOutcome("deferred")
+        _record_auth_deferred(db, run, exc, closure)
+    else:
+        logger.warning(
+            "paper runner: %s got 401 on balance; attempting cred refresh",
+            run.id,
+        )
+
+    heartbeat(phase="auth-refresh", force=True)
+    try:
+        fresh = _recover_from_auth_loss(db, run, exc)
+        if fresh is not None:
+            heartbeat(phase="auth-refresh-recheck", force=True)
+            balance = fresh.get_account_balance()
+            return _AuthOutcome("recovered", client=fresh, balance=balance)
+    except OandaError as refresh_exc:
+        if not _is_auth_error(refresh_exc):
+            logger.warning(
+                "paper runner: %s auth-refresh hit a broker error: %s",
+                run.id,
+                refresh_exc,
+            )
+            if market_closed:
+                return _AuthOutcome("deferred")
+            return _AuthOutcome("broker_error", error=refresh_exc)
+        logger.warning(
+            "paper runner: %s refreshed client still gets auth error: %s",
+            run.id,
+            refresh_exc,
+        )
+    return _AuthOutcome("deferred" if market_closed else "halt")
+
+
+def _record_auth_deferred(db, run, exc: Exception, closure: str) -> None:
+    """Write the once-per-streak USER_AUTH_DEFERRED_MARKET_CLOSED row."""
+    try:
+        _write_decision(
+            db,
+            run,
+            action=_AUTH_DEFERRED_ACTION,
+            reason=(
+                f"OANDA auth error while market closed ({closure}); "
+                "retrying with backoff instead of halting"
+            ),
+            outputs={
+                "paper_run_id": run.id,
+                "closure": closure,
+                "error": str(exc)[:500],
+            },
+        )
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        logger.exception(
+            "paper runner: %s failed to write %s decision",
+            run.id,
+            _AUTH_DEFERRED_ACTION,
+        )
 
 
 def _is_auth_error(exc: Exception) -> bool:
