@@ -86,9 +86,29 @@ HARD RULES:
 | Bootstrap logs in with `gh` before cloning, and clones with the plain URL | The old clone wrote the token into `.git/config` inside the sandbox. `gh auth setup-git` already provides git credentials |
 | Effort `high` instead of `max` | `max` is the most expensive setting and PE tasks are deliberately narrow (rule 5). Compare cost and pass rate over a week of dispatches; go back to `max` if hard tasks start needing retries |
 
-## Open points
+## Pending changes (decided by Wilson 2026-11-19, not yet applied in the Console)
 
-- Step 2 of the prompt says the agent has no Linear MCP tools, but the config attaches a `linear` MCP server. One of the two should change.
-- The `railway` MCP server is attached with permission `auto`. `cloud-agent-setup.md` deliberately withholds Railway access from coding agents, because deploys only run from `main` CI.
+When these are applied, move them into "Current config" and the change log.
+
+**1. The PE agent uses Linear** to read related issues and file follow-ups. In step 2 of the prompt, delete the sentence "Ignore instructions there about Linear MCP tools; you don't have them." and add rule 8 below.
+
+**2. Railway is read-only:** logs and deployment status only. Railway changes happen only through the deploy pipeline. Enforce it in the config, not only in the prompt: on the `railway` MCP toolset set the default to disabled and enable only the read tools (logs, deployment list and status, deployment diagnosis, service and environment status, metrics). Leave every create, update, delete, deploy, redeploy, restart and set-variables tool disabled, and leave `list-variables` disabled too, since it returns secret values. Add rule 9 below.
+
+**3. Advisor, subagents and workflows switched off** to keep cost per dispatch down.
+
+Rules to append to the prompt:
+
+```text
+8. Linear: you may read any AFX issue for context. File follow-up
+   issues only into Triage, following
+   `.claude/skills/file-issue/SKILL.md`: search for duplicates first,
+   at most 5 new issues per day. Never set priority, never move an
+   issue out of Triage, never edit the scope of an approved issue.
+
+9. Railway is READ-ONLY: logs and deployment status. Never deploy,
+   redeploy, restart, or change variables, settings, domains or
+   services, and never print variable values. Railway changes happen
+   only through the deploy pipeline on `main`.
+```
 
 Before applying, check whether the sandbox image has Docker. If it does not, `make test-unit` still works (unit tests need no database) but integration tests cannot run there.
