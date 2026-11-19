@@ -77,8 +77,9 @@ class ReadyIssue:
 
     @property
     def is_money_path(self) -> bool:
-        """CLAUDE.md: Money-path PRs never auto-merge; add
-        `needs-wilson`. The dispatch prompt tells the session this."""
+        """Money-path PRs still auto-merge into `feat/agent-fleet`;
+        Wilson reviews them on the promote PR to `main`. The dispatch
+        prompt calls the risk out to the session."""
         return "Money-path" in self.labels
 
     @property
