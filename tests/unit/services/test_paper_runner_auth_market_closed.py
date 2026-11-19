@@ -101,7 +101,26 @@ class TestAuthErrorWhileMarketClosed:
         db = MagicMock()
         sleep_fn = MagicMock()
 
-        with patch(_RECOVER, return_value=None) as recover:
+        # Record a heartbeat only when it is actually committed:
+        # `flag_modified(run, "parameters")` followed by `db.commit()`.
+        flagged = {"pending": False}
+        committed_heartbeats: list[str] = []
+
+        def _flag(obj, key):
+            assert obj is run and key == "parameters"
+            flagged["pending"] = True
+
+        def _commit():
+            if flagged["pending"]:
+                committed_heartbeats.append(run.parameters["last_heartbeat_at"])
+                flagged["pending"] = False
+
+        db.commit.side_effect = _commit
+
+        with (
+            patch(_RECOVER, return_value=None) as recover,
+            patch("sqlalchemy.orm.attributes.flag_modified", _flag),
+        ):
             _execute_loop(
                 db=db,
                 run=run,
@@ -129,8 +148,10 @@ class TestAuthErrorWhileMarketClosed:
             _balance_retry_sleep_seconds(2),
             _balance_retry_sleep_seconds(3),
         ]
-        # Heartbeat keeps flowing so the supervisor doesn't zombie-restart.
-        assert "last_heartbeat_at" in run.parameters
+        # Heartbeat keeps flowing so the supervisor doesn't zombie-restart:
+        # startup, then at least one committed beat before each deferred
+        # sleep.
+        assert len(committed_heartbeats) >= 1 + sleep_fn.call_count
 
     def test_weekend_refresh_success_resumes_with_fresh_client(self):
         run = _run()
