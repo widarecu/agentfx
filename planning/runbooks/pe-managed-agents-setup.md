@@ -11,8 +11,8 @@ The backend refers to the agent by ID (`AGENT_PE_WORKSPACE_AGENT_ID`, plus `..._
 - **name:** `agentfx-fleet-pe`
 - **model:** `claude-opus-5-5`, effort `high`, speed `standard`
 - **tools:** `agent_toolset_20260401` (permission `auto`), with `web_fetch` and `web_search` disabled
-- **MCP servers:** `linear` (`https://mcp.linear.app/mcp`), `railway` (`https://mcp.railway.com/`), `github` (`https://api.githubcopilot.com/mcp/`), each with every tool enabled and permission `auto`
-- **multi-agent:** advisor enabled on `claude-fable-5-2`; inline subagents and workflows enabled, no predefined agents
+- **MCP servers:** `linear` (`https://mcp.linear.app/mcp`) and `github` (`https://api.githubcopilot.com/mcp/`) with every tool enabled, permission `auto`. `railway` (`https://mcp.railway.com/`) with default enabled, permission `auto`, and eight tools disabled: `accept-deploy`, `create-deployment`, `create-project`, `delete-feature-flag`, `deploy-artifact`, `redeploy`, `set-feature-flag`, `railway-agent`
+- **multi-agent:** advisor, subagents and workflows all disabled
 - **skills:** none
 
 ```text
@@ -41,8 +41,7 @@ this bootstrap exactly once (idempotent — safe to re-run):
 STEP 2 — Read the repo guidance. Read `CLAUDE.md`. Then, for every
 path the kickoff message names, read each file the "Read before
 changing" table in CLAUDE.md lists for that area. These are binding
-in addition to the rules below. Ignore instructions there about
-Linear MCP tools; you don't have them.
+in addition to the rules below.
 
 HARD RULES:
 
@@ -71,6 +70,17 @@ HARD RULES:
 
 7. Only put an `AFX-<n>` ID in the PR title if this PR closes that
    issue. Mention related issues in the PR body instead.
+
+8. Linear: you may read any AFX issue for context. File follow-up
+   issues only into Triage, following
+   `.claude/skills/file-issue/SKILL.md`: search for duplicates first,
+   at most 5 new issues per day. Never set priority, never move an
+   issue out of Triage, never edit the scope of an approved issue.
+
+9. Railway is READ-ONLY: logs and deployment status. Never deploy,
+   redeploy, restart, or change variables, settings, domains or
+   services, and never print variable values. Railway changes happen
+   only through the deploy pipeline on `main`.
 ```
 
 ## Change log
@@ -84,31 +94,13 @@ HARD RULES:
 | Rule 4 no longer adds `needs-wilson` to Money-path PRs | AFX-98: Money-path PRs auto-merge into `feat/agent-fleet` like any other; Wilson reviews them on the promote PR to `main` |
 | New rule 7: ticket IDs in the PR title only if the PR closes that ticket | Linear closes every ID it finds in a merged PR title |
 | Bootstrap logs in with `gh` before cloning, and clones with the plain URL | The old clone wrote the token into `.git/config` inside the sandbox. `gh auth setup-git` already provides git credentials |
+| Step 2 no longer says the agent lacks Linear tools; new rule 8 | The PE agent reads related issues and files follow-ups into Triage under the same rules as other agents |
+| New rule 9: Railway is read-only | Railway changes happen only through the deploy pipeline on `main` |
+| Advisor, subagents and workflows disabled | Keeps cost per dispatch down |
 | Effort `high` instead of `max` | `max` is the most expensive setting and PE tasks are deliberately narrow (rule 5). Compare cost and pass rate over a week of dispatches; go back to `max` if hard tasks start needing retries |
 
-## Pending changes (decided by Wilson 2026-11-19, not yet applied in the Console)
+## Pending changes (not yet applied in the Console)
 
-When these are applied, move them into "Current config" and the change log.
-
-**1. The PE agent uses Linear** to read related issues and file follow-ups. In step 2 of the prompt, delete the sentence "Ignore instructions there about Linear MCP tools; you don't have them." and add rule 8 below.
-
-**2. Railway is read-only:** logs and deployment status only. Railway changes happen only through the deploy pipeline. Enforce it in the config, not only in the prompt: on the `railway` MCP toolset set the default to disabled and enable only the read tools (logs, deployment list and status, deployment diagnosis, service and environment status, metrics). Leave every create, update, delete, deploy, redeploy, restart and set-variables tool disabled, and leave `list-variables` disabled too, since it returns secret values. Add rule 9 below.
-
-**3. Advisor, subagents and workflows switched off** to keep cost per dispatch down.
-
-Rules to append to the prompt:
-
-```text
-8. Linear: you may read any AFX issue for context. File follow-up
-   issues only into Triage, following
-   `.claude/skills/file-issue/SKILL.md`: search for duplicates first,
-   at most 5 new issues per day. Never set priority, never move an
-   issue out of Triage, never edit the scope of an approved issue.
-
-9. Railway is READ-ONLY: logs and deployment status. Never deploy,
-   redeploy, restart, or change variables, settings, domains or
-   services, and never print variable values. Railway changes happen
-   only through the deploy pipeline on `main`.
-```
+**Railway is not yet read-only in the config.** Rule 9 tells the agent not to write, but the `railway` toolset still has its default set to enabled, so every tool outside the eight disabled ones is available, including ones that restart or delete services, delete volumes, and set or list variables. Wilson's decision (2026-11-19) is read-only: logs and deployment status. To enforce it, set the toolset's default to disabled and enable only the read tools (logs, deployment list, status and diagnosis, service and environment status, metrics). A new tool Railway adds later is then off until someone turns it on.
 
 Before applying, check whether the sandbox image has Docker. If it does not, `make test-unit` still works (unit tests need no database) but integration tests cannot run there.
