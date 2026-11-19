@@ -121,15 +121,17 @@ test-file:
 test-pattern:
 	ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/pytest -v -k "$(PATTERN)" --ignore=tests/e2e
 
+# Mirrors the lint step in ci.yml / agent-fleet-ci.yml and the
+# pre-commit hooks, which use ruff for both checks and formatting.
 lint:
-	$(VENV)/bin/ruff .
-	$(VENV)/bin/black --check .
+	$(VENV)/bin/ruff check .
+	$(VENV)/bin/ruff format --check src/
 
 typecheck:
 	$(VENV)/bin/mypy src || true
 
 format:
-	$(VENV)/bin/black .
+	$(VENV)/bin/ruff format src/
 
 # --- .env workflow and smoke run ---
 .PHONY: dotenv run-backfill smoke check-env-example check-settings-vitest
@@ -222,7 +224,7 @@ start-all:
 # via ${VAR:-default} substitution, so the same compose file serves all
 # profiles with profile-appropriate defaults.
 #
-# Environment isolation rules (see CLAUDE.md → "Environment isolation"):
+# Environment isolation rules (see planning/runbooks/environments.md):
 #   • test → wiped by `make e2e` every run; never store long-lived data here.
 #   • uat  → long-lived; NEVER run `make e2e` against this profile.
 #            scripts/run-e2e-tests.sh has a guard that refuses to run

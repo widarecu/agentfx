@@ -1,6 +1,6 @@
 ---
 trigger: model_decision
-description: When required to identify the next activity to run with, any decision should be aligned with the backlog to ensure all the efforts are focused in the planned outcome of the project
+description: When required to identify the next activity to run with, any decision should be aligned with the planned work to ensure all the efforts are focused in the planned outcome of the project
 ---
 
-Refer always to the planning directory ensuring any proposed activity is alligned to an item in the planning/BACKLOG.md and planning/ROADMAP.md. In order to deviate and work on a separate activity, there needs to be agreement by the user to add a new item in the backlog with the proper specifications before start working on it
+Work is tracked in Linear (team AFX), not in planning/BACKLOG.md, which is a frozen snapshot from 2026-10-22. Only work issues in the Ready state, and align proposals with planning/ROADMAP.md. To work on something else, file it into Linear Triage and wait for Wilson's approval before starting. Rules: CLAUDE.md and planning/runbooks/linear-operating-model.md.

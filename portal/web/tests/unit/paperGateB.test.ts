@@ -140,7 +140,7 @@ describe('clearsGateB (aggregate)', () => {
 });
 
 describe('GATE_B_THRESHOLDS constants', () => {
-  // Locks the actual numbers against the backend's plan/CLAUDE.md.
+  // Locks the actual numbers against planning/MVP_CONSTRAINTS.md (Gate B).
   // Not a "test" of behaviour so much as a canary — if these change,
   // a downstream metric widget probably needs updating too.
   it('mirrors the plan', () => {

@@ -25,8 +25,13 @@ data/
 *.sqlite
 *.sqlite3
 
-# Claude Code plans and settings
-.claude/
+# Claude Code: settings.json, hooks/, rules/ and skills/ are shared and
+# committed so cloud sessions and fleet agents see them. Personal
+# overrides and scratch state stay local.
+.claude/settings.local.json
+.claude/worktrees/
+.claude/plans/
+CLAUDE.local.md
 
 # Symlink to portal/web/node_modules used by Playwright. The link target
 # is already ignored above, but git lists the link itself as untracked
