@@ -1,7 +1,7 @@
 # AgentFX on Linear — operating model
 
 Approved by Wilson 2026-10-22. Workspace: https://linear.app/agentfx (team **AFX**).
-The workspace structure is defined in `config/linear/workspace.yaml` and applied with `scripts/linear/bootstrap.py`. CLAUDE.md carries the short version of the agent rules (section 7).
+The workspace structure is defined in `config/linear/workspace.yaml` and applied with `scripts/linear/bootstrap.py`. CLAUDE.md carries the two headline rules (Ready only, Triage only); the `work-issue` and `file-issue` skills in `.claude/skills/` carry the procedure from section 7.
 
 ## 1. Principles
 
@@ -24,7 +24,7 @@ The workspace structure is defined in `config/linear/workspace.yaml` and applied
 ## 3. Workflow states (the approval gate)
 
 ```
-Triage ──Wilson accepts──▶ Backlog ──Wilson prioritises──▶ Ready ──agent picks up──▶ In Progress ──PR opened──▶ In Review ──PR merged──▶ Done
+Triage ──Wilson accepts──▶ Backlog ──Wilson prioritises──▶ Ready ──agent picks up──▶ In Progress ──PR opened──▶ In Review ──merged to feat/agent-fleet──▶ In Staging ──promoted to main + deploy OK──▶ Done
    │                                                                                                   │
    └──Wilson declines──▶ Canceled / Duplicate                                     (money-path: Wilson reviews it on the promote PR to main)
 ```
@@ -36,7 +36,8 @@ Triage ──Wilson accepts──▶ Backlog ──Wilson prioritises──▶ R
 | **Ready** | Unstarted | Wilson only | Approved and prioritised. **This is the only state agents may pick work from.** |
 | **In Progress** | Started | Coding agent | Work started on branch `agent/AFX-123-short-slug`. |
 | **In Review** | Started | Automatic, via the GitHub integration when the PR opens | CI running; awaiting review agent or Wilson. |
-| **Done** | Completed | Automatic on PR merge | Shipped. |
+| **In Staging** | Started | Automatic, when the PR merges to `feat/agent-fleet` | Merged to the fleet branch; waiting for Wilson to promote to `main`. |
+| **Done** | Completed | Automatic, by `agent-fleet-state-on-promote.yml` after the promote to `main` deploys successfully | Shipped to staging. |
 | **Canceled** / **Duplicate** | Canceled | Wilson; agents only for their own duplicates | |
 
 Linear can't stop an agent from moving a ticket out of Triage. The rule is enforced in two ways: agent instructions forbid it, and a weekly audit (a ticket) flags any move into Backlog or Ready that Wilson didn't make.
@@ -67,7 +68,7 @@ Every template has the same backbone so any agent can pick it up cold:
 
 **Test gap:** What isn't covered · How a bug could slip through · Proposed tests
 
-## 7. Rules for agents (copied into CLAUDE.md)
+## 7. Rules for agents (canonical; summarised in CLAUDE.md and the `.claude/skills/` files)
 
 Creating tickets:
 1. **Search before creating.** If an open issue has the same fingerprint or clearly the same problem, add a comment with the new evidence instead of filing a new issue.
@@ -119,7 +120,7 @@ Done:
 - Linear MCP server: user-level config plus project `.mcp.json`, so cloud sessions get it too.
 
 Wilson, still to do:
-- Connect the GitHub integration (Settings → Integrations → GitHub), with PR opened → In Review and PR merged → Done.
+- Connect the GitHub integration (Settings → Integrations → GitHub), with PR opened → In Review and PR merged to `feat/agent-fleet` → In Staging. Done is set only by `agent-fleet-state-on-promote.yml` after a successful deploy (see `branch-flow.md`).
 - Install the mobile app and turn on notifications for Triage and "assigned to me".
 - Revoke the `bootstrap` personal API key once structure changes settle. Re-create it when the YAML changes.
 

@@ -54,7 +54,7 @@ make test-integration    # pytest -m "integration and not slow" against Postgres
 make docker-down PROFILE=test
 ```
 
-`make test-unit` alone is the pre-PR gate the operating model requires (per CLAUDE.md section 7 rule 7). `test-integration` is needed only when the change touches DB code.
+`make test-unit` alone is the pre-PR gate the operating model requires (per CLAUDE.md hard rule 8). `test-integration` is needed only when the change touches DB code.
 
 ## 3. First trial
 
@@ -64,7 +64,7 @@ Pick AFX-13's own definition of "nightly routine" as the first trial issue — s
 2. Branches `agent/AFX-N-slug`, implements, commits, runs `make test-unit` locally.
 3. Opens PR to `feat/agent-fleet` with `AFX-N` in the title → Linear auto-moves to **In Review** (verified: `gitAutomationStates` on team AFX wires `review → In Review`).
 4. Wilson reviews on phone (Linear mobile app + GitHub mobile), approves.
-5. If labelled `agent-authored`, `.github/workflows/agent-fleet-ci.yml` auto-merges on green CI → Linear auto-moves to **Done** (`merge → Done`).
+5. If labelled `agent-authored`, `.github/workflows/agent-fleet-ci.yml` auto-merges on green CI → Linear auto-moves to **In Staging**. **Done** is set only after Wilson promotes to `main` and the deploy succeeds.
 
 ## 4. Troubleshooting
 

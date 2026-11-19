@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Flag Settings-page PRs that ship without a Vitest change (AFX-55).
 
-The bar (CLAUDE.md -> "UI testing bar: state-dependent portal UI"): any PR
+The bar (.claude/rules/portal-ui-testing.md): any PR
 that touches a Settings component must add or change a Vitest that pins the
 pure selector driving its rendering, covering every branch a user can land
 on. This check is the CI enforcement: if the diff touches a SETTINGS_SURFACE
@@ -57,7 +57,7 @@ def find_problem(changed: list[str]) -> str | None:
         "Settings UI changed with no new/changed Vitest "
         f"({', '.join(touched)}). Extract the branching into a pure "
         "selector and pin every rendered state in portal/web/tests/unit/ "
-        "(CLAUDE.md -> UI testing bar, AFX-55)."
+        "(.claude/rules/portal-ui-testing.md, AFX-55)."
     )
 
 

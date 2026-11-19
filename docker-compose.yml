@@ -9,7 +9,7 @@
 #
 # Credentials are loaded from .env.development / .env.test / .env.uat automatically.
 #
-# Environment isolation rules (also in CLAUDE.md):
+# Environment isolation rules (also in planning/runbooks/environments.md):
 #   • dev   — developer verification; ports 8000/5173/5432; long-lived but
 #             may be wiped on demand for clean rebuilds.
 #   • test  — automated/E2E; ports 8001/5174/5433; volume `postgres_test_data`
@@ -62,7 +62,7 @@ services:
       # the container will use. Override via shell at `make docker-up`
       # time (e.g. `INGESTION_ENABLED=false make docker-up PROFILE=dev`
       # to spin up dev without ingestion). The same vars also exist on
-      # the backend-test service — see CLAUDE.md → "Ingestion toggle:
+      # the backend-test service — see .claude/rules/ingestion-config.md ("Ingestion settings:
       # three-surface model" for the design rationale.
       INGESTION_ENABLED: "${INGESTION_ENABLED:-true}"
       # Dev default is 5y (1825) — meaningful local evolution runs need
@@ -126,11 +126,9 @@ services:
       # scripts/seed_test_candles.py — running OANDA backfill in parallel
       # makes timeframe-availability tests timing-dependent.
       #
-      # For acceptance/exploratory runs that need real OANDA data, set
-      # INGESTION_ENABLED=true in the shell before `make docker-up
-      # PROFILE=test` (or `make docker-up PROFILE=test INGESTION_ENABLED=true`).
-      # See CLAUDE.md → "Running an acceptance/exploratory test session"
-      # for the full flow.
+      # For acceptance/exploratory runs that need real OANDA data, use
+      # the uat profile instead: its volume is never wiped. See
+      # planning/runbooks/environments.md.
       INGESTION_ENABLED: "${INGESTION_ENABLED:-false}"
       # Same parameterisation for backfill window — defaults to 7 days
       # for the E2E flow; set to a larger value (e.g. 365) for acceptance

@@ -22,6 +22,15 @@ from agentfx.services.paper_runner import _execute_loop
 
 pytestmark = pytest.mark.unit
 
+# AFX-93 routes a 401 by market state, so pin each 401 scenario to
+# both: just after the Friday close (the 11-13 incident) and Thursday
+# market hours.
+_MARKET_CLOSED = datetime(2026, 11, 13, 22, 16, 11, tzinfo=UTC)
+_MARKET_OPEN = datetime(2026, 11, 12, 14, 16, 11, tzinfo=UTC)
+_BOTH_MARKET_STATES = pytest.mark.parametrize(
+    "start", [_MARKET_CLOSED, _MARKET_OPEN], ids=["market_closed", "market_open"]
+)
+
 # Worst case for one adapter call that walks the full 401 ladder:
 # 4 attempts x 15s timeout + ~30/60/120s (+15% jitter) of backoff.
 _LADDER_CALL_SECONDS = 300.0
@@ -49,6 +58,7 @@ def _run():
 
     return SimpleNamespace(
         id="run_afx92",
+        user_id=7,
         pair="AUD_USD",
         snapshot_balance=10_000.0,
         last_transaction_id="1",
@@ -93,6 +103,7 @@ def _drive(run, client, clock, *, max_iterations, recover):
             run=run,
             client=client,
             sleep_fn=clock.advance,
+            now_fn=lambda: clock.now.timestamp(),
             max_iterations=max_iterations,
         )
     return heartbeats
@@ -104,8 +115,8 @@ def _max_gap(start: datetime, heartbeats: list[datetime], end: datetime) -> floa
 
 
 class TestHeartbeatDuringAuthLadder:
-    def test_401_ladder_keeps_heartbeat_inside_stale_window(self):
-        start = datetime(2026, 11, 13, 22, 16, 11, tzinfo=UTC)
+    @_BOTH_MARKET_STATES
+    def test_401_ladder_keeps_heartbeat_inside_stale_window(self, start):
         clock = _FakeClock(start)
         run = _run()
 
@@ -169,10 +180,41 @@ class TestHeartbeatDuringAuthLadder:
         gap = _max_gap(start, heartbeats, clock.now)
         assert gap < _HEARTBEAT_STALE_SECONDS
 
+    def test_weekend_persistent_401_keeps_heartbeat_inside_stale_window(self):
+        """AFX-93 worst case: every balance call walks the full 401
+        ladder and every refresh fails, all weekend. The run must stay
+        RUNNING and never look stale to the supervisor."""
+        start = _MARKET_CLOSED
+        clock = _FakeClock(start)
+        run = _run()
+
+        def _balance():
+            clock.advance(_LADDER_CALL_SECONDS)
+            raise OandaError("401 Insufficient authorization (attempt 4/4)")
+
+        client = MagicMock()
+        client.get_account_balance.side_effect = _balance
+
+        def _recover(db, run, exc):  # noqa: ARG001
+            clock.advance(_LADDER_CALL_SECONDS)
+            return None
+
+        heartbeats = _drive(run, client, clock, max_iterations=20, recover=_recover)
+
+        from agentfx.api.models import RunStatus
+
+        assert run.status == RunStatus.RUNNING
+        client.close_all_positions.assert_not_called()
+        gap = _max_gap(start, heartbeats, clock.now)
+        assert gap < _HEARTBEAT_STALE_SECONDS, (
+            f"heartbeat gap {gap:.0f}s reached the {_HEARTBEAT_STALE_SECONDS:.0f}s "
+            "zombie window during closed-market 401 retries"
+        )
+
 
 class TestStartupHeartbeat:
-    def test_heartbeat_persisted_before_first_broker_call(self):
-        start = datetime(2026, 11, 13, 22, 32, 25, tzinfo=UTC)
+    @_BOTH_MARKET_STATES
+    def test_heartbeat_persisted_before_first_broker_call(self, start):
         clock = _FakeClock(start)
         run = _run()
         seen_at_first_call: list[str | None] = []
