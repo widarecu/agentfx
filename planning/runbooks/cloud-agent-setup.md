@@ -68,7 +68,7 @@ Pick AFX-13's own definition of "nightly routine" as the first trial issue — s
 
 ## 4. Troubleshooting
 
-- **Agent picks up a Money-path issue**: that's fine, but its PR will never auto-merge — the three-tier gate requires Wilson's manual approval on `main` PRs. The agent should add `needs-wilson` to the PR body so you see it on your phone.
+- **Agent picks up a Money-path issue**: that's fine. Its PR still gets `agent-authored` and auto-merges into `feat/agent-fleet` on green CI. Wilson reviews it on the promote PR to `main`, which lists Money-path PRs first and never auto-merges.
 - **`make test-integration` fails with "could not connect to server"**: Docker-in-Docker not enabled on the cloud agent provider. Fall back to the agent provider's hosted Postgres and set `DATABASE_URL` manually; the test profile uses port 5433 by default.
 - **Linear MCP times out**: usually means `LINEAR_API_KEY` isn't set in the agent env. Check with `env | grep LINEAR_` (never log the value itself).
 - **GitHub push rejected (403)**: `GITHUB_TOKEN` scope is wrong. Fine-grained tokens need `Contents: write` + `Pull requests: write` on this repo specifically.

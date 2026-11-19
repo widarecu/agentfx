@@ -512,7 +512,20 @@ class TestDispatchNarrative:
         iss = _issue(labels=["agent-filed", "Bug", "Money-path"])
         narrative = platform_engineer._render_dispatch_narrative(issue=iss)
         assert "Money-path" in narrative
-        assert "needs-wilson" in narrative
+        assert "--add-label agent-authored" in narrative
+        assert "--add-label needs-wilson" not in narrative
+        assert "INSTEAD" not in narrative
+        assert "promote PR" in narrative
+
+    def test_agent_authored_regardless_of_risk(self):
+        """AFX-98: Money-path PRs auto-merge into feat/agent-fleet; the
+        review gate is the promote PR to main."""
+        for labels in (["agent-filed", "Bug"], ["agent-filed", "Money-path"]):
+            narrative = platform_engineer._render_dispatch_narrative(
+                issue=_issue(labels=labels)
+            )
+            assert "--add-label agent-authored" in narrative
+            assert "regardless of risk" in narrative
 
     def test_notes_missing_description(self):
         iss = _issue(description="")

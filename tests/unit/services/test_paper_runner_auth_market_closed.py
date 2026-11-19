@@ -114,9 +114,10 @@ class TestAuthErrorWhileMarketClosed:
         assert run.status == RunStatus.RUNNING
         assert run.stop_reason is None
         client.close_all_positions.assert_not_called()
-        # Kept retrying (with a cred refresh each time) instead of halting.
+        # Kept retrying instead of halting; creds are refreshed once per
+        # closed-market streak, not on every retry.
         assert client.get_account_balance.call_count == 3
-        assert recover.call_count == 3
+        assert recover.call_count == 1
         # One decision per closed-market streak, not one per retry.
         logged = _decisions(db, _AUTH_DEFERRED_ACTION)
         assert len(logged) == 1
@@ -138,7 +139,7 @@ class TestAuthErrorWhileMarketClosed:
         fresh.get_account_balance.return_value = {"balance": 10_000.0}
         db = MagicMock()
 
-        with patch(_RECOVER, side_effect=[None, fresh]):
+        with patch(_RECOVER, return_value=fresh):
             _execute_loop(
                 db=db,
                 run=run,
@@ -149,7 +150,9 @@ class TestAuthErrorWhileMarketClosed:
             )
 
         assert run.status == RunStatus.RUNNING
-        assert fresh.get_account_balance.call_count >= 1
+        # Subsequent ticks use the fresh client.
+        assert client.get_account_balance.call_count == 1
+        assert fresh.get_account_balance.call_count == 3
         client.close_all_positions.assert_not_called()
 
     def test_weekend_refresh_non_auth_error_keeps_retrying(self):
@@ -169,6 +172,57 @@ class TestAuthErrorWhileMarketClosed:
 
         assert run.status == RunStatus.RUNNING
         client.close_all_positions.assert_not_called()
+
+    def test_weekend_flapping_auth_on_recheck_defers_not_crashes(self):
+        """Refresh succeeds but the re-read on the fresh client 401s
+        again (the 11-13 flapping pattern). Must defer, not escape the
+        loop as an uncaught OandaError (process_crashed -> restart)."""
+        run = _run()
+        client = _auth_client()
+        fresh = _auth_client()
+        db = MagicMock()
+
+        with patch(_RECOVER, return_value=fresh) as recover:
+            _execute_loop(
+                db=db,
+                run=run,
+                client=client,
+                sleep_fn=MagicMock(),
+                now_fn=_clock(SATURDAY),
+                max_iterations=3,
+            )
+
+        assert run.status == RunStatus.RUNNING
+        assert run.stop_reason is None
+        assert recover.call_count == 1
+        assert fresh.get_account_balance.call_count == 1
+        client.close_all_positions.assert_not_called()
+        fresh.close_all_positions.assert_not_called()
+        assert len(_decisions(db, _AUTH_DEFERRED_ACTION)) == 1
+
+    def test_new_streak_after_recovery_refreshes_again(self):
+        run = _run()
+        client = MagicMock()
+        client.get_account_balance.side_effect = [
+            OandaError("401 Insufficient authorization (attempt 4/4)"),
+            {"balance": 10_000.0},
+            OandaError("401 Insufficient authorization (attempt 4/4)"),
+        ]
+        db = MagicMock()
+
+        with patch(_RECOVER, return_value=None) as recover:
+            _execute_loop(
+                db=db,
+                run=run,
+                client=client,
+                sleep_fn=MagicMock(),
+                now_fn=_clock(SATURDAY),
+                max_iterations=3,
+            )
+
+        assert run.status == RunStatus.RUNNING
+        assert recover.call_count == 2
+        assert len(_decisions(db, _AUTH_DEFERRED_ACTION)) == 2
 
 
 class TestAuthErrorWhileMarketOpen:
@@ -192,6 +246,46 @@ class TestAuthErrorWhileMarketOpen:
         assert client.get_account_balance.call_count == 1
         client.close_all_positions.assert_called_once_with("AUD_USD")
         assert _decisions(db, _AUTH_DEFERRED_ACTION) == []
+
+    def test_flapping_auth_on_recheck_in_market_hours_halts_not_crashes(self):
+        run = _run()
+        client = _auth_client()
+        fresh = _auth_client()
+        db = MagicMock()
+
+        with patch(_RECOVER, return_value=fresh):
+            _execute_loop(
+                db=db,
+                run=run,
+                client=client,
+                sleep_fn=MagicMock(),
+                now_fn=_clock(THURSDAY_MARKET_HOURS),
+                max_iterations=3,
+            )
+
+        assert run.status == RunStatus.ERROR
+        assert run.stop_reason == "OANDA_AUTH_LOST"
+        client.close_all_positions.assert_called_once_with("AUD_USD")
+
+    def test_refresh_broker_error_in_market_hours_uses_retry_budget(self):
+        """A non-auth error during the refresh is a broker problem: it
+        counts toward BROKER_NETWORK instead of crashing the process."""
+        run = _run()
+        client = _auth_client()
+        db = MagicMock()
+
+        with patch(_RECOVER, side_effect=OandaError("503 Service unavailable")):
+            _execute_loop(
+                db=db,
+                run=run,
+                client=client,
+                sleep_fn=MagicMock(),
+                now_fn=_clock(THURSDAY_MARKET_HOURS),
+                max_iterations=10,
+            )
+
+        assert run.status == RunStatus.ERROR
+        assert run.stop_reason == "BROKER_NETWORK"
 
     def test_401_persisting_past_reopen_halts_on_first_open_tick(self):
         run = _run()

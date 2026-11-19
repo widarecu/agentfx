@@ -311,7 +311,8 @@ def _render_dispatch_narrative(*, issue: ReadyIssue) -> str:
     """Workspace prompt. Includes:
     - The Linear issue identifier, title, body
     - Branch gate (never push to main)
-    - Risk-aware instructions (Money-path → needs-wilson label on PR)
+    - Risk-aware instructions (Money-path → still `agent-authored`;
+      Wilson reviews it on the promote PR to `main`)
     - `[NEEDS DESIGN]` escape hatch for ambiguous requirements
     """
     lines: list[str] = []
@@ -356,10 +357,13 @@ def _render_dispatch_narrative(*, issue: ReadyIssue) -> str:
         lines.append(
             "- This ticket has the **Risk: Money-path** label (order "
             "execution, sizing, kill switch, credentials, deploy gates).\n"
-            "- Add the `needs-wilson` label to your PR "
-            "(`gh pr edit --add-label needs-wilson`). The CI "
-            "auto-merge workflow will NOT merge a `needs-wilson` PR; "
-            "Wilson reviews and merges by hand."
+            "- Still add the `agent-authored` label (Workflow step 8). "
+            "Do NOT add `needs-wilson` to your PR: Money-path PRs "
+            "auto-merge into `feat/agent-fleet` on green CI like any "
+            "other. Wilson reviews them on the promote PR to `main`, "
+            "which never auto-merges.\n"
+            "- Call out the money-path impact in the PR body so it is "
+            "easy to spot on the promote PR."
         )
         lines.append("")
 
@@ -377,7 +381,7 @@ def _render_dispatch_narrative(*, issue: ReadyIssue) -> str:
         f"against `feat/agent-fleet`.\n"
         "8. Add label `agent-authored` so the CI auto-merge workflow runs "
         "(`gh pr edit --add-label agent-authored`). "
-        "(If this is a Money-path ticket, add `needs-wilson` INSTEAD.)\n"
+        "Do this regardless of risk, Money-path included.\n"
         "9. If after 3 attempts tests still fail, STOP and report the "
         "failing output in a PR comment."
     )
