@@ -622,6 +622,18 @@ class _FakeLinearWithLabels(_FakeLinear):
     def has_comment_containing(self, ident, needle):
         return any(needle in b for b in self.comments.get(ident, []))
 
+    def add_label(self, ident, team_key, name):
+        if name in self.labels.setdefault(ident, set()):
+            return False
+        self.labels[ident].add(name)
+        self.calls.append(("add_label", ident, name))
+        return True
+
+    def comment_once(self, ident, body, marker):
+        self.comments.setdefault(ident, []).append(body)
+        self.calls.append(("comment", ident, marker))
+        return True
+
     def remove_label(self, ident, name):
         if name not in self.labels.get(ident, set()):
             return False
@@ -685,7 +697,11 @@ def test_dispatch_success_removes_needs_wilson_left_by_an_earlier_failed_deploy(
     fake = _FakeLinearWithLabels(
         {"AFX-93": "Blocked"},
         labels={"AFX-93": {fsop.NEEDS_WILSON}},
-        comments={"AFX-93": ["oops " + fsop.failed_marker(_SHA)]},
+        comments={
+            "AFX-93": [
+                "oops " + fsop.failed_marker(_SHA) + fsop.NEEDS_WILSON_ADDED_MARKER
+            ]
+        },
     )
     fsop.dispatch(
         fake,
@@ -794,3 +810,41 @@ def test_deploy_workflow_retries_playwright_install():
     )
     assert "for attempt in" in step["run"]
     assert "playwright install --with-deps" in step["run"]
+
+
+def test_failed_deploy_then_green_rerun_keeps_pre_existing_needs_wilson():
+    """needs-wilson was already on the ticket (real blocker) when the deploy
+    failed: the green re-run must not clear it."""
+    fake = _FakeLinearWithLabels(
+        {"AFX-93": "In Staging"}, labels={"AFX-93": {fsop.NEEDS_WILSON}}
+    )
+    for outcome in (fsop.DEPLOY_FAILED, "success"):
+        fsop.dispatch(
+            fake,
+            ["AFX-93"],
+            sha=_SHA,
+            outcome=outcome,
+            run_url="u",
+            team_key="AFX",
+            now=_NOW,
+        )
+    assert fsop.NEEDS_WILSON_ADDED_MARKER not in fake.comments["AFX-93"][0]
+    assert ("remove_label", "AFX-93", fsop.NEEDS_WILSON) not in fake.calls
+    assert fake.labels["AFX-93"] == {fsop.NEEDS_WILSON}
+
+
+def test_failed_deploy_then_green_rerun_clears_needs_wilson_it_added():
+    fake = _FakeLinearWithLabels({"AFX-93": "In Staging"})
+    for outcome in (fsop.DEPLOY_FAILED, "success"):
+        fsop.dispatch(
+            fake,
+            ["AFX-93"],
+            sha=_SHA,
+            outcome=outcome,
+            run_url="u",
+            team_key="AFX",
+            now=_NOW,
+        )
+    assert fsop.NEEDS_WILSON_ADDED_MARKER in fake.comments["AFX-93"][0]
+    assert fake.states["AFX-93"] == "Done"
+    assert fake.labels["AFX-93"] == set()

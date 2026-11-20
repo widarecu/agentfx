@@ -87,6 +87,9 @@ SUCCESS_MARKER_FMT = "<!-- afx-70:promoted-to-main:{sha} -->"
 FAILED_MARKER_PREFIX = "<!-- afx-70:deploy-failed:"
 FAILED_MARKER_FMT = FAILED_MARKER_PREFIX + "{sha} -->"
 E2E_FAILED_MARKER_FMT = "<!-- afx-105:e2e-failed:{sha} -->"
+# Appended to the failed-deploy comment only when this workflow actually
+# added `needs-wilson`; a later success removes the label only then.
+NEEDS_WILSON_ADDED_MARKER = "<!-- afx-105:needs-wilson-added -->"
 
 # Outcomes. `success` / `failure` / `cancelled` are workflow conclusions;
 # `failure` is refined into one of the three below by `resolve_outcome`.
@@ -593,14 +596,16 @@ def dispatch(
         old = linear.transition(ident, target_state, allowed_from=TRANSITIONABLE)
         if old is None:
             continue
+        comment = body
         if add_needs_wilson:
-            linear.add_label(ident, team_key, NEEDS_WILSON)
-        elif linear.has_comment_containing(ident, FAILED_MARKER_PREFIX):
+            if linear.add_label(ident, team_key, NEEDS_WILSON):
+                comment = f"{body}\n{NEEDS_WILSON_ADDED_MARKER}"
+        elif linear.has_comment_containing(ident, NEEDS_WILSON_ADDED_MARKER):
             # Only undo the label this workflow added; a needs-wilson set
             # for any other reason is a real blocker.
             if linear.remove_label(ident, NEEDS_WILSON):
                 print(f"Removed {NEEDS_WILSON} from {ident}")
-        if linear.comment_once(ident, body, marker):
+        if linear.comment_once(ident, comment, marker):
             print(f"Commented on {ident}")
 
 
