@@ -103,7 +103,7 @@ def walk(
     high_series: pd.Series | None = None,
     low_series: pd.Series | None = None,
     open_series: pd.Series | None = None,
-    blocked_entry_bar_ts: datetime | None = None,
+    no_entry_through_ts: datetime | None = None,
 ) -> WalkResult:
     """Walk bars strictly newer than `bookmark_ts` through the strategy
     state machine. Returns the terminal state, all transitions along
@@ -155,10 +155,12 @@ def walk(
     open_series : pd.Series[float] | None
         Per-bar opens. Wick mode only: a bar that opens past the SL/TP
         fills at the open (gap-aware, same as `_apply_exits`).
-    blocked_entry_bar_ts : datetime | None
-        No entry from flat on this one bar. The runner passes the bar
-        in which a broker-side SL/TP filled: backtest never re-enters
-        on the bar its stop/target fired. Later bars are unaffected.
+    no_entry_through_ts : datetime | None
+        No entry from flat on any bar that STARTED at or before this
+        instant. The runner passes the last broker-side SL/TP fill
+        time: bars before the fill were held (not flat) in the
+        backtest, and the bar containing the fill is consumed by the
+        exit. Bars starting after the fill trade normally.
 
     Returns
     -------
@@ -379,7 +381,7 @@ def walk(
             continue
 
         # in_position == 0 → look for entry.
-        if raw != 0 and bar_ts != blocked_entry_bar_ts:
+        if raw != 0 and (no_entry_through_ts is None or bar_ts > no_entry_through_ts):
             transitions.append(
                 Transition(
                     bar_ts=bar_ts,

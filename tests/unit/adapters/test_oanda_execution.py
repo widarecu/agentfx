@@ -554,6 +554,7 @@ class TestCloseAllPositions:
                     "pl": "-25.00",
                     "units": "-10000",
                     "price": "0.67352",
+                    "time": "2026-07-10T12:00:01.123456789Z",
                 }
             }
         )
@@ -561,6 +562,7 @@ class TestCloseAllPositions:
         r = client.close_all_positions("AUD_USD")
         assert r["long_fill_price"] == 0.67352
         assert r["short_fill_price"] is None
+        assert r["long_fill_time"] == "2026-07-10T12:00:01.123456789Z"
 
     def test_race_between_get_and_put_swallowed(self, client, mock_session):
         """Position closes (SL/TP fill) between our GET and PUT →

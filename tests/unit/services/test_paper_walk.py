@@ -918,8 +918,8 @@ class TestWickGapFills:
         self._assert_parity(idx, result, reasons, prices, 1, "stop", 1.14800)
 
 
-class TestBlockedEntryBar:
-    def test_blocks_only_the_named_bar(self):
+class TestNoEntryThrough:
+    def test_blocks_bars_started_at_or_before_cutoff(self):
         idx = _bars(3)
         result = walk(
             raw_entries=_series([1, 0, -1], idx),
@@ -928,7 +928,7 @@ class TestBlockedEntryBar:
             bookmark_ts=(BASE_TS - timedelta(minutes=1)),
             exit_rules=_rules(),
             pip_size=PIP,
-            blocked_entry_bar_ts=idx[0].to_pydatetime(),
+            no_entry_through_ts=idx[0].to_pydatetime() + timedelta(seconds=30),
         )
         assert [(t.kind, t.bar_ts) for t in result.transitions] == [
             ("open", idx[2].to_pydatetime())
