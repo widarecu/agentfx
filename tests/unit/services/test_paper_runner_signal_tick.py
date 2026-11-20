@@ -2043,3 +2043,178 @@ class TestJustClosedBarWait:
             and r.action == "USER_SIGNAL_SKIPPED_STALE"
             for r in added
         )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# AFX-50: one signal fire → at most one order, even with two runners
+# ─────────────────────────────────────────────────────────────────────
+
+
+class _SharedOrdersTable:
+    """Stands in for the `orders` primary key shared by every runner
+    process: the second commit of the same order id raises
+    IntegrityError, as Postgres does."""
+
+    def __init__(self) -> None:
+        self.ids: set[str] = set()
+
+    def db(self) -> MagicMock:
+        from sqlalchemy.exc import IntegrityError
+
+        db = _make_db()
+        pending: list = []
+
+        def _add(obj):
+            if type(obj).__name__ == "Order":
+                pending.append(obj)
+
+        def _commit():
+            while pending:
+                order = pending.pop()
+                if order.id in self.ids:
+                    pending.clear()
+                    raise IntegrityError("INSERT INTO orders", {}, Exception("dup"))
+                self.ids.add(order.id)
+
+        db.add.side_effect = _add
+        db.commit.side_effect = _commit
+        return db
+
+
+def _flat_client() -> MagicMock:
+    client = MagicMock()
+    client.get_position.return_value = {"long_units": 0, "short_units": 0}
+    client.get_account_balance.return_value = {"balance": 10_000.0, "currency": "USD"}
+    client.place_market_order.return_value = {
+        "trade_id": "trade_broker_123",
+        "fill_price": 1.1005,
+        "units": 25_000,
+    }
+    return client
+
+
+def _tick(db, run, client, strategy, candles_df, now_utc) -> None:
+    _signal_tick(
+        db=db,
+        run=run,
+        client=client,
+        strategy=strategy,
+        candle_fetch_fn=MagicMock(return_value=candles_df),
+        instrument="EUR_USD",
+        granularity_seconds=60,
+        now_utc=now_utc,
+    )
+
+
+def _decisions(db) -> list:
+    return [
+        c.args[0]
+        for c in db.add.call_args_list
+        if type(c.args[0]).__name__ == "DecisionLog"
+    ]
+
+
+class TestDuplicateOrderSuppression:
+    NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+
+    def test_two_runners_same_run_same_bar_place_one_order(self):
+        """Two runner processes for one run (deploy overlap, double
+        schedule) both see the account flat on the same bar. Before
+        AFX-50 both sent the order."""
+        orders = _SharedOrdersTable()
+        client = _flat_client()
+        strategy = _make_strategy(signals=[0, 0, 1])
+        df = _mk_candles_df(3, self.NOW)
+        db_a, db_b = orders.db(), orders.db()
+
+        _tick(db_a, _make_run(), client, strategy, df, self.NOW)
+        _tick(db_b, _make_run(), client, strategy, df, self.NOW)
+
+        assert client.place_market_order.call_count == 1
+        assert any(d.action == "USER_ORDER_PLACED" for d in _decisions(db_a))
+        skipped = [
+            d for d in _decisions(db_b) if d.action == "USER_ORDER_DUPLICATE_SKIPPED"
+        ]
+        assert len(skipped) == 1
+        assert not any(
+            type(c.args[0]).__name__ == "Trade" for c in db_b.add.call_args_list
+        )
+        db_b.rollback.assert_called()
+
+    def test_next_bar_still_trades(self):
+        orders = _SharedOrdersTable()
+        client = _flat_client()
+        strategy = _make_strategy(signals=[0, 0, 1])
+        later = self.NOW + timedelta(minutes=1)
+
+        _tick(
+            orders.db(),
+            _make_run(),
+            client,
+            strategy,
+            _mk_candles_df(3, self.NOW),
+            self.NOW,
+        )
+        _tick(
+            orders.db(), _make_run(), client, strategy, _mk_candles_df(3, later), later
+        )
+
+        assert client.place_market_order.call_count == 2
+
+    def test_claim_records_fill_and_links_trade(self):
+        db = _make_db()
+        client = _flat_client()
+        _tick(
+            db,
+            _make_run(),
+            client,
+            _make_strategy([0, 0, 1]),
+            _mk_candles_df(3, self.NOW),
+            self.NOW,
+        )
+
+        added = [c.args[0] for c in db.add.call_args_list]
+        order = next(r for r in added if type(r).__name__ == "Order")
+        trade = next(r for r in added if type(r).__name__ == "Trade")
+        assert order.id == f"paper:run_test_signal:{self.NOW.isoformat()}:buy"
+        assert order.status == "filled"
+        assert order.filled_quantity == 25_000
+        assert order.trade_id == trade.id
+
+    def test_broker_reject_keeps_claim_marked_rejected(self):
+        from agentfx.adapters.oanda import OandaOrderRejected
+
+        db = _make_db()
+        client = _flat_client()
+        client.place_market_order.side_effect = OandaOrderRejected(
+            "INSUFFICIENT_MARGIN", transaction_id="t1", order_type="MARKET"
+        )
+        _tick(
+            db,
+            _make_run(),
+            client,
+            _make_strategy([0, 0, 1]),
+            _mk_candles_df(3, self.NOW),
+            self.NOW,
+        )
+
+        order = next(
+            c.args[0]
+            for c in db.add.call_args_list
+            if type(c.args[0]).__name__ == "Order"
+        )
+        assert order.status == "rejected"
+
+
+class TestClaimRunner:
+    @pytest.mark.parametrize(("rows", "expected"), [(1, True), (0, False)])
+    def test_only_approved_run_is_claimed(self, rows, expected):
+        from agentfx.services.paper_runner import _claim_runner
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.update.return_value = rows
+        run = SimpleNamespace(id="run_x")
+
+        assert _claim_runner(db, run) is expected
+        db.commit.assert_called_once()
+        db.refresh.assert_called_once_with(run)
