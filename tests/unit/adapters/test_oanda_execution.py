@@ -305,6 +305,7 @@ class TestPlaceMarketOrder:
             "order_id": "1234",
             "trade_id": "trade-42",
             "fill_transaction_id": "1235",
+            "fill_time": None,
             "fill_price": 1.09342,
             "units": 10000,
             "financing": 0.0,

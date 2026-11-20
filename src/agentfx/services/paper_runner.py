@@ -1821,6 +1821,7 @@ def _open_position_and_persist(
     risk_cfg: dict,
     position_snapshot,
     signal_bar_ts: datetime,
+    order_row=None,
 ) -> None:
     """Size + place a market order + persist the trade + write the
     decision log. Extracted from `_signal_tick` verbatim so the walk-
@@ -1837,6 +1838,8 @@ def _open_position_and_persist(
       the tick; only used for the final equity snapshot.
     - `signal_bar_ts` is the bar the signal fired on. Together with the
       run and side it is the order's idempotency key (AFX-50).
+    - `order_row` is a claim the caller already won (the flip path
+      claims before closing); when None this function claims itself.
 
     Returns None. On sizing failure, broker rejection, or other
     recoverable errors, writes an appropriate decision log entry and
@@ -1922,6 +1925,9 @@ def _open_position_and_persist(
                 "sizing": sizing.__dict__,
             },
         )
+        if order_row is not None:
+            order_row.status = "canceled"
+            db.commit()
         return
     signed_units = (
         sizing.capped_units if signal_direction == "long" else -sizing.capped_units
@@ -1934,37 +1940,27 @@ def _open_position_and_persist(
 
     from agentfx.adapters.oanda import OandaOrderRejected
 
-    order_row = _claim_order_slot(
-        db,
-        run,
-        signal_bar_ts=signal_bar_ts,
-        side="buy" if signed_units > 0 else "sell",
-        units=abs(signed_units),
-    )
     if order_row is None:
-        _write_decision(
+        order_row = _claim_order_slot(
             db,
             run,
-            action="USER_ORDER_DUPLICATE_SKIPPED",
-            reason=(
-                f"{signal_direction.upper()} {instrument} for bar "
-                f"{_iso(signal_bar_ts)} was already submitted by another "
-                "runner for this run; not sending a second order"
-            ),
-            outputs={
-                "paper_run_id": run.id,
-                "instrument": instrument,
-                "signed_units": signed_units,
-                "signal_bar_ts": _iso(signal_bar_ts),
-                "idempotency_key": _order_idempotency_key(
-                    run.id, signal_bar_ts, "buy" if signed_units > 0 else "sell"
-                ),
-            },
+            signal_bar_ts=signal_bar_ts,
+            side="buy" if signed_units > 0 else "sell",
+            units=abs(signed_units),
         )
-        _persist_equity_snapshot(
-            db=db, run=run, position=position_snapshot, now_utc=now_utc
-        )
-        return
+        if order_row is None:
+            _write_duplicate_skip(
+                db,
+                run,
+                instrument=instrument,
+                signal_direction=signal_direction,
+                signal_bar_ts=signal_bar_ts,
+                position_snapshot=position_snapshot,
+                now_utc=now_utc,
+            )
+            return
+    else:
+        order_row.quantity = float(abs(signed_units))
 
     try:
         result = client.place_market_order(
@@ -2007,7 +2003,11 @@ def _open_position_and_persist(
     trade_id = result.get("trade_id")
     fill_transaction_id = result.get("fill_transaction_id")
     order_row.status = "filled"
-    order_row.filled_at = now_utc
+    from agentfx.services.paper_reconciler import _parse_oanda_time
+
+    order_row.filled_at = _parse_oanda_time(result.get("fill_time")) or datetime.now(
+        UTC
+    )
     order_row.filled_quantity = abs(filled_units)
     order_row.average_fill_price = fill_price
     # Pass the candles DataFrame so `_signal_reason` can compute
@@ -2087,6 +2087,39 @@ def _iso(ts) -> str:
 
 def _order_idempotency_key(run_id: str, signal_bar_ts, side: str) -> str:
     return f"paper:{run_id}:{_iso(signal_bar_ts)}:{side}"
+
+
+def _write_duplicate_skip(
+    db,
+    run,
+    *,
+    instrument: str,
+    signal_direction: str,
+    signal_bar_ts,
+    position_snapshot,
+    now_utc: datetime,
+) -> None:
+    side = "buy" if signal_direction == "long" else "sell"
+    _write_decision(
+        db,
+        run,
+        action="USER_ORDER_DUPLICATE_SKIPPED",
+        reason=(
+            f"{signal_direction.upper()} {instrument} for bar "
+            f"{_iso(signal_bar_ts)} was already submitted by another "
+            "runner for this run; not sending a second order"
+        ),
+        outputs={
+            "paper_run_id": run.id,
+            "instrument": instrument,
+            "signal_direction": signal_direction,
+            "signal_bar_ts": _iso(signal_bar_ts),
+            "idempotency_key": _order_idempotency_key(run.id, signal_bar_ts, side),
+        },
+    )
+    _persist_equity_snapshot(
+        db=db, run=run, position=position_snapshot, now_utc=now_utc
+    )
 
 
 def _claim_order_slot(db, run, *, signal_bar_ts, side: str, units: int):
@@ -2238,6 +2271,28 @@ def _execute_walk_transitions(
         # market order) mirroring the pre-refactor opposite_flip
         # behaviour. If the close leg fails, don't open the new side —
         # the retry on the next tick will handle it.
+        signal_direction = "long" if last_t.direction > 0 else "short"
+        # AFX-50: claim the whole reversal before the close. A second
+        # runner that also decided to flip must not close the position
+        # the first runner just opened.
+        order_row = _claim_order_slot(
+            db,
+            run,
+            signal_bar_ts=last_t.bar_ts,
+            side="buy" if last_t.direction > 0 else "sell",
+            units=0,
+        )
+        if order_row is None:
+            _write_duplicate_skip(
+                db,
+                run,
+                instrument=instrument,
+                signal_direction=signal_direction,
+                signal_bar_ts=last_t.bar_ts,
+                position_snapshot=broker_position,
+                now_utc=now_utc,
+            )
+            return
         try:
             _close_position_and_persist(
                 db=db,
@@ -2268,12 +2323,17 @@ def _execute_walk_transitions(
                     "close_context": "opposite_flip",
                 },
             )
+            order_row.status = "canceled"
+            order_row.metadata_ = {
+                **(order_row.metadata_ or {}),
+                "canceled_reason": "flip_close_rejected",
+            }
+            db.commit()
             _persist_equity_snapshot(
                 db=db, run=run, position=broker_position, now_utc=now_utc
             )
             return
         # Close succeeded — open the new side.
-        signal_direction = "long" if last_t.direction > 0 else "short"
         _open_position_and_persist(
             db=db,
             run=run,
@@ -2287,6 +2347,7 @@ def _execute_walk_transitions(
             risk_cfg=risk_cfg,
             position_snapshot=broker_position,
             signal_bar_ts=last_t.bar_ts,
+            order_row=order_row,
         )
         return
 

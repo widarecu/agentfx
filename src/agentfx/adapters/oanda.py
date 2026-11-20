@@ -687,6 +687,7 @@ class OandaClient:
             # `trades.broker_open_transaction_id`). Distinct from
             # `order_id` (the MARKET_ORDER creation transaction).
             "fill_transaction_id": fill.get("id"),
+            "fill_time": fill.get("time"),
             "fill_price": float(fill["price"]) if "price" in fill else None,
             "units": (
                 int(trade_opened["units"]) if "units" in trade_opened else int(units)
