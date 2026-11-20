@@ -2248,3 +2248,113 @@ class TestClaimRunner:
         assert _claim_runner(db, run) is expected
         db.commit.assert_called_once()
         db.refresh.assert_called_once_with(run)
+
+
+class TestDuplicateFlipSuppression:
+    """Review on PR #140: a slower runner flipping the same position
+    must not close the faster runner's replacement position."""
+
+    NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+
+    def _flip_client(self) -> MagicMock:
+        client = MagicMock()
+        client.get_position.return_value = {"long_units": 10_000, "short_units": 0}
+        client.close_all_positions.return_value = {
+            "long_realized_pnl": 5.0,
+            "short_realized_pnl": 0.0,
+        }
+        client.get_account_balance.return_value = {
+            "balance": 10_000.0,
+            "currency": "USD",
+        }
+        client.place_market_order.return_value = {
+            "trade_id": "trade_after_flip",
+            "fill_price": 1.1020,
+            "units": -25_000,
+            "fill_time": "2026-07-10T12:00:02.000000000Z",
+        }
+        return client
+
+    def _db(self, orders: _SharedOrdersTable) -> MagicMock:
+        db = orders.db()
+        _set_open_trade(db, None)
+        db.query.return_value.filter.return_value.all.return_value = []
+        return db
+
+    def test_second_runner_flip_neither_closes_nor_opens(self):
+        orders = _SharedOrdersTable()
+        client = self._flip_client()
+        strategy = _make_strategy(signals=[0, 0, -1])
+        df = _mk_candles_df(3, self.NOW)
+        db_a, db_b = self._db(orders), self._db(orders)
+
+        # Runner B decides on the same stale "long open" snapshot but
+        # only runs after A's reversal has completed.
+        _tick(db_a, _make_run(), client, strategy, df, self.NOW)
+        _tick(db_b, _make_run(), client, strategy, df, self.NOW)
+
+        client.close_all_positions.assert_called_once_with("EUR_USD")
+        client.place_market_order.assert_called_once()
+        assert any(d.action == "USER_ORDER_DUPLICATE_SKIPPED" for d in _decisions(db_b))
+
+        order = next(
+            c.args[0]
+            for c in db_a.add.call_args_list
+            if type(c.args[0]).__name__ == "Order"
+        )
+        assert order.side == "sell"
+        assert order.status == "filled"
+        assert order.quantity == 25_000
+        assert order.filled_at == datetime(2026, 7, 10, 12, 0, 2, tzinfo=UTC)
+
+    def test_rejected_flip_close_cancels_claim_without_opening(self):
+        from agentfx.adapters.oanda import OandaOrderRejected
+
+        orders = _SharedOrdersTable()
+        client = self._flip_client()
+        client.close_all_positions.side_effect = OandaOrderRejected(
+            "MARKET_HALTED", transaction_id="t9", order_type="MARKET"
+        )
+        db = self._db(orders)
+        _tick(
+            db,
+            _make_run(),
+            client,
+            _make_strategy([0, 0, -1]),
+            _mk_candles_df(3, self.NOW),
+            self.NOW,
+        )
+
+        client.place_market_order.assert_not_called()
+        order = next(
+            c.args[0]
+            for c in db.add.call_args_list
+            if type(c.args[0]).__name__ == "Order"
+        )
+        assert order.status == "canceled"
+        assert order.filled_at is None
+
+
+def test_duplicate_skip_is_in_paper_timeline_allowlist():
+    from agentfx.api.services.paper import _PAPER_DECISION_ACTIONS
+
+    assert "USER_ORDER_DUPLICATE_SKIPPED" in _PAPER_DECISION_ACTIONS
+
+
+def test_order_schema_reads_orm_metadata_column():
+    from agentfx.api.models import Order
+    from agentfx.api.schemas.run import Order as OrderSchema
+
+    row = Order(
+        id="paper:run_x:2026-07-10T12:00:00+00:00:buy",
+        run_id="run_x",
+        order_type="market",
+        side="buy",
+        quantity=1000.0,
+        status="filled",
+        filled_quantity=1000.0,
+        metadata_={"signal_bar_ts": "2026-07-10T12:00:00+00:00"},
+        created_at=datetime(2026, 7, 10, 12, 0, 1, tzinfo=UTC),
+    )
+    out = OrderSchema.model_validate(row).model_dump()
+    assert out["metadata"] == {"signal_bar_ts": "2026-07-10T12:00:00+00:00"}

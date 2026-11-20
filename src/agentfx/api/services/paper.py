@@ -922,6 +922,7 @@ def _link_to_evolution_run_id(genome: models.StrategyGenome) -> str | None:
 _PAPER_DECISION_ACTIONS: tuple[str, ...] = (
     "USER_ORDER_PLACED",
     "USER_ORDER_REJECTED",
+    "USER_ORDER_DUPLICATE_SKIPPED",
     "USER_EXIT_ORDERS_PLACED",
     "USER_EXIT_ORDERS_REJECTED",
     "USER_POSITION_CLOSED",
