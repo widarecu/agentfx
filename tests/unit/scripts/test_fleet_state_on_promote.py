@@ -630,7 +630,10 @@ class _FakeLinearWithLabels(_FakeLinear):
         return True
 
     def comment_once(self, ident, body, marker):
-        self.comments.setdefault(ident, []).append(body)
+        bodies = self.comments.setdefault(ident, [])
+        if any(marker in b for b in bodies):
+            return False
+        bodies.append(body)
         self.calls.append(("comment", ident, marker))
         return True
 
@@ -846,5 +849,23 @@ def test_failed_deploy_then_green_rerun_clears_needs_wilson_it_added():
             now=_NOW,
         )
     assert fsop.NEEDS_WILSON_ADDED_MARKER in fake.comments["AFX-93"][0]
+    assert fake.states["AFX-93"] == "Done"
+    assert fake.labels["AFX-93"] == set()
+
+
+def test_repeat_failure_same_sha_records_label_ownership_when_label_re_added():
+    """needs-wilson pre-existed at the first failure (not ours), Wilson
+    cleared it, the re-run failed again and this workflow re-added it. The
+    failed comment is deduped, so ownership must be recorded separately or
+    the green re-run leaves the label on a Done ticket."""
+    fake = _FakeLinearWithLabels(
+        {"AFX-93": "In Staging"}, labels={"AFX-93": {fsop.NEEDS_WILSON}}
+    )
+    kw = {"sha": _SHA, "run_url": "u", "team_key": "AFX", "now": _NOW}
+    fsop.dispatch(fake, ["AFX-93"], outcome=fsop.DEPLOY_FAILED, **kw)
+    fake.labels["AFX-93"].discard(fsop.NEEDS_WILSON)  # Wilson clears it
+    fsop.dispatch(fake, ["AFX-93"], outcome=fsop.DEPLOY_FAILED, **kw)
+    assert fake.labels["AFX-93"] == {fsop.NEEDS_WILSON}
+    fsop.dispatch(fake, ["AFX-93"], outcome="success", **kw)
     assert fake.states["AFX-93"] == "Done"
     assert fake.labels["AFX-93"] == set()

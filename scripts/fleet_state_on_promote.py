@@ -596,17 +596,26 @@ def dispatch(
         old = linear.transition(ident, target_state, allowed_from=TRANSITIONABLE)
         if old is None:
             continue
-        comment = body
-        if add_needs_wilson:
-            if linear.add_label(ident, team_key, NEEDS_WILSON):
-                comment = f"{body}\n{NEEDS_WILSON_ADDED_MARKER}"
-        elif linear.has_comment_containing(ident, NEEDS_WILSON_ADDED_MARKER):
+        added = add_needs_wilson and linear.add_label(ident, team_key, NEEDS_WILSON)
+        if not add_needs_wilson and linear.has_comment_containing(
+            ident, NEEDS_WILSON_ADDED_MARKER
+        ):
             # Only undo the label this workflow added; a needs-wilson set
             # for any other reason is a real blocker.
             if linear.remove_label(ident, NEEDS_WILSON):
                 print(f"Removed {NEEDS_WILSON} from {ident}")
+        comment = f"{body}\n{NEEDS_WILSON_ADDED_MARKER}" if added else body
         if linear.comment_once(ident, comment, marker):
             print(f"Commented on {ident}")
+        elif added:
+            # Failed comment for this SHA already posted (re-run): record
+            # label ownership separately so a later success can clear it.
+            linear.comment_once(
+                ident,
+                f"Added `{NEEDS_WILSON}` after the failed deploy at "
+                f"`{sha[:7]}`.\n\n{NEEDS_WILSON_ADDED_MARKER}",
+                NEEDS_WILSON_ADDED_MARKER,
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
