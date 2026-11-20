@@ -375,14 +375,13 @@ class TestSignalTick:
             now_utc=datetime(2026, 7, 10, 12, 0, tzinfo=UTC),
         )
 
-        # Wilson 2026-08-15: broker order now carries only a wide
-        # fail-safe SL sized from kill_switch_dd_pct (5% default),
-        # and NO broker-side TP. Strategy's own SL/TP is enforced
-        # walk-side on bar close. $10k × 5% / (25k × $0.0001) = 200 pips.
+        # Broker order carries only a wide fail-safe SL and NO
+        # broker-side TP. Strategy's own SL/TP is enforced walk-side on
+        # bar close. AFX-104: fail-safe = max(100, 3 × 20-pip DSL stop).
         client.place_market_order.assert_called_once_with(
             "EUR_USD",
             25_000,
-            stop_loss_pips=200,
+            stop_loss_pips=100,
             take_profit_pips=None,
         )
         # A Trade row got added.
@@ -999,13 +998,12 @@ class TestSignalTick:
     def test_broker_failsafe_sl_replaces_dsl_sl_tp(self):
         # Wilson 2026-08-15: legacy `risk_config.stop_loss_pips` /
         # `take_profit_pips` are no longer forwarded to the broker.
-        # Broker always gets a WIDE fail-safe SL sized from
-        # kill_switch_dd_pct, and NO broker-side TP. The DSL's own
-        # SL/TP is enforced walk-side on bar close.
+        # Broker always gets a WIDE fail-safe SL and NO broker-side TP.
+        # The DSL's own SL/TP is enforced walk-side on bar close.
         #
         # Sizing (unchanged): balance $10k × 0.005 / (20pip × $0.0001)
-        # = 25,000 units. Fail-safe SL: $10k × 5% / (25k × $0.0001)
-        # = 200 pips.
+        # = 25,000 units. AFX-104 fail-safe SL: max(100, 3 × 20) = 100
+        # pips, independent of the legacy `kill_switch_dd_pct`.
         strategy = _make_strategy(signals=[0, 0, 1])
         candles_df = _mk_candles_df(3, datetime(2026, 7, 10, 12, 0, tzinfo=UTC))
         fetch = MagicMock(return_value=candles_df)
@@ -1044,7 +1042,7 @@ class TestSignalTick:
         client.place_market_order.assert_called_once_with(
             "EUR_USD",
             25_000,
-            stop_loss_pips=200,
+            stop_loss_pips=100,
             take_profit_pips=None,
         )
 

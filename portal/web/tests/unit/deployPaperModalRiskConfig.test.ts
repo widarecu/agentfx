@@ -17,18 +17,13 @@ import { _buildRiskConfig } from '../../src/components/DeployPaperModal';
 
 describe('_buildRiskConfig', () => {
   const baseline = {
-    lossCapPct: '2.0',
-    killDdPct: '5.0',
     stopLossPips: '',
     takeProfitPips: '',
   };
 
   it('omits SL/TP when both fields are empty', () => {
     const cfg = _buildRiskConfig(baseline);
-    expect(cfg).toEqual({
-      loss_cap_pct: 2,
-      kill_switch_dd_pct: 5,
-    });
+    expect(cfg).toEqual({});
     expect(cfg).not.toHaveProperty('stop_loss_pips');
     expect(cfg).not.toHaveProperty('take_profit_pips');
   });
@@ -82,13 +77,23 @@ describe('_buildRiskConfig', () => {
     // set.
     const combos = [
       baseline,
-      { ...baseline, lossCapPct: '5', killDdPct: '10' },
       { ...baseline, stopLossPips: '20', takeProfitPips: '40' },
       { ...baseline, stopLossPips: '20' },
     ];
     for (const inputs of combos) {
       const cfg = _buildRiskConfig(inputs);
       expect(cfg).not.toHaveProperty('max_position_size_units');
+    }
+  });
+
+  it('AFX-104: never emits loss_cap_pct / kill_switch_dd_pct', () => {
+    for (const inputs of [
+      baseline,
+      { ...baseline, stopLossPips: '20', takeProfitPips: '40' },
+    ]) {
+      const cfg = _buildRiskConfig(inputs);
+      expect(cfg).not.toHaveProperty('loss_cap_pct');
+      expect(cfg).not.toHaveProperty('kill_switch_dd_pct');
     }
   });
 });

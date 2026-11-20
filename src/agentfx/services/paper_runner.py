@@ -667,11 +667,6 @@ def _execute_loop(
     """
     from agentfx.adapters.oanda import OandaCircuitOpen
     from agentfx.api.models import RunStatus
-    from agentfx.services.paper_policy import (
-        RiskState,
-        check_kill_switch_dd,
-        check_loss_cap,
-    )
 
     if now_fn is None:  # pragma: no cover — trivial
 
@@ -874,34 +869,10 @@ def _execute_loop(
         # too so a fresh subprocess registers a heartbeat immediately.
         _heartbeat()
 
-        # Evaluate risk gates against the current balance. The health
-        # tick only checks halt-gates (kill_switch, loss cap);
-        # position-size gating happens at order-placement time inside
-        # `_signal_tick` where the real proposed units are known.
-        # v0.6.2 (Wilson UAT 2026-07-19): previously called
-        # `evaluate_all(state, proposed_units=state.max_position_size_units)`
-        # which compared max against itself — a no-op check that
-        # forced legacy runs to carry a stale `max_position_size_units`
-        # value even though sizing is fully dynamic.
-        risk_cfg = run.risk_config or {}
-        state = RiskState(
-            snapshot_balance=run.snapshot_balance or 0.0,
-            current_balance=run.current_balance,
-            max_position_size_units=int(
-                risk_cfg.get("max_position_size_units") or 10_000_000
-            ),
-            loss_cap_pct=float(risk_cfg.get("loss_cap_pct", 2.0)),
-            kill_switch_dd_pct=float(risk_cfg.get("kill_switch_dd_pct", 5.0)),
-        )
-        for check in (check_kill_switch_dd(state), check_loss_cap(state)):
-            if not check.ok:
-                logger.info(
-                    "paper runner: gate refused on %s (%s); halting",
-                    run.id,
-                    check.reason,
-                )
-                _flatten_and_halt(db, run, client, reason=check.reason)
-                return
+        # AFX-104: paper has no loss-based auto-halts (CLAUDE.md rule
+        # 11). Stored `loss_cap_pct` / `kill_switch_dd_pct` on legacy
+        # `risk_config` blobs are ignored; OANDA's margin closeout is the
+        # only loss guardrail (see `_halt_on_margin_closeout`).
 
         # ─── Broker transaction reconciliation (T1 — every 12 ticks) ─
         # Every ~60s, poll OANDA's authoritative transaction log for
@@ -924,9 +895,16 @@ def _execute_loop(
                         result.transactions_seen,
                     )
             except Exception:  # noqa: BLE001
+                result = None
                 logger.exception(
                     "reconciler: failed on run %s (will retry next tick)", run.id
                 )
+            if result is not None and result.margin_closeout:
+                logger.warning(
+                    "paper runner: %s OANDA margin closeout; halting", run.id
+                )
+                _flatten_and_halt(db, run, client, reason="MARGIN_CLOSEOUT")
+                return
 
         # ─── Signal tick (only when past the boundary) ───────────────
         now = now_fn()
@@ -1768,9 +1746,9 @@ def _open_position_and_persist(
     # backtest — every wick that would have recovered becomes a
     # locked loss.
     #
-    # The broker order now carries only a WIDE fail-safe SL sized
-    # from `kill_switch_dd_pct` (matches the run's hard-halt loss
-    # cap), and NO broker-side TP. The walk enforces the strategy's
+    # The broker order now carries only a WIDE fail-safe SL
+    # (`FAILSAFE_SL_STOP_MULTIPLE` × the DSL stop, at least 100 pips)
+    # and NO broker-side TP. The walk enforces the strategy's
     # real SL + TP on close each tick; the broker SL only fires if
     # the runner is dead. See `compute_failsafe_sl_pips` for the
     # sizing formula.
@@ -1844,17 +1822,10 @@ def _open_position_and_persist(
         sizing.capped_units if signal_direction == "long" else -sizing.capped_units
     )
 
-    # Broker fail-safe SL, sized from the run's hard-halt loss cap
-    # (kill_switch_dd_pct). Wide enough that normal price action never
-    # touches it; only fires if the runner is dead. Walk enforces the
-    # DSL's real SL + TP on bar close each tick.
-    kill_switch_dd_pct = float(risk_cfg.get("kill_switch_dd_pct", 5.0))
-    failsafe_sl_pips = compute_failsafe_sl_pips(
-        balance=sizing.balance,
-        units=sizing.capped_units,
-        pip_value_account=sizing.pip_value_account,
-        kill_switch_dd_pct=kill_switch_dd_pct,
-    )
+    # Broker fail-safe SL, sized from the DSL stop. Wide enough that
+    # normal price action never touches it; only fires if the runner
+    # is dead. Walk enforces the DSL's real SL + TP on bar close.
+    failsafe_sl_pips = compute_failsafe_sl_pips(stop_pips=sl_pips_dsl)
 
     from agentfx.adapters.oanda import OandaOrderRejected
 
@@ -1935,8 +1906,7 @@ def _open_position_and_persist(
         reason=(
             f"{signal_direction.upper()} {abs(filled_units)} {instrument} "
             f"@ {fill_price:.5f} ({signal_reason}) | sizing: {sizing_note} | "
-            f"broker failsafe SL: {failsafe_sl_pips} pips "
-            f"({kill_switch_dd_pct}% of balance)"
+            f"broker failsafe SL: {failsafe_sl_pips} pips"
         ),
         outputs={
             "paper_run_id": run.id,

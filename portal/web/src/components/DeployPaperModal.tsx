@@ -23,6 +23,7 @@ import {
 } from '../services/paperApi';
 import type { UserOandaAccountPublic } from '../types/credentials';
 import type { ApprovalQueueItem } from '../types/paper';
+import { PAPER_NO_LOSS_HALT_NOTE } from '../utils/paperLossHalt';
 
 export interface DeployPaperModalProps {
   item: ApprovalQueueItem;
@@ -54,8 +55,6 @@ export function DeployPaperModal({
   // orders that exceed real capacity. The extra knob confused the UX
   // (users set numbers that under-sized compounding strategies) and
   // added no safety over the broker's own controls.
-  const [lossCapPct, setLossCapPct] = useState<string>('2.0');
-  const [killDdPct, setKillDdPct] = useState<string>('5.0');
   // Broker-side SL/TP. Pre-populated from the strategy's DSL exit
   // block so paper trades always ship with the strategy's designed
   // stop/target. User can override; the fields are always visible
@@ -115,8 +114,6 @@ export function DeployPaperModal({
     }
 
     const riskConfig = _buildRiskConfig({
-      lossCapPct,
-      killDdPct,
       stopLossPips,
       takeProfitPips,
     });
@@ -314,23 +311,11 @@ export function DeployPaperModal({
               )}
             </div>
 
-            <div className="grid grid-cols-2 gap-4">
-              <NumericField
-                label="Loss cap (soft halt)"
-                hint="Halt the run when cumulative loss reaches this % of the starting balance"
-                suffix="% of balance"
-                value={lossCapPct}
-                onChange={setLossCapPct}
-                step="0.1"
-              />
-              <NumericField
-                label="Loss cap (hard halt)"
-                hint="Safety net: hard halt if losses keep going past the soft cap. Must be higher than the soft halt."
-                suffix="% of balance"
-                value={killDdPct}
-                onChange={setKillDdPct}
-                step="0.1"
-              />
+            <div
+              className="text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded px-3 py-2"
+              data-testid="paper-no-loss-halt-note"
+            >
+              {PAPER_NO_LOSS_HALT_NOTE}
             </div>
 
             {/* v0.6.1 UAT fix (2026-07-13): SL/TP are always visible
@@ -468,15 +453,13 @@ function NumericField({
  * treats them as "no broker-side SL/TP registered".
  */
 export function _buildRiskConfig(inputs: {
-  lossCapPct: string;
-  killDdPct: string;
   stopLossPips: string;
   takeProfitPips: string;
 }): Record<string, number> {
-  const cfg: Record<string, number> = {
-    loss_cap_pct: Math.max(0.01, Number(inputs.lossCapPct) || 2),
-    kill_switch_dd_pct: Math.max(0.01, Number(inputs.killDdPct) || 5),
-  };
+  // AFX-104: paper has no loss cap or drawdown kill switch. OANDA's
+  // margin closeout is the only loss guardrail, so `loss_cap_pct` /
+  // `kill_switch_dd_pct` are never sent.
+  const cfg: Record<string, number> = {};
   // v0.6.2 (Wilson UAT 2026-07-19): `max_position_size_units` was
   // dropped as an editable input — sizing is `balance × risk_pct ÷
   // stop_pips` and OANDA's own margin/leverage checks are the real

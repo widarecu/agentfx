@@ -62,10 +62,10 @@ export interface RiskConfig {
   // (pre-2026-07-19); absent on new runs, where sizing is fully
   // dynamic (`balance × risk_pct ÷ stop_pips`).
   max_position_size_units?: number;
-  // Renamed from `daily_loss_pct` on 2026-08-15. Cumulative loss cap
-  // vs snapshot balance for the LIFE of the run, not a per-day reset.
-  loss_cap_pct: number;
-  kill_switch_dd_pct: number;
+  // Legacy (pre AFX-104) loss-halt thresholds. Ignored by the runner:
+  // paper never halts on loss. See `utils/paperLossHalt.ts`.
+  loss_cap_pct?: number | null;
+  kill_switch_dd_pct?: number | null;
   stop_loss_pips?: number;
   take_profit_pips?: number;
 }

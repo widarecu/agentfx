@@ -49,8 +49,9 @@ _WATCHDOG_POLL_SECONDS = 5.0
 # `run.parameters['auto_restart_attempts']`.
 #
 # Explicitly NOT auto-restarted: OANDA_AUTH_LOST (credential issue,
-# user action), LOSS_CAP_HIT / BROKER_CIRCUIT (risk gate trips,
-# should be reviewed), USER_KILL (operator intent). The gate is
+# user action), MARGIN_CLOSEOUT (OANDA force-closed the account,
+# should be reviewed), BROKER_CIRCUIT, legacy LOSS_CAP_HIT, USER_KILL
+# (operator intent). The gate is
 # strictly the transient stop_reasons defined here.
 # ─────────────────────────────────────────────────────────────────────
 
@@ -437,8 +438,8 @@ def _is_transient_stop_reason(stop_reason: str | None) -> bool:
 
     Exact match against `_TRANSIENT_STOP_REASONS`; prefix match against
     `_TRANSIENT_STOP_PREFIXES` (so `process_crashed (exit_code=1)` is
-    caught). Anything else — LOSS_CAP_HIT, BROKER_CIRCUIT, USER_KILL,
-    OANDA_AUTH_LOST — is deliberately excluded: those need human
+    caught). Anything else — MARGIN_CLOSEOUT, BROKER_CIRCUIT, USER_KILL,
+    OANDA_AUTH_LOST, legacy LOSS_CAP_HIT — is deliberately excluded: those need human
     review.
     """
     if not stop_reason:

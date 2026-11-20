@@ -39,23 +39,21 @@ class RiskConfig(BaseSchema):
             "compatibility with legacy runs."
         ),
     )
-    loss_cap_pct: float = Field(
-        default=2.0,
+    # AFX-104 (Wilson 2026-11-20): paper has no loss cap or drawdown
+    # kill switch; OANDA's margin closeout is the only loss guardrail.
+    # Kept Optional so legacy risk_config blobs and older clients still
+    # validate. The runner ignores both fields.
+    loss_cap_pct: float | None = Field(
+        default=None,
         gt=0,
         le=100,
-        description=(
-            "Auto-halt when cumulative loss since the run started "
-            "exceeds this % of the snapshot balance. NOTE: this is a "
-            "run-lifetime cap, not a per-day reset. Renamed from "
-            "`daily_loss_pct` on 2026-08-15 (the old name implied "
-            "day-scoped behaviour it never had)."
-        ),
+        description="Deprecated and ignored: paper runs never halt on loss.",
     )
-    kill_switch_dd_pct: float = Field(
-        default=5.0,
+    kill_switch_dd_pct: float | None = Field(
+        default=None,
         gt=0,
         le=100,
-        description="Auto-halt if drawdown from snapshot balance exceeds this %.",
+        description="Deprecated and ignored: paper runs never halt on drawdown.",
     )
 
 
