@@ -544,6 +544,24 @@ class TestCloseAllPositions:
         assert excinfo.value.reject_reason == "POSITION_LOCKED"
         assert excinfo.value.transaction_id == "999"
 
+    def test_returns_close_fill_price(self, client, mock_session):
+        """AFX-106: the fill price, not pnl/units (pnl is in account
+        currency, so the derivation is wrong on a non-USD account)."""
+        position = _position_response(long_units=10000, short_units=0)
+        close = _http_ok(
+            {
+                "longOrderFillTransaction": {
+                    "pl": "-25.00",
+                    "units": "-10000",
+                    "price": "0.67352",
+                }
+            }
+        )
+        mock_session.request.side_effect = _close_dispatch(position, close)
+        r = client.close_all_positions("AUD_USD")
+        assert r["long_fill_price"] == 0.67352
+        assert r["short_fill_price"] is None
+
     def test_race_between_get_and_put_swallowed(self, client, mock_session):
         """Position closes (SL/TP fill) between our GET and PUT →
         OANDA returns CLOSEOUT_POSITION_DOESNT_EXIST 4xx. From the
@@ -698,3 +716,66 @@ class TestGetPricing:
         client.get_pricing(["EUR_USD", "USD_JPY"])
         params = mock_session.request.call_args.kwargs["params"]
         assert params["instruments"] == "EUR_USD,USD_JPY"
+
+
+class TestSetTradeExitOrders:
+    """AFX-106: rest the DSL's exact SL / TP on an open trade."""
+
+    def test_puts_absolute_prices_on_trade(self, client, mock_session):
+        mock_session.request.return_value = _http_ok(
+            {
+                "stopLossOrderTransaction": {"id": "201"},
+                "takeProfitOrderTransaction": {"id": "202"},
+            }
+        )
+        r = client.set_trade_exit_orders(
+            "T1", "AUD_USD", stop_loss_price=0.671412, take_profit_price=0.67755
+        )
+        call = mock_session.request.call_args
+        assert call.args[0] == "PUT"
+        assert call.args[1].endswith("/accounts/101-004-12345678-001/trades/T1/orders")
+        assert call.kwargs["json"] == {
+            "stopLoss": {"price": "0.67141", "timeInForce": "GTC"},
+            "takeProfit": {"price": "0.67755", "timeInForce": "GTC"},
+        }
+        assert r == {
+            "stop_loss_order_id": "201",
+            "take_profit_order_id": "202",
+            "filled": False,
+        }
+
+    def test_jpy_prices_use_three_decimals(self, client, mock_session):
+        mock_session.request.return_value = _http_ok({})
+        client.set_trade_exit_orders(
+            "T1", "USD_JPY", stop_loss_price=150.12345, take_profit_price=None
+        )
+        assert mock_session.request.call_args.kwargs["json"] == {
+            "stopLoss": {"price": "150.123", "timeInForce": "GTC"}
+        }
+
+    def test_reject_transaction_raises(self, client, mock_session):
+        from src.agentfx.adapters.oanda import OandaOrderRejected
+
+        mock_session.request.return_value = _http_ok(
+            {
+                "stopLossOrderRejectTransaction": {
+                    "id": "203",
+                    "rejectReason": "PRICE_PRECISION_EXCEEDED",
+                }
+            }
+        )
+        with pytest.raises(OandaOrderRejected) as excinfo:
+            client.set_trade_exit_orders(
+                "T1", "EUR_USD", stop_loss_price=1.1, take_profit_price=1.2
+            )
+        assert excinfo.value.reject_reason == "PRICE_PRECISION_EXCEEDED"
+        assert excinfo.value.order_type == "STOP_LOSS"
+
+    def test_immediate_fill_is_reported(self, client, mock_session):
+        mock_session.request.return_value = _http_ok(
+            {"stopLossOrderFillTransaction": {"id": "204"}}
+        )
+        r = client.set_trade_exit_orders(
+            "T1", "EUR_USD", stop_loss_price=1.1, take_profit_price=None
+        )
+        assert r["filled"] is True

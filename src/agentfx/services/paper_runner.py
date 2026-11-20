@@ -1400,7 +1400,9 @@ def _signal_tick(
     # our open Trade row is stranded with exit_timestamp=None forever.
     # Detect and reconcile BEFORE the walk so the walk sees the
     # correct starting state.
+    broker_closed_this_tick = False
     if net_units == 0 and open_trade is not None:
+        broker_closed_this_tick = True
         _reconcile_broker_side_close(
             db=db,
             run=run,
@@ -1466,8 +1468,12 @@ def _signal_tick(
     # pass unconditionally when available so the walk decides.
     high_series = df["high"].astype(float) if "high" in df.columns else None
     low_series = df["low"].astype(float) if "low" in df.columns else None
+    open_series = df["open"].astype(float) if "open" in df.columns else None
 
     # ── Walk ─────────────────────────────────────────────────────
+    # A broker-side SL/TP closed the trade since the last tick: the
+    # backtest never re-enters on the bar its stop/target fired, so
+    # the walk must not either (AFX-106).
     result = walk(
         raw_entries=raw_entries,
         close_series=close_series,
@@ -1477,6 +1483,8 @@ def _signal_tick(
         pip_size=pip_size,
         high_series=high_series,
         low_series=low_series,
+        open_series=open_series,
+        allow_entry=not broker_closed_this_tick,
     )
 
     # ── Advance bookmark UNCONDITIONALLY on any successful tick ──
@@ -1520,6 +1528,154 @@ def _signal_tick(
         broker_position=position,
         exit_rules=exit_rules_full,
         risk_cfg=risk_cfg,
+    )
+    _sync_broker_exit_orders(
+        db=db,
+        run=run,
+        client=client,
+        strategy=strategy,
+        instrument=instrument,
+        latest_close=float(df["close"].iloc[-1]),
+        final_state=result.final_state,
+        now_utc=now_utc,
+    )
+
+
+def _sync_broker_exit_orders(
+    *,
+    db,
+    run,
+    client,
+    strategy,
+    instrument: str,
+    latest_close: float,
+    final_state,
+    now_utc: datetime,
+) -> None:
+    """Wick-mode genomes: rest the DSL's exact SL / TP at OANDA once
+    `min_hold_bars` has elapsed (AFX-106).
+
+    Backtest wick mode fills a stop/target the moment a bar's wick
+    touches the level. A bar-close poll can't reproduce that — it
+    fills at the next close, often several pips past the level — so
+    the levels must live at the broker. They are attached after the
+    bar that ends the hold closes, so they are live for exactly the
+    bars the backtest checks (`bars_held >= min_hold_bars`).
+
+    If price is already past a level when the hold ends, close at
+    market now: the backtest fills that case at the next bar's open,
+    which is where price is right now. A resting order can't be
+    placed on the wrong side of the market.
+
+    Close-mode genomes are untouched: wide fail-safe SL at OANDA,
+    DSL levels enforced by the walk on bar close.
+    """
+    from agentfx.adapters.oanda import OandaError
+    from agentfx.api.models import Trade
+
+    spec = getattr(strategy, "spec", None)
+    exit_block = getattr(spec, "exit", None) if spec is not None else None
+    if exit_block is None or getattr(exit_block, "eval_mode", "close") != "wick":
+        return
+    if final_state.in_position == 0:
+        return
+    min_hold = int(getattr(exit_block, "min_hold_bars", 0) or 0)
+    if final_state.bars_held < min_hold - 1:
+        return
+
+    open_trade = (
+        db.query(Trade)
+        .filter(Trade.run_id == run.id, Trade.exit_timestamp.is_(None))
+        .order_by(Trade.entry_timestamp.asc())
+        .first()
+    )
+    if open_trade is None or not getattr(open_trade, "broker_trade_id", None):
+        return
+    is_long = open_trade.side == "buy"
+    if is_long != (final_state.in_position == 1):
+        return  # walk and DB disagree; leave it to the next tick
+    params = getattr(run, "parameters", None) or {}
+    broker_trade_id = str(open_trade.broker_trade_id)
+    if params.get("broker_exit_orders_trade_id") == broker_trade_id:
+        return  # already attached for this trade
+
+    pip_size = float(getattr(strategy, "pip_size", 0.0001) or 0.0001)
+    entry = float(open_trade.entry_price)
+    stop_dist = float(exit_block.stop_pips) * pip_size
+    target_dist = float(exit_block.target_pips) * pip_size
+    if is_long:
+        sl_price, tp_price = entry - stop_dist, entry + target_dist
+        past_sl, past_tp = latest_close <= sl_price, latest_close >= tp_price
+    else:
+        sl_price, tp_price = entry + stop_dist, entry - target_dist
+        past_sl, past_tp = latest_close >= sl_price, latest_close <= tp_price
+
+    if past_sl or past_tp:
+        exit_reason = "stop" if past_sl else "target"
+        _close_position_and_persist(
+            db=db,
+            run=run,
+            client=client,
+            instrument=instrument,
+            now_utc=now_utc,
+            reason=(
+                f"min_hold ended with price {latest_close:.5f} already past "
+                f"{exit_reason} level "
+                f"{sl_price if past_sl else tp_price:.5f}"
+            ),
+            exit_reason=exit_reason,
+        )
+        return
+
+    try:
+        result = client.set_trade_exit_orders(
+            broker_trade_id,
+            instrument,
+            stop_loss_price=sl_price,
+            take_profit_price=tp_price,
+        )
+    except OandaError as exc:
+        # Walk still enforces the levels on bar close, and the
+        # fail-safe SL stays on the trade; retried next tick.
+        _write_decision(
+            db,
+            run,
+            action="USER_EXIT_ORDERS_REJECTED",
+            reason=(
+                f"OANDA refused SL {sl_price:.5f} / TP {tp_price:.5f} on "
+                f"trade {broker_trade_id}: {exc}"
+            ),
+            outputs={
+                "paper_run_id": run.id,
+                "broker_trade_id": broker_trade_id,
+                "stop_loss_price": sl_price,
+                "take_profit_price": tp_price,
+                "error": str(exc),
+                "reject_reason": getattr(exc, "reject_reason", None),
+            },
+        )
+        return
+
+    run.parameters = {**params, "broker_exit_orders_trade_id": broker_trade_id}
+    db.commit()
+    _write_decision(
+        db,
+        run,
+        action="USER_EXIT_ORDERS_PLACED",
+        reason=(
+            f"min_hold elapsed — resting SL {sl_price:.5f} "
+            f"({exit_block.stop_pips} pips) / TP {tp_price:.5f} "
+            f"({exit_block.target_pips} pips) on trade {broker_trade_id}"
+        ),
+        outputs={
+            "paper_run_id": run.id,
+            "broker_trade_id": broker_trade_id,
+            "stop_loss_price": sl_price,
+            "take_profit_price": tp_price,
+            "stop_loss_order_id": result.get("stop_loss_order_id"),
+            "take_profit_order_id": result.get("take_profit_order_id"),
+            "filled_immediately": result.get("filled", False),
+        },
     )
 
 
@@ -2232,6 +2388,7 @@ def _close_position_and_persist(
     close_txn_id = result.get("long_fill_transaction_id") or result.get(
         "short_fill_transaction_id"
     )
+    close_fill_price = result.get("long_fill_price") or result.get("short_fill_price")
 
     # Update every open Trade row for this run — a normal single-side
     # position will have exactly one; the multi-fill / partial-close
@@ -2255,11 +2412,16 @@ def _close_position_and_persist(
                 (t.pnl / (t.entry_price * t.quantity)) * 100 if t.entry_price else 0.0
             )
             t.exit_timestamp = now_utc
-            # Exit price: derive from the pnl share + entry price. Not
-            # exact for JPY vs major pip differences but close enough
-            # for the UI. If this drifts noticeably we'll read the
-            # actual fill price from the OANDA response in v0.6.2.
-            t.exit_price = t.entry_price + (t.pnl / t.quantity if t.quantity else 0.0)
+            # AFX-106: the OANDA close fill price. The old pnl-derived
+            # fallback treats account-currency pnl as quote-currency
+            # price movement (~1.5x off on an AUD account trading
+            # AUD_USD); kept only for responses without a price.
+            if close_fill_price:
+                t.exit_price = float(close_fill_price)
+            else:
+                t.exit_price = t.entry_price + (
+                    t.pnl / t.quantity if t.quantity else 0.0
+                )
             if exit_reason is not None:
                 t.exit_reason = exit_reason
             # v0.6.1: accumulate financing + commission on this close.

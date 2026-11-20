@@ -146,6 +146,7 @@ def _make_strategy(
     min_hold_bars: int = 0,
     opposite_signal: bool = True,
     risk_pct: float = 0.005,
+    eval_mode: str = "close",
 ) -> SimpleNamespace:
     """A stand-in for `CompiledDSLStrategy`.
 
@@ -178,6 +179,7 @@ def _make_strategy(
         max_hold_bars=max_hold_bars,
         min_hold_bars=min_hold_bars,
         opposite_signal=opposite_signal,
+        eval_mode=eval_mode,
     )
     size_rules = SimpleNamespace(risk_pct=risk_pct)
     spec = SimpleNamespace(entry=entry, exit=exit_rules, size=size_rules)
@@ -1045,6 +1047,192 @@ class TestSignalTick:
             stop_loss_pips=200,
             take_profit_pips=None,
         )
+
+
+class TestWickBrokerExitOrders:
+    """AFX-106: wick-mode genomes rest the DSL's exact SL / TP at OANDA
+    once min_hold_bars has elapsed, so paper fills on a touch the way
+    the backtest assumes. Close-mode genomes keep the wide fail-safe."""
+
+    NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+
+    def _tick(
+        self,
+        *,
+        entry_price: float = 1.10,
+        bars_since_entry: int = 1,
+        min_hold_bars: int = 3,
+        eval_mode: str = "wick",
+        run_parameters: dict | None = None,
+        signals: list[int] | None = None,
+        broker_units: int = 10_000,
+        client: MagicMock | None = None,
+    ):
+        strategy = _make_strategy(
+            signals=signals or [0, 0, 0],
+            stop_pips=20,
+            target_pips=50,
+            min_hold_bars=min_hold_bars,
+            eval_mode=eval_mode,
+        )
+        # Closes 1.1000 / 1.1001 / 1.1002; lows never below 1.0995.
+        fetch = MagicMock(return_value=_mk_candles_df(3, self.NOW))
+        client = client or MagicMock()
+        client.get_position.return_value = {
+            "long_units": broker_units,
+            "short_units": 0,
+        }
+        client.close_all_positions.return_value = {
+            "long_realized_pnl": -5.0,
+            "short_realized_pnl": 0.0,
+            "long_fill_price": 1.1002,
+        }
+        client.set_trade_exit_orders.return_value = {
+            "stop_loss_order_id": "201",
+            "take_profit_order_id": "202",
+            "filled": False,
+        }
+        trade = SimpleNamespace(
+            id="tr_open",
+            run_id="run_test_signal",
+            side="buy",
+            entry_price=entry_price,
+            quantity=10_000,
+            entry_timestamp=self.NOW - timedelta(minutes=2),
+            exit_timestamp=None,
+            exit_price=None,
+            exit_reason=None,
+            pnl=None,
+            pnl_pct=None,
+            broker_trade_id="T1",
+            broker_close_transaction_id=None,
+        )
+        db = _make_db()
+        _set_open_trade(db, trade)
+        db.query.return_value.filter.return_value.count.return_value = bars_since_entry
+        db.query.return_value.filter.return_value.all.return_value = [trade]
+        run = _make_run()
+        run.parameters = dict(run_parameters or {})
+        _signal_tick(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=self.NOW,
+        )
+        decisions = [
+            c.args[0].action
+            for c in db.add.call_args_list
+            if type(c.args[0]).__name__ == "DecisionLog"
+        ]
+        return client, run, trade, decisions
+
+    def test_attaches_exact_levels_when_min_hold_ends(self):
+        # Walk's final bars_held = min_hold - 1: the NEXT bar is the
+        # first one the backtest checks, so the orders go on now.
+        client, run, _trade, decisions = self._tick(bars_since_entry=1)
+        client.set_trade_exit_orders.assert_called_once()
+        call = client.set_trade_exit_orders.call_args
+        assert call.args == ("T1", "EUR_USD")
+        assert call.kwargs["stop_loss_price"] == pytest.approx(1.0980)
+        assert call.kwargs["take_profit_price"] == pytest.approx(1.1050)
+        assert run.parameters["broker_exit_orders_trade_id"] == "T1"
+        assert "USER_EXIT_ORDERS_PLACED" in decisions
+        client.close_all_positions.assert_not_called()
+
+    def test_not_attached_during_min_hold(self):
+        client, run, _trade, _ = self._tick(bars_since_entry=0)
+        client.set_trade_exit_orders.assert_not_called()
+        assert "broker_exit_orders_trade_id" not in run.parameters
+
+    def test_not_reattached_for_same_trade(self):
+        client, _run, _trade, _ = self._tick(
+            bars_since_entry=5,
+            run_parameters={"broker_exit_orders_trade_id": "T1"},
+        )
+        client.set_trade_exit_orders.assert_not_called()
+
+    def test_close_mode_never_attaches(self):
+        client, _run, _trade, _ = self._tick(bars_since_entry=5, eval_mode="close")
+        client.set_trade_exit_orders.assert_not_called()
+
+    def test_price_already_past_stop_closes_at_market(self):
+        # Entry 1.1030 → SL 1.1010. The hold ends with price at 1.1002,
+        # below the stop. Backtest fills at the next bar's open (~here);
+        # paper closes at market rather than resting an order that
+        # can't be placed below the market.
+        client, _run, trade, _ = self._tick(entry_price=1.1030, bars_since_entry=1)
+        client.set_trade_exit_orders.assert_not_called()
+        client.close_all_positions.assert_called_once_with("EUR_USD")
+        assert trade.exit_reason == "stop"
+        assert trade.exit_price == pytest.approx(1.1002)
+
+    def test_rejected_orders_are_logged_and_retried(self):
+        from agentfx.adapters.oanda import OandaOrderRejected
+
+        client = MagicMock()
+        client.set_trade_exit_orders.side_effect = OandaOrderRejected(
+            "TRADE_DOESNT_EXIST", transaction_id="9", order_type="STOP_LOSS"
+        )
+        _client, run, _trade, decisions = self._tick(bars_since_entry=1, client=client)
+        assert "USER_EXIT_ORDERS_REJECTED" in decisions
+        assert "broker_exit_orders_trade_id" not in run.parameters
+
+    def test_broker_side_close_blocks_same_tick_reentry(self):
+        # OANDA's SL filled since the last tick; the latest bar also
+        # carries a fresh entry. Backtest never re-enters on the bar
+        # its stop fired, so paper must not either.
+        client, _run, _trade, _ = self._tick(
+            bars_since_entry=5, signals=[0, 0, 1], broker_units=0
+        )
+        client.place_market_order.assert_not_called()
+
+
+class TestRunnerCloseExitPrice:
+    def test_exit_price_is_broker_fill_not_pnl_derived(self):
+        """AFX-106: on an AUD account, pnl/units overstated the price
+        move ~1.5x. The close fill price is authoritative."""
+        now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+        strategy = _make_strategy(signals=[0, 0, 0], max_hold_bars=5)
+        fetch = MagicMock(return_value=_mk_candles_df(3, now))
+        client = MagicMock()
+        client.get_position.return_value = {"long_units": 10_000, "short_units": 0}
+        client.close_all_positions.return_value = {
+            "long_realized_pnl": -30.0,
+            "short_realized_pnl": 0.0,
+            "long_fill_price": 1.0980,
+        }
+        trade = SimpleNamespace(
+            id="tr_open",
+            run_id="run_test",
+            entry_price=1.10,
+            quantity=10_000,
+            entry_timestamp=now - timedelta(seconds=400),
+            exit_timestamp=None,
+            pnl=None,
+            pnl_pct=None,
+            exit_price=None,
+        )
+        db = _make_db()
+        _set_open_trade(db, trade)
+        db.query.return_value.filter.return_value.count.return_value = 6
+        db.query.return_value.filter.return_value.all.return_value = [trade]
+
+        _signal_tick(
+            db=db,
+            run=_make_run(),
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=now,
+        )
+
+        assert trade.exit_price == pytest.approx(1.0980)
 
 
 # ─────────────────────────────────────────────────────────────────────
