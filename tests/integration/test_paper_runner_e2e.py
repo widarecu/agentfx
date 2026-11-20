@@ -142,65 +142,78 @@ class TestKillSwitch:
         client.close_all_positions.assert_called_once_with("EUR_USD")
 
 
-class TestLossCapHalt:
-    def test_declining_balance_trips_loss_cap(self, db_session, alice_paper_run):
-        """A 5% balance drop hits both the DD gate and the loss-cap
-        gate. `evaluate_all` orders DD first, so the observed reason
-        is BROKER_CIRCUIT (kill switch). The loss-cap-only scenario
-        is a smaller drop that hits ONLY the 2% cap without exceeding
-        the 5% DD cap — that's the case this test locks."""
+class TestNoLossHalt:
+    """AFX-104: paper runs never auto-halt on loss or drawdown. OANDA's
+    margin closeout is the only loss guardrail."""
+
+    @pytest.mark.parametrize("balance", [9_800.0, 9_500.0, 7_000.0])
+    def test_declining_balance_keeps_running(
+        self, db_session, alice_paper_run, balance
+    ):
         from src.agentfx.api.models import RunStatus
         from agentfx.services.paper_runner import _execute_loop
 
-        # Snapshot at 10_000, balance drops to 9_800 = exactly 2% loss.
-        # DD gate at 5% is fine; loss-cap gate at 2% trips.
         alice_paper_run.snapshot_balance = 10_000.0
         alice_paper_run.current_balance = 10_000.0
+        alice_paper_run.risk_config = {"loss_cap_pct": 2.0, "kill_switch_dd_pct": 5.0}
         db_session.commit()
 
         client = MagicMock()
-        client.get_account_balance.return_value = {"balance": 9_800.0}
+        client.get_account_balance.return_value = {"balance": balance}
 
         _execute_loop(
             db=db_session,
             run=alice_paper_run,
             client=client,
             sleep_fn=MagicMock(),
-            max_iterations=1,
+            max_iterations=2,
+        )
+
+        db_session.refresh(alice_paper_run)
+        assert alice_paper_run.status == RunStatus.RUNNING
+        assert alice_paper_run.stop_reason is None
+        assert alice_paper_run.current_balance == balance
+        client.close_all_positions.assert_not_called()
+
+    def test_margin_closeout_halts_run(self, db_session, alice_paper_run):
+        from src.agentfx.api.models import RunStatus
+        from agentfx.services.paper_runner import _execute_loop
+
+        alice_paper_run.snapshot_balance = 10_000.0
+        alice_paper_run.current_balance = 10_000.0
+        alice_paper_run.last_transaction_id = "100"
+        db_session.commit()
+
+        client = MagicMock()
+        client.get_account_balance.return_value = {"balance": 2_000.0}
+        client.get_position.return_value = {"long_units": 0, "short_units": 0}
+        client.get_transactions_since.return_value = {
+            "transactions": [
+                {
+                    "id": "150",
+                    "type": "ORDER_FILL",
+                    "reason": "MARKET_ORDER_MARGIN_CLOSEOUT",
+                    "pl": "-8000.00",
+                }
+            ],
+            "lastTransactionID": "150",
+        }
+
+        _execute_loop(
+            db=db_session,
+            run=alice_paper_run,
+            client=client,
+            sleep_fn=MagicMock(),
+            max_iterations=12,  # reconciler runs every 12th iteration
         )
 
         db_session.refresh(alice_paper_run)
         assert alice_paper_run.status == RunStatus.ERROR
-        assert alice_paper_run.stop_reason == "LOSS_CAP_HIT"
+        assert alice_paper_run.stop_reason == "MARGIN_CLOSEOUT"
         client.close_all_positions.assert_called_once_with("EUR_USD")
 
 
 class TestBrokerCircuit:
-    def test_dd_gate_trips_broker_circuit(self, db_session, alice_paper_run):
-        """5% balance drop trips the kill-switch DD gate before the
-        loss-cap gate (per evaluate_all precedence)."""
-        from src.agentfx.api.models import RunStatus
-        from agentfx.services.paper_runner import _execute_loop
-
-        alice_paper_run.snapshot_balance = 10_000.0
-        alice_paper_run.current_balance = 10_000.0
-        db_session.commit()
-
-        client = MagicMock()
-        client.get_account_balance.return_value = {"balance": 9_500.0}
-
-        _execute_loop(
-            db=db_session,
-            run=alice_paper_run,
-            client=client,
-            sleep_fn=MagicMock(),
-            max_iterations=1,
-        )
-
-        db_session.refresh(alice_paper_run)
-        assert alice_paper_run.status == RunStatus.ERROR
-        assert alice_paper_run.stop_reason == "BROKER_CIRCUIT"
-
     def test_client_circuit_open_halts_with_broker_reason(
         self, db_session, alice_paper_run
     ):

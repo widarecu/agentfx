@@ -97,8 +97,6 @@ export interface ApprovePaperRunRequest {
      *  Optional in the wire type so callers can omit it entirely; the
      *  runner sizes each trade dynamically off risk_pct × balance. */
     max_position_size_units?: number;
-    loss_cap_pct: number;
-    kill_switch_dd_pct: number;
     /** v0.6.1 (US-028): optional broker-side SL. When set, passed
      *  through to `client.place_market_order` on the runner's next
      *  signal tick. Absent → no broker-side SL registered. */
