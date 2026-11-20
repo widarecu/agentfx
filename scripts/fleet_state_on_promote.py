@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""Transition Linear tickets after a promote PR merge + Railway deploy (AFX-70).
+"""Transition Linear tickets after a promote PR merge + deploy (AFX-70, AFX-105).
 
 Run by `.github/workflows/agent-fleet-state-on-promote.yml`, which triggers on
-the `Deploy` workflow's completion. The Deploy workflow IS the Railway deploy,
-so `workflow_run.conclusion` is the Railway deploy outcome.
+the `Deploy` workflow's completion. The Deploy workflow runs three jobs (E2E
+Tests, Deploy Backend → Railway, Deploy Frontend → Vercel), so a failed
+workflow conclusion does not mean the deploy failed: on failure the script
+reads the run's jobs and classifies the outcome (`classify_deploy_jobs`).
 
 For every `AFX-<n>` tag in the commits that just landed on `main`:
 
 * Deploy succeeded → transition the ticket to `Done`, post a "promoted to main"
-  comment with a staging link.
-* Deploy failed / cancelled → transition the ticket to `Blocked`, add the
-  `needs-wilson` label, post a warning comment.
+  comment with a staging link, and drop the `needs-wilson` label if an
+  earlier failed deploy of this workflow added it.
+* A deploy job (Railway / Vercel) failed, or the failing job can't be
+  determined → transition the ticket to `Blocked`, add the `needs-wilson`
+  label, post a warning comment.
+* Only E2E failed (the code is live) → post an informational comment; the
+  ticket keeps its state and moves to `Done` when a re-run goes green.
+* Cancelled → skip.
 
 Dedup is marker-based, same pattern as `fleet_promote_pr.py`. Linear failures
 never fail the workflow — a missed comment is better than a blocked deploy.
@@ -18,7 +25,8 @@ never fail the workflow — a missed comment is better than a blocked deploy.
 Stdlib only + `gh` CLI (authenticated through `GH_TOKEN`):
 
     python3 scripts/fleet_state_on_promote.py --sha <merge-sha> --outcome success
-    python3 scripts/fleet_state_on_promote.py --sha <merge-sha> --outcome failure
+    python3 scripts/fleet_state_on_promote.py --sha <merge-sha> --outcome failure \
+        --deploy-run-id <deploy-run-id>
     python3 scripts/fleet_state_on_promote.py --sha <merge-sha> --outcome success --dry-run
 """
 
@@ -76,7 +84,19 @@ NEEDS_WILSON = "needs-wilson"
 STAGING_URL = "https://agentfx-staging.up.railway.app"
 
 SUCCESS_MARKER_FMT = "<!-- afx-70:promoted-to-main:{sha} -->"
-FAILED_MARKER_FMT = "<!-- afx-70:deploy-failed:{sha} -->"
+FAILED_MARKER_PREFIX = "<!-- afx-70:deploy-failed:"
+FAILED_MARKER_FMT = FAILED_MARKER_PREFIX + "{sha} -->"
+E2E_FAILED_MARKER_FMT = "<!-- afx-105:e2e-failed:{sha} -->"
+
+# Outcomes. `success` / `failure` / `cancelled` are workflow conclusions;
+# `failure` is refined into one of the three below by `resolve_outcome`.
+DEPLOY_FAILED = "deploy_failed"
+E2E_FAILED = "e2e_failed"
+UNKNOWN_FAILURE = "failure"
+
+# Job names in `.github/workflows/deploy.yml`. Keep in sync.
+DEPLOY_JOB_NAMES = ("Deploy Backend → Railway", "Deploy Frontend → Vercel")
+_FAILED_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "cancelled"}
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -102,6 +122,54 @@ def failed_marker(sha: str) -> str:
     return FAILED_MARKER_FMT.format(sha=sha[:7])
 
 
+def e2e_failed_marker(sha: str) -> str:
+    return E2E_FAILED_MARKER_FMT.format(sha=sha[:7])
+
+
+def deploy_run_url(server_url: str, repo: str, run_id: str) -> str:
+    """Link to the Deploy workflow run, or "" when no run id is known."""
+    if not run_id:
+        return ""
+    return f"{server_url.rstrip('/')}/{repo}/actions/runs/{run_id}"
+
+
+def classify_deploy_jobs(jobs: list[dict]) -> tuple[str, list[str]]:
+    """Classify a Deploy run from its jobs. Returns (outcome, failed job names).
+
+    * any deploy job failed                      → DEPLOY_FAILED
+    * every deploy job succeeded, another failed → E2E_FAILED (code is live)
+    * every job succeeded                        → "success"
+    * anything else (deploy job skipped/missing,
+      no job data)                               → UNKNOWN_FAILURE
+    """
+    by_name = {j.get("name"): j.get("conclusion") for j in jobs}
+    failed = [j["name"] for j in jobs if j.get("conclusion") in _FAILED_CONCLUSIONS]
+    failed_deploy = [n for n in failed if n in DEPLOY_JOB_NAMES]
+    if failed_deploy:
+        return DEPLOY_FAILED, failed_deploy
+    deployed = all(by_name.get(n) == "success" for n in DEPLOY_JOB_NAMES)
+    if deployed and failed:
+        return E2E_FAILED, failed
+    if deployed and not failed:
+        return "success", []
+    return UNKNOWN_FAILURE, failed
+
+
+def resolve_outcome(outcome: str, repo: str, run_id: str) -> tuple[str, list[str]]:
+    """Refine a `failure` workflow conclusion using the Deploy run's jobs.
+    Any lookup problem falls back to UNKNOWN_FAILURE, which still blocks."""
+    if outcome != UNKNOWN_FAILURE:
+        return outcome, []
+    if not run_id:
+        return UNKNOWN_FAILURE, []
+    try:
+        jobs = fetch_deploy_jobs(repo, run_id)
+    except Exception as exc:  # noqa: BLE001
+        warn(f"Could not read jobs for Deploy run {run_id}: {exc}")
+        return UNKNOWN_FAILURE, []
+    return classify_deploy_jobs(jobs)
+
+
 def success_comment(sha: str, *, now: datetime) -> str:
     return (
         f"Promoted to `main` and deployed to staging at "
@@ -112,14 +180,45 @@ def success_comment(sha: str, *, now: datetime) -> str:
     )
 
 
-def failed_comment(sha: str, *, run_url: str) -> str:
+def failed_comment(
+    sha: str,
+    *,
+    run_url: str,
+    outcome: str = DEPLOY_FAILED,
+    failed_jobs: list[str] | None = None,
+) -> str:
+    if outcome == DEPLOY_FAILED:
+        jobs = ", ".join(f"`{n}`" for n in failed_jobs or []) or "a deploy job"
+        what = f"the deploy **failed** ({jobs})"
+    else:
+        what = (
+            "the Deploy workflow **failed** and the automation could not "
+            "tell which job failed, so the deploy may not be live"
+        )
     return (
-        f"Promoted to `main` but the Railway deploy **failed** at commit "
+        f"Promoted to `main` but {what} at commit "
         f"`{sha[:7]}`. Ticket moved to `Blocked` pending investigation. "
         f"Do not re-attempt the promote until the deploy issue is resolved.\n\n"
-        f"Deploy run: {run_url}\n\n"
+        f"Deploy run: {run_url or '(not available)'}\n\n"
         f"{failed_marker(sha)}\n"
         "_Posted by agent-fleet-state-on-promote.yml (AFX-70)._"
+    )
+
+
+def e2e_failed_comment(
+    sha: str, *, run_url: str, failed_jobs: list[str] | None = None
+) -> str:
+    jobs = ", ".join(f"`{n}`" for n in failed_jobs or []) or "`E2E Tests`"
+    return (
+        f"Promoted to `main` and deployed to staging (Railway and Vercel "
+        f"succeeded) at commit `{sha[:7]}`, but {jobs} failed in the same "
+        f"Deploy run. The change is live; the ticket was left in its current "
+        f"state. Check whether the E2E failure is a real regression or a "
+        f"flake (e.g. an apt mirror outage) and re-run the failed job: a "
+        f"green re-run moves the ticket to `Done`.\n\n"
+        f"Deploy run: {run_url or '(not available)'}\n\n"
+        f"{e2e_failed_marker(sha)}\n"
+        "_Posted by agent-fleet-state-on-promote.yml (AFX-105)._"
     )
 
 
@@ -154,6 +253,30 @@ def _gh_json(*args: str):
 
 def warn(msg: str) -> None:
     print(f"::warning ::{msg}")
+
+
+def fetch_deploy_jobs(repo: str, run_id: str) -> list[dict]:
+    """Jobs of the Deploy run's latest attempt. Uses `ACTIONS_TOKEN` (the
+    workflow's `GITHUB_TOKEN` with `actions: read`) when set, because the
+    fleet-bot App token is only minted with contents/pull-requests."""
+    env = dict(os.environ)
+    if env.get("ACTIONS_TOKEN"):
+        env["GH_TOKEN"] = env["ACTIONS_TOKEN"]
+    proc = subprocess.run(
+        (
+            "gh",
+            "api",
+            "--paginate",
+            f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100",
+            "--jq",
+            ".jobs[] | {name, conclusion}",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    return [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
 
 
 def fetch_merge_commits(repo: str, sha: str) -> list[dict]:
@@ -363,6 +486,41 @@ class Linear:
         issue["labels"]["nodes"].append({"id": label_id, "name": name})
         return True
 
+    def remove_label(self, ident: str, name: str) -> bool:
+        """Remove a label from the issue by name. No-op if absent."""
+        issue = self.issue(ident)
+        if not issue:
+            return False
+        nodes = (issue.get("labels") or {}).get("nodes", [])
+        match = next((n for n in nodes if n["name"] == name), None)
+        if not match:
+            return False
+        try:
+            self._gql(
+                "mutation($id: String!, $labelId: String!) { "
+                "issueRemoveLabel(id: $id, labelId: $labelId) { success } }",
+                {"id": issue["id"], "labelId": match["id"]},
+            )
+        except Exception as exc:  # noqa: BLE001
+            warn(f"Linear remove label failed for {ident}: {exc}")
+            return False
+        nodes.remove(match)
+        return True
+
+    def current_state(self, ident: str) -> str | None:
+        issue = self.issue(ident)
+        return ((issue or {}).get("state") or {}).get("name")
+
+    def has_comment_containing(self, ident: str, needle: str) -> bool:
+        issue = self.issue(ident)
+        if not issue:
+            return False
+        try:
+            return any(needle in b for b in self.comment_bodies(issue))
+        except Exception as exc:  # noqa: BLE001
+            warn(f"Linear comment lookup failed for {ident}: {exc}")
+            return False
+
     def comment_once(self, ident: str, body: str, marker: str) -> bool:
         """Post the comment unless any existing comment already carries
         the marker. Returns True if a new comment was posted."""
@@ -403,8 +561,21 @@ def dispatch(
     run_url: str,
     team_key: str,
     now: datetime,
+    failed_jobs: list[str] | None = None,
 ) -> None:
     """Apply the right state + comment to every AFX-ID."""
+    if outcome == E2E_FAILED:
+        marker = e2e_failed_marker(sha)
+        body = e2e_failed_comment(sha, run_url=run_url, failed_jobs=failed_jobs)
+        for ident in idents:
+            current = linear.current_state(ident)
+            if current not in TRANSITIONABLE:
+                print(f"::notice ::{ident} in {current!r}; no E2E comment")
+                continue
+            if linear.comment_once(ident, body, marker):
+                print(f"Commented on {ident}")
+        return
+
     if outcome == "success":
         marker = success_marker(sha)
         body = success_comment(sha, now=now)
@@ -412,7 +583,9 @@ def dispatch(
         add_needs_wilson = False
     else:
         marker = failed_marker(sha)
-        body = failed_comment(sha, run_url=run_url)
+        body = failed_comment(
+            sha, run_url=run_url, outcome=outcome, failed_jobs=failed_jobs
+        )
         target_state = "Blocked"
         add_needs_wilson = True
 
@@ -422,6 +595,11 @@ def dispatch(
             continue
         if add_needs_wilson:
             linear.add_label(ident, team_key, NEEDS_WILSON)
+        elif linear.has_comment_containing(ident, FAILED_MARKER_PREFIX):
+            # Only undo the label this workflow added; a needs-wilson set
+            # for any other reason is a real blocker.
+            if linear.remove_label(ident, NEEDS_WILSON):
+                print(f"Removed {NEEDS_WILSON} from {ident}")
         if linear.comment_once(ident, body, marker):
             print(f"Commented on {ident}")
 
@@ -432,13 +610,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--outcome",
         required=True,
-        choices=("success", "failure", "cancelled"),
-        help="Deploy workflow conclusion",
+        choices=("success", "failure", "cancelled", DEPLOY_FAILED, E2E_FAILED),
+        help=(
+            "Deploy workflow conclusion; `failure` is refined from the run's "
+            f"jobs. `{DEPLOY_FAILED}` / `{E2E_FAILED}` force a classification "
+            "(manual dispatch)."
+        ),
+    )
+    parser.add_argument(
+        "--deploy-run-id",
+        default="",
+        help="ID of the Deploy workflow run (job lookup + comment link)",
     )
     parser.add_argument(
         "--run-url",
         default="",
-        help="GitHub Actions run URL of the failed deploy (for the failure comment)",
+        help="Override the Deploy run link (default: built from --deploy-run-id)",
     )
     parser.add_argument(
         "--repo", default=os.environ.get("GITHUB_REPOSITORY", "widarecu/agentfx")
@@ -455,6 +642,12 @@ def main(argv: list[str] | None = None) -> int:
         print("Deploy was cancelled; not transitioning any tickets.")
         return 0
 
+    run_url = args.run_url or deploy_run_url(
+        os.environ.get("GITHUB_SERVER_URL", "https://github.com"),
+        args.repo,
+        args.deploy_run_id,
+    )
+
     commits = fetch_merge_commits(args.repo, args.sha)
     idents = collect_afx_ids_from_commits(commits)
     if not idents:
@@ -466,6 +659,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Would mark these as {args.outcome!r} and transition.")
         return 0
 
+    outcome, failed_jobs = resolve_outcome(args.outcome, args.repo, args.deploy_run_id)
+    print(f"Deploy outcome: {outcome} (failed jobs: {failed_jobs or 'none'})")
+
     api_key = os.environ.get("LINEAR_API_KEY")
     if not api_key:
         warn("LINEAR_API_KEY not set: cannot transition states.")
@@ -476,10 +672,11 @@ def main(argv: list[str] | None = None) -> int:
         linear,
         idents,
         sha=args.sha,
-        outcome=args.outcome,
-        run_url=args.run_url,
+        outcome=outcome,
+        run_url=run_url,
         team_key=args.team_key,
         now=now,
+        failed_jobs=failed_jobs,
     )
     return 0
 

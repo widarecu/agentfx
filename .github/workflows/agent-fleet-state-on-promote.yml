@@ -1,11 +1,15 @@
 name: Transition Linear tickets on main-merge + deploy outcome
 
-# Fires when the Deploy workflow completes (AFX-70 Phase 1). The Deploy
-# workflow IS the Railway deploy, so its conclusion is what we react to:
-#   success  → transition each AFX-N carried by the merge to `Done` + post
-#              "promoted + deployed" comment with staging link.
-#   failure  → transition to `Blocked`, add `needs-wilson`, warn comment.
-#   cancelled→ log + skip.
+# Fires when the Deploy workflow completes (AFX-70 Phase 1). Deploy runs
+# E2E Tests + Railway + Vercel jobs, so on failure the script reads the
+# run's jobs to tell a deploy failure from an E2E-only failure (AFX-105):
+#   success       → transition each AFX-N carried by the merge to `Done` +
+#                   post "promoted + deployed" comment with staging link;
+#                   drop the `needs-wilson` an earlier failed deploy added.
+#   deploy failed → (Railway/Vercel job failed, or unknown) transition to
+#                   `Blocked`, add `needs-wilson`, warn comment.
+#   E2E failed    → deploy is live: comment only, state unchanged.
+#   cancelled     → log + skip.
 #
 # feat/agent-fleet → In Staging is Linear-native via branch rules (Wilson's
 # admin config, 2026-11-14). This workflow only owns the main-merge edge.
@@ -29,7 +33,13 @@ on:
         options:
           - success
           - failure
+          - deploy_failed
+          - e2e_failed
           - cancelled
+      deploy_run_id:
+        description: "Deploy workflow run ID (job lookup for `failure` + comment link)"
+        required: false
+        default: ""
 
 permissions: {}
 
@@ -48,6 +58,9 @@ jobs:
        github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     environment: fleet-bot
+    # Read the Deploy run's jobs (classify deploy vs E2E failure).
+    permissions:
+      actions: read
     timeout-minutes: 10
     steps:
       - name: Mint fleet-bot token
@@ -73,10 +86,11 @@ jobs:
       - name: Transition AFX tickets
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ACTIONS_TOKEN: ${{ github.token }}
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           LINEAR_TEAM_KEY: AFX
         run: |
           python3 scripts/fleet_state_on_promote.py \
             --sha '${{ github.event.workflow_run.head_sha || inputs.sha }}' \
             --outcome '${{ github.event.workflow_run.conclusion || inputs.outcome }}' \
-            --run-url '${{ github.event.workflow_run.html_url || github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+            --deploy-run-id '${{ github.event.workflow_run.id || inputs.deploy_run_id }}'

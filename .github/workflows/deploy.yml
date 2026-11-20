@@ -122,7 +122,14 @@ jobs:
         run: ln -s ${{ github.workspace }}/portal/web/node_modules ${{ github.workspace }}/tests/e2e/node_modules
 
       - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium
+        # Retry: Ubuntu's apt mirrors return transient 503s (AFX-105).
+        run: |
+          for attempt in 1 2 3; do
+            npx playwright install --with-deps chromium && exit 0
+            echo "::warning ::playwright install failed (attempt $attempt/3)"
+            sleep 30
+          done
+          exit 1
         working-directory: portal/web
 
       - name: Run E2E tests
