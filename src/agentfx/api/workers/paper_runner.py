@@ -326,17 +326,21 @@ def _mark_run_failed_after_crash(run_id: str, exit_code: int | None) -> None:
 def _record_child_pid(run_id: str, pid: int | None) -> None:
     """Persist the subprocess PID onto the run row so the router can
     surface it (and the escape-hatch SIGTERM can find it).
+
+    Only while the run is still APPROVED: once a child has claimed the
+    run it records its own pid (AFX-50), and a losing duplicate child
+    must not overwrite it.
     """
     try:
         from agentfx.api.core.database import SessionLocal
-        from agentfx.api.services import paper as paper_service
+        from agentfx.api.models import Run, RunStatus
 
         db = SessionLocal()
         try:
-            run = paper_service.get_paper_run(db, run_id)
-            if run is not None:
-                run.process_pid = pid
-                db.commit()
+            db.query(Run).filter(
+                Run.id == run_id, Run.status == RunStatus.APPROVED
+            ).update({Run.process_pid: pid}, synchronize_session=False)
+            db.commit()
         finally:
             db.close()
     except Exception:  # noqa: BLE001

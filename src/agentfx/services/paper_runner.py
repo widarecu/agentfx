@@ -34,6 +34,7 @@ halted with zero trades because of that gap. US-024 closes it.
 from __future__ import annotations
 
 import logging
+import os
 import time
 import traceback
 import uuid
@@ -369,6 +370,29 @@ def _ensure_started_at(run) -> None:
         run.started_at = datetime.now(UTC)
 
 
+def _claim_runner(db, run) -> bool:
+    """AFX-50: atomically move the run APPROVED -> RUNNING for this process.
+
+    Every scheduling path (approve, resume, boot recovery, auto-restart)
+    sets APPROVED before spawning a runner. If two runners get spawned
+    for one run, only the first flips the row; the second sees zero
+    rows updated and must exit before it can trade.
+    """
+    from agentfx.api.models import Run, RunStatus
+
+    claimed = (
+        db.query(Run)
+        .filter(Run.id == run.id, Run.status == RunStatus.APPROVED)
+        .update(
+            {Run.status: RunStatus.RUNNING, Run.process_pid: os.getpid()},
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    db.refresh(run)
+    return claimed == 1
+
+
 def run_paper_run(
     run_id: str,
 ) -> None:  # pragma: no cover — exercised via subprocess in PR-G integration tests only
@@ -457,7 +481,14 @@ def run_paper_run(
                 )
                 strategy = None
 
-        run.status = RunStatus.RUNNING
+        if not _claim_runner(db, run):
+            logger.warning(
+                "paper runner: run %s is no longer APPROVED (status=%s); "
+                "another runner already claimed it, exiting without trading",
+                run_id,
+                run.status,
+            )
+            return
         _ensure_started_at(run)
         db.commit()
 
@@ -1740,6 +1771,7 @@ def _open_position_and_persist(
     exit_rules,  # spec.exit chain; the caller has already resolved to spec
     risk_cfg: dict,
     position_snapshot,
+    signal_bar_ts: datetime,
 ) -> None:
     """Size + place a market order + persist the trade + write the
     decision log. Extracted from `_signal_tick` verbatim so the walk-
@@ -1754,6 +1786,8 @@ def _open_position_and_persist(
       exit block — matches the pre-extract naming).
     - `position_snapshot` is the broker position dict at the start of
       the tick; only used for the final equity snapshot.
+    - `signal_bar_ts` is the bar the signal fired on. Together with the
+      run and side it is the order's idempotency key (AFX-50).
 
     Returns None. On sizing failure, broker rejection, or other
     recoverable errors, writes an appropriate decision log entry and
@@ -1858,6 +1892,38 @@ def _open_position_and_persist(
 
     from agentfx.adapters.oanda import OandaOrderRejected
 
+    order_row = _claim_order_slot(
+        db,
+        run,
+        signal_bar_ts=signal_bar_ts,
+        side="buy" if signed_units > 0 else "sell",
+        units=abs(signed_units),
+    )
+    if order_row is None:
+        _write_decision(
+            db,
+            run,
+            action="USER_ORDER_DUPLICATE_SKIPPED",
+            reason=(
+                f"{signal_direction.upper()} {instrument} for bar "
+                f"{_iso(signal_bar_ts)} was already submitted by another "
+                "runner for this run; not sending a second order"
+            ),
+            outputs={
+                "paper_run_id": run.id,
+                "instrument": instrument,
+                "signed_units": signed_units,
+                "signal_bar_ts": _iso(signal_bar_ts),
+                "idempotency_key": _order_idempotency_key(
+                    run.id, signal_bar_ts, "buy" if signed_units > 0 else "sell"
+                ),
+            },
+        )
+        _persist_equity_snapshot(
+            db=db, run=run, position=position_snapshot, now_utc=now_utc
+        )
+        return
+
     try:
         result = client.place_market_order(
             instrument,
@@ -1866,6 +1932,8 @@ def _open_position_and_persist(
             take_profit_pips=None,
         )
     except OandaOrderRejected as exc:
+        order_row.status = "rejected"
+        db.commit()
         # Broker refused to fill (INSUFFICIENT_MARGIN, MARKET_HALTED,
         # POSITION_LOCKED, NO_FILL_TRANSACTION_RETURNED, etc.). Log
         # with the specific reject reason so the operator sees why —
@@ -1896,6 +1964,10 @@ def _open_position_and_persist(
     filled_units = int(result.get("units") or signed_units)
     trade_id = result.get("trade_id")
     fill_transaction_id = result.get("fill_transaction_id")
+    order_row.status = "filled"
+    order_row.filled_at = now_utc
+    order_row.filled_quantity = abs(filled_units)
+    order_row.average_fill_price = fill_price
     # Pass the candles DataFrame so `_signal_reason` can compute
     # actual indicator values at the trigger bar. Wilson's UAT
     # feedback (2026-07-13): "the indicator on the graph didn't seem
@@ -1903,7 +1975,7 @@ def _open_position_and_persist(
     # verifiable at a glance.
     signal_reason = _signal_reason(strategy, signal_direction, df)
 
-    _persist_trade_entry(
+    trade = _persist_trade_entry(
         db=db,
         run=run,
         instrument=instrument,
@@ -1917,6 +1989,8 @@ def _open_position_and_persist(
         entry_financing=float(result.get("financing") or 0.0),
         entry_commission=float(result.get("commission") or 0.0),
     )
+    order_row.trade_id = trade.id
+    db.commit()
     # Sizing trace so the operator can audit `why this many units` at
     # a glance — surface balance × risk_pct / (stop × pip_value) plus
     # the account currency and conversion rate used. Full breakdown
@@ -1964,6 +2038,55 @@ def _open_position_and_persist(
     _persist_equity_snapshot(
         db=db, run=run, position=position_snapshot, now_utc=now_utc
     )
+
+
+def _iso(ts) -> str:
+    return ts.isoformat() if isinstance(ts, datetime) else str(ts)
+
+
+def _order_idempotency_key(run_id: str, signal_bar_ts, side: str) -> str:
+    return f"paper:{run_id}:{_iso(signal_bar_ts)}:{side}"
+
+
+def _claim_order_slot(db, run, *, signal_bar_ts, side: str, units: int):
+    """AFX-50: claim the right to send the order for this run, bar and
+    side, before OANDA sees it.
+
+    The claim is an `orders` row whose primary key is the idempotency
+    key, committed before the broker call. Two runners on the same
+    run (deploy overlap, a double schedule) both see the account flat
+    and both reach here; Postgres lets only one insert win. The loser
+    gets None and must not place the order.
+
+    The claim is kept even if OANDA then rejects the order: the bar
+    bookmark has already moved on, so the bar is never retried anyway.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from agentfx.api.models import Order
+
+    key = _order_idempotency_key(run.id, signal_bar_ts, side)
+    order_row = Order(
+        id=key,
+        run_id=run.id,
+        order_type="market",
+        side=side,
+        quantity=float(units),
+        status="new",
+        metadata_={"signal_bar_ts": _iso(signal_bar_ts)},
+    )
+    db.add(order_row)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        logger.warning(
+            "paper runner: duplicate order for run %s suppressed (key=%s)",
+            run.id,
+            key,
+        )
+        return None
+    return order_row
 
 
 def _execute_walk_transitions(
@@ -2122,6 +2245,7 @@ def _execute_walk_transitions(
             exit_rules=exit_rules,
             risk_cfg=risk_cfg,
             position_snapshot=broker_position,
+            signal_bar_ts=last_t.bar_ts,
         )
         return
 
@@ -2140,6 +2264,7 @@ def _execute_walk_transitions(
             exit_rules=exit_rules,
             risk_cfg=risk_cfg,
             position_snapshot=broker_position,
+            signal_bar_ts=last_t.bar_ts,
         )
         return
 
@@ -2173,7 +2298,7 @@ def _persist_trade_entry(
     broker_open_transaction_id: str | None = None,
     entry_financing: float = 0.0,
     entry_commission: float = 0.0,
-) -> None:
+):
     """Insert a new Trade row for a placed order.
 
     Side convention on the Trade table is 'buy' / 'sell' (legacy). Map
@@ -2203,6 +2328,7 @@ def _persist_trade_entry(
     )
     db.add(trade)
     db.commit()
+    return trade
 
 
 def _reconcile_broker_side_close(
