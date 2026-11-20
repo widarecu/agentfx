@@ -1479,12 +1479,12 @@ def _signal_tick(
     open_series = df["open"].astype(float) if "open" in df.columns else None
 
     # ── Walk ─────────────────────────────────────────────────────
-    # The backtest never re-enters on the bar its stop/target fired,
-    # so block entry on the candle a broker-side SL/TP filled in
-    # (AFX-106). Only that candle; later ones trade normally.
-    blocked_entry_bar_ts = _broker_exit_bar_ts(
-        run=run, index=df.index, granularity_seconds=granularity_seconds
-    )
+    # Backtest parity (AFX-106): candles that started before a broker
+    # SL/TP fill were HELD in the backtest, and the fill candle is
+    # consumed by the exit, so none of them may open from flat. The
+    # fill can land in a candle that isn't complete yet (fill between
+    # the boundary and this delayed tick), hence a time cutoff rather
+    # than a candle lookup.
     result = walk(
         raw_entries=raw_entries,
         close_series=close_series,
@@ -1495,7 +1495,7 @@ def _signal_tick(
         high_series=high_series,
         low_series=low_series,
         open_series=open_series,
-        blocked_entry_bar_ts=blocked_entry_bar_ts,
+        no_entry_through_ts=_broker_exit_cutoff(run),
     )
 
     # ── Advance bookmark UNCONDITIONALLY on any successful tick ──
@@ -1553,30 +1553,21 @@ def _signal_tick(
     )
 
 
-def _broker_exit_bar_ts(*, run, index, granularity_seconds: int) -> datetime | None:
-    """The candle (by open timestamp) containing the last broker-side
-    SL/TP fill, or None. Set by `_reconcile_broker_side_close` or the
-    transaction reconciler, whichever sees the fill first."""
+def _broker_exit_cutoff(run) -> datetime | None:
+    """Time of the last broker-side (or hold-ending market) SL/TP fill,
+    or None. Written by `_reconcile_broker_side_close`, the
+    transaction reconciler, or `_sync_broker_exit_orders`, whichever
+    records the fill first."""
     params = (
         run.parameters if isinstance(getattr(run, "parameters", None), dict) else {}
     )
     raw = params.get("last_broker_exit_at")
-    if not raw or len(index) == 0:
+    if not raw:
         return None
-    import pandas as pd
-
     exit_ts = datetime.fromisoformat(raw)
     if exit_ts.tzinfo is None:
         exit_ts = exit_ts.replace(tzinfo=UTC)
-    pos = int(index.searchsorted(pd.Timestamp(exit_ts), side="right")) - 1
-    if pos < 0:
-        return None
-    bar_ts = pd.Timestamp(index[pos]).to_pydatetime()
-    if bar_ts.tzinfo is None:
-        bar_ts = bar_ts.replace(tzinfo=UTC)
-    if exit_ts >= bar_ts + timedelta(seconds=granularity_seconds):
-        return None
-    return bar_ts
+    return exit_ts
 
 
 def _sync_broker_exit_orders(
@@ -1685,7 +1676,7 @@ def _sync_broker_exit_orders(
         exit_reason = "stop" if past_sl else "target"
         # +1ms: the transition step already wrote an (open-position)
         # equity sample at now_utc; the flat one must sort after it.
-        _close_position_and_persist(
+        close_result = _close_position_and_persist(
             db=db,
             run=run,
             client=client,
@@ -1698,6 +1689,22 @@ def _sync_broker_exit_orders(
             ),
             exit_reason=exit_reason,
         )
+        # This fill is stamped on the trade, so the transaction
+        # reconciler skips it: record the re-entry cutoff here, at the
+        # broker fill time (not the synthetic +1ms).
+        from agentfx.services.paper_reconciler import _parse_oanda_time
+
+        close_result = close_result if isinstance(close_result, dict) else {}
+        fill_ts = (
+            _parse_oanda_time(
+                close_result.get("long_fill_time")
+                or close_result.get("short_fill_time")
+            )
+            or now_utc
+        )
+        params_now = run.parameters if isinstance(run.parameters, dict) else {}
+        run.parameters = {**params_now, "last_broker_exit_at": fill_ts.isoformat()}
+        db.commit()
         return
 
     try:
@@ -2529,7 +2536,7 @@ def _close_position_and_persist(
     now_utc: datetime,
     reason: str,
     exit_reason: str | None = None,
-) -> None:
+) -> dict:
     """Flatten the OANDA position, update matching open Trade rows,
     and write a `USER_POSITION_CLOSED` decision log.
 
@@ -2639,6 +2646,7 @@ def _close_position_and_persist(
     )
     # Position is now flat — snapshot equity without unrealized_pnl.
     _persist_equity_snapshot(db=db, run=run, position=None, now_utc=now_utc)
+    return result
 
 
 def _persist_equity_snapshot(

@@ -894,6 +894,9 @@ class OandaClient:
             "short_fill_price": (
                 float(short_fill["price"]) if "price" in short_fill else None
             ),
+            # Raw OANDA ISO time of the fill transaction.
+            "long_fill_time": long_fill.get("time"),
+            "short_fill_time": short_fill.get("time"),
         }
 
     def get_trade(

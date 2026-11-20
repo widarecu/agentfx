@@ -1089,6 +1089,7 @@ class TestWickBrokerExitOrders:
             "long_realized_pnl": -5.0,
             "short_realized_pnl": 0.0,
             "long_fill_price": bid,
+            "long_fill_time": "2026-07-10T12:00:01.500000000Z",
         }
         client.set_trade_exit_orders.return_value = {
             "stop_loss_order_id": "201",
@@ -1182,6 +1183,11 @@ class TestWickBrokerExitOrders:
         assert trade.exit_reason == "stop"
         assert trade.exit_price == pytest.approx(1.0975)
         assert trade.exit_timestamp > self.NOW
+        # Re-entry cutoff recorded at the broker fill time; the
+        # reconciler will skip this already-stamped fill.
+        assert _run.parameters["last_broker_exit_at"] == (
+            "2026-07-10T12:00:01.500000+00:00"
+        )
 
     def test_fresh_entry_uses_live_quote_not_prior_candle(self):
         # Entry filled at 1.1007 with a 20-pip stop (1.0987). The
@@ -1282,6 +1288,30 @@ class TestBrokerExitReentryBlock:
         client.place_market_order.assert_not_called()
         assert trade.exit_price == pytest.approx(1.0980)
         assert run.parameters["last_broker_exit_at"].startswith("2026-07-10T12:00:20")
+
+    def test_fill_after_latest_candle_blocks_pre_fill_signal(self):
+        # The 12:00 candle closed with a long signal while the trade
+        # was still open; the stop filled at 12:01:05, after that
+        # candle, before this delayed tick. The backtest was holding
+        # through 12:00, so that signal must not open a new trade.
+        client, _run = self._tick(
+            signals=[0, 0, 1],
+            run_parameters={"last_broker_exit_at": "2026-07-10T12:01:05+00:00"},
+        )
+        client.place_market_order.assert_not_called()
+
+    def test_market_exit_cutoff_blocks_next_tick_entry_on_exit_candle(self):
+        # Tick 1 closed at market (hold-ending quote past the stop) at
+        # 12:00:01 and recorded the cutoff. Tick 2 walks the 12:00
+        # exit candle, which carries a long signal: no entry.
+        client, _run = self._tick(
+            signals=[0, 0, 1],
+            run_parameters={
+                "last_broker_exit_at": "2026-07-10T12:00:01.500000+00:00",
+                "last_evaluated_bar_ts": "2026-07-10T11:59:00+00:00",
+            },
+        )
+        client.place_market_order.assert_not_called()
 
     def test_reconciler_recorded_fill_blocks_entry_on_fill_candle(self):
         # Health-loop reconciler already closed the Trade row and
