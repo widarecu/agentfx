@@ -420,10 +420,13 @@ def build_user_prompt(
         "produces higher-Sharpe backtests but under-reports how often "
         "broker-side stops would fire in real trading.\n"
         '  * "wick": bar\'s LOW (long SL / short TP) or HIGH (long '
-        "TP / short SL) triggers exit at exactly the threshold price. "
-        "Realistic model of a broker-side stop-loss / take-profit "
-        "order. Backtest Sharpe is lower but predicts paper P&L "
-        "faithfully.\n"
+        "TP / short SL) triggers exit at the threshold price, or at the "
+        "bar's OPEN if the bar opens already past it (gap, or price "
+        "moved past during min_hold_bars). Realistic model of a "
+        "broker-side stop-loss / take-profit order, which paper places "
+        "once min_hold_bars has elapsed. A long min_hold_bars with a "
+        "tight stop_pips lets losses run well past stop_pips. Backtest "
+        "Sharpe is lower but predicts paper P&L faithfully.\n"
         'Prefer "wick" when SL is tight relative to the pair\'s typical '
         'M1 range (e.g. stop_pips <= 25 on EUR_USD); prefer "close" '
         "when SL is deliberately wide to ride out noise.\n"
