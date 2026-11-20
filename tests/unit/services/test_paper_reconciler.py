@@ -184,6 +184,9 @@ class TestReconcile:
         assert trade.broker_close_transaction_id == "150"
         assert trade.exit_timestamp is not None
         assert run.last_transaction_id == "150"
+        # AFX-106: fill time recorded so the signal tick blocks
+        # re-entry on that candle.
+        assert run.parameters["last_broker_exit_at"].startswith("2026-07-15T13:35:00")
         db.commit.assert_called()
 
     def test_take_profit_fill_updates_trade(self):

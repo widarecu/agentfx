@@ -896,6 +896,25 @@ class OandaClient:
             ),
         }
 
+    def get_trade(
+        self,
+        trade_id: str,
+        *,
+        account_id: str | None = None,
+    ) -> dict:
+        """Return one trade's state and, once closed, its close time
+        (raw OANDA ISO string) and average close price."""
+        aid = self._resolve_account_id(account_id)
+        resp = self._request("GET", f"/accounts/{aid}/trades/{trade_id}")
+        raw = resp.get("trade") or {}
+        avg_close = raw.get("averageClosePrice")
+        return {
+            "trade_id": raw.get("id"),
+            "state": raw.get("state"),
+            "close_time": raw.get("closeTime"),
+            "average_close_price": float(avg_close) if avg_close else None,
+        }
+
     def set_trade_exit_orders(
         self,
         trade_id: str,

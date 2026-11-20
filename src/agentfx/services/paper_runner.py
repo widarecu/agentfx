@@ -1400,12 +1400,11 @@ def _signal_tick(
     # our open Trade row is stranded with exit_timestamp=None forever.
     # Detect and reconcile BEFORE the walk so the walk sees the
     # correct starting state.
-    broker_closed_this_tick = False
     if net_units == 0 and open_trade is not None:
-        broker_closed_this_tick = True
         _reconcile_broker_side_close(
             db=db,
             run=run,
+            client=client,
             strategy=strategy,
             latest_close=float(df["close"].iloc[-1]),
             latest_high=float(df["high"].iloc[-1]),
@@ -1471,9 +1470,12 @@ def _signal_tick(
     open_series = df["open"].astype(float) if "open" in df.columns else None
 
     # ── Walk ─────────────────────────────────────────────────────
-    # A broker-side SL/TP closed the trade since the last tick: the
-    # backtest never re-enters on the bar its stop/target fired, so
-    # the walk must not either (AFX-106).
+    # The backtest never re-enters on the bar its stop/target fired,
+    # so block entry on the candle a broker-side SL/TP filled in
+    # (AFX-106). Only that candle; later ones trade normally.
+    blocked_entry_bar_ts = _broker_exit_bar_ts(
+        run=run, index=df.index, granularity_seconds=granularity_seconds
+    )
     result = walk(
         raw_entries=raw_entries,
         close_series=close_series,
@@ -1484,7 +1486,7 @@ def _signal_tick(
         high_series=high_series,
         low_series=low_series,
         open_series=open_series,
-        allow_entry=not broker_closed_this_tick,
+        blocked_entry_bar_ts=blocked_entry_bar_ts,
     )
 
     # ── Advance bookmark UNCONDITIONALLY on any successful tick ──
@@ -1535,10 +1537,37 @@ def _signal_tick(
         client=client,
         strategy=strategy,
         instrument=instrument,
-        latest_close=float(df["close"].iloc[-1]),
+        granularity=granularity,
+        granularity_seconds=granularity_seconds,
         final_state=result.final_state,
         now_utc=now_utc,
     )
+
+
+def _broker_exit_bar_ts(*, run, index, granularity_seconds: int) -> datetime | None:
+    """The candle (by open timestamp) containing the last broker-side
+    SL/TP fill, or None. Set by `_reconcile_broker_side_close` or the
+    transaction reconciler, whichever sees the fill first."""
+    params = (
+        run.parameters if isinstance(getattr(run, "parameters", None), dict) else {}
+    )
+    raw = params.get("last_broker_exit_at")
+    if not raw or len(index) == 0:
+        return None
+    import pandas as pd
+
+    exit_ts = datetime.fromisoformat(raw)
+    if exit_ts.tzinfo is None:
+        exit_ts = exit_ts.replace(tzinfo=UTC)
+    pos = int(index.searchsorted(pd.Timestamp(exit_ts), side="right")) - 1
+    if pos < 0:
+        return None
+    bar_ts = pd.Timestamp(index[pos]).to_pydatetime()
+    if bar_ts.tzinfo is None:
+        bar_ts = bar_ts.replace(tzinfo=UTC)
+    if exit_ts >= bar_ts + timedelta(seconds=granularity_seconds):
+        return None
+    return bar_ts
 
 
 def _sync_broker_exit_orders(
@@ -1548,7 +1577,8 @@ def _sync_broker_exit_orders(
     client,
     strategy,
     instrument: str,
-    latest_close: float,
+    granularity: str,
+    granularity_seconds: int,
     final_state,
     now_utc: datetime,
 ) -> None:
@@ -1562,10 +1592,16 @@ def _sync_broker_exit_orders(
     bar that ends the hold closes, so they are live for exactly the
     bars the backtest checks (`bars_held >= min_hold_bars`).
 
-    If price is already past a level when the hold ends, close at
-    market now: the backtest fills that case at the next bar's open,
-    which is where price is right now. A resting order can't be
-    placed on the wrong side of the market.
+    Bars held are counted from the trade's real entry time, not the
+    walk's projected entry: a catch-up walk can open on an old candle
+    but the broker order is only placed now.
+
+    If the current executable quote (bid for a long, ask for a short)
+    is already past a level when the hold ends, close at market now:
+    the backtest fills that case at the next bar's open, which is
+    where price is right now. A resting order can't be placed on the
+    wrong side of the market. No quote → retry next tick; a completed
+    candle is not a substitute (it can predate the entry fill).
 
     Close-mode genomes are untouched: wide fail-safe SL at OANDA,
     DSL levels enforced by the walk on bar close.
@@ -1580,8 +1616,6 @@ def _sync_broker_exit_orders(
     if final_state.in_position == 0:
         return
     min_hold = int(getattr(exit_block, "min_hold_bars", 0) or 0)
-    if final_state.bars_held < min_hold - 1:
-        return
 
     open_trade = (
         db.query(Trade)
@@ -1599,27 +1633,57 @@ def _sync_broker_exit_orders(
     if params.get("broker_exit_orders_trade_id") == broker_trade_id:
         return  # already attached for this trade
 
+    # Same count the walk uses (`_count_bars_since` + 1 per walked
+    # candle), anchored on the real entry. Shifting the anchor back
+    # one bar counts the candle the entry landed in.
+    entry_ts = open_trade.entry_timestamp
+    if entry_ts.tzinfo is None:
+        entry_ts = entry_ts.replace(tzinfo=UTC)
+    if entry_ts >= now_utc:
+        bars_held = 0  # opened on this tick
+    else:
+        bars_held = _count_bars_since(
+            db=db,
+            instrument=instrument,
+            granularity=granularity,
+            entry_ts=entry_ts - timedelta(seconds=granularity_seconds),
+            now_utc=now_utc,
+        )
+    if bars_held < min_hold - 1:
+        return
+
+    try:
+        quotes = client.get_pricing(instrument)
+        quote = quotes[0] if quotes else {}
+        px = float(quote.get("bid" if is_long else "ask") or 0.0)
+    except (OandaError, AttributeError, IndexError, TypeError, ValueError):
+        px = 0.0
+    if px <= 0.0:
+        return
+
     pip_size = float(getattr(strategy, "pip_size", 0.0001) or 0.0001)
     entry = float(open_trade.entry_price)
     stop_dist = float(exit_block.stop_pips) * pip_size
     target_dist = float(exit_block.target_pips) * pip_size
     if is_long:
         sl_price, tp_price = entry - stop_dist, entry + target_dist
-        past_sl, past_tp = latest_close <= sl_price, latest_close >= tp_price
+        past_sl, past_tp = px <= sl_price, px >= tp_price
     else:
         sl_price, tp_price = entry + stop_dist, entry - target_dist
-        past_sl, past_tp = latest_close >= sl_price, latest_close <= tp_price
+        past_sl, past_tp = px >= sl_price, px <= tp_price
 
     if past_sl or past_tp:
         exit_reason = "stop" if past_sl else "target"
+        # +1ms: the transition step already wrote an (open-position)
+        # equity sample at now_utc; the flat one must sort after it.
         _close_position_and_persist(
             db=db,
             run=run,
             client=client,
             instrument=instrument,
-            now_utc=now_utc,
+            now_utc=now_utc + timedelta(milliseconds=1),
             reason=(
-                f"min_hold ended with price {latest_close:.5f} already past "
+                f"min_hold ended with price {px:.5f} already past "
                 f"{exit_reason} level "
                 f"{sl_price if past_sl else tp_price:.5f}"
             ),
@@ -2214,6 +2278,7 @@ def _reconcile_broker_side_close(
     latest_high: float,
     latest_low: float,
     now_utc: datetime,
+    client=None,
 ) -> None:
     """Detect and reconcile a broker-side SL/TP fill.
 
@@ -2317,9 +2382,26 @@ def _reconcile_broker_side_close(
     # Pips derived from (entry_price, exit_price_est) are currency-
     # agnostic and stay approximately correct even without
     # conversion.
-    open_trade.exit_timestamp = now_utc
+    # AFX-106: OANDA's own close time + price when available. The
+    # close time decides which candle re-entry is blocked on.
+    exit_ts = now_utc
+    if client is not None and getattr(open_trade, "broker_trade_id", None):
+        from agentfx.adapters.oanda import OandaError
+        from agentfx.services.paper_reconciler import _parse_oanda_time
+
+        try:
+            info = client.get_trade(str(open_trade.broker_trade_id))
+        except OandaError:
+            info = None
+        if isinstance(info, dict) and info.get("state") == "CLOSED":
+            exit_ts = _parse_oanda_time(info.get("close_time")) or now_utc
+            if info.get("average_close_price"):
+                exit_price_est = float(info["average_close_price"])
+    open_trade.exit_timestamp = exit_ts
     open_trade.exit_price = exit_price_est
     open_trade.exit_reason = classified
+    params = run.parameters if isinstance(run.parameters, dict) else {}
+    run.parameters = {**params, "last_broker_exit_at": exit_ts.isoformat()}
     # pnl / pnl_pct intentionally left NULL — see comment above.
     db.commit()
 
