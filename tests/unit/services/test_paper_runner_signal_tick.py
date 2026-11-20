@@ -1058,12 +1058,14 @@ class TestWickBrokerExitOrders:
         self,
         *,
         entry_price: float = 1.10,
-        bars_since_entry: int = 1,
+        entry_timestamp: datetime | None = None,
+        bars_since_entry: int = 2,
         min_hold_bars: int = 3,
         eval_mode: str = "wick",
         run_parameters: dict | None = None,
         signals: list[int] | None = None,
         broker_units: int = 10_000,
+        bid: float | None = 1.1002,
         client: MagicMock | None = None,
     ):
         strategy = _make_strategy(
@@ -1080,10 +1082,13 @@ class TestWickBrokerExitOrders:
             "long_units": broker_units,
             "short_units": 0,
         }
+        client.get_pricing.return_value = (
+            [{"bid": bid, "ask": bid + 0.0001}] if bid is not None else []
+        )
         client.close_all_positions.return_value = {
             "long_realized_pnl": -5.0,
             "short_realized_pnl": 0.0,
-            "long_fill_price": 1.1002,
+            "long_fill_price": bid,
         }
         client.set_trade_exit_orders.return_value = {
             "stop_loss_order_id": "201",
@@ -1096,7 +1101,7 @@ class TestWickBrokerExitOrders:
             side="buy",
             entry_price=entry_price,
             quantity=10_000,
-            entry_timestamp=self.NOW - timedelta(minutes=2),
+            entry_timestamp=entry_timestamp or (self.NOW - timedelta(minutes=2)),
             exit_timestamp=None,
             exit_price=None,
             exit_reason=None,
@@ -1129,9 +1134,9 @@ class TestWickBrokerExitOrders:
         return client, run, trade, decisions
 
     def test_attaches_exact_levels_when_min_hold_ends(self):
-        # Walk's final bars_held = min_hold - 1: the NEXT bar is the
+        # Trade has held min_hold - 1 candles: the NEXT candle is the
         # first one the backtest checks, so the orders go on now.
-        client, run, _trade, decisions = self._tick(bars_since_entry=1)
+        client, run, _trade, decisions = self._tick(bars_since_entry=2)
         client.set_trade_exit_orders.assert_called_once()
         call = client.set_trade_exit_orders.call_args
         assert call.args == ("T1", "EUR_USD")
@@ -1142,9 +1147,18 @@ class TestWickBrokerExitOrders:
         client.close_all_positions.assert_not_called()
 
     def test_not_attached_during_min_hold(self):
-        client, run, _trade, _ = self._tick(bars_since_entry=0)
+        client, run, _trade, _ = self._tick(bars_since_entry=1)
         client.set_trade_exit_orders.assert_not_called()
         assert "broker_exit_orders_trade_id" not in run.parameters
+
+    def test_trade_opened_this_tick_counts_zero_bars(self):
+        # Catch-up walk: the walk projects an entry several candles
+        # back, but the broker order was placed now. The candle count
+        # must come from the real entry (this tick → 0 bars held).
+        client, _run, _trade, _ = self._tick(
+            entry_timestamp=self.NOW, bars_since_entry=5
+        )
+        client.set_trade_exit_orders.assert_not_called()
 
     def test_not_reattached_for_same_trade(self):
         client, _run, _trade, _ = self._tick(
@@ -1157,16 +1171,36 @@ class TestWickBrokerExitOrders:
         client, _run, _trade, _ = self._tick(bars_since_entry=5, eval_mode="close")
         client.set_trade_exit_orders.assert_not_called()
 
-    def test_price_already_past_stop_closes_at_market(self):
-        # Entry 1.1030 → SL 1.1010. The hold ends with price at 1.1002,
-        # below the stop. Backtest fills at the next bar's open (~here);
-        # paper closes at market rather than resting an order that
-        # can't be placed below the market.
-        client, _run, trade, _ = self._tick(entry_price=1.1030, bars_since_entry=1)
+    def test_bid_already_past_stop_closes_at_market(self):
+        # SL 1.0980. Candles never touch it, but the live bid is
+        # 1.0975 when the hold ends. Backtest fills at the next bar's
+        # open (~here); paper closes at market rather than resting an
+        # order on the wrong side of the market.
+        client, _run, trade, _ = self._tick(bars_since_entry=2, bid=1.0975)
         client.set_trade_exit_orders.assert_not_called()
         client.close_all_positions.assert_called_once_with("EUR_USD")
         assert trade.exit_reason == "stop"
-        assert trade.exit_price == pytest.approx(1.1002)
+        assert trade.exit_price == pytest.approx(1.0975)
+        assert trade.exit_timestamp > self.NOW
+
+    def test_fresh_entry_uses_live_quote_not_prior_candle(self):
+        # Entry filled at 1.1007 with a 20-pip stop (1.0987). The
+        # prior candle closed at 1.1002 but the bid is 1.1006: attach,
+        # don't close.
+        client, _run, _trade, _ = self._tick(
+            entry_price=1.1007,
+            entry_timestamp=self.NOW,
+            min_hold_bars=0,
+            bid=1.1006,
+        )
+        client.close_all_positions.assert_not_called()
+        client.set_trade_exit_orders.assert_called_once()
+
+    def test_no_quote_defers_to_next_tick(self):
+        client, run, _trade, _ = self._tick(bars_since_entry=2, bid=None)
+        client.set_trade_exit_orders.assert_not_called()
+        client.close_all_positions.assert_not_called()
+        assert "broker_exit_orders_trade_id" not in run.parameters
 
     def test_rejected_orders_are_logged_and_retried(self):
         from agentfx.adapters.oanda import OandaOrderRejected
@@ -1175,18 +1209,101 @@ class TestWickBrokerExitOrders:
         client.set_trade_exit_orders.side_effect = OandaOrderRejected(
             "TRADE_DOESNT_EXIST", transaction_id="9", order_type="STOP_LOSS"
         )
-        _client, run, _trade, decisions = self._tick(bars_since_entry=1, client=client)
+        _client, run, _trade, decisions = self._tick(bars_since_entry=2, client=client)
         assert "USER_EXIT_ORDERS_REJECTED" in decisions
         assert "broker_exit_orders_trade_id" not in run.parameters
 
-    def test_broker_side_close_blocks_same_tick_reentry(self):
-        # OANDA's SL filled since the last tick; the latest bar also
-        # carries a fresh entry. Backtest never re-enters on the bar
-        # its stop fired, so paper must not either.
-        client, _run, _trade, _ = self._tick(
-            bars_since_entry=5, signals=[0, 0, 1], broker_units=0
+
+class TestBrokerExitReentryBlock:
+    """AFX-106: backtest never re-enters on the candle its stop/target
+    fired. Paper blocks entry on the candle the broker fill landed in,
+    whichever path recorded the fill first, and only that candle."""
+
+    NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+
+    def _tick(self, *, signals, run_parameters, open_trade=None, client=None):
+        strategy = _make_strategy(signals=signals, eval_mode="wick")
+        fetch = MagicMock(return_value=_mk_candles_df(3, self.NOW))
+        client = client or MagicMock()
+        client.get_position.return_value = {"long_units": 0, "short_units": 0}
+        client.get_account_balance.return_value = {
+            "balance": 10_000.0,
+            "currency": "USD",
+        }
+        client.place_market_order.return_value = {
+            "trade_id": "T2",
+            "fill_price": 1.1003,
+            "units": 25_000,
+        }
+        db = _make_db()
+        if open_trade is not None:
+            _set_open_trade(db, open_trade)
+        run = _make_run()
+        run.parameters = dict(run_parameters)
+        _signal_tick(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=self.NOW,
+        )
+        return client, run
+
+    def test_runner_detected_fill_blocks_entry_on_fill_candle(self):
+        # Broker flat, Trade row still open: the runner reconciles it,
+        # taking OANDA's close time (inside the latest candle).
+        trade = SimpleNamespace(
+            id="tr_open",
+            run_id="run_test_signal",
+            side="buy",
+            entry_price=1.10,
+            quantity=10_000,
+            entry_timestamp=self.NOW - timedelta(minutes=10),
+            exit_timestamp=None,
+            exit_price=None,
+            exit_reason=None,
+            broker_trade_id="T1",
+        )
+        client = MagicMock()
+        client.get_trade.return_value = {
+            "state": "CLOSED",
+            "close_time": "2026-07-10T12:00:20.000000Z",
+            "average_close_price": 1.0980,
+        }
+        client, run = self._tick(
+            signals=[0, 0, 1],
+            run_parameters={},
+            open_trade=trade,
+            client=client,
         )
         client.place_market_order.assert_not_called()
+        assert trade.exit_price == pytest.approx(1.0980)
+        assert run.parameters["last_broker_exit_at"].startswith("2026-07-10T12:00:20")
+
+    def test_reconciler_recorded_fill_blocks_entry_on_fill_candle(self):
+        # Health-loop reconciler already closed the Trade row and
+        # recorded the fill time; no open trade is left for the tick.
+        client, _run = self._tick(
+            signals=[0, 0, 1],
+            run_parameters={"last_broker_exit_at": "2026-07-10T12:00:20+00:00"},
+        )
+        client.place_market_order.assert_not_called()
+
+    def test_entry_on_later_candle_in_catch_up_still_fires(self):
+        # Fill landed in the 11:58 candle; a catch-up tick walks
+        # 11:58..12:00. Entry on 11:58 is blocked, entry on 12:00
+        # trades normally.
+        client, _run = self._tick(
+            signals=[1, 0, 1],
+            run_parameters={
+                "last_broker_exit_at": "2026-07-10T11:58:30+00:00",
+                "last_evaluated_bar_ts": "2026-07-10T11:57:00+00:00",
+            },
+        )
+        client.place_market_order.assert_called_once()
 
 
 class TestRunnerCloseExitPrice:

@@ -301,6 +301,14 @@ def reconcile_broker_transactions(*, db, run, client) -> ReconcileResult:
                 )
             trade.exit_reason = _classify_exit_reason(txn.get("reason"))
             trade.broker_close_transaction_id = str(txn.get("id") or "")
+            # AFX-106: the signal tick blocks re-entry on the candle
+            # this broker-side close happened in (backtest parity).
+            params = getattr(run, "parameters", None)
+            params = params if isinstance(params, dict) else {}
+            run.parameters = {
+                **params,
+                "last_broker_exit_at": trade.exit_timestamp.isoformat(),
+            }
             updated += 1
             notes.append(
                 f"reconciled trade {trade.id} broker_trade_id={broker_tid} "

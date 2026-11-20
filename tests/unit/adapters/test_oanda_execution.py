@@ -779,3 +779,27 @@ class TestSetTradeExitOrders:
             "T1", "EUR_USD", stop_loss_price=1.1, take_profit_price=None
         )
         assert r["filled"] is True
+
+
+class TestGetTrade:
+    def test_closed_trade_returns_close_time_and_price(self, client, mock_session):
+        mock_session.request.return_value = _http_ok(
+            {
+                "trade": {
+                    "id": "T1",
+                    "state": "CLOSED",
+                    "closeTime": "2026-07-10T12:00:20.123456789Z",
+                    "averageClosePrice": "1.09800",
+                }
+            }
+        )
+        r = client.get_trade("T1")
+        assert mock_session.request.call_args.args[1].endswith(
+            "/accounts/101-004-12345678-001/trades/T1"
+        )
+        assert r == {
+            "trade_id": "T1",
+            "state": "CLOSED",
+            "close_time": "2026-07-10T12:00:20.123456789Z",
+            "average_close_price": 1.098,
+        }
