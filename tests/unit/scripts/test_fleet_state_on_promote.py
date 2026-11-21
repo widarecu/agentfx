@@ -79,6 +79,70 @@ def test_collect_afx_ids_ignores_body_only_references():
     assert fsop.collect_afx_ids_from_commits(commits) == ["AFX-70"]
 
 
+def _pr(number, title, head, *, merged=True):
+    return {
+        "number": number,
+        "title": title,
+        "head": {"ref": head},
+        "merged_at": "2026-11-20T11:42:50Z" if merged else None,
+    }
+
+
+def test_collect_afx_ids_from_prs_reads_title_and_branch():
+    """AFX-106 regression: #137 was a single-commit squash, so its commit
+    subject on main lacked the ID its PR title carried, and #139/#141 named
+    AFX-106 only in their branches. Linear linked all three (In Staging);
+    the Done step must see the same IDs."""
+    prs = [
+        _pr(
+            137,
+            "fix(paper,backtest): AFX-106 wick-mode broker SL/TP",
+            "agent/AFX-106-wick-stop-fidelity",
+        ),
+        _pr(139, "fix(paper): address #137 review", "agent/AFX-106-review-fixes"),
+        _pr(140, "fix(paper): one order per signal bar (AFX-50)", "agent/afx-50-x"),
+        _pr(114, "fix: gate B drawdown", "agent/2026-11-12-afx-63-bug-gate-b"),
+    ]
+    assert fsop.collect_afx_ids_from_prs(prs) == ["AFX-106", "AFX-50", "AFX-63"]
+
+
+def test_collect_afx_ids_from_prs_skips_unmerged_promote_and_backmerge():
+    prs = [
+        _pr(143, "Promote feat/agent-fleet → main (AFX-1)", "feat/agent-fleet"),
+        _pr(144, "Back-merge main → feat/agent-fleet (AFX-2)", "main"),
+        _pr(150, "AFX-3 still open", "agent/AFX-3-wip", merged=False),
+    ]
+    assert fsop.collect_afx_ids_from_prs(prs) == []
+
+
+def test_fetch_merged_prs_dedupes_and_survives_lookup_failure(monkeypatch):
+    calls = []
+
+    def fake_gh_json(*args):
+        calls.append(args[1])
+        if args[1].endswith("/bad/pulls"):
+            raise fsop.subprocess.CalledProcessError(1, "gh")
+        return [_pr(137, "t", "agent/AFX-106-x")]
+
+    monkeypatch.setattr(fsop, "_gh_json", fake_gh_json)
+    commits = [{"sha": "aaa"}, {"sha": "bad"}, {"sha": "bbb"}, {}]
+    prs = fsop.fetch_merged_prs("w/r", commits)
+    assert [p["number"] for p in prs] == [137]
+    assert calls == [
+        "repos/w/r/commits/aaa/pulls",
+        "repos/w/r/commits/bad/pulls",
+        "repos/w/r/commits/bbb/pulls",
+    ]
+
+
+def test_merge_afx_ids_keeps_first_seen_order():
+    assert fsop.merge_afx_ids(["AFX-104", "AFX-50"], ["AFX-106", "AFX-50"]) == [
+        "AFX-104",
+        "AFX-50",
+        "AFX-106",
+    ]
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Markers + comment bodies
 # ─────────────────────────────────────────────────────────────────────
