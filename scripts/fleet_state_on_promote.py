@@ -7,7 +7,8 @@ Tests, Deploy Backend → Railway, Deploy Frontend → Vercel), so a failed
 workflow conclusion does not mean the deploy failed: on failure the script
 reads the run's jobs and classifies the outcome (`classify_deploy_jobs`).
 
-For every `AFX-<n>` tag in the commits that just landed on `main`:
+For every `AFX-<n>` tag in the subjects of the commits that just landed on
+`main`, or in the titles and branch names of the PRs that merged them:
 
 * Deploy succeeded → transition the ticket to `Done`, post a "promoted to main"
   comment with a staging link, and drop the `needs-wilson` label if an
@@ -81,6 +82,7 @@ TRANSITIONABLE = {
 }
 
 NEEDS_WILSON = "needs-wilson"
+PASS_THROUGH_BRANCHES = {"main", "feat/agent-fleet"}
 STAGING_URL = "https://agentfx-staging.up.railway.app"
 
 SUCCESS_MARKER_FMT = "<!-- afx-70:promoted-to-main:{sha} -->"
@@ -241,6 +243,39 @@ def collect_afx_ids_from_commits(commits: list[dict]) -> list[str]:
     return seen
 
 
+def collect_afx_ids_from_prs(prs: list[dict]) -> list[str]:
+    """Deduplicated AFX-IDs from the **titles and head branch names** of the
+    merged PRs behind the commits. These are what Linear's GitHub
+    integration links on, so they are how a ticket reached `In Staging`.
+    A single-commit squash keeps the commit's own subject instead of the PR
+    title, and follow-up PRs often name the ticket only in their branch
+    (AFX-106: #137, #139, #141), so commit subjects alone miss them.
+    PR bodies are ignored for the same reason as commit bodies. Promote
+    PRs (head `feat/agent-fleet`) and back-merges (head `main`) are skipped:
+    they carry other PRs' work, not their own.
+    """
+    seen: list[str] = []
+    for pr in prs:
+        if not pr.get("merged_at"):
+            continue
+        head = (pr.get("head") or {}).get("ref") or ""
+        if head in PASS_THROUGH_BRANCHES:
+            continue
+        for ident in afx_ids(f"{pr.get('title') or ''} {head}"):
+            if ident not in seen:
+                seen.append(ident)
+    return seen
+
+
+def merge_afx_ids(*groups: list[str]) -> list[str]:
+    seen: list[str] = []
+    for group in groups:
+        for ident in group:
+            if ident not in seen:
+                seen.append(ident)
+    return seen
+
+
 # ─────────────────────────────────────────────────────────────────────
 # I/O helpers
 # ─────────────────────────────────────────────────────────────────────
@@ -307,6 +342,24 @@ def fetch_merge_commits(repo: str, sha: str) -> list[dict]:
         for c in compare.get("commits") or []:
             commits.append(c)
     return commits
+
+
+def fetch_merged_prs(repo: str, commits: list[dict]) -> list[dict]:
+    """The PRs associated with each commit, deduplicated by number. A failed
+    lookup warns and is skipped; commit subjects still apply."""
+    prs: dict[int, dict] = {}
+    for c in commits:
+        sha = c.get("sha")
+        if not sha:
+            continue
+        try:
+            candidates = _gh_json("api", f"repos/{repo}/commits/{sha}/pulls") or []
+        except (subprocess.CalledProcessError, ValueError) as exc:
+            warn(f"PR lookup failed for {sha[:7]}: {exc}")
+            continue
+        for pr in candidates:
+            prs.setdefault(pr["number"], pr)
+    return list(prs.values())
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -663,7 +716,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     commits = fetch_merge_commits(args.repo, args.sha)
-    idents = collect_afx_ids_from_commits(commits)
+    idents = merge_afx_ids(
+        collect_afx_ids_from_commits(commits),
+        collect_afx_ids_from_prs(fetch_merged_prs(args.repo, commits)),
+    )
     if not idents:
         print(f"No AFX-IDs found in commits for {args.sha[:7]}; nothing to do.")
         return 0

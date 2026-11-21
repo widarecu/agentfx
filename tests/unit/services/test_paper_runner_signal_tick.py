@@ -146,6 +146,7 @@ def _make_strategy(
     min_hold_bars: int = 0,
     opposite_signal: bool = True,
     risk_pct: float = 0.005,
+    eval_mode: str = "close",
 ) -> SimpleNamespace:
     """A stand-in for `CompiledDSLStrategy`.
 
@@ -178,6 +179,7 @@ def _make_strategy(
         max_hold_bars=max_hold_bars,
         min_hold_bars=min_hold_bars,
         opposite_signal=opposite_signal,
+        eval_mode=eval_mode,
     )
     size_rules = SimpleNamespace(risk_pct=risk_pct)
     spec = SimpleNamespace(entry=entry, exit=exit_rules, size=size_rules)
@@ -373,14 +375,13 @@ class TestSignalTick:
             now_utc=datetime(2026, 7, 10, 12, 0, tzinfo=UTC),
         )
 
-        # Wilson 2026-08-15: broker order now carries only a wide
-        # fail-safe SL sized from kill_switch_dd_pct (5% default),
-        # and NO broker-side TP. Strategy's own SL/TP is enforced
-        # walk-side on bar close. $10k × 5% / (25k × $0.0001) = 200 pips.
+        # Broker order carries only a wide fail-safe SL and NO
+        # broker-side TP. Strategy's own SL/TP is enforced walk-side on
+        # bar close. AFX-104: fail-safe = max(100, 3 × 20-pip DSL stop).
         client.place_market_order.assert_called_once_with(
             "EUR_USD",
             25_000,
-            stop_loss_pips=200,
+            stop_loss_pips=100,
             take_profit_pips=None,
         )
         # A Trade row got added.
@@ -997,13 +998,12 @@ class TestSignalTick:
     def test_broker_failsafe_sl_replaces_dsl_sl_tp(self):
         # Wilson 2026-08-15: legacy `risk_config.stop_loss_pips` /
         # `take_profit_pips` are no longer forwarded to the broker.
-        # Broker always gets a WIDE fail-safe SL sized from
-        # kill_switch_dd_pct, and NO broker-side TP. The DSL's own
-        # SL/TP is enforced walk-side on bar close.
+        # Broker always gets a WIDE fail-safe SL and NO broker-side TP.
+        # The DSL's own SL/TP is enforced walk-side on bar close.
         #
         # Sizing (unchanged): balance $10k × 0.005 / (20pip × $0.0001)
-        # = 25,000 units. Fail-safe SL: $10k × 5% / (25k × $0.0001)
-        # = 200 pips.
+        # = 25,000 units. AFX-104 fail-safe SL: max(100, 3 × 20) = 100
+        # pips, independent of the legacy `kill_switch_dd_pct`.
         strategy = _make_strategy(signals=[0, 0, 1])
         candles_df = _mk_candles_df(3, datetime(2026, 7, 10, 12, 0, tzinfo=UTC))
         fetch = MagicMock(return_value=candles_df)
@@ -1042,9 +1042,342 @@ class TestSignalTick:
         client.place_market_order.assert_called_once_with(
             "EUR_USD",
             25_000,
-            stop_loss_pips=200,
+            stop_loss_pips=100,
             take_profit_pips=None,
         )
+
+
+class TestWickBrokerExitOrders:
+    """AFX-106: wick-mode genomes rest the DSL's exact SL / TP at OANDA
+    once min_hold_bars has elapsed, so paper fills on a touch the way
+    the backtest assumes. Close-mode genomes keep the wide fail-safe."""
+
+    NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+
+    def _tick(
+        self,
+        *,
+        entry_price: float = 1.10,
+        entry_timestamp: datetime | None = None,
+        bars_since_entry: int = 2,
+        min_hold_bars: int = 3,
+        eval_mode: str = "wick",
+        run_parameters: dict | None = None,
+        signals: list[int] | None = None,
+        broker_units: int = 10_000,
+        bid: float | None = 1.1002,
+        client: MagicMock | None = None,
+    ):
+        strategy = _make_strategy(
+            signals=signals or [0, 0, 0],
+            stop_pips=20,
+            target_pips=50,
+            min_hold_bars=min_hold_bars,
+            eval_mode=eval_mode,
+        )
+        # Closes 1.1000 / 1.1001 / 1.1002; lows never below 1.0995.
+        fetch = MagicMock(return_value=_mk_candles_df(3, self.NOW))
+        client = client or MagicMock()
+        client.get_position.return_value = {
+            "long_units": broker_units,
+            "short_units": 0,
+        }
+        client.get_pricing.return_value = (
+            [{"bid": bid, "ask": bid + 0.0001}] if bid is not None else []
+        )
+        client.close_all_positions.return_value = {
+            "long_realized_pnl": -5.0,
+            "short_realized_pnl": 0.0,
+            "long_fill_price": bid,
+            "long_fill_time": "2026-07-10T12:00:01.500000000Z",
+        }
+        client.set_trade_exit_orders.return_value = {
+            "stop_loss_order_id": "201",
+            "take_profit_order_id": "202",
+            "filled": False,
+        }
+        trade = SimpleNamespace(
+            id="tr_open",
+            run_id="run_test_signal",
+            side="buy",
+            entry_price=entry_price,
+            quantity=10_000,
+            entry_timestamp=entry_timestamp or (self.NOW - timedelta(minutes=2)),
+            exit_timestamp=None,
+            exit_price=None,
+            exit_reason=None,
+            pnl=None,
+            pnl_pct=None,
+            broker_trade_id="T1",
+            broker_close_transaction_id=None,
+        )
+        db = _make_db()
+        _set_open_trade(db, trade)
+        db.query.return_value.filter.return_value.count.return_value = bars_since_entry
+        db.query.return_value.filter.return_value.all.return_value = [trade]
+        run = _make_run()
+        run.parameters = dict(run_parameters or {})
+        _signal_tick(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=self.NOW,
+        )
+        decisions = [
+            c.args[0].action
+            for c in db.add.call_args_list
+            if type(c.args[0]).__name__ == "DecisionLog"
+        ]
+        return client, run, trade, decisions
+
+    def test_attaches_exact_levels_when_min_hold_ends(self):
+        # Trade has held min_hold - 1 candles: the NEXT candle is the
+        # first one the backtest checks, so the orders go on now.
+        client, run, _trade, decisions = self._tick(bars_since_entry=2)
+        client.set_trade_exit_orders.assert_called_once()
+        call = client.set_trade_exit_orders.call_args
+        assert call.args == ("T1", "EUR_USD")
+        assert call.kwargs["stop_loss_price"] == pytest.approx(1.0980)
+        assert call.kwargs["take_profit_price"] == pytest.approx(1.1050)
+        assert run.parameters["broker_exit_orders_trade_id"] == "T1"
+        assert "USER_EXIT_ORDERS_PLACED" in decisions
+        client.close_all_positions.assert_not_called()
+
+    def test_not_attached_during_min_hold(self):
+        client, run, _trade, _ = self._tick(bars_since_entry=1)
+        client.set_trade_exit_orders.assert_not_called()
+        assert "broker_exit_orders_trade_id" not in run.parameters
+
+    def test_trade_opened_this_tick_counts_zero_bars(self):
+        # Catch-up walk: the walk projects an entry several candles
+        # back, but the broker order was placed now. The candle count
+        # must come from the real entry (this tick → 0 bars held).
+        client, _run, _trade, _ = self._tick(
+            entry_timestamp=self.NOW, bars_since_entry=5
+        )
+        client.set_trade_exit_orders.assert_not_called()
+
+    def test_not_reattached_for_same_trade(self):
+        client, _run, _trade, _ = self._tick(
+            bars_since_entry=5,
+            run_parameters={"broker_exit_orders_trade_id": "T1"},
+        )
+        client.set_trade_exit_orders.assert_not_called()
+
+    def test_close_mode_never_attaches(self):
+        client, _run, _trade, _ = self._tick(bars_since_entry=5, eval_mode="close")
+        client.set_trade_exit_orders.assert_not_called()
+
+    def test_bid_already_past_stop_closes_at_market(self):
+        # SL 1.0980. Candles never touch it, but the live bid is
+        # 1.0975 when the hold ends. Backtest fills at the next bar's
+        # open (~here); paper closes at market rather than resting an
+        # order on the wrong side of the market.
+        client, _run, trade, _ = self._tick(bars_since_entry=2, bid=1.0975)
+        client.set_trade_exit_orders.assert_not_called()
+        client.close_all_positions.assert_called_once_with("EUR_USD")
+        assert trade.exit_reason == "stop"
+        assert trade.exit_price == pytest.approx(1.0975)
+        assert trade.exit_timestamp > self.NOW
+        # Re-entry cutoff recorded at the broker fill time; the
+        # reconciler will skip this already-stamped fill.
+        assert _run.parameters["last_broker_exit_at"] == (
+            "2026-07-10T12:00:01.500000+00:00"
+        )
+
+    def test_fresh_entry_uses_live_quote_not_prior_candle(self):
+        # Entry filled at 1.1007 with a 20-pip stop (1.0987). The
+        # prior candle closed at 1.1002 but the bid is 1.1006: attach,
+        # don't close.
+        client, _run, _trade, _ = self._tick(
+            entry_price=1.1007,
+            entry_timestamp=self.NOW,
+            min_hold_bars=0,
+            bid=1.1006,
+        )
+        client.close_all_positions.assert_not_called()
+        client.set_trade_exit_orders.assert_called_once()
+
+    def test_no_quote_defers_to_next_tick(self):
+        client, run, _trade, _ = self._tick(bars_since_entry=2, bid=None)
+        client.set_trade_exit_orders.assert_not_called()
+        client.close_all_positions.assert_not_called()
+        assert "broker_exit_orders_trade_id" not in run.parameters
+
+    def test_rejected_orders_are_logged_and_retried(self):
+        from agentfx.adapters.oanda import OandaOrderRejected
+
+        client = MagicMock()
+        client.set_trade_exit_orders.side_effect = OandaOrderRejected(
+            "TRADE_DOESNT_EXIST", transaction_id="9", order_type="STOP_LOSS"
+        )
+        _client, run, _trade, decisions = self._tick(bars_since_entry=2, client=client)
+        assert "USER_EXIT_ORDERS_REJECTED" in decisions
+        assert "broker_exit_orders_trade_id" not in run.parameters
+
+
+class TestBrokerExitReentryBlock:
+    """AFX-106: backtest never re-enters on the candle its stop/target
+    fired. Paper blocks entry on the candle the broker fill landed in,
+    whichever path recorded the fill first, and only that candle."""
+
+    NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+
+    def _tick(self, *, signals, run_parameters, open_trade=None, client=None):
+        strategy = _make_strategy(signals=signals, eval_mode="wick")
+        fetch = MagicMock(return_value=_mk_candles_df(3, self.NOW))
+        client = client or MagicMock()
+        client.get_position.return_value = {"long_units": 0, "short_units": 0}
+        client.get_account_balance.return_value = {
+            "balance": 10_000.0,
+            "currency": "USD",
+        }
+        client.place_market_order.return_value = {
+            "trade_id": "T2",
+            "fill_price": 1.1003,
+            "units": 25_000,
+        }
+        db = _make_db()
+        if open_trade is not None:
+            _set_open_trade(db, open_trade)
+        run = _make_run()
+        run.parameters = dict(run_parameters)
+        _signal_tick(
+            db=db,
+            run=run,
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=self.NOW,
+        )
+        return client, run
+
+    def test_runner_detected_fill_blocks_entry_on_fill_candle(self):
+        # Broker flat, Trade row still open: the runner reconciles it,
+        # taking OANDA's close time (inside the latest candle).
+        trade = SimpleNamespace(
+            id="tr_open",
+            run_id="run_test_signal",
+            side="buy",
+            entry_price=1.10,
+            quantity=10_000,
+            entry_timestamp=self.NOW - timedelta(minutes=10),
+            exit_timestamp=None,
+            exit_price=None,
+            exit_reason=None,
+            broker_trade_id="T1",
+        )
+        client = MagicMock()
+        client.get_trade.return_value = {
+            "state": "CLOSED",
+            "close_time": "2026-07-10T12:00:20.000000Z",
+            "average_close_price": 1.0980,
+        }
+        client, run = self._tick(
+            signals=[0, 0, 1],
+            run_parameters={},
+            open_trade=trade,
+            client=client,
+        )
+        client.place_market_order.assert_not_called()
+        assert trade.exit_price == pytest.approx(1.0980)
+        assert run.parameters["last_broker_exit_at"].startswith("2026-07-10T12:00:20")
+
+    def test_fill_after_latest_candle_blocks_pre_fill_signal(self):
+        # The 12:00 candle closed with a long signal while the trade
+        # was still open; the stop filled at 12:01:05, after that
+        # candle, before this delayed tick. The backtest was holding
+        # through 12:00, so that signal must not open a new trade.
+        client, _run = self._tick(
+            signals=[0, 0, 1],
+            run_parameters={"last_broker_exit_at": "2026-07-10T12:01:05+00:00"},
+        )
+        client.place_market_order.assert_not_called()
+
+    def test_market_exit_cutoff_blocks_next_tick_entry_on_exit_candle(self):
+        # Tick 1 closed at market (hold-ending quote past the stop) at
+        # 12:00:01 and recorded the cutoff. Tick 2 walks the 12:00
+        # exit candle, which carries a long signal: no entry.
+        client, _run = self._tick(
+            signals=[0, 0, 1],
+            run_parameters={
+                "last_broker_exit_at": "2026-07-10T12:00:01.500000+00:00",
+                "last_evaluated_bar_ts": "2026-07-10T11:59:00+00:00",
+            },
+        )
+        client.place_market_order.assert_not_called()
+
+    def test_reconciler_recorded_fill_blocks_entry_on_fill_candle(self):
+        # Health-loop reconciler already closed the Trade row and
+        # recorded the fill time; no open trade is left for the tick.
+        client, _run = self._tick(
+            signals=[0, 0, 1],
+            run_parameters={"last_broker_exit_at": "2026-07-10T12:00:20+00:00"},
+        )
+        client.place_market_order.assert_not_called()
+
+    def test_entry_on_later_candle_in_catch_up_still_fires(self):
+        # Fill landed in the 11:58 candle; a catch-up tick walks
+        # 11:58..12:00. Entry on 11:58 is blocked, entry on 12:00
+        # trades normally.
+        client, _run = self._tick(
+            signals=[1, 0, 1],
+            run_parameters={
+                "last_broker_exit_at": "2026-07-10T11:58:30+00:00",
+                "last_evaluated_bar_ts": "2026-07-10T11:57:00+00:00",
+            },
+        )
+        client.place_market_order.assert_called_once()
+
+
+class TestRunnerCloseExitPrice:
+    def test_exit_price_is_broker_fill_not_pnl_derived(self):
+        """AFX-106: on an AUD account, pnl/units overstated the price
+        move ~1.5x. The close fill price is authoritative."""
+        now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+        strategy = _make_strategy(signals=[0, 0, 0], max_hold_bars=5)
+        fetch = MagicMock(return_value=_mk_candles_df(3, now))
+        client = MagicMock()
+        client.get_position.return_value = {"long_units": 10_000, "short_units": 0}
+        client.close_all_positions.return_value = {
+            "long_realized_pnl": -30.0,
+            "short_realized_pnl": 0.0,
+            "long_fill_price": 1.0980,
+        }
+        trade = SimpleNamespace(
+            id="tr_open",
+            run_id="run_test",
+            entry_price=1.10,
+            quantity=10_000,
+            entry_timestamp=now - timedelta(seconds=400),
+            exit_timestamp=None,
+            pnl=None,
+            pnl_pct=None,
+            exit_price=None,
+        )
+        db = _make_db()
+        _set_open_trade(db, trade)
+        db.query.return_value.filter.return_value.count.return_value = 6
+        db.query.return_value.filter.return_value.all.return_value = [trade]
+
+        _signal_tick(
+            db=db,
+            run=_make_run(),
+            client=client,
+            strategy=strategy,
+            candle_fetch_fn=fetch,
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=now,
+        )
+
+        assert trade.exit_price == pytest.approx(1.0980)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1740,3 +2073,288 @@ class TestJustClosedBarWait:
             and r.action == "USER_SIGNAL_SKIPPED_STALE"
             for r in added
         )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# AFX-50: one signal fire → at most one order, even with two runners
+# ─────────────────────────────────────────────────────────────────────
+
+
+class _SharedOrdersTable:
+    """Stands in for the `orders` primary key shared by every runner
+    process: the second commit of the same order id raises
+    IntegrityError, as Postgres does."""
+
+    def __init__(self) -> None:
+        self.ids: set[str] = set()
+
+    def db(self) -> MagicMock:
+        from sqlalchemy.exc import IntegrityError
+
+        db = _make_db()
+        pending: list = []
+
+        def _add(obj):
+            if type(obj).__name__ == "Order":
+                pending.append(obj)
+
+        def _commit():
+            while pending:
+                order = pending.pop()
+                if order.id in self.ids:
+                    pending.clear()
+                    raise IntegrityError("INSERT INTO orders", {}, Exception("dup"))
+                self.ids.add(order.id)
+
+        db.add.side_effect = _add
+        db.commit.side_effect = _commit
+        return db
+
+
+def _flat_client() -> MagicMock:
+    client = MagicMock()
+    client.get_position.return_value = {"long_units": 0, "short_units": 0}
+    client.get_account_balance.return_value = {"balance": 10_000.0, "currency": "USD"}
+    client.place_market_order.return_value = {
+        "trade_id": "trade_broker_123",
+        "fill_price": 1.1005,
+        "units": 25_000,
+    }
+    return client
+
+
+def _tick(db, run, client, strategy, candles_df, now_utc) -> None:
+    _signal_tick(
+        db=db,
+        run=run,
+        client=client,
+        strategy=strategy,
+        candle_fetch_fn=MagicMock(return_value=candles_df),
+        instrument="EUR_USD",
+        granularity_seconds=60,
+        now_utc=now_utc,
+    )
+
+
+def _decisions(db) -> list:
+    return [
+        c.args[0]
+        for c in db.add.call_args_list
+        if type(c.args[0]).__name__ == "DecisionLog"
+    ]
+
+
+class TestDuplicateOrderSuppression:
+    NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+
+    def test_two_runners_same_run_same_bar_place_one_order(self):
+        """Two runner processes for one run (deploy overlap, double
+        schedule) both see the account flat on the same bar. Before
+        AFX-50 both sent the order."""
+        orders = _SharedOrdersTable()
+        client = _flat_client()
+        strategy = _make_strategy(signals=[0, 0, 1])
+        df = _mk_candles_df(3, self.NOW)
+        db_a, db_b = orders.db(), orders.db()
+
+        _tick(db_a, _make_run(), client, strategy, df, self.NOW)
+        _tick(db_b, _make_run(), client, strategy, df, self.NOW)
+
+        assert client.place_market_order.call_count == 1
+        assert any(d.action == "USER_ORDER_PLACED" for d in _decisions(db_a))
+        skipped = [
+            d for d in _decisions(db_b) if d.action == "USER_ORDER_DUPLICATE_SKIPPED"
+        ]
+        assert len(skipped) == 1
+        assert not any(
+            type(c.args[0]).__name__ == "Trade" for c in db_b.add.call_args_list
+        )
+        db_b.rollback.assert_called()
+
+    def test_next_bar_still_trades(self):
+        orders = _SharedOrdersTable()
+        client = _flat_client()
+        strategy = _make_strategy(signals=[0, 0, 1])
+        later = self.NOW + timedelta(minutes=1)
+
+        _tick(
+            orders.db(),
+            _make_run(),
+            client,
+            strategy,
+            _mk_candles_df(3, self.NOW),
+            self.NOW,
+        )
+        _tick(
+            orders.db(), _make_run(), client, strategy, _mk_candles_df(3, later), later
+        )
+
+        assert client.place_market_order.call_count == 2
+
+    def test_claim_records_fill_and_links_trade(self):
+        db = _make_db()
+        client = _flat_client()
+        _tick(
+            db,
+            _make_run(),
+            client,
+            _make_strategy([0, 0, 1]),
+            _mk_candles_df(3, self.NOW),
+            self.NOW,
+        )
+
+        added = [c.args[0] for c in db.add.call_args_list]
+        order = next(r for r in added if type(r).__name__ == "Order")
+        trade = next(r for r in added if type(r).__name__ == "Trade")
+        assert order.id == f"paper:run_test_signal:{self.NOW.isoformat()}:buy"
+        assert order.status == "filled"
+        assert order.filled_quantity == 25_000
+        assert order.trade_id == trade.id
+
+    def test_broker_reject_keeps_claim_marked_rejected(self):
+        from agentfx.adapters.oanda import OandaOrderRejected
+
+        db = _make_db()
+        client = _flat_client()
+        client.place_market_order.side_effect = OandaOrderRejected(
+            "INSUFFICIENT_MARGIN", transaction_id="t1", order_type="MARKET"
+        )
+        _tick(
+            db,
+            _make_run(),
+            client,
+            _make_strategy([0, 0, 1]),
+            _mk_candles_df(3, self.NOW),
+            self.NOW,
+        )
+
+        order = next(
+            c.args[0]
+            for c in db.add.call_args_list
+            if type(c.args[0]).__name__ == "Order"
+        )
+        assert order.status == "rejected"
+
+
+class TestClaimRunner:
+    @pytest.mark.parametrize(("rows", "expected"), [(1, True), (0, False)])
+    def test_only_approved_run_is_claimed(self, rows, expected):
+        from agentfx.services.paper_runner import _claim_runner
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.update.return_value = rows
+        run = SimpleNamespace(id="run_x")
+
+        assert _claim_runner(db, run) is expected
+        db.commit.assert_called_once()
+        db.refresh.assert_called_once_with(run)
+
+
+class TestDuplicateFlipSuppression:
+    """Review on PR #140: a slower runner flipping the same position
+    must not close the faster runner's replacement position."""
+
+    NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+
+    def _flip_client(self) -> MagicMock:
+        client = MagicMock()
+        client.get_position.return_value = {"long_units": 10_000, "short_units": 0}
+        client.close_all_positions.return_value = {
+            "long_realized_pnl": 5.0,
+            "short_realized_pnl": 0.0,
+        }
+        client.get_account_balance.return_value = {
+            "balance": 10_000.0,
+            "currency": "USD",
+        }
+        client.place_market_order.return_value = {
+            "trade_id": "trade_after_flip",
+            "fill_price": 1.1020,
+            "units": -25_000,
+            "fill_time": "2026-07-10T12:00:02.000000000Z",
+        }
+        return client
+
+    def _db(self, orders: _SharedOrdersTable) -> MagicMock:
+        db = orders.db()
+        _set_open_trade(db, None)
+        db.query.return_value.filter.return_value.all.return_value = []
+        return db
+
+    def test_second_runner_flip_neither_closes_nor_opens(self):
+        orders = _SharedOrdersTable()
+        client = self._flip_client()
+        strategy = _make_strategy(signals=[0, 0, -1])
+        df = _mk_candles_df(3, self.NOW)
+        db_a, db_b = self._db(orders), self._db(orders)
+
+        # Runner B decides on the same stale "long open" snapshot but
+        # only runs after A's reversal has completed.
+        _tick(db_a, _make_run(), client, strategy, df, self.NOW)
+        _tick(db_b, _make_run(), client, strategy, df, self.NOW)
+
+        client.close_all_positions.assert_called_once_with("EUR_USD")
+        client.place_market_order.assert_called_once()
+        assert any(d.action == "USER_ORDER_DUPLICATE_SKIPPED" for d in _decisions(db_b))
+
+        order = next(
+            c.args[0]
+            for c in db_a.add.call_args_list
+            if type(c.args[0]).__name__ == "Order"
+        )
+        assert order.side == "sell"
+        assert order.status == "filled"
+        assert order.quantity == 25_000
+        assert order.filled_at == datetime(2026, 7, 10, 12, 0, 2, tzinfo=UTC)
+
+    def test_rejected_flip_close_cancels_claim_without_opening(self):
+        from agentfx.adapters.oanda import OandaOrderRejected
+
+        orders = _SharedOrdersTable()
+        client = self._flip_client()
+        client.close_all_positions.side_effect = OandaOrderRejected(
+            "MARKET_HALTED", transaction_id="t9", order_type="MARKET"
+        )
+        db = self._db(orders)
+        _tick(
+            db,
+            _make_run(),
+            client,
+            _make_strategy([0, 0, -1]),
+            _mk_candles_df(3, self.NOW),
+            self.NOW,
+        )
+
+        client.place_market_order.assert_not_called()
+        order = next(
+            c.args[0]
+            for c in db.add.call_args_list
+            if type(c.args[0]).__name__ == "Order"
+        )
+        assert order.status == "canceled"
+        assert order.filled_at is None
+
+
+def test_duplicate_skip_is_in_paper_timeline_allowlist():
+    from agentfx.api.services.paper import _PAPER_DECISION_ACTIONS
+
+    assert "USER_ORDER_DUPLICATE_SKIPPED" in _PAPER_DECISION_ACTIONS
+
+
+def test_order_schema_reads_orm_metadata_column():
+    from agentfx.api.models import Order
+    from agentfx.api.schemas.run import Order as OrderSchema
+
+    row = Order(
+        id="paper:run_x:2026-07-10T12:00:00+00:00:buy",
+        run_id="run_x",
+        order_type="market",
+        side="buy",
+        quantity=1000.0,
+        status="filled",
+        filled_quantity=1000.0,
+        metadata_={"signal_bar_ts": "2026-07-10T12:00:00+00:00"},
+        created_at=datetime(2026, 7, 10, 12, 0, 1, tzinfo=UTC),
+    )
+    out = OrderSchema.model_validate(row).model_dump()
+    assert out["metadata"] == {"signal_bar_ts": "2026-07-10T12:00:00+00:00"}

@@ -64,6 +64,7 @@ import {
   granularityToSeconds,
 } from '../utils/candles';
 import { buildIndicatorsFromDsl } from '../utils/dslIndicators';
+import { describePaperLossHalt } from '../utils/paperLossHalt';
 import { formatUTC } from '../utils/time';
 
 const POLL_INTERVAL_MS = 5_000;
@@ -1206,15 +1207,8 @@ function RiskConfigPanel({ run }: { run: PaperRunPublic }) {
               : 'dynamic (risk_pct × balance)'}
           </span>
         </Row>
-        <Row label="Loss cap (soft halt)">
-          <span className="font-mono">
-            {cfg ? `${cfg.loss_cap_pct}%` : '—'}
-          </span>
-        </Row>
-        <Row label="Loss cap (hard halt)">
-          <span className="font-mono">
-            {cfg ? `${cfg.kill_switch_dd_pct}%` : '—'}
-          </span>
+        <Row label="Loss halt">
+          <span>{describePaperLossHalt(cfg)}</span>
         </Row>
       </dl>
     </div>

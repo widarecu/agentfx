@@ -18,13 +18,100 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agentfx.services.paper_runner import (
     TickAction,
+    _close_position_and_persist,
     _execute_loop,
     _mark_terminal,
     _snapshot_balance_if_needed,
     decide_action,
 )
+
+
+@pytest.mark.parametrize(
+    "side,pnl,expected",
+    [
+        ("sell", -100, 1.12),
+        ("sell", 100, 1.10),
+        ("buy", -100, 1.10),
+        ("buy", 100, 1.12),
+    ],
+)
+def test_close_price_fallback_respects_side(side, pnl, expected):
+    trade = _close_with_price_fallback(side=side, pnl=pnl)
+    assert trade.exit_price == pytest.approx(expected)
+    assert trade.pnl == pnl
+
+
+@pytest.mark.parametrize("currency", ["AUD", None])
+def test_close_price_fallback_requires_quote_currency(currency):
+    trade = _close_with_price_fallback(currency=currency)
+    assert trade.exit_price is None
+    assert trade.pnl == -100
+
+
+def test_close_price_fallback_balance_error_leaves_price_unset():
+    trade = _close_with_price_fallback(balance_error=True)
+    assert trade.exit_price is None
+    assert trade.pnl == -100
+
+
+def test_close_price_prefers_broker_fill():
+    trade = _close_with_price_fallback(currency="AUD", fill_price=1.13)
+    assert trade.exit_price == 1.13
+
+
+def test_close_price_fallback_zero_quantity_leaves_price_unset():
+    trade = _close_with_price_fallback(quantity=0)
+    assert trade.exit_price is None
+
+
+def _close_with_price_fallback(
+    *,
+    side="sell",
+    pnl=-100,
+    currency="USD",
+    balance_error=False,
+    fill_price=None,
+    quantity=10_000,
+):
+    from agentfx.adapters.oanda import OandaError
+
+    trade = SimpleNamespace(
+        side=side,
+        entry_price=1.11,
+        quantity=quantity,
+        exit_price=None,
+        financing=None,
+        commission=None,
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = [trade]
+    client = MagicMock()
+    client.close_all_positions.return_value = {
+        "short_realized_pnl" if side == "sell" else "long_realized_pnl": pnl,
+        "short_fill_price" if side == "sell" else "long_fill_price": fill_price,
+    }
+    client.get_account_balance.return_value = {"currency": currency}
+    if balance_error:
+        client.get_account_balance.side_effect = OandaError("unavailable")
+    with (
+        patch("agentfx.services.paper_runner._write_decision"),
+        patch("agentfx.services.paper_runner._persist_equity_snapshot"),
+    ):
+        _close_position_and_persist(
+            db=db,
+            run=SimpleNamespace(id="run_test"),
+            client=client,
+            instrument="EUR_USD",
+            now_utc=datetime.now(UTC),
+            reason="stop",
+        )
+    if fill_price:
+        client.get_account_balance.assert_not_called()
+    return trade
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -210,11 +297,10 @@ class TestExecuteLoop:
         assert run.status == RunStatus.HALTED_MANUAL
         assert run.stop_reason == "USER_KILL"
 
-    def test_gate_refusal_halts(self):
-        # Simulate DD trip: current balance 5% below snapshot.
+    def _legacy_run(self, **overrides):
         from agentfx.api.models import RunStatus
 
-        run = SimpleNamespace(
+        fields = dict(
             id="run_test",
             pair="EUR_USD",
             snapshot_balance=10_000.0,
@@ -222,6 +308,7 @@ class TestExecuteLoop:
             current_balance=10_000.0,
             pnl=0.0,
             kill_requested_at=None,
+            # Stored before AFX-104: these keys must be ignored.
             risk_config={
                 "max_position_size_units": 10_000,
                 "loss_cap_pct": 2.0,
@@ -231,21 +318,72 @@ class TestExecuteLoop:
             stop_reason=None,
             completed_at=None,
         )
+        fields.update(overrides)
+        return SimpleNamespace(**fields)
+
+    @pytest.mark.parametrize(
+        "balance",
+        [
+            9_750.0,  # 2.5% loss: past the old 2% loss cap
+            9_400.0,  # 6% drawdown: past the old 5% kill switch
+            4_000.0,  # 60% drawdown
+        ],
+    )
+    def test_loss_does_not_halt_paper_run(self, balance):
+        """AFX-104: paper has no loss-based auto-halts, even for runs
+        whose stored `risk_config` still carries the old thresholds."""
+        from agentfx.api.models import RunStatus
+
+        run = self._legacy_run()
         client = MagicMock()
-        # Simulate balance drop 5% → hits kill_switch_dd_pct
-        client.get_account_balance.return_value = {"balance": 9_500.0}
-        db = MagicMock()
+        client.get_account_balance.return_value = {"balance": balance}
 
         _execute_loop(
-            db=db,
+            db=MagicMock(),
             run=run,
             client=client,
             sleep_fn=MagicMock(),
-            max_iterations=1,
+            max_iterations=3,
         )
 
+        assert run.status == RunStatus.RUNNING
+        assert run.stop_reason is None
+        assert run.completed_at is None
+        assert run.current_balance == balance
+        client.close_all_positions.assert_not_called()
+
+    def test_margin_closeout_halts_with_clear_reason(self):
+        """AFX-104: OANDA's margin closeout is the only loss guardrail
+        on paper; the run ends with `MARGIN_CLOSEOUT`."""
+        from agentfx.api.models import RunStatus
+        from agentfx.services.paper_reconciler import ReconcileResult
+
+        run = self._legacy_run(current_balance=3_000.0)
+        client = MagicMock()
+        client.get_account_balance.return_value = {"balance": 3_000.0}
+        result = ReconcileResult(
+            transactions_seen=1,
+            trades_updated=1,
+            new_last_transaction_id="101",
+            notes=[],
+            margin_closeout=True,
+        )
+
+        with patch(
+            "agentfx.services.paper_reconciler.reconcile_broker_transactions",
+            return_value=result,
+        ):
+            _execute_loop(
+                db=MagicMock(),
+                run=run,
+                client=client,
+                sleep_fn=MagicMock(),
+                max_iterations=12,  # reconciler runs every 12th iteration
+            )
+
         assert run.status == RunStatus.ERROR
-        assert run.stop_reason == "BROKER_CIRCUIT"
+        assert run.stop_reason == "MARGIN_CLOSEOUT"
+        client.close_all_positions.assert_called_once_with("EUR_USD")
 
     def test_client_circuit_open_caught_and_halts(self):
         """PR-G robustness: OandaCircuitOpen from the client during

@@ -22,7 +22,7 @@ Design invariants (unchanged from the Slack version):
 
 Callers should use `post_paper_run_alert` and pass the ORM `Run` row
 plus a stable `reason` string (one of the `stop_reason` values the
-runner emits — USER_KILL, LOSS_CAP_HIT, BROKER_CIRCUIT,
+runner emits — USER_KILL, MARGIN_CLOSEOUT, BROKER_CIRCUIT,
 BROKER_NETWORK, OANDA_AUTH_LOST, process_crashed,
 crashed_pre_init, ...).
 """
