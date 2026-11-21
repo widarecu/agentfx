@@ -184,6 +184,8 @@ def _apply_exits(
     exit_rules: ExitRules,
     pip_size: float,
     open_: np.ndarray | None = None,
+    *,
+    wick_half_spread: float = 0.0,
 ) -> tuple[np.ndarray, dict[int, str], dict[int, float]]:
     """Walk bars with state and apply DSL exit rules to a raw position
     series.
@@ -196,10 +198,10 @@ def _apply_exits(
         that touch the SL/TP but recover before close do NOT trigger.
 
       * `"wick"`: SL and TP fire when the bar's LOW (long SL / short
-        TP) or HIGH (long TP / short SL) touches the threshold. Realistic
-        model of how a broker-side stop / take-profit order fills.
-        Trigger price = exactly the SL/TP price; the returned exit_price
-        override reflects this so the trade P&L matches a real fill.
+        TP) or HIGH (long TP / short SL) reaches the threshold, shifted
+        in mid-price space by +wick_half_spread for longs (bid) and
+        -wick_half_spread for shorts (ask). Spread affects only the
+        trigger; an ordinary touch still fills at the SL/TP level.
         Gap-aware (AFX-106): when `open_` is given and the bar OPENS
         already past the SL/TP (weekend gap, or price drifted past the
         level while `min_hold_bars` suppressed exits), the fill is the
@@ -219,7 +221,7 @@ def _apply_exits(
       * signals: per-bar target position after the walk.
       * exit_reasons: bar_idx → 'stop'/'target'/'max_hold'/'opposite_flip'.
       * exit_prices: bar_idx → override exit price. For wick-mode SL/TP
-        this is the trigger price (better fidelity than close). For all
+        this is the SL/TP level or the bar open on a gap. For all
         other exits (close-mode, max_hold, opposite_flip) the dict has
         no entry and the caller should fall back to `close[t]`.
     """
@@ -263,36 +265,40 @@ def _apply_exits(
             trigger_price: float | None = None
 
             if wick:
-                # Touch-based check against bar extremes.
                 bar_open = float(open_[t]) if open_ is not None else None
+                trigger_shift = in_position * wick_half_spread
                 if in_position == 1:  # LONG
                     long_sl = entry_close - stop_price_dist
                     long_tp = entry_close + target_price_dist
-                    if bar_open is not None and bar_open <= long_sl:
+                    sl_trigger = long_sl + trigger_shift
+                    tp_trigger = long_tp + trigger_shift
+                    if bar_open is not None and bar_open <= sl_trigger:
                         stop_hit = True
                         trigger_price = bar_open
-                    elif bar_open is not None and bar_open >= long_tp:
+                    elif bar_open is not None and bar_open >= tp_trigger:
                         target_hit = True
                         trigger_price = bar_open
-                    elif low[t] <= long_sl:
+                    elif low[t] <= sl_trigger:
                         stop_hit = True
                         trigger_price = long_sl
-                    elif high[t] >= long_tp:
+                    elif high[t] >= tp_trigger:
                         target_hit = True
                         trigger_price = long_tp
                 else:  # SHORT
                     short_sl = entry_close + stop_price_dist
                     short_tp = entry_close - target_price_dist
-                    if bar_open is not None and bar_open >= short_sl:
+                    sl_trigger = short_sl + trigger_shift
+                    tp_trigger = short_tp + trigger_shift
+                    if bar_open is not None and bar_open >= sl_trigger:
                         stop_hit = True
                         trigger_price = bar_open
-                    elif bar_open is not None and bar_open <= short_tp:
+                    elif bar_open is not None and bar_open <= tp_trigger:
                         target_hit = True
                         trigger_price = bar_open
-                    elif high[t] >= short_sl:
+                    elif high[t] >= sl_trigger:
                         stop_hit = True
                         trigger_price = short_sl
-                    elif low[t] <= short_tp:
+                    elif low[t] <= tp_trigger:
                         target_hit = True
                         trigger_price = short_tp
             else:
@@ -367,18 +373,18 @@ class CompiledDSLStrategy(Strategy):
     target instrument's pip_size.
     """
 
-    def __init__(self, spec: StrategySpec, pip_size: float) -> None:
+    def __init__(
+        self, spec: StrategySpec, pip_size: float, *, wick_half_spread: float = 0.0
+    ) -> None:
         self.spec = spec
         self.pip_size = float(pip_size)
+        self.wick_half_spread = wick_half_spread
         # Populated by generate_signals; maps timestamp → exit reason
         # for callers (the backtest engine) that need it to annotate
         # each closed trade / exit signal. Per-instance state because
         # we call generate_signals once per backtest invocation.
         self.exit_reasons_by_ts: dict[pd.Timestamp, str] = {}
-        # Wilson 2026-08-15: for eval_mode="wick" exits, the trigger
-        # price is exactly the SL/TP threshold, not the bar's close.
-        # Backtest reads this map to override the default `close[t]`
-        # exit price when present.
+        # Backtest uses wick-mode fill prices to override `close[t]`.
         self.exit_prices_by_ts: dict[pd.Timestamp, float] = {}
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
@@ -409,7 +415,14 @@ class CompiledDSLStrategy(Strategy):
         low = df["low"].to_numpy() if "low" in df.columns else None
         open_ = df["open"].to_numpy() if "open" in df.columns else None
         final, exit_reasons_by_idx, exit_prices_by_idx = _apply_exits(
-            raw_pos, close, high, low, self.spec.exit, self.pip_size, open_=open_
+            raw_pos,
+            close,
+            high,
+            low,
+            self.spec.exit,
+            self.pip_size,
+            open_=open_,
+            wick_half_spread=self.wick_half_spread,
         )
         # Translate bar-index → timestamp so the backtest engine can
         # look up the reason (and wick-mode trigger price) by signal
@@ -465,7 +478,9 @@ class CompiledDSLStrategy(Strategy):
         return raw
 
 
-def compile_spec(spec: StrategySpec, pip_size: float = 0.0001) -> Strategy:
+def compile_spec(
+    spec: StrategySpec, pip_size: float = 0.0001, *, wick_half_spread: float = 0.0
+) -> Strategy:
     """Validate and compile a `StrategySpec` into a runnable `Strategy`.
 
     `pip_size` defaults to 0.0001 (EUR_USD-style majors). Callers must
@@ -473,9 +488,14 @@ def compile_spec(spec: StrategySpec, pip_size: float = 0.0001) -> Strategy:
     backtest engine handles this via `make_strategy("dsl", spec=…,
     pip_size=…)`.
 
+    `wick_half_spread` is in price units and defaults to unshifted triggers
+    for callers without a modeled spread.
+
     Raises `CompilerError` on any semantic problem (out-of-bounds args,
     wrong arity, etc.). Pydantic-level grammar errors raise `ValidationError`
     earlier (at spec construction time).
     """
     _validate_entry(spec.entry)
-    return CompiledDSLStrategy(spec, pip_size=pip_size)
+    return CompiledDSLStrategy(
+        spec, pip_size=pip_size, wick_half_spread=wick_half_spread
+    )
