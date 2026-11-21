@@ -33,7 +33,9 @@ def evaluate_gate_b(
     Args:
         metrics: Performance metrics from a backtest. Recognised keys:
             - "sharpe": Sharpe ratio (default 0 if missing)
-            - "max_drawdown": Max drawdown as a fraction (default 1.0 if missing)
+            - "max_drawdown": Max drawdown as a fraction, either sign
+              (-0.35 and 0.35 both mean a 35% drawdown; compared by
+              magnitude against the cap). Default 1.0 if missing.
             - "hit_rate": Win rate as a fraction (default 0 if missing)
             - "n_trades": Trade count (default 0 if missing)
             - "cagr": Net annualised return as a fraction (default -1.0
@@ -55,10 +57,12 @@ def evaluate_gate_b(
     if sharpe < thresholds["sharpe_min"]:
         failures.append(f"Sharpe {sharpe:.2f} < {thresholds['sharpe_min']}")
 
-    max_dd = metrics.get("max_drawdown", 1.0)
+    # Judge the magnitude: metrics.py reports drawdown as a negative
+    # fraction (-0.35 = 35% DD), but positive callers are also accepted.
+    max_dd = abs(metrics.get("max_drawdown", 1.0))
     if max_dd > thresholds["max_drawdown"]:
         failures.append(
-            f"Max DD {abs(max_dd) * 100:.1f}% > cap {thresholds['max_drawdown'] * 100:.0f}%"
+            f"Max DD {max_dd * 100:.1f}% > cap {thresholds['max_drawdown'] * 100:.0f}%"
         )
 
     hit_rate = metrics.get("hit_rate", 0)
