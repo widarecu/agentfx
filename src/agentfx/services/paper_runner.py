@@ -2610,6 +2610,7 @@ def _close_position_and_persist(
     a prior runner instance and lost, we still commit the OANDA close
     and log the decision so the audit trail is preserved.
     """
+    from agentfx.adapters.oanda import OandaError
     from agentfx.api.models import Trade
 
     result = client.close_all_positions(instrument)
@@ -2645,6 +2646,13 @@ def _close_position_and_persist(
         .all()
     )
     if open_trades:
+        account_currency = None
+        if not close_fill_price:
+            try:
+                account_currency = client.get_account_balance().get("currency")
+            except OandaError:
+                pass
+        quote_currency = instrument.rsplit("_", 1)[-1]
         # Split the realized pnl proportionally to quantity. Rough
         # apportionment is fine — OANDA's per-trade close would give
         # us exact per-trade pnl but we're closing everything at once
@@ -2655,19 +2663,18 @@ def _close_position_and_persist(
             share = float(t.quantity) / total_qty
             t.pnl = total_pnl * share
             t.pnl_pct = (
-                (t.pnl / (t.entry_price * t.quantity)) * 100 if t.entry_price else 0.0
+                (t.pnl / (t.entry_price * t.quantity)) * 100
+                if t.entry_price and t.quantity
+                else 0.0
             )
             t.exit_timestamp = now_utc
-            # AFX-106: the OANDA close fill price. The old pnl-derived
-            # fallback treats account-currency pnl as quote-currency
-            # price movement (~1.5x off on an AUD account trading
-            # AUD_USD); kept only for responses without a price.
             if close_fill_price:
                 t.exit_price = float(close_fill_price)
+            elif account_currency == quote_currency and t.quantity:
+                direction = 1 if t.side == "buy" else -1
+                t.exit_price = t.entry_price + direction * t.pnl / t.quantity
             else:
-                t.exit_price = t.entry_price + (
-                    t.pnl / t.quantity if t.quantity else 0.0
-                )
+                t.exit_price = None
             if exit_reason is not None:
                 t.exit_reason = exit_reason
             # v0.6.1: accumulate financing + commission on this close.

@@ -22,11 +22,96 @@ import pytest
 
 from agentfx.services.paper_runner import (
     TickAction,
+    _close_position_and_persist,
     _execute_loop,
     _mark_terminal,
     _snapshot_balance_if_needed,
     decide_action,
 )
+
+
+@pytest.mark.parametrize(
+    "side,pnl,expected",
+    [
+        ("sell", -100, 1.12),
+        ("sell", 100, 1.10),
+        ("buy", -100, 1.10),
+        ("buy", 100, 1.12),
+    ],
+)
+def test_close_price_fallback_respects_side(side, pnl, expected):
+    trade = _close_with_price_fallback(side=side, pnl=pnl)
+    assert trade.exit_price == pytest.approx(expected)
+    assert trade.pnl == pnl
+
+
+@pytest.mark.parametrize("currency", ["AUD", None])
+def test_close_price_fallback_requires_quote_currency(currency):
+    trade = _close_with_price_fallback(currency=currency)
+    assert trade.exit_price is None
+    assert trade.pnl == -100
+
+
+def test_close_price_fallback_balance_error_leaves_price_unset():
+    trade = _close_with_price_fallback(balance_error=True)
+    assert trade.exit_price is None
+    assert trade.pnl == -100
+
+
+def test_close_price_prefers_broker_fill():
+    trade = _close_with_price_fallback(currency="AUD", fill_price=1.13)
+    assert trade.exit_price == 1.13
+
+
+def test_close_price_fallback_zero_quantity_leaves_price_unset():
+    trade = _close_with_price_fallback(quantity=0)
+    assert trade.exit_price is None
+
+
+def _close_with_price_fallback(
+    *,
+    side="sell",
+    pnl=-100,
+    currency="USD",
+    balance_error=False,
+    fill_price=None,
+    quantity=10_000,
+):
+    from agentfx.adapters.oanda import OandaError
+
+    trade = SimpleNamespace(
+        side=side,
+        entry_price=1.11,
+        quantity=quantity,
+        exit_price=None,
+        financing=None,
+        commission=None,
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = [trade]
+    client = MagicMock()
+    client.close_all_positions.return_value = {
+        "short_realized_pnl" if side == "sell" else "long_realized_pnl": pnl,
+        "short_fill_price" if side == "sell" else "long_fill_price": fill_price,
+    }
+    client.get_account_balance.return_value = {"currency": currency}
+    if balance_error:
+        client.get_account_balance.side_effect = OandaError("unavailable")
+    with (
+        patch("agentfx.services.paper_runner._write_decision"),
+        patch("agentfx.services.paper_runner._persist_equity_snapshot"),
+    ):
+        _close_position_and_persist(
+            db=db,
+            run=SimpleNamespace(id="run_test"),
+            client=client,
+            instrument="EUR_USD",
+            now_utc=datetime.now(UTC),
+            reason="stop",
+        )
+    if fill_price:
+        client.get_account_balance.assert_not_called()
+    return trade
 
 
 # ─────────────────────────────────────────────────────────────────────
