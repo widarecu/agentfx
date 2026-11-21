@@ -514,7 +514,12 @@ def run_backtest_from_db(
 
     # Create strategy and generate signals — DSL strategies need pip_size
     # for the stop/target/max_hold exit walker; classic ones ignore it.
-    strat = make_strategy(strategy_name, pip_size=pip_size, **strategy_params)
+    strat = make_strategy(
+        strategy_name,
+        pip_size=pip_size,
+        wick_half_spread=spread_pips * pip_size / 2,
+        **strategy_params,
+    )
     raw_signals = strat.generate_signals(df)
     # DSL strategies expose `exit_reasons_by_ts` populated during
     # generate_signals — bar timestamp → 'stop'/'target'/'max_hold'/
@@ -524,10 +529,7 @@ def run_backtest_from_db(
     # re-entered" from "stop hit, re-entered" without re-deriving from
     # prices (UAT 2026-06-17 OBV-seed confusion).
     exit_reasons_by_ts: dict = getattr(strat, "exit_reasons_by_ts", {}) or {}
-    # Wilson 2026-08-15: for wick-mode SL/TP exits the trigger price is
-    # the SL/TP threshold, not the bar close. Override map is populated
-    # by DSL strategies with eval_mode="wick"; empty for close-mode and
-    # classic strategies.
+    # Only wick-mode SL/TP exits override the bar close as the fill price.
     exit_prices_by_ts: dict = getattr(strat, "exit_prices_by_ts", {}) or {}
 
     # Apply policies
@@ -648,10 +650,8 @@ def run_backtest_from_db(
                 ):
                     # Exit (or flip — close current position first)
                     signal_type = "exit_long" if prev_signal > 0 else "exit_short"
-                    # Wick-mode SL/TP fills at the trigger price; every
-                    # other exit fills at the bar close. `exit_prices_by_ts`
-                    # is populated only for wick-mode SL/TP; falls back
-                    # to close[t] otherwise.
+                    # Wick-mode SL/TP fills at the order level or gap open;
+                    # every other exit fills at the bar close.
                     exit_price_override = exit_prices_by_ts.get(timestamp)
                     if exit_price_override is not None:
                         exit_price = float(exit_price_override)
@@ -1065,7 +1065,7 @@ def _get_indicator_values(
     return None
 
 
-def make_strategy(name: str, **kwargs) -> Strategy:
+def make_strategy(name: str, *, wick_half_spread: float = 0.0, **kwargs) -> Strategy:
     n = name.lower()
     if n == "dsl":
         # DSL dispatch: compile a v0.3.0 StrategySpec into a Strategy.
@@ -1091,7 +1091,7 @@ def make_strategy(name: str, **kwargs) -> Strategy:
         # default of 0.0001 covers majors when the caller hasn't
         # threaded it through.
         pip_size = float(kwargs.get("pip_size", 0.0001))
-        return compile_spec(spec, pip_size=pip_size)
+        return compile_spec(spec, pip_size=pip_size, wick_half_spread=wick_half_spread)
     if n in ("ma", "mac", "ma_crossover", "macrossover"):
         return MACrossover(
             fast=int(kwargs.get("fast", 20)), slow=int(kwargs.get("slow", 50))
@@ -1142,7 +1142,12 @@ def run_backtest(
 
     pip_size = pip_size_for_pair(pair)
 
-    strat = make_strategy(strategy_name, pip_size=pip_size, **strategy_params)
+    strat = make_strategy(
+        strategy_name,
+        pip_size=pip_size,
+        wick_half_spread=spread_pips * pip_size / 2,
+        **strategy_params,
+    )
     raw_signals = strat.generate_signals(df)
     # Apply policies
     pconf = PolicyConfig(
