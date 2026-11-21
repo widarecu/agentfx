@@ -34,6 +34,7 @@ import {
   granularityToSeconds,
 } from '../utils/candles';
 import { formatUTC } from '../utils/time';
+import { describePaperLossHalt } from '../utils/paperLossHalt';
 
 const POLL_INTERVAL_MS = 5_000;
 const CANDLES_POLL_INTERVAL_MS = 60_000;
@@ -584,15 +585,8 @@ export function MobilePaperRiskRoute(): React.ReactElement {
       value: tpLabel,
     },
     {
-      label: 'Loss cap (soft halt)',
-      value: risk?.loss_cap_pct != null ? `${risk.loss_cap_pct.toFixed(2)}%` : '—',
-    },
-    {
-      label: 'Loss cap (hard halt)',
-      value:
-        risk?.kill_switch_dd_pct != null
-          ? `${risk.kill_switch_dd_pct.toFixed(2)}%`
-          : '—',
+      label: 'Loss halt',
+      value: describePaperLossHalt(risk),
     },
     {
       label: 'Max position size',

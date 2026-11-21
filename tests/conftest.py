@@ -32,7 +32,7 @@ os.environ["TESTING"] = "true"
 # backfill → 60s teardown timeouts that hang the test session. This is
 # enforced in code (not in .env.test) so a developer can't accidentally
 # flip it on for the test path while keeping Docker behaviour separate.
-# See CLAUDE.md → "Ingestion toggle: three-surface model".
+# See .claude/rules/ingestion-config.md ("Ingestion settings").
 os.environ["INGESTION_ENABLED"] = "false"
 
 # Test-correctness invariant: outbound email notifications MUST be off
@@ -52,7 +52,7 @@ if _prev_env and _prev_env != "test":
     warnings.warn(
         f"Test environment forced from '{_prev_env}' to 'test'. "
         "Use 'make test-unit' or 'make test-integration' to avoid this warning. "
-        "See CLAUDE.md for canonical test commands.",
+        "See tests/README.md for canonical test commands.",
         UserWarning,
         stacklevel=1,
     )

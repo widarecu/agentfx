@@ -2,7 +2,23 @@
 
 from __future__ import annotations
 
+import pytest
+
+from agentfx.api.schemas.optimization import TrialMetrics
+from agentfx.api.schemas.optimization import evaluate_gate_b as evaluate_trial_gate_b
 from agentfx.core.gates import GATE_B_THRESHOLDS, evaluate_gate_b
+
+# metrics.py returns drawdown as a NEGATIVE fraction; Gate B must treat
+# drawdown as a magnitude so either sign is judged against the 10% cap
+# (AFX-63). Boundary ±0.10 is "at the cap" and passes.
+MDD_SIGN_CASES = [
+    pytest.param(+0.35, False, id="+0.35-fails"),
+    pytest.param(-0.35, False, id="-0.35-fails"),
+    pytest.param(+0.09, True, id="+0.09-passes"),
+    pytest.param(-0.09, True, id="-0.09-passes"),
+    pytest.param(+0.10, True, id="+0.10-boundary-passes"),
+    pytest.param(-0.10, True, id="-0.10-boundary-passes"),
+]
 
 
 class TestEvaluateGateB:
@@ -108,6 +124,42 @@ class TestEvaluateGateB:
 
         passes_relaxed, _ = evaluate_gate_b(metrics, overrides={"min_cagr": 0.05})
         assert passes_relaxed is True  # 8% > 5% override
+
+
+class TestMaxDrawdownSign:
+    @pytest.mark.parametrize(("max_dd", "expected_pass"), MDD_SIGN_CASES)
+    def test_core_gate_judges_drawdown_magnitude(
+        self, max_dd: float, expected_pass: bool
+    ) -> None:
+        metrics = {
+            "sharpe": 2.0,
+            "max_drawdown": max_dd,
+            "hit_rate": 0.55,
+            "n_trades": 500,
+            "cagr": 0.5,
+        }
+        passes, failures = evaluate_gate_b(metrics)
+        assert passes is expected_pass
+        if expected_pass:
+            assert failures == []
+        else:
+            assert failures == [f"Max DD {abs(max_dd) * 100:.1f}% > cap 10%"]
+
+    @pytest.mark.parametrize(("max_dd", "expected_pass"), MDD_SIGN_CASES)
+    def test_optimization_trial_gate_judges_drawdown_magnitude(
+        self, max_dd: float, expected_pass: bool
+    ) -> None:
+        metrics = TrialMetrics(
+            sharpe=2.0,
+            max_drawdown=max_dd,
+            hit_rate=0.55,
+            trade_count=500,
+            total_return=0.5,
+            profit_factor=1.5,
+        )
+        passes, failures = evaluate_trial_gate_b(metrics)
+        assert passes is expected_pass
+        assert any("Max DD" in f for f in failures) is (not expected_pass)
 
 
 class TestThresholdConstants:

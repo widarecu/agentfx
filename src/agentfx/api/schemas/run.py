@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from ..models.run import RunEnvironment, RunStatus
 from .base import BaseSchema
@@ -103,6 +103,11 @@ class OrderCreate(OrderBase):
 
 
 class OrderInDBBase(OrderBase, BaseSchema):
+    # The ORM attribute is `metadata_`; `metadata` on a model is
+    # SQLAlchemy's schema MetaData.
+    metadata: dict[str, Any] | None = Field(
+        default=None, validation_alias=AliasChoices("metadata_", "metadata")
+    )
     id: str
     run_id: str
     trade_id: str | None

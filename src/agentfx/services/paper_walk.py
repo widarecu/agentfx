@@ -102,6 +102,8 @@ def walk(
     *,
     high_series: pd.Series | None = None,
     low_series: pd.Series | None = None,
+    open_series: pd.Series | None = None,
+    no_entry_through_ts: datetime | None = None,
 ) -> WalkResult:
     """Walk bars strictly newer than `bookmark_ts` through the strategy
     state machine. Returns the terminal state, all transitions along
@@ -150,6 +152,15 @@ def walk(
     pip_size : float
         The instrument's price-per-pip (0.01 JPY, 0.0001 non-JPY).
         Used for `move_pips` computation.
+    open_series : pd.Series[float] | None
+        Per-bar opens. Wick mode only: a bar that opens past the SL/TP
+        fills at the open (gap-aware, same as `_apply_exits`).
+    no_entry_through_ts : datetime | None
+        No entry from flat on any bar that STARTED at or before this
+        instant. The runner passes the last broker-side SL/TP fill
+        time: bars before the fill were held (not flat) in the
+        backtest, and the bar containing the fill is consumed by the
+        exit. Bars starting after the fill trade normally.
 
     Returns
     -------
@@ -183,6 +194,8 @@ def walk(
             close_series.index
         ) or not low_series.index.equals(close_series.index):
             raise ValueError("high_series/low_series must share close_series index")
+        if open_series is not None and not open_series.index.equals(close_series.index):
+            raise ValueError("open_series must share close_series index")
 
     # Filter to bars strictly greater than bookmark.
     if bookmark_ts is not None:
@@ -194,6 +207,8 @@ def walk(
         if wick:
             high_series = high_series[mask]
             low_series = low_series[mask]
+            if open_series is not None:
+                open_series = open_series[mask]
     else:
         # No bookmark → this is the first tick after a fresh deploy.
         # Only consider the latest bar; don't backfill history. Matches
@@ -203,6 +218,8 @@ def walk(
         if wick:
             high_series = high_series.tail(1)
             low_series = low_series.tail(1)
+            if open_series is not None:
+                open_series = open_series.tail(1)
 
     if len(raw_entries) == 0:
         # Bookmark was already at or past the latest bar. No-op tick.
@@ -255,10 +272,21 @@ def walk(
             if wick:
                 bar_high = float(high_series.loc[bar_ts_val])
                 bar_low = float(low_series.loc[bar_ts_val])
+                bar_open = (
+                    float(open_series.loc[bar_ts_val])
+                    if open_series is not None
+                    else None
+                )
                 if state.in_position == 1:
                     long_sl = state.entry_close - stop_price_dist
                     long_tp = state.entry_close + target_price_dist
-                    if bar_low <= long_sl:
+                    if bar_open is not None and bar_open <= long_sl:
+                        stop_hit = True
+                        exit_px = bar_open
+                    elif bar_open is not None and bar_open >= long_tp:
+                        target_hit = True
+                        exit_px = bar_open
+                    elif bar_low <= long_sl:
                         stop_hit = True
                         exit_px = long_sl
                     elif bar_high >= long_tp:
@@ -267,7 +295,13 @@ def walk(
                 else:  # SHORT
                     short_sl = state.entry_close + stop_price_dist
                     short_tp = state.entry_close - target_price_dist
-                    if bar_high >= short_sl:
+                    if bar_open is not None and bar_open >= short_sl:
+                        stop_hit = True
+                        exit_px = bar_open
+                    elif bar_open is not None and bar_open <= short_tp:
+                        target_hit = True
+                        exit_px = bar_open
+                    elif bar_high >= short_sl:
                         stop_hit = True
                         exit_px = short_sl
                     elif bar_low <= short_tp:
@@ -347,7 +381,7 @@ def walk(
             continue
 
         # in_position == 0 → look for entry.
-        if raw != 0:
+        if raw != 0 and (no_entry_through_ts is None or bar_ts > no_entry_through_ts):
             transitions.append(
                 Transition(
                     bar_ts=bar_ts,

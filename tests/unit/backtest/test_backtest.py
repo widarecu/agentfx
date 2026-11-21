@@ -5,7 +5,17 @@ import tempfile
 from datetime import UTC, datetime, timedelta
 
 import pandas as pd
+import pytest
 
+from agentfx.core.dsl.grammar import (
+    Comparison,
+    EntryConditions,
+    ExitRules,
+    IndicatorCall,
+    SizeRules,
+    StrategySpec,
+)
+from agentfx.services import backtest as bt_module
 from agentfx.services.backtest import run_backtest
 
 
@@ -101,6 +111,63 @@ def test_costs_reduce_cagr_vs_no_costs():
         assert with_cost["metrics"]["cagr"] <= no_cost["metrics"]["cagr"], (
             "Costs should not improve CAGR"
         )
+
+
+@pytest.mark.parametrize(
+    ("direction", "reason", "order_level", "extreme"),
+    [
+        ("long", "stop", 99.90, "low"),
+        ("long", "target", 100.20, "high"),
+        ("short", "stop", 100.10, "high"),
+        ("short", "target", 99.80, "low"),
+    ],
+    ids=["long-stop", "long-target", "short-stop", "short-target"],
+)
+@pytest.mark.parametrize("gap_open", [False, True], ids=["wick-touch", "open-touch"])
+def test_dsl_wick_exit_uses_half_the_pair_spread(
+    monkeypatch, direction, reason, order_level, extreme, gap_open
+):
+    entry_price = 100.0
+    spread_pips = 4.0
+    trigger = order_level + (0.02 if direction == "long" else -0.02)
+    times = pd.date_range("2026-01-01", periods=4, freq="min", tz="UTC")
+    df = pd.DataFrame(
+        {col: entry_price for col in ("open", "high", "low", "close")},
+        index=times,
+    )
+    df["volume"] = 1
+    df.loc[times[2], extreme] = trigger + (0.01 if extreme == "low" else -0.01)
+    df.loc[times[3], extreme] = trigger
+    if gap_open:
+        df.loc[times[3], "open"] = trigger
+
+    spec = StrategySpec(
+        entry=EntryConditions(
+            **{direction: Comparison(lhs=IndicatorCall(ind="close"), cmp=">", rhs=0)}
+        ),
+        exit=ExitRules(
+            stop_pips=10, target_pips=20, max_hold_bars=240, eval_mode="wick"
+        ),
+        size=SizeRules(risk_pct=0.005),
+    )
+    monkeypatch.setattr(bt_module, "load_price_df_from_db", lambda **_: df)
+    monkeypatch.setattr(bt_module, "_lookup_typical_spread", lambda _: spread_pips)
+    monkeypatch.setattr(bt_module, "_lookup_financing_rates", lambda _: (0.0, 0.0))
+
+    result = bt_module.run_backtest_from_db(
+        instrument="USD_JPY",
+        strategy_name="dsl",
+        strategy_params={"spec": spec},
+        capture_signals=True,
+    )
+
+    (trade,) = result["trades"]
+    assert trade["entry_timestamp"] == times[1].isoformat()
+    assert trade["exit_timestamp"] == times[3].isoformat()
+    assert trade["exit_reason"] == reason
+    assert trade["exit_price"] == pytest.approx(trigger if gap_open else order_level)
+    assert trade["spread_cost_pips"] == spread_pips
+    assert trade["net_pips"] == pytest.approx(trade["pips"] - spread_pips)
 
 
 # ─────────────────────────────────────────────────────────────────────────

@@ -15,7 +15,7 @@ Contract, for every `Field(..., env="NAME")` in config.py:
   commented `# NAME=...` line for a setting that is documented but
   deliberately left unset (deprecated, not honoured, ...).
 * Exception: SURFACE_GOVERNED settings (the ingestion knobs) have one source
-  of truth per execution surface (CLAUDE.md -> "Ingestion toggle:
+  of truth per execution surface (.claude/rules/ingestion-config.md -> "Ingestion settings:
   three-surface model"). `.env.example` must mention them, to say where they
   live, but must NOT assign them: `make dotenv` would copy the assignment
   into `.env.development` and re-create the shadowing that model prevents.
@@ -44,7 +44,7 @@ CONFIG_PY = REPO_ROOT / "src" / "agentfx" / "api" / "core" / "config.py"
 ENV_EXAMPLE = REPO_ROOT / ".env.example"
 
 # Owned by pytest / docker-compose / Railway, one source per surface. Keep in
-# sync with CLAUDE.md and the "Candle Ingestion Worker" block of .env.example.
+# sync with .claude/rules/ingestion-config.md and the "Candle Ingestion Worker" block of .env.example.
 SURFACE_GOVERNED = frozenset(
     {
         "INGESTION_ENABLED",

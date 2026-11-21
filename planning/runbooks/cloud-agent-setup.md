@@ -54,7 +54,7 @@ make test-integration    # pytest -m "integration and not slow" against Postgres
 make docker-down PROFILE=test
 ```
 
-`make test-unit` alone is the pre-PR gate the operating model requires (per CLAUDE.md section 7 rule 7). `test-integration` is needed only when the change touches DB code.
+`make test-unit` alone is the pre-PR gate the operating model requires (per CLAUDE.md hard rule 8). `test-integration` is needed only when the change touches DB code.
 
 ## 3. First trial
 
@@ -64,11 +64,11 @@ Pick AFX-13's own definition of "nightly routine" as the first trial issue — s
 2. Branches `agent/AFX-N-slug`, implements, commits, runs `make test-unit` locally.
 3. Opens PR to `feat/agent-fleet` with `AFX-N` in the title → Linear auto-moves to **In Review** (verified: `gitAutomationStates` on team AFX wires `review → In Review`).
 4. Wilson reviews on phone (Linear mobile app + GitHub mobile), approves.
-5. If labelled `agent-authored`, `.github/workflows/agent-fleet-ci.yml` auto-merges on green CI → Linear auto-moves to **Done** (`merge → Done`).
+5. If labelled `agent-authored`, `.github/workflows/agent-fleet-ci.yml` auto-merges on green CI → Linear auto-moves to **In Staging**. **Done** is set only after Wilson promotes to `main` and the deploy succeeds.
 
 ## 4. Troubleshooting
 
-- **Agent picks up a Money-path issue**: that's fine, but its PR will never auto-merge — the three-tier gate requires Wilson's manual approval on `main` PRs. The agent should add `needs-wilson` to the PR body so you see it on your phone.
+- **Agent picks up a Money-path issue**: that's fine. Its PR still gets `agent-authored` and auto-merges into `feat/agent-fleet` on green CI. Wilson reviews it on the promote PR to `main`, which lists Money-path PRs first and never auto-merges.
 - **`make test-integration` fails with "could not connect to server"**: Docker-in-Docker not enabled on the cloud agent provider. Fall back to the agent provider's hosted Postgres and set `DATABASE_URL` manually; the test profile uses port 5433 by default.
 - **Linear MCP times out**: usually means `LINEAR_API_KEY` isn't set in the agent env. Check with `env | grep LINEAR_` (never log the value itself).
 - **GitHub push rejected (403)**: `GITHUB_TOKEN` scope is wrong. Fine-grained tokens need `Contents: write` + `Pull requests: write` on this repo specifically.

@@ -1,0 +1,47 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make test-unit:*)",
+      "Bash(make test-integration:*)",
+      "Bash(make test-file:*)",
+      "Bash(make test-pattern:*)",
+      "Bash(make lint:*)",
+      "Bash(make format:*)",
+      "Bash(make typecheck:*)",
+      "Bash(make verify-fixtures:*)",
+      "Bash(make check-env-example:*)",
+      "Bash(make check-settings-vitest:*)"
+    ],
+    "deny": [
+      "Edit(.env.development)",
+      "Edit(.env.test)",
+      "Edit(.env.uat)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard-bash.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/lint-on-edit.py\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

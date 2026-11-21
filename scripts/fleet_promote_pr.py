@@ -7,7 +7,7 @@ Run by `.github/workflows/agent-fleet-promote.yml`. Each run:
    `main` would leave `main`'s tree unchanged. Not ancestry or a plain tip
    diff: back-merge commits make the fleet branch look ahead with nothing to
    promote, and a hotfix on `main` that hasn't been back-merged yet makes the
-   tips differ (CLAUDE.md -> Branch flow).
+   tips differ (planning/runbooks/branch-flow.md).
 2. Lists every PR merged into `feat/agent-fleet` that is not on `main` yet
    (first-parent `git log main..feat/agent-fleet`, back-merge PRs skipped),
    with risk and touched files. Money-path PRs go first.
@@ -146,7 +146,7 @@ def render_section(
         f"on every merge into `{HEAD}`. Text outside this block is kept.",
         "",
         '**Merge with "Create a merge commit". Never squash** '
-        "(CLAUDE.md -> Branch flow).",
+        "(planning/runbooks/branch-flow.md).",
     ]
     body: list[str] = []
     if money:

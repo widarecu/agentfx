@@ -821,3 +821,115 @@ class TestEvalModeWick:
         # Wick-mode fires on bar 2.
         _, wick_reasons, _ = _apply_exits(raw, close, high, low, wick_rules, PIP)
         assert wick_reasons.get(2) == "stop"
+
+
+class TestWickGapFills:
+    """AFX-106: a resting broker order can't fill at a level the market
+    never traded at. When a bar OPENS past the SL/TP (weekend gap, or
+    price ran past the level while min_hold suppressed exits) both the
+    backtest and the paper walk fill at the bar's open.
+
+    Both sides model the SAME trade: the backtest enters on bar 0's
+    close; the walk starts LONG at bar 0's close with the bookmark on
+    bar 0, so it walks bar 1 onward. Exit bar and price must match."""
+
+    def _walk_and_apply(self, *, side, opens, highs, lows, closes, rules):
+        idx = _bars(len(closes))
+        start = _long_at(closes[0]) if side == 1 else _short_at(closes[0])
+        result = walk(
+            raw_entries=_series([0] * len(closes), idx),
+            close_series=_series(closes, idx),
+            start_state=start,
+            bookmark_ts=idx[0].to_pydatetime(),
+            exit_rules=rules,
+            pip_size=PIP,
+            high_series=_series(highs, idx),
+            low_series=_series(lows, idx),
+            open_series=_series(opens, idx),
+        )
+        raw_pos = [side] + [0] * (len(closes) - 1)
+        _, reasons, prices = _apply_exits(
+            np.array(raw_pos, dtype=np.int8),
+            np.array(closes),
+            np.array(highs),
+            np.array(lows),
+            rules,
+            PIP,
+            open_=np.array(opens),
+        )
+        return idx, result, reasons, prices
+
+    def _assert_parity(self, idx, result, reasons, prices, bar, reason, px):
+        assert [t.reason for t in result.transitions] == [reason]
+        assert result.transitions[0].bar_ts == idx[bar].to_pydatetime()
+        assert result.transitions[0].close_px == pytest.approx(px, abs=1e-9)
+        assert reasons == {bar: reason}
+        assert prices[bar] == pytest.approx(px, abs=1e-9)
+
+    def test_long_stop_delayed_by_min_hold_fills_at_open_not_level(self):
+        # The AFX-106 trade: entry 1.15000, SL 20 pips (1.14800),
+        # min_hold=3. Price falls through the stop during the hold;
+        # bar 3 (first bar exits are allowed) opens at 1.14600.
+        rules = _wick_rules(stop_pips=20, target_pips=40, min_hold=3)
+        idx, result, reasons, prices = self._walk_and_apply(
+            side=1,
+            closes=[1.15000, 1.14700, 1.14600, 1.14550],
+            opens=[1.15000, 1.14900, 1.14700, 1.14600],
+            highs=[1.15010, 1.14910, 1.14710, 1.14620],
+            lows=[1.14990, 1.14690, 1.14590, 1.14500],
+            rules=rules,
+        )
+        self._assert_parity(idx, result, reasons, prices, 3, "stop", 1.14600)
+
+    def test_long_gap_above_target_fills_at_open(self):
+        rules = _wick_rules(stop_pips=20, target_pips=40)
+        idx, result, reasons, prices = self._walk_and_apply(
+            side=1,
+            closes=[1.15000, 1.15600],
+            opens=[1.15000, 1.15500],  # opens 10 pips beyond TP 1.15400
+            highs=[1.15010, 1.15650],
+            lows=[1.14990, 1.15450],
+            rules=rules,
+        )
+        self._assert_parity(idx, result, reasons, prices, 1, "target", 1.15500)
+
+    def test_short_gap_above_stop_fills_at_open(self):
+        rules = _wick_rules(stop_pips=20, target_pips=40)
+        idx, result, reasons, prices = self._walk_and_apply(
+            side=-1,
+            closes=[1.15000, 1.15400],
+            opens=[1.15000, 1.15300],  # short SL 1.15200
+            highs=[1.15010, 1.15450],
+            lows=[1.14990, 1.15250],
+            rules=rules,
+        )
+        self._assert_parity(idx, result, reasons, prices, 1, "stop", 1.15300)
+
+    def test_wick_inside_bar_still_fills_at_level(self):
+        rules = _wick_rules(stop_pips=20, target_pips=40)
+        idx, result, reasons, prices = self._walk_and_apply(
+            side=1,
+            closes=[1.15000, 1.14900],
+            opens=[1.15000, 1.14950],  # opens above SL, wicks through
+            highs=[1.15010, 1.14960],
+            lows=[1.14990, 1.14750],
+            rules=rules,
+        )
+        self._assert_parity(idx, result, reasons, prices, 1, "stop", 1.14800)
+
+
+class TestNoEntryThrough:
+    def test_blocks_bars_started_at_or_before_cutoff(self):
+        idx = _bars(3)
+        result = walk(
+            raw_entries=_series([1, 0, -1], idx),
+            close_series=_series([1.15, 1.15, 1.15], idx),
+            start_state=_flat(),
+            bookmark_ts=(BASE_TS - timedelta(minutes=1)),
+            exit_rules=_rules(),
+            pip_size=PIP,
+            no_entry_through_ts=idx[0].to_pydatetime() + timedelta(seconds=30),
+        )
+        assert [(t.kind, t.bar_ts) for t in result.transitions] == [
+            ("open", idx[2].to_pydatetime())
+        ]

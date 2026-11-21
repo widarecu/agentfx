@@ -10,13 +10,19 @@ Source: SIFMA Holiday Schedule (https://www.sifma.org/resources/guides-playbooks
 """
 
 import logging
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import yaml
 
 logger = logging.getLogger(__name__)
+
+# The FX week closes Friday and reopens Sunday at 17:00 New York time
+# (22:00Z in winter, 21:00Z in summer).
+_NEW_YORK = ZoneInfo("America/New_York")
+_WEEKLY_ROLLOVER_NY = time(17, 0)
 
 # Singleton calendar cache
 _calendar: dict[str, Any] | None = None
@@ -358,5 +364,39 @@ def is_market_closure(gap_start: datetime, gap_end: datetime) -> tuple[bool, str
     # 5. Low-liquidity period check
     if _is_low_liquidity_period(gap_start, gap_end):
         return True, "low_liquidity"
+
+    return False, ""
+
+
+def market_closure_at(now: datetime) -> tuple[bool, str]:
+    """
+    Check whether the FX market is closed at a single instant.
+
+    Covers the weekly closure (Friday 17:00 to Sunday 17:00 New York time,
+    DST-aware) and the full-closure holidays in the calendar (UTC date).
+    Extended closures and early closes are not included: the market still
+    trades on those days.
+
+    Args:
+        now: Instant to check. Naive datetimes are treated as UTC.
+
+    Returns:
+        (True, "weekend"), (True, "holiday:YYYY-MM-DD") or (False, "").
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+
+    ny = now.astimezone(_NEW_YORK)
+    weekday = ny.weekday()
+    if (
+        weekday == 5
+        or (weekday == 4 and ny.time() >= _WEEKLY_ROLLOVER_NY)
+        or (weekday == 6 and ny.time() < _WEEKLY_ROLLOVER_NY)
+    ):
+        return True, "weekend"
+
+    today = now.astimezone(UTC).date()
+    if is_holiday(today):
+        return True, f"holiday:{today.isoformat()}"
 
     return False, ""

@@ -20,6 +20,12 @@ const ACTION_STYLES: Record<string, string> = {
     'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300',
   USER_ORDER_REJECTED:
     'bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300',
+  USER_ORDER_DUPLICATE_SKIPPED:
+    'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
+  USER_EXIT_ORDERS_PLACED:
+    'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300',
+  USER_EXIT_ORDERS_REJECTED:
+    'bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300',
   USER_POSITION_CLOSED:
     'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300',
   USER_CLOSE_REJECTED:
@@ -35,6 +41,8 @@ const ACTION_STYLES: Record<string, string> = {
   USER_SIGNAL_INDICATOR_DIVERGENCE:
     'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
   USER_ENTRY_MISSED:
+    'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
+  USER_AUTH_DEFERRED_MARKET_CLOSED:
     'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
   USER_KILL_PAPER:
     'bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300',
