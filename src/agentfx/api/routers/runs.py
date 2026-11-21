@@ -135,6 +135,11 @@ def list_run_orders(
     """
     List orders for a specific run.
     """
+    db_run = run_service.get_run(db, run_id=run_id)
+    if not db_run or (
+        db_run.user_id != current_user.id and current_user.role != models.UserRole.ADMIN
+    ):
+        raise HTTPException(status_code=404, detail="Run not found")
     return run_service.get_orders(
         db,
         run_id=run_id,

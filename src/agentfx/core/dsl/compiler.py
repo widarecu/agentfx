@@ -183,6 +183,7 @@ def _apply_exits(
     low: np.ndarray | None,
     exit_rules: ExitRules,
     pip_size: float,
+    open_: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[int, str], dict[int, float]]:
     """Walk bars with state and apply DSL exit rules to a raw position
     series.
@@ -199,6 +200,11 @@ def _apply_exits(
         model of how a broker-side stop / take-profit order fills.
         Trigger price = exactly the SL/TP price; the returned exit_price
         override reflects this so the trade P&L matches a real fill.
+        Gap-aware (AFX-106): when `open_` is given and the bar OPENS
+        already past the SL/TP (weekend gap, or price drifted past the
+        level while `min_hold_bars` suppressed exits), the fill is the
+        bar's open, not the level. A resting broker order can't fill
+        at a price the market never traded at.
 
     Order of exits (both modes): stop → target → max_hold → opposite.
     First match wins. Same-bar exit + re-entry in the same direction
@@ -258,10 +264,17 @@ def _apply_exits(
 
             if wick:
                 # Touch-based check against bar extremes.
+                bar_open = float(open_[t]) if open_ is not None else None
                 if in_position == 1:  # LONG
                     long_sl = entry_close - stop_price_dist
                     long_tp = entry_close + target_price_dist
-                    if low[t] <= long_sl:
+                    if bar_open is not None and bar_open <= long_sl:
+                        stop_hit = True
+                        trigger_price = bar_open
+                    elif bar_open is not None and bar_open >= long_tp:
+                        target_hit = True
+                        trigger_price = bar_open
+                    elif low[t] <= long_sl:
                         stop_hit = True
                         trigger_price = long_sl
                     elif high[t] >= long_tp:
@@ -270,7 +283,13 @@ def _apply_exits(
                 else:  # SHORT
                     short_sl = entry_close + stop_price_dist
                     short_tp = entry_close - target_price_dist
-                    if high[t] >= short_sl:
+                    if bar_open is not None and bar_open >= short_sl:
+                        stop_hit = True
+                        trigger_price = bar_open
+                    elif bar_open is not None and bar_open <= short_tp:
+                        target_hit = True
+                        trigger_price = bar_open
+                    elif high[t] >= short_sl:
                         stop_hit = True
                         trigger_price = short_sl
                     elif low[t] <= short_tp:
@@ -388,8 +407,9 @@ class CompiledDSLStrategy(Strategy):
         # available on OHLC DataFrames — pass them unconditionally.
         high = df["high"].to_numpy() if "high" in df.columns else None
         low = df["low"].to_numpy() if "low" in df.columns else None
+        open_ = df["open"].to_numpy() if "open" in df.columns else None
         final, exit_reasons_by_idx, exit_prices_by_idx = _apply_exits(
-            raw_pos, close, high, low, self.spec.exit, self.pip_size
+            raw_pos, close, high, low, self.spec.exit, self.pip_size, open_=open_
         )
         # Translate bar-index → timestamp so the backtest engine can
         # look up the reason (and wick-mode trigger price) by signal

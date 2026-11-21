@@ -7,7 +7,7 @@ This document defines standards for AI agents (Claude, planner, developer, teste
 ## Quick Start for Agents
 
 Before starting any task:
-1. Read `CLAUDE.md` for project overview
+1. Read `CLAUDE.md` for the hard rules, then the files its "Read before changing" table lists for your area
 2. Read `planning/BACKLOG.md` for current work items
 3. Read `planning/requirements/US-XXX.md` for specific requirements
 4. Check `planning/architecture/STANDARDS.md` for tech stack
@@ -403,8 +403,8 @@ try {
 | Action | Update |
 |--------|--------|
 | New endpoint | Add to API docs, update US-XXX |
-| New config option | Update CLAUDE.md, .env.example |
-| New agent | Update CLAUDE.md agent table |
+| New config option | Update .env.example (`make check-env-example`) |
+| New agent | Update the repo map in CLAUDE.md and `planning/ROADMAP.md` |
 | Schema change | Update relevant US-XXX API contract |
 | Breaking change | Create ADR |
 

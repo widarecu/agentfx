@@ -244,14 +244,20 @@ class TestIsTransientStopReason:
     def test_loss_cap_hit_is_not_transient(self):
         from agentfx.api.workers.paper_runner import _is_transient_stop_reason
 
-        # LOSS_CAP_HIT means a risk gate tripped — operator should
+        # Legacy (pre AFX-104) risk-gate halt — operator should
         # review the strategy, not blind-restart.
         assert _is_transient_stop_reason("LOSS_CAP_HIT") is False
+
+    def test_margin_closeout_is_not_transient(self):
+        from agentfx.api.workers.paper_runner import _is_transient_stop_reason
+
+        # AFX-104: OANDA margin call ended the run — never blind-restart.
+        assert _is_transient_stop_reason("MARGIN_CLOSEOUT") is False
 
     def test_broker_circuit_is_not_transient(self):
         from agentfx.api.workers.paper_runner import _is_transient_stop_reason
 
-        # Kill-switch DD — same as LOSS_CAP_HIT, needs review.
+        # OANDA circuit breaker open — needs review.
         assert _is_transient_stop_reason("BROKER_CIRCUIT") is False
 
     def test_oanda_auth_lost_is_not_transient(self):
@@ -640,6 +646,11 @@ class TestScanZombieRunning:
         db = self._fake_db([run])
         scheduled: list[str] = []
         with (
+            # AFX-92: the prior pid must be dead before a reschedule.
+            patch(
+                "agentfx.api.workers.paper_runner._pid_alive",
+                return_value=False,
+            ),
             patch(
                 "agentfx.api.workers.paper_runner.schedule_paper_run",
                 side_effect=lambda rid: scheduled.append(rid),
@@ -739,3 +750,246 @@ class TestScanZombieRunning:
 
         assert restarted == 0
         assert scheduled == []
+
+
+class TestZombieLivePid:
+    """AFX-92: zombie detection must never start a second runner while
+    the previous runner process is still alive."""
+
+    def _stale_run(self, pid):
+        from datetime import UTC, datetime, timedelta
+
+        from agentfx.api.models import RunStatus
+        from agentfx.api.workers.paper_runner import _HEARTBEAT_STALE_SECONDS
+
+        now = datetime(2026, 11, 13, 22, 32, 25, tzinfo=UTC)
+        stale_hb = now - timedelta(seconds=_HEARTBEAT_STALE_SECONDS + 74)
+        run = SimpleNamespace(
+            id="run_1793531450652_paper_AUD_USD_M30_ed6038361a",
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+            approved_at=now - timedelta(days=12),
+            parameters={"last_heartbeat_at": stale_hb.isoformat()},
+            process_pid=pid,
+            pair="AUD_USD",
+            user_id=42,
+        )
+        return run, now
+
+    def _fake_db(self, candidates):
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = candidates
+        return db
+
+    def test_stale_heartbeat_with_live_unmanaged_pid_does_not_reschedule(self):
+        """Repro: RUNNING row, heartbeat older than 900s, process_pid
+        still alive. Before the fix the scan scheduled a second runner."""
+        import subprocess
+
+        from agentfx.api.models import RunStatus
+        from agentfx.api.workers.paper_runner import scan_and_restart_zombie_running
+
+        live = subprocess.Popen(["sleep", "60"])
+        try:
+            run, now = self._stale_run(live.pid)
+            db = self._fake_db([run])
+            scheduled: list[str] = []
+            with (
+                patch(
+                    "agentfx.api.workers.paper_runner.schedule_paper_run",
+                    side_effect=lambda rid: scheduled.append(rid),
+                ),
+                patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()),
+            ):
+                restarted = scan_and_restart_zombie_running(db=db, now=now)
+
+            assert restarted == 0
+            assert scheduled == []
+            assert run.status == RunStatus.RUNNING
+            assert run.process_pid == live.pid
+            assert "auto_restart_attempts" not in run.parameters
+            assert live.poll() is None, "must not signal a process it didn't spawn"
+        finally:
+            live.kill()
+            live.wait()
+
+    def test_live_managed_child_is_terminated_and_reaped_before_reschedule(self):
+        import threading
+
+        from agentfx.api.models import RunStatus
+        from agentfx.api.workers import paper_runner as worker
+
+        events: list[str] = []
+        exited = threading.Event()
+        proc = MagicMock()
+        proc.pid = 37
+        proc.terminate.side_effect = lambda: (events.append("terminate"), exited.set())
+
+        handle = worker._ChildHandle(proc=proc, exited=exited)
+        run, now = self._stale_run(37)
+        db = self._fake_db([run])
+        with (
+            patch.dict(worker._CHILDREN, {37: handle}, clear=True),
+            patch(
+                "agentfx.api.workers.paper_runner.schedule_paper_run",
+                side_effect=lambda rid: events.append(f"schedule:{rid}"),
+            ),
+            patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()),
+        ):
+            restarted = worker.scan_and_restart_zombie_running(db=db, now=now)
+
+        assert restarted == 1
+        assert events == ["terminate", f"schedule:{run.id}"]
+        assert handle.superseded is True
+        proc.kill.assert_not_called()
+        assert run.status == RunStatus.APPROVED
+        assert run.process_pid is None
+
+    def test_managed_child_that_ignores_sigterm_is_killed(self):
+        import threading
+
+        from agentfx.api.workers import paper_runner as worker
+
+        exited = threading.Event()
+        proc = MagicMock()
+        proc.pid = 37
+        proc.kill.side_effect = exited.set
+        handle = worker._ChildHandle(proc=proc, exited=exited)
+        run, now = self._stale_run(37)
+        db = self._fake_db([run])
+        scheduled: list[str] = []
+        with (
+            patch.dict(worker._CHILDREN, {37: handle}, clear=True),
+            patch.object(worker, "_TERMINATE_GRACE_SECONDS", 0.01),
+            patch(
+                "agentfx.api.workers.paper_runner.schedule_paper_run",
+                side_effect=lambda rid: scheduled.append(rid),
+            ),
+            patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()),
+        ):
+            restarted = worker.scan_and_restart_zombie_running(db=db, now=now)
+
+        proc.terminate.assert_called_once()
+        proc.kill.assert_called_once()
+        assert restarted == 1
+        assert scheduled == [run.id]
+
+    def test_managed_child_that_survives_sigkill_is_not_rescheduled(self):
+        import threading
+
+        from agentfx.api.models import RunStatus
+        from agentfx.api.workers import paper_runner as worker
+
+        proc = MagicMock()
+        proc.pid = 37
+        handle = worker._ChildHandle(proc=proc, exited=threading.Event())
+        run, now = self._stale_run(37)
+        db = self._fake_db([run])
+        scheduled: list[str] = []
+        with (
+            patch.dict(worker._CHILDREN, {37: handle}, clear=True),
+            patch.object(worker, "_TERMINATE_GRACE_SECONDS", 0.01),
+            patch.object(worker, "_KILL_GRACE_SECONDS", 0.01),
+            patch(
+                "agentfx.api.workers.paper_runner.schedule_paper_run",
+                side_effect=lambda rid: scheduled.append(rid),
+            ),
+            patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()),
+        ):
+            restarted = worker.scan_and_restart_zombie_running(db=db, now=now)
+
+        assert restarted == 0
+        assert scheduled == []
+        assert run.status == RunStatus.RUNNING
+
+    def test_dead_pid_is_rescheduled(self):
+        from agentfx.api.models import RunStatus
+        from agentfx.api.workers import paper_runner as worker
+
+        run, now = self._stale_run(793)
+        db = self._fake_db([run])
+        scheduled: list[str] = []
+        with (
+            patch.dict(worker._CHILDREN, {}, clear=True),
+            patch.object(worker, "_pid_alive", return_value=False),
+            patch(
+                "agentfx.api.workers.paper_runner.schedule_paper_run",
+                side_effect=lambda rid: scheduled.append(rid),
+            ),
+            patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()),
+        ):
+            restarted = worker.scan_and_restart_zombie_running(db=db, now=now)
+
+        assert restarted == 1
+        assert scheduled == [run.id]
+        assert run.status == RunStatus.APPROVED
+
+    def test_decision_row_reports_heartbeat_age_not_run_age(self):
+        from agentfx.api.workers import paper_runner as worker
+
+        run, now = self._stale_run(None)
+        db = self._fake_db([run])
+        with (
+            patch(
+                "agentfx.api.workers.paper_runner.schedule_paper_run",
+                MagicMock(),
+            ),
+            patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()),
+        ):
+            worker.scan_and_restart_zombie_running(db=db, now=now)
+
+        row = db.add.call_args.args[0]
+        assert row.outputs_json["waited_seconds"] == pytest.approx(
+            worker._HEARTBEAT_STALE_SECONDS + 74
+        )
+        assert "backoff" not in row.reasoning_text
+
+    def test_watchdog_skips_crash_marking_for_superseded_child(self):
+        import threading
+
+        from agentfx.api.workers import paper_runner as worker
+
+        proc = MagicMock()
+        proc.pid = 37
+        proc.exitcode = -15
+        handle = worker._ChildHandle(
+            proc=proc, exited=threading.Event(), superseded=True
+        )
+        with (
+            patch.dict(worker._CHILDREN, {37: handle}, clear=True),
+            patch.object(worker, "_mark_run_failed_after_crash") as mark_failed,
+        ):
+            worker._start_watchdog("run_x", proc, handle)
+            assert handle.exited.wait(2.0)
+            mark_failed.assert_not_called()
+            assert 37 not in worker._CHILDREN
+
+    def test_replacement_runner_gets_grace_after_zombie_restart(self):
+        """A zombie restart clears `last_heartbeat_at` but keeps the
+        original `approved_at`; the replacement must still get a full
+        stale window to emit its first heartbeat."""
+        from datetime import timedelta
+
+        from agentfx.api.models import RunStatus
+        from agentfx.api.workers import paper_runner as worker
+
+        run, now = self._stale_run(793)
+        run.parameters = {
+            "auto_restart_attempts": 1,
+            "auto_restart_last_at": (now - timedelta(seconds=240)).isoformat(),
+        }
+        db = self._fake_db([run])
+        with (
+            patch.object(worker, "_ensure_prior_runner_dead") as ensure_dead,
+            patch(
+                "agentfx.api.workers.paper_runner.schedule_paper_run",
+            ) as schedule,
+            patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()),
+        ):
+            restarted = worker.scan_and_restart_zombie_running(db=db, now=now)
+
+        assert restarted == 0
+        ensure_dead.assert_not_called()
+        schedule.assert_not_called()
+        assert run.status == RunStatus.RUNNING

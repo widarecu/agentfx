@@ -43,6 +43,7 @@ import {
   granularityToSeconds,
 } from '../utils/candles';
 import { formatUTC } from '../utils/time';
+import { describePaperLossHalt } from '../utils/paperLossHalt';
 
 const POLL_INTERVAL_MS = 5_000;
 const EQUITY_POLL_INTERVAL_MS = 60_000;
@@ -478,23 +479,6 @@ export default function MobilePaperRunDetail(): React.ReactElement {
     [lastPolledAt, nowTick],
   );
 
-  const lossCapPct = run?.risk_config?.loss_cap_pct ?? null;
-  // Cap gauge: bar range is [-lossCapPct, +lossCapPct]; halt tick is
-  // at 0% (leftmost). Marker sits at the current pnl-pct scaled onto
-  // this range. Below 50%-of-cap = SAFE, 50–80% = WARNING, 80%+ = NEAR HALT.
-  const capUsage =
-    lossCapPct != null && pnlPct != null
-      ? Math.max(0, -pnlPct) / lossCapPct
-      : 0;
-  const capLabel =
-    capUsage >= 0.8 ? 'Near halt' : capUsage >= 0.5 ? 'Warning' : 'Safe';
-  const capLabelClass =
-    capUsage >= 0.8
-      ? 'text-rose-400 animate-pulse'
-      : capUsage >= 0.5
-        ? 'text-amber-400'
-        : 'text-emerald-400';
-
   const spark = useMemo(
     () => equityToSparkline(equity, run?.snapshot_balance ?? null),
     [equity, run?.snapshot_balance],
@@ -863,52 +847,18 @@ export default function MobilePaperRunDetail(): React.ReactElement {
           </button>
         </section>
 
-        {/* 5. LOSS CAP GAUGE (soft-halt threshold) */}
-        {lossCapPct != null && (
-          <section
-            className="bg-slate-800 border border-slate-700 rounded-xl p-4"
-            aria-label="P&L versus soft loss cap"
-          >
-            <div className="flex items-center justify-between">
-              <span className="text-[10px] uppercase tracking-wider text-slate-500">
-                Loss cap (soft halt)
-              </span>
-              <span
-                className={`text-[10px] font-mono uppercase tracking-wider ${capLabelClass}`}
-              >
-                {capLabel}
-              </span>
-            </div>
-            <LossCapBar pnlPct={pnlPct ?? 0} lossCapPct={lossCapPct} />
-            <div className="flex items-center justify-between mt-2 text-[10px] font-mono text-slate-500">
-              <span className="text-rose-400">
-                −{lossCapPct.toFixed(2)}% halt
-              </span>
-              <span>0</span>
-              <span className="text-slate-400">
-                +{lossCapPct.toFixed(2)}%
-              </span>
-            </div>
-            <div className="mt-2 text-[11px] text-slate-400">
-              <span className={`font-mono ${pnlColor}`}>
-                {formatPct(pnlPct, { signed: true })}
-              </span>{' '}
-              today ·{' '}
-              <span className="font-mono">
-                {run.snapshot_balance != null && pnlPct != null
-                  ? formatUSD(
-                      Math.max(
-                        0,
-                        run.snapshot_balance * (lossCapPct / 100) +
-                          (pnlPct / 100) * run.snapshot_balance,
-                      ),
-                    )
-                  : '—'}
-              </span>{' '}
-              from halt threshold
-            </div>
-          </section>
-        )}
+        {/* 5. LOSS HALT (AFX-104: paper never halts on loss) */}
+        <section
+          className="bg-slate-800 border border-slate-700 rounded-xl p-4"
+          aria-label="Loss halt"
+        >
+          <div className="text-[10px] uppercase tracking-wider text-slate-500">
+            Loss halt
+          </div>
+          <div className="mt-1 text-[11px] text-slate-300">
+            {describePaperLossHalt(run.risk_config)}
+          </div>
+        </section>
 
         {/* 6. SUB-ROUTES GRID */}
         <section
@@ -1209,69 +1159,6 @@ function CandlePreview({ candles }: { candles: CandleData[] }) {
         );
       })}
     </svg>
-  );
-}
-
-function LossCapBar({
-  pnlPct,
-  lossCapPct,
-}: {
-  pnlPct: number;
-  lossCapPct: number;
-}) {
-  // Range: [-lossCapPct, +lossCapPct]. Marker at pnlPct.
-  const halfRange = lossCapPct;
-  const clamped = Math.max(-halfRange, Math.min(halfRange, pnlPct));
-  const markerPct = ((clamped + halfRange) / (halfRange * 2)) * 100;
-  const markerColor = pnlPct >= 0 ? '#34d399' : '#fb7185';
-  const gradient =
-    'linear-gradient(90deg, rgba(244,63,94,0.45) 0%, rgba(244,63,94,0.20) 20%, rgba(100,116,139,0.25) 40%, rgba(100,116,139,0.25) 50%, rgba(52,211,153,0.20) 60%, rgba(52,211,153,0.45) 100%)';
-  return (
-    <div
-      className="mt-3 relative border border-slate-700 rounded-md overflow-hidden"
-      style={{ height: 24, background: gradient }}
-      role="progressbar"
-      aria-valuemin={-halfRange}
-      aria-valuemax={halfRange}
-      aria-valuenow={pnlPct}
-    >
-      <div
-        className="absolute"
-        style={{
-          left: 0,
-          top: -6,
-          bottom: -6,
-          width: 2,
-          background: '#fb7185',
-          boxShadow: '0 0 0 3px rgba(251,113,133,0.25)',
-        }}
-        title={`Auto-halt −${lossCapPct.toFixed(2)}%`}
-      />
-      <div
-        className="absolute"
-        style={{
-          left: '50%',
-          top: -4,
-          bottom: -4,
-          width: 1,
-          background: '#475569',
-        }}
-      />
-      <div
-        className="absolute"
-        style={{
-          left: `${markerPct}%`,
-          top: -8,
-          bottom: -8,
-          width: 3,
-          background: markerColor,
-          borderRadius: 2,
-          boxShadow: `0 0 0 3px ${markerColor}40`,
-          transform: 'translateX(-50%)',
-        }}
-        title={`Now ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%`}
-      />
-    </div>
   );
 }
 

@@ -34,6 +34,7 @@ halted with zero trades because of that gap. US-024 closes it.
 from __future__ import annotations
 
 import logging
+import os
 import time
 import traceback
 import uuid
@@ -86,6 +87,19 @@ DEFAULT_LOOKBACK_BARS = 500
 # outages. 150s tolerance → M1 threshold 210s = 3.5 bar lengths.
 INGEST_LAG_TOLERANCE_SECONDS = 150
 
+# AFX-87: on late-polled pairs the just-closed bar can land in the DB
+# after the signal tick. Instead of rejecting the tick as stale and
+# waiting a full period for the next one, re-check every few seconds
+# until the bar arrives or the cap runs out. Observed close-to-complete
+# tails reach ~240s on M30, so cap at 300s (and never past the next
+# boundary on short granularities).
+JUST_CLOSED_BAR_RETRY_SECONDS = 5.0
+JUST_CLOSED_BAR_MAX_WAIT_SECONDS = 300.0
+# OANDA aligns H4/D bars to 17:00 America/New_York, not the UTC epoch
+# grid the scheduler uses (AFX-88), so `boundary - g` is never an
+# OANDA bar there. Only wait on granularities up to H1.
+JUST_CLOSED_BAR_WAIT_MAX_GRANULARITY_SECONDS = 3600
+
 # Consecutive non-auth OANDA failures on the balance refresh before we
 # give up and halt with `BROKER_NETWORK`.
 #
@@ -100,6 +114,45 @@ INGEST_LAG_TOLERANCE_SECONDS = 150
 # (15 + 30 + 60 + 120 + 240 = 465s) ≈ 15.25 min total tolerance.
 _BALANCE_RETRY_LIMIT = 6
 _BALANCE_RETRY_BACKOFF_SECONDS = (15.0, 30.0, 60.0, 120.0, 240.0)
+
+
+# AFX-93: decision-log action for an OANDA 401/403 seen while the FX
+# market is closed. OANDA weekend maintenance returns transient 401s;
+# off-hours the runner retries instead of halting with OANDA_AUTH_LOST.
+_AUTH_DEFERRED_ACTION = "USER_AUTH_DEFERRED_MARKET_CLOSED"
+
+
+# AFX-92: wall-clock heartbeat cadence. Must stay well under the
+# supervisor's `_HEARTBEAT_STALE_SECONDS` (900s) even when one adapter
+# call blocks for its full retry ladder (~300s).
+_HEARTBEAT_INTERVAL_SECONDS = 300.0
+
+
+def _persist_heartbeat(
+    db, run, iteration: int, now_dt: datetime, *, phase: str | None = None
+) -> None:
+    """Log + persist `run.parameters['last_heartbeat_at']`. Never raises."""
+    logger.info(
+        "paper runner heartbeat: run=%s iter=%d balance=%.2f pnl=%.2f%s",
+        run.id,
+        iteration,
+        run.current_balance or 0.0,
+        run.pnl or 0.0,
+        f" phase={phase}" if phase else "",
+    )
+    try:
+        params = dict(run.parameters or {})
+        params["last_heartbeat_at"] = now_dt.isoformat()
+        run.parameters = params
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(run, "parameters")
+        db.commit()
+    except Exception:  # noqa: BLE001 — never let heartbeat crash the loop
+        logger.exception(
+            "paper runner: heartbeat persist failed on %s (loop continues)",
+            run.id,
+        )
 
 
 def _balance_retry_sleep_seconds(consecutive_failures: int) -> float:
@@ -228,6 +281,59 @@ def align_to_granularity(now_ts: float, granularity_seconds: int) -> float:
     return now_ts + (granularity_seconds - remainder)
 
 
+def _due_boundary(now_ts: float, tick_offset: float, granularity_seconds: int) -> float:
+    """Latest granularity boundary whose signal tick (boundary + offset)
+    is at or before `now_ts`."""
+    if granularity_seconds <= 0:
+        return now_ts
+    shifted = now_ts - tick_offset
+    return shifted - (shifted % granularity_seconds)
+
+
+def _bar_wait_cap_seconds(granularity_seconds: int, tick_offset: float) -> float:
+    """How long past the tick to wait for the just-closed bar (AFX-87)."""
+    if granularity_seconds > JUST_CLOSED_BAR_WAIT_MAX_GRANULARITY_SECONDS:
+        return 0.0
+    return max(
+        0.0,
+        min(JUST_CLOSED_BAR_MAX_WAIT_SECONDS, granularity_seconds - tick_offset),
+    )
+
+
+def _just_closed_bar_missing(
+    *,
+    candle_fetch_fn,
+    instrument: str,
+    granularity_seconds: int,
+    expected_bar_ts: datetime,
+) -> bool:
+    """True when the newest complete bar is exactly one bar behind
+    `expected_bar_ts`, i.e. the ingester hasn't marked the just-closed
+    bar complete yet.
+
+    Bigger gaps (weekend, outage, sparse M1 minutes) return False so
+    the stale guard in `_signal_tick` handles them exactly as before.
+    Uses the cheap last-N-bars fetch, not the fold-anchored range.
+    """
+    granularity = _seconds_to_granularity(granularity_seconds)
+    try:
+        df = candle_fetch_fn(instrument, granularity, 3)
+    except Exception:  # noqa: BLE001 — fall through to the real tick
+        logger.debug("paper runner: just-closed bar probe failed", exc_info=True)
+        return False
+    if df is None or len(df) == 0:
+        return False
+    latest = df.index[-1]
+    if hasattr(latest, "to_pydatetime"):
+        latest = latest.to_pydatetime()
+    if not isinstance(latest, datetime):
+        return False
+    if latest.tzinfo is None:
+        latest = latest.replace(tzinfo=UTC)
+    previous_bar_ts = expected_bar_ts - timedelta(seconds=granularity_seconds)
+    return previous_bar_ts <= latest < expected_bar_ts
+
+
 def pip_size_for_pair(pair: str) -> float:
     """0.01 for JPY crosses, 0.0001 for majors.
 
@@ -262,6 +368,29 @@ def _ensure_started_at(run) -> None:
         from datetime import UTC, datetime
 
         run.started_at = datetime.now(UTC)
+
+
+def _claim_runner(db, run) -> bool:
+    """AFX-50: atomically move the run APPROVED -> RUNNING for this process.
+
+    Every scheduling path (approve, resume, boot recovery, auto-restart)
+    sets APPROVED before spawning a runner. If two runners get spawned
+    for one run, only the first flips the row; the second sees zero
+    rows updated and must exit before it can trade.
+    """
+    from agentfx.api.models import Run, RunStatus
+
+    claimed = (
+        db.query(Run)
+        .filter(Run.id == run.id, Run.status == RunStatus.APPROVED)
+        .update(
+            {Run.status: RunStatus.RUNNING, Run.process_pid: os.getpid()},
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    db.refresh(run)
+    return claimed == 1
 
 
 def run_paper_run(
@@ -352,7 +481,14 @@ def run_paper_run(
                 )
                 strategy = None
 
-        run.status = RunStatus.RUNNING
+        if not _claim_runner(db, run):
+            logger.warning(
+                "paper runner: run %s is no longer APPROVED (status=%s); "
+                "another runner already claimed it, exiting without trading",
+                run_id,
+                run.status,
+            )
+            return
         _ensure_started_at(run)
         db.commit()
 
@@ -562,11 +698,6 @@ def _execute_loop(
     """
     from agentfx.adapters.oanda import OandaCircuitOpen
     from agentfx.api.models import RunStatus
-    from agentfx.services.paper_policy import (
-        RiskState,
-        check_kill_switch_dd,
-        check_loss_cap,
-    )
 
     if now_fn is None:  # pragma: no cover — trivial
 
@@ -591,13 +722,14 @@ def _execute_loop(
     from agentfx.api.core.config import settings
 
     _tick_offset = float(settings.SIGNAL_TICK_OFFSET_SECONDS)
+    _bar_wait_cap = _bar_wait_cap_seconds(granularity_seconds, _tick_offset)
+    # AFX-87: boundary whose tick is waiting for its just-closed bar.
+    pending_boundary: float | None = None
     next_signal_at = (
         align_to_granularity(now_fn(), granularity_seconds) + _tick_offset
         if signal_enabled
         else float("inf")
     )
-
-    _snapshot_balance_if_needed(db=db, run=run, client=client)
 
     # Consecutive non-auth OANDA failures on the balance refresh. A
     # single 15s read-timeout no longer crashes the subprocess (Wilson
@@ -605,6 +737,8 @@ def _execute_loop(
     # and only after `_BALANCE_RETRY_LIMIT` failures in a row do we halt
     # cleanly with `BROKER_NETWORK`. Reset to 0 on any successful call.
     consecutive_balance_failures = 0
+    # AFX-93: consecutive auth failures while the market is closed.
+    closed_market_auth_failures = 0
 
     # Wilson 2026-08-24: subprocess heartbeat. Persisted to
     # `run.parameters['last_heartbeat_at']` every ~5 minutes of
@@ -615,9 +749,38 @@ def _execute_loop(
     # restart them. Also grep-able signature in Railway logs — the
     # absence of "paper runner heartbeat" lines after N minutes is
     # proof of silent death. Loop iterates every ~5s so 60 = ~5 min.
+    #
+    # AFX-92: the heartbeat also fires on elapsed wall time, and is
+    # forced between steps of the balance retry / 401 ladder. One
+    # iteration can block for minutes inside the adapter's own retries,
+    # so an iteration count alone let a live runner look stale to the
+    # supervisor, which then started a second runner.
     _HEARTBEAT_INTERVAL_ITERATIONS = 60
+    last_heartbeat: datetime | None = None
 
+    def _heartbeat(*, phase: str | None = None, force: bool = False) -> None:
+        nonlocal last_heartbeat
+        now_dt = datetime.now(UTC)
+        due = (
+            force
+            or iteration == 1
+            or iteration % _HEARTBEAT_INTERVAL_ITERATIONS == 0
+            or (now_dt - last_heartbeat).total_seconds() >= _HEARTBEAT_INTERVAL_SECONDS
+        )
+        if not due:
+            return
+        last_heartbeat = now_dt
+        _persist_heartbeat(db, run, iteration, now_dt, phase=phase)
+
+    # Heartbeat before the first broker call: a freshly (re)started
+    # runner whose first balance call ladders must not look like a
+    # zombie to the supervisor before it has had a chance to beat.
     iteration = 0
+    last_heartbeat = datetime.now(UTC)
+    _persist_heartbeat(db, run, iteration, last_heartbeat, phase="startup")
+
+    _snapshot_balance_if_needed(db=db, run=run, client=client)
+
     while True:
         if max_iterations is not None and iteration >= max_iterations:
             logger.info(
@@ -657,6 +820,7 @@ def _execute_loop(
         # can prompt the user to re-verify.
         from agentfx.adapters.oanda import OandaError
 
+        balance_exc: OandaError | None = None
         try:
             balance = client.get_account_balance()
         except OandaCircuitOpen:
@@ -664,115 +828,82 @@ def _execute_loop(
             _flatten_and_halt(db, run, client, reason="BROKER_CIRCUIT")
             return
         except OandaError as exc:
-            if _is_auth_error(exc):
-                logger.warning(
-                    "paper runner: %s got 401 on balance; attempting cred refresh",
+            balance_exc = exc
+        if balance_exc is not None and _is_auth_error(balance_exc):
+            outcome = _resolve_auth_failure(
+                db,
+                run,
+                balance_exc,
+                now=datetime.fromtimestamp(now_fn(), tz=UTC),
+                prior_closed_failures=closed_market_auth_failures,
+                heartbeat=_heartbeat,
+            )
+            if outcome.kind == "halt":
+                logger.error(
+                    "paper runner: %s auth-refresh failed; halting oanda_auth_lost",
                     run.id,
                 )
-                new_client = _recover_from_auth_loss(db, run, exc)
-                if new_client is None:
-                    logger.error(
-                        "paper runner: %s auth-refresh failed; halting oanda_auth_lost",
-                        run.id,
-                    )
-                    _flatten_and_halt(db, run, client, reason="OANDA_AUTH_LOST")
-                    return
-                client = new_client
-                balance = client.get_account_balance()
-            else:
-                # Non-auth OANDA failure — most commonly a read timeout
-                # after the adapter's own 5-retry chain gave up
-                # (`connection_error:` prefix). Wilson 2026-08-14: this
-                # used to `raise` and kill the subprocess; the runner
-                # now skips the tick and retries next iteration. If it
-                # keeps failing we halt cleanly via BROKER_NETWORK
-                # instead of leaving the position stranded on OANDA.
-                consecutive_balance_failures += 1
-                if consecutive_balance_failures >= _BALANCE_RETRY_LIMIT:
-                    logger.error(
-                        "paper runner: %s balance refresh failed %d times "
-                        "in a row (%s); halting broker_network",
-                        run.id,
-                        consecutive_balance_failures,
-                        exc,
-                    )
-                    _flatten_and_halt(db, run, client, reason="BROKER_NETWORK")
-                    return
-                sleep_seconds = _balance_retry_sleep_seconds(
-                    consecutive_balance_failures
-                )
-                logger.warning(
-                    "paper runner: %s balance refresh failed (%s); "
-                    "skipping tick (%d/%d), backing off %.0fs",
-                    run.id,
-                    exc,
-                    consecutive_balance_failures,
-                    _BALANCE_RETRY_LIMIT,
-                    sleep_seconds,
-                )
-                sleep_fn(sleep_seconds)
+                _flatten_and_halt(db, run, client, reason="OANDA_AUTH_LOST")
+                return
+            if outcome.kind == "deferred":
+                closed_market_auth_failures += 1
+                _heartbeat(phase="auth-deferred", force=True)
+                sleep_fn(_balance_retry_sleep_seconds(closed_market_auth_failures))
                 continue
+            if outcome.kind == "recovered":
+                client = outcome.client
+                balance = outcome.balance
+                balance_exc = None
+            else:
+                balance_exc = outcome.error
+        if balance_exc is not None:
+            # Non-auth OANDA failure — most commonly a read timeout
+            # after the adapter's own 5-retry chain gave up
+            # (`connection_error:` prefix). Wilson 2026-08-14: this
+            # used to `raise` and kill the subprocess; the runner
+            # now skips the tick and retries next iteration. If it
+            # keeps failing we halt cleanly via BROKER_NETWORK
+            # instead of leaving the position stranded on OANDA.
+            consecutive_balance_failures += 1
+            if consecutive_balance_failures >= _BALANCE_RETRY_LIMIT:
+                logger.error(
+                    "paper runner: %s balance refresh failed %d times "
+                    "in a row (%s); halting broker_network",
+                    run.id,
+                    consecutive_balance_failures,
+                    balance_exc,
+                )
+                _flatten_and_halt(db, run, client, reason="BROKER_NETWORK")
+                return
+            sleep_seconds = _balance_retry_sleep_seconds(consecutive_balance_failures)
+            logger.warning(
+                "paper runner: %s balance refresh failed (%s); "
+                "skipping tick (%d/%d), backing off %.0fs",
+                run.id,
+                balance_exc,
+                consecutive_balance_failures,
+                _BALANCE_RETRY_LIMIT,
+                sleep_seconds,
+            )
+            _heartbeat(phase="balance-retry", force=True)
+            sleep_fn(sleep_seconds)
+            continue
         consecutive_balance_failures = 0
+        closed_market_auth_failures = 0
         run.current_balance = balance["balance"]
         run.pnl = balance["balance"] - (run.snapshot_balance or 0.0)
         db.commit()
 
         # Heartbeat: log INFO + persist `last_heartbeat_at` every
-        # ~5 min (60 iterations at 5s cadence) of healthy iteration.
-        # Supervisor uses this to detect zombie RUNNING rows and
-        # restart them. Emitted on iteration 1 too so a fresh
-        # subprocess registers a heartbeat immediately.
-        if iteration == 1 or iteration % _HEARTBEAT_INTERVAL_ITERATIONS == 0:
-            heartbeat_iso = datetime.now(UTC).isoformat()
-            logger.info(
-                "paper runner heartbeat: run=%s iter=%d balance=%.2f pnl=%.2f",
-                run.id,
-                iteration,
-                run.current_balance or 0.0,
-                run.pnl or 0.0,
-            )
-            try:
-                params = dict(run.parameters or {})
-                params["last_heartbeat_at"] = heartbeat_iso
-                run.parameters = params
-                from sqlalchemy.orm.attributes import flag_modified as _flag_hb
+        # ~5 min of healthy iteration. Supervisor uses this to detect
+        # zombie RUNNING rows and restart them. Emitted on iteration 1
+        # too so a fresh subprocess registers a heartbeat immediately.
+        _heartbeat()
 
-                _flag_hb(run, "parameters")
-                db.commit()
-            except Exception:  # noqa: BLE001 — never let heartbeat crash the loop
-                logger.exception(
-                    "paper runner: heartbeat persist failed on %s (loop continues)",
-                    run.id,
-                )
-
-        # Evaluate risk gates against the current balance. The health
-        # tick only checks halt-gates (kill_switch, loss cap);
-        # position-size gating happens at order-placement time inside
-        # `_signal_tick` where the real proposed units are known.
-        # v0.6.2 (Wilson UAT 2026-07-19): previously called
-        # `evaluate_all(state, proposed_units=state.max_position_size_units)`
-        # which compared max against itself — a no-op check that
-        # forced legacy runs to carry a stale `max_position_size_units`
-        # value even though sizing is fully dynamic.
-        risk_cfg = run.risk_config or {}
-        state = RiskState(
-            snapshot_balance=run.snapshot_balance or 0.0,
-            current_balance=run.current_balance,
-            max_position_size_units=int(
-                risk_cfg.get("max_position_size_units") or 10_000_000
-            ),
-            loss_cap_pct=float(risk_cfg.get("loss_cap_pct", 2.0)),
-            kill_switch_dd_pct=float(risk_cfg.get("kill_switch_dd_pct", 5.0)),
-        )
-        for check in (check_kill_switch_dd(state), check_loss_cap(state)):
-            if not check.ok:
-                logger.info(
-                    "paper runner: gate refused on %s (%s); halting",
-                    run.id,
-                    check.reason,
-                )
-                _flatten_and_halt(db, run, client, reason=check.reason)
-                return
+        # AFX-104: paper has no loss-based auto-halts (CLAUDE.md rule
+        # 11). Stored `loss_cap_pct` / `kill_switch_dd_pct` on legacy
+        # `risk_config` blobs are ignored; OANDA's margin closeout is the
+        # only loss guardrail (see `_halt_on_margin_closeout`).
 
         # ─── Broker transaction reconciliation (T1 — every 12 ticks) ─
         # Every ~60s, poll OANDA's authoritative transaction log for
@@ -795,52 +926,105 @@ def _execute_loop(
                         result.transactions_seen,
                     )
             except Exception:  # noqa: BLE001
+                result = None
                 logger.exception(
                     "reconciler: failed on run %s (will retry next tick)", run.id
                 )
+            if result is not None and result.margin_closeout:
+                logger.warning(
+                    "paper runner: %s OANDA margin closeout; halting", run.id
+                )
+                _flatten_and_halt(db, run, client, reason="MARGIN_CLOSEOUT")
+                return
 
         # ─── Signal tick (only when past the boundary) ───────────────
         now = now_fn()
         if signal_enabled and now >= next_signal_at:
-            try:
-                _signal_tick(
-                    db=db,
-                    run=run,
-                    client=client,
-                    strategy=strategy,
-                    candle_fetch_fn=candle_fetch_fn,
-                    instrument=instrument,
-                    granularity_seconds=granularity_seconds,
-                    now_utc=datetime.fromtimestamp(now, tz=UTC),
-                )
-            except Exception as exc:  # noqa: BLE001
-                # Signal work is best-effort — a compilation failure /
-                # arithmetic overflow / OANDA network blip mustn't take
-                # the whole runner down. Log and continue; the health
-                # tick keeps the kill switch responsive.
-                logger.exception(
-                    "paper runner: signal tick failed on %s; skipping this bar",
+            due_boundary = _due_boundary(now, _tick_offset, granularity_seconds)
+            if pending_boundary is not None and due_boundary > pending_boundary:
+                # The loop stalled (e.g. balance retries) past the next
+                # boundary's tick; the old wait's freshness exemption no
+                # longer applies, so start over on the current boundary.
+                logger.info(
+                    "paper runner: %s dropping wait for %s bar %s; "
+                    "loop resumed past the next boundary",
                     run.id,
+                    instrument,
+                    datetime.fromtimestamp(
+                        pending_boundary - granularity_seconds, tz=UTC
+                    ).isoformat(),
                 )
-                _record_tick_failure(db=db, run=run, exc=exc)
-            else:
-                _clear_tick_failure(db=db, run=run)
-            # Advance to the NEXT boundary strictly after `now`.
-            # `align_to_granularity` handles both cases: if `now` is
-            # exactly on a boundary it returns `now + granularity` (so
-            # we don't re-fire the current tick); otherwise it rounds
-            # up to the next boundary.
-            #
-            # BUG FIXED 2026-07-15 (Wilson UAT): previously we did
-            # `align(now + granularity, granularity)` — that overshoots
-            # by one bar. If tick fires at 12:47:00.230, `now + 60` is
-            # 12:48:00.230 which rounds up to 12:49:00 — skipping the
-            # 12:48 boundary. Result: every M1 tick was on 2-minute
-            # cadence, missing half the signals. Wilson lost the 13:03
-            # MACD cross_up because the 13:06 catch-up tick was skipped.
-            next_signal_at = (
-                align_to_granularity(now, granularity_seconds) + _tick_offset
+                pending_boundary = None
+            if pending_boundary is None:
+                pending_boundary = due_boundary
+            boundary = pending_boundary
+            wait_deadline = boundary + _tick_offset + _bar_wait_cap
+            expected_bar_ts = datetime.fromtimestamp(
+                boundary - granularity_seconds, tz=UTC
             )
+            if now < wait_deadline and _just_closed_bar_missing(
+                candle_fetch_fn=candle_fetch_fn,
+                instrument=instrument,
+                granularity_seconds=granularity_seconds,
+                expected_bar_ts=expected_bar_ts,
+            ):
+                if now - boundary - _tick_offset < JUST_CLOSED_BAR_RETRY_SECONDS:
+                    logger.info(
+                        "paper runner: %s waiting for just-closed %s bar %s "
+                        "(retry every %.0fs, up to %.0fs)",
+                        run.id,
+                        instrument,
+                        expected_bar_ts.isoformat(),
+                        JUST_CLOSED_BAR_RETRY_SECONDS,
+                        _bar_wait_cap,
+                    )
+                next_signal_at = min(now + JUST_CLOSED_BAR_RETRY_SECONDS, wait_deadline)
+            else:
+                waited = now - boundary - _tick_offset
+                if waited >= JUST_CLOSED_BAR_RETRY_SECONDS:
+                    logger.info(
+                        "paper runner: %s just-closed %s bar %s %s after %.1fs "
+                        "(%.1fs after bar close)",
+                        run.id,
+                        instrument,
+                        expected_bar_ts.isoformat(),
+                        "still missing, giving up"
+                        if now >= wait_deadline
+                        else "arrived",
+                        waited,
+                        now - boundary,
+                    )
+                try:
+                    _signal_tick(
+                        db=db,
+                        run=run,
+                        client=client,
+                        strategy=strategy,
+                        candle_fetch_fn=candle_fetch_fn,
+                        instrument=instrument,
+                        granularity_seconds=granularity_seconds,
+                        now_utc=datetime.fromtimestamp(now, tz=UTC),
+                        expected_bar_ts=expected_bar_ts,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # Signal work is best-effort — a compilation failure /
+                    # arithmetic overflow / OANDA network blip mustn't take
+                    # the whole runner down. Log and continue; the health
+                    # tick keeps the kill switch responsive.
+                    logger.exception(
+                        "paper runner: signal tick failed on %s; skipping this bar",
+                        run.id,
+                    )
+                    _record_tick_failure(db=db, run=run, exc=exc)
+                else:
+                    _clear_tick_failure(db=db, run=run)
+                # Advance from the boundary just processed, not from `now`:
+                # a tick that waited for its bar (AFX-87) must not skip the
+                # next boundary's own tick, and `boundary + g` never
+                # overshoots by a bar (the 2026-07-15 every-other-M1-tick
+                # bug from `align(now + g)`).
+                pending_boundary = None
+                next_signal_at = boundary + granularity_seconds + _tick_offset
 
         # Cadence — health tick every 5s, or sooner if the next signal
         # tick is closer. Injectable `sleep_fn` so tests skip the wait
@@ -1014,6 +1198,7 @@ def _signal_tick(
     instrument: str,
     granularity_seconds: int,
     now_utc: datetime,
+    expected_bar_ts: datetime | None = None,
 ) -> None:
     """One granularity-boundary tick: fetch → walk → act.
 
@@ -1124,8 +1309,15 @@ def _signal_tick(
     # OANDA/ingester lag. Uniform tolerance across granularities
     # since the lag is set by the ingester's poll cadence, not by bar
     # length. See UAT observation 2026-07-13 (Wilson).
+    #
+    # AFX-87: a tick that waited for its just-closed bar can run past
+    # that threshold; the bar it waited for is fresh by definition.
     stale_threshold_seconds = granularity_seconds + INGEST_LAG_TOLERANCE_SECONDS
-    if (now_utc - latest_dt).total_seconds() > stale_threshold_seconds:
+    has_expected_bar = expected_bar_ts is not None and latest_dt >= expected_bar_ts
+    if (
+        not has_expected_bar
+        and (now_utc - latest_dt).total_seconds() > stale_threshold_seconds
+    ):
         logger.info(
             "paper runner: %s signal tick skipped: stale candles "
             "(latest %s %s bar %s, now %s)",
@@ -1221,6 +1413,7 @@ def _signal_tick(
         _reconcile_broker_side_close(
             db=db,
             run=run,
+            client=client,
             strategy=strategy,
             latest_close=float(df["close"].iloc[-1]),
             latest_high=float(df["high"].iloc[-1]),
@@ -1283,8 +1476,15 @@ def _signal_tick(
     # pass unconditionally when available so the walk decides.
     high_series = df["high"].astype(float) if "high" in df.columns else None
     low_series = df["low"].astype(float) if "low" in df.columns else None
+    open_series = df["open"].astype(float) if "open" in df.columns else None
 
     # ── Walk ─────────────────────────────────────────────────────
+    # Backtest parity (AFX-106): candles that started before a broker
+    # SL/TP fill were HELD in the backtest, and the fill candle is
+    # consumed by the exit, so none of them may open from flat. The
+    # fill can land in a candle that isn't complete yet (fill between
+    # the boundary and this delayed tick), hence a time cutoff rather
+    # than a candle lookup.
     result = walk(
         raw_entries=raw_entries,
         close_series=close_series,
@@ -1294,6 +1494,8 @@ def _signal_tick(
         pip_size=pip_size,
         high_series=high_series,
         low_series=low_series,
+        open_series=open_series,
+        no_entry_through_ts=_broker_exit_cutoff(run),
     )
 
     # ── Advance bookmark UNCONDITIONALLY on any successful tick ──
@@ -1337,6 +1539,223 @@ def _signal_tick(
         broker_position=position,
         exit_rules=exit_rules_full,
         risk_cfg=risk_cfg,
+    )
+    _sync_broker_exit_orders(
+        db=db,
+        run=run,
+        client=client,
+        strategy=strategy,
+        instrument=instrument,
+        granularity=granularity,
+        granularity_seconds=granularity_seconds,
+        final_state=result.final_state,
+        now_utc=now_utc,
+    )
+
+
+def _broker_exit_cutoff(run) -> datetime | None:
+    """Time of the last broker-side (or hold-ending market) SL/TP fill,
+    or None. Written by `_reconcile_broker_side_close`, the
+    transaction reconciler, or `_sync_broker_exit_orders`, whichever
+    records the fill first."""
+    params = (
+        run.parameters if isinstance(getattr(run, "parameters", None), dict) else {}
+    )
+    raw = params.get("last_broker_exit_at")
+    if not raw:
+        return None
+    exit_ts = datetime.fromisoformat(raw)
+    if exit_ts.tzinfo is None:
+        exit_ts = exit_ts.replace(tzinfo=UTC)
+    return exit_ts
+
+
+def _sync_broker_exit_orders(
+    *,
+    db,
+    run,
+    client,
+    strategy,
+    instrument: str,
+    granularity: str,
+    granularity_seconds: int,
+    final_state,
+    now_utc: datetime,
+) -> None:
+    """Wick-mode genomes: rest the DSL's exact SL / TP at OANDA once
+    `min_hold_bars` has elapsed (AFX-106).
+
+    Backtest wick mode fills a stop/target the moment a bar's wick
+    touches the level. A bar-close poll can't reproduce that — it
+    fills at the next close, often several pips past the level — so
+    the levels must live at the broker. They are attached after the
+    bar that ends the hold closes, so they are live for exactly the
+    bars the backtest checks (`bars_held >= min_hold_bars`).
+
+    Bars held are counted from the trade's real entry time, not the
+    walk's projected entry: a catch-up walk can open on an old candle
+    but the broker order is only placed now.
+
+    If the current executable quote (bid for a long, ask for a short)
+    is already past a level when the hold ends, close at market now:
+    the backtest fills that case at the next bar's open, which is
+    where price is right now. A resting order can't be placed on the
+    wrong side of the market. No quote → retry next tick; a completed
+    candle is not a substitute (it can predate the entry fill).
+
+    Close-mode genomes are untouched: wide fail-safe SL at OANDA,
+    DSL levels enforced by the walk on bar close.
+    """
+    from agentfx.adapters.oanda import OandaError
+    from agentfx.api.models import Trade
+
+    spec = getattr(strategy, "spec", None)
+    exit_block = getattr(spec, "exit", None) if spec is not None else None
+    if exit_block is None or getattr(exit_block, "eval_mode", "close") != "wick":
+        return
+    if final_state.in_position == 0:
+        return
+    min_hold = int(getattr(exit_block, "min_hold_bars", 0) or 0)
+
+    open_trade = (
+        db.query(Trade)
+        .filter(Trade.run_id == run.id, Trade.exit_timestamp.is_(None))
+        .order_by(Trade.entry_timestamp.asc())
+        .first()
+    )
+    if open_trade is None or not getattr(open_trade, "broker_trade_id", None):
+        return
+    is_long = open_trade.side == "buy"
+    if is_long != (final_state.in_position == 1):
+        return  # walk and DB disagree; leave it to the next tick
+    params = getattr(run, "parameters", None) or {}
+    broker_trade_id = str(open_trade.broker_trade_id)
+    if params.get("broker_exit_orders_trade_id") == broker_trade_id:
+        return  # already attached for this trade
+
+    # Same count the walk uses (`_count_bars_since` + 1 per walked
+    # candle), anchored on the real entry. Shifting the anchor back
+    # one bar counts the candle the entry landed in.
+    entry_ts = open_trade.entry_timestamp
+    if entry_ts.tzinfo is None:
+        entry_ts = entry_ts.replace(tzinfo=UTC)
+    if entry_ts >= now_utc:
+        bars_held = 0  # opened on this tick
+    else:
+        bars_held = _count_bars_since(
+            db=db,
+            instrument=instrument,
+            granularity=granularity,
+            entry_ts=entry_ts - timedelta(seconds=granularity_seconds),
+            now_utc=now_utc,
+        )
+    if bars_held < min_hold - 1:
+        return
+
+    try:
+        quotes = client.get_pricing(instrument)
+        quote = quotes[0] if quotes else {}
+        px = float(quote.get("bid" if is_long else "ask") or 0.0)
+    except (OandaError, AttributeError, IndexError, TypeError, ValueError):
+        px = 0.0
+    if px <= 0.0:
+        return
+
+    pip_size = float(getattr(strategy, "pip_size", 0.0001) or 0.0001)
+    entry = float(open_trade.entry_price)
+    stop_dist = float(exit_block.stop_pips) * pip_size
+    target_dist = float(exit_block.target_pips) * pip_size
+    if is_long:
+        sl_price, tp_price = entry - stop_dist, entry + target_dist
+        past_sl, past_tp = px <= sl_price, px >= tp_price
+    else:
+        sl_price, tp_price = entry + stop_dist, entry - target_dist
+        past_sl, past_tp = px >= sl_price, px <= tp_price
+
+    if past_sl or past_tp:
+        exit_reason = "stop" if past_sl else "target"
+        # +1ms: the transition step already wrote an (open-position)
+        # equity sample at now_utc; the flat one must sort after it.
+        close_result = _close_position_and_persist(
+            db=db,
+            run=run,
+            client=client,
+            instrument=instrument,
+            now_utc=now_utc + timedelta(milliseconds=1),
+            reason=(
+                f"min_hold ended with price {px:.5f} already past "
+                f"{exit_reason} level "
+                f"{sl_price if past_sl else tp_price:.5f}"
+            ),
+            exit_reason=exit_reason,
+        )
+        # This fill is stamped on the trade, so the transaction
+        # reconciler skips it: record the re-entry cutoff here, at the
+        # broker fill time (not the synthetic +1ms).
+        from agentfx.services.paper_reconciler import _parse_oanda_time
+
+        close_result = close_result if isinstance(close_result, dict) else {}
+        fill_ts = (
+            _parse_oanda_time(
+                close_result.get("long_fill_time")
+                or close_result.get("short_fill_time")
+            )
+            or now_utc
+        )
+        params_now = run.parameters if isinstance(run.parameters, dict) else {}
+        run.parameters = {**params_now, "last_broker_exit_at": fill_ts.isoformat()}
+        db.commit()
+        return
+
+    try:
+        result = client.set_trade_exit_orders(
+            broker_trade_id,
+            instrument,
+            stop_loss_price=sl_price,
+            take_profit_price=tp_price,
+        )
+    except OandaError as exc:
+        # Walk still enforces the levels on bar close, and the
+        # fail-safe SL stays on the trade; retried next tick.
+        _write_decision(
+            db,
+            run,
+            action="USER_EXIT_ORDERS_REJECTED",
+            reason=(
+                f"OANDA refused SL {sl_price:.5f} / TP {tp_price:.5f} on "
+                f"trade {broker_trade_id}: {exc}"
+            ),
+            outputs={
+                "paper_run_id": run.id,
+                "broker_trade_id": broker_trade_id,
+                "stop_loss_price": sl_price,
+                "take_profit_price": tp_price,
+                "error": str(exc),
+                "reject_reason": getattr(exc, "reject_reason", None),
+            },
+        )
+        return
+
+    run.parameters = {**params, "broker_exit_orders_trade_id": broker_trade_id}
+    db.commit()
+    _write_decision(
+        db,
+        run,
+        action="USER_EXIT_ORDERS_PLACED",
+        reason=(
+            f"min_hold elapsed — resting SL {sl_price:.5f} "
+            f"({exit_block.stop_pips} pips) / TP {tp_price:.5f} "
+            f"({exit_block.target_pips} pips) on trade {broker_trade_id}"
+        ),
+        outputs={
+            "paper_run_id": run.id,
+            "broker_trade_id": broker_trade_id,
+            "stop_loss_price": sl_price,
+            "take_profit_price": tp_price,
+            "stop_loss_order_id": result.get("stop_loss_order_id"),
+            "take_profit_order_id": result.get("take_profit_order_id"),
+            "filled_immediately": result.get("filled", False),
+        },
     )
 
 
@@ -1401,6 +1820,8 @@ def _open_position_and_persist(
     exit_rules,  # spec.exit chain; the caller has already resolved to spec
     risk_cfg: dict,
     position_snapshot,
+    signal_bar_ts: datetime,
+    order_row=None,
 ) -> None:
     """Size + place a market order + persist the trade + write the
     decision log. Extracted from `_signal_tick` verbatim so the walk-
@@ -1415,6 +1836,10 @@ def _open_position_and_persist(
       exit block — matches the pre-extract naming).
     - `position_snapshot` is the broker position dict at the start of
       the tick; only used for the final equity snapshot.
+    - `signal_bar_ts` is the bar the signal fired on. Together with the
+      run and side it is the order's idempotency key (AFX-50).
+    - `order_row` is a claim the caller already won (the flip path
+      claims before closing); when None this function claims itself.
 
     Returns None. On sizing failure, broker rejection, or other
     recoverable errors, writes an appropriate decision log entry and
@@ -1429,9 +1854,9 @@ def _open_position_and_persist(
     # backtest — every wick that would have recovered becomes a
     # locked loss.
     #
-    # The broker order now carries only a WIDE fail-safe SL sized
-    # from `kill_switch_dd_pct` (matches the run's hard-halt loss
-    # cap), and NO broker-side TP. The walk enforces the strategy's
+    # The broker order now carries only a WIDE fail-safe SL
+    # (`FAILSAFE_SL_STOP_MULTIPLE` × the DSL stop, at least 100 pips)
+    # and NO broker-side TP. The walk enforces the strategy's
     # real SL + TP on close each tick; the broker SL only fires if
     # the runner is dead. See `compute_failsafe_sl_pips` for the
     # sizing formula.
@@ -1500,24 +1925,42 @@ def _open_position_and_persist(
                 "sizing": sizing.__dict__,
             },
         )
+        if order_row is not None:
+            order_row.status = "canceled"
+            db.commit()
         return
     signed_units = (
         sizing.capped_units if signal_direction == "long" else -sizing.capped_units
     )
 
-    # Broker fail-safe SL, sized from the run's hard-halt loss cap
-    # (kill_switch_dd_pct). Wide enough that normal price action never
-    # touches it; only fires if the runner is dead. Walk enforces the
-    # DSL's real SL + TP on bar close each tick.
-    kill_switch_dd_pct = float(risk_cfg.get("kill_switch_dd_pct", 5.0))
-    failsafe_sl_pips = compute_failsafe_sl_pips(
-        balance=sizing.balance,
-        units=sizing.capped_units,
-        pip_value_account=sizing.pip_value_account,
-        kill_switch_dd_pct=kill_switch_dd_pct,
-    )
+    # Broker fail-safe SL, sized from the DSL stop. Wide enough that
+    # normal price action never touches it; only fires if the runner
+    # is dead. Walk enforces the DSL's real SL + TP on bar close.
+    failsafe_sl_pips = compute_failsafe_sl_pips(stop_pips=sl_pips_dsl)
 
     from agentfx.adapters.oanda import OandaOrderRejected
+
+    if order_row is None:
+        order_row = _claim_order_slot(
+            db,
+            run,
+            signal_bar_ts=signal_bar_ts,
+            side="buy" if signed_units > 0 else "sell",
+            units=abs(signed_units),
+        )
+        if order_row is None:
+            _write_duplicate_skip(
+                db,
+                run,
+                instrument=instrument,
+                signal_direction=signal_direction,
+                signal_bar_ts=signal_bar_ts,
+                position_snapshot=position_snapshot,
+                now_utc=now_utc,
+            )
+            return
+    else:
+        order_row.quantity = float(abs(signed_units))
 
     try:
         result = client.place_market_order(
@@ -1527,6 +1970,8 @@ def _open_position_and_persist(
             take_profit_pips=None,
         )
     except OandaOrderRejected as exc:
+        order_row.status = "rejected"
+        db.commit()
         # Broker refused to fill (INSUFFICIENT_MARGIN, MARKET_HALTED,
         # POSITION_LOCKED, NO_FILL_TRANSACTION_RETURNED, etc.). Log
         # with the specific reject reason so the operator sees why —
@@ -1557,6 +2002,14 @@ def _open_position_and_persist(
     filled_units = int(result.get("units") or signed_units)
     trade_id = result.get("trade_id")
     fill_transaction_id = result.get("fill_transaction_id")
+    order_row.status = "filled"
+    from agentfx.services.paper_reconciler import _parse_oanda_time
+
+    order_row.filled_at = _parse_oanda_time(result.get("fill_time")) or datetime.now(
+        UTC
+    )
+    order_row.filled_quantity = abs(filled_units)
+    order_row.average_fill_price = fill_price
     # Pass the candles DataFrame so `_signal_reason` can compute
     # actual indicator values at the trigger bar. Wilson's UAT
     # feedback (2026-07-13): "the indicator on the graph didn't seem
@@ -1564,7 +2017,7 @@ def _open_position_and_persist(
     # verifiable at a glance.
     signal_reason = _signal_reason(strategy, signal_direction, df)
 
-    _persist_trade_entry(
+    trade = _persist_trade_entry(
         db=db,
         run=run,
         instrument=instrument,
@@ -1578,6 +2031,8 @@ def _open_position_and_persist(
         entry_financing=float(result.get("financing") or 0.0),
         entry_commission=float(result.get("commission") or 0.0),
     )
+    order_row.trade_id = trade.id
+    db.commit()
     # Sizing trace so the operator can audit `why this many units` at
     # a glance — surface balance × risk_pct / (stop × pip_value) plus
     # the account currency and conversion rate used. Full breakdown
@@ -1596,8 +2051,7 @@ def _open_position_and_persist(
         reason=(
             f"{signal_direction.upper()} {abs(filled_units)} {instrument} "
             f"@ {fill_price:.5f} ({signal_reason}) | sizing: {sizing_note} | "
-            f"broker failsafe SL: {failsafe_sl_pips} pips "
-            f"({kill_switch_dd_pct}% of balance)"
+            f"broker failsafe SL: {failsafe_sl_pips} pips"
         ),
         outputs={
             "paper_run_id": run.id,
@@ -1625,6 +2079,88 @@ def _open_position_and_persist(
     _persist_equity_snapshot(
         db=db, run=run, position=position_snapshot, now_utc=now_utc
     )
+
+
+def _iso(ts) -> str:
+    return ts.isoformat() if isinstance(ts, datetime) else str(ts)
+
+
+def _order_idempotency_key(run_id: str, signal_bar_ts, side: str) -> str:
+    return f"paper:{run_id}:{_iso(signal_bar_ts)}:{side}"
+
+
+def _write_duplicate_skip(
+    db,
+    run,
+    *,
+    instrument: str,
+    signal_direction: str,
+    signal_bar_ts,
+    position_snapshot,
+    now_utc: datetime,
+) -> None:
+    side = "buy" if signal_direction == "long" else "sell"
+    _write_decision(
+        db,
+        run,
+        action="USER_ORDER_DUPLICATE_SKIPPED",
+        reason=(
+            f"{signal_direction.upper()} {instrument} for bar "
+            f"{_iso(signal_bar_ts)} was already submitted by another "
+            "runner for this run; not sending a second order"
+        ),
+        outputs={
+            "paper_run_id": run.id,
+            "instrument": instrument,
+            "signal_direction": signal_direction,
+            "signal_bar_ts": _iso(signal_bar_ts),
+            "idempotency_key": _order_idempotency_key(run.id, signal_bar_ts, side),
+        },
+    )
+    _persist_equity_snapshot(
+        db=db, run=run, position=position_snapshot, now_utc=now_utc
+    )
+
+
+def _claim_order_slot(db, run, *, signal_bar_ts, side: str, units: int):
+    """AFX-50: claim the right to send the order for this run, bar and
+    side, before OANDA sees it.
+
+    The claim is an `orders` row whose primary key is the idempotency
+    key, committed before the broker call. Two runners on the same
+    run (deploy overlap, a double schedule) both see the account flat
+    and both reach here; Postgres lets only one insert win. The loser
+    gets None and must not place the order.
+
+    The claim is kept even if OANDA then rejects the order: the bar
+    bookmark has already moved on, so the bar is never retried anyway.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from agentfx.api.models import Order
+
+    key = _order_idempotency_key(run.id, signal_bar_ts, side)
+    order_row = Order(
+        id=key,
+        run_id=run.id,
+        order_type="market",
+        side=side,
+        quantity=float(units),
+        status="new",
+        metadata_={"signal_bar_ts": _iso(signal_bar_ts)},
+    )
+    db.add(order_row)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        logger.warning(
+            "paper runner: duplicate order for run %s suppressed (key=%s)",
+            run.id,
+            key,
+        )
+        return None
+    return order_row
 
 
 def _execute_walk_transitions(
@@ -1735,6 +2271,28 @@ def _execute_walk_transitions(
         # market order) mirroring the pre-refactor opposite_flip
         # behaviour. If the close leg fails, don't open the new side —
         # the retry on the next tick will handle it.
+        signal_direction = "long" if last_t.direction > 0 else "short"
+        # AFX-50: claim the whole reversal before the close. A second
+        # runner that also decided to flip must not close the position
+        # the first runner just opened.
+        order_row = _claim_order_slot(
+            db,
+            run,
+            signal_bar_ts=last_t.bar_ts,
+            side="buy" if last_t.direction > 0 else "sell",
+            units=0,
+        )
+        if order_row is None:
+            _write_duplicate_skip(
+                db,
+                run,
+                instrument=instrument,
+                signal_direction=signal_direction,
+                signal_bar_ts=last_t.bar_ts,
+                position_snapshot=broker_position,
+                now_utc=now_utc,
+            )
+            return
         try:
             _close_position_and_persist(
                 db=db,
@@ -1765,12 +2323,17 @@ def _execute_walk_transitions(
                     "close_context": "opposite_flip",
                 },
             )
+            order_row.status = "canceled"
+            order_row.metadata_ = {
+                **(order_row.metadata_ or {}),
+                "canceled_reason": "flip_close_rejected",
+            }
+            db.commit()
             _persist_equity_snapshot(
                 db=db, run=run, position=broker_position, now_utc=now_utc
             )
             return
         # Close succeeded — open the new side.
-        signal_direction = "long" if last_t.direction > 0 else "short"
         _open_position_and_persist(
             db=db,
             run=run,
@@ -1783,6 +2346,8 @@ def _execute_walk_transitions(
             exit_rules=exit_rules,
             risk_cfg=risk_cfg,
             position_snapshot=broker_position,
+            signal_bar_ts=last_t.bar_ts,
+            order_row=order_row,
         )
         return
 
@@ -1801,6 +2366,7 @@ def _execute_walk_transitions(
             exit_rules=exit_rules,
             risk_cfg=risk_cfg,
             position_snapshot=broker_position,
+            signal_bar_ts=last_t.bar_ts,
         )
         return
 
@@ -1834,7 +2400,7 @@ def _persist_trade_entry(
     broker_open_transaction_id: str | None = None,
     entry_financing: float = 0.0,
     entry_commission: float = 0.0,
-) -> None:
+):
     """Insert a new Trade row for a placed order.
 
     Side convention on the Trade table is 'buy' / 'sell' (legacy). Map
@@ -1864,6 +2430,7 @@ def _persist_trade_entry(
     )
     db.add(trade)
     db.commit()
+    return trade
 
 
 def _reconcile_broker_side_close(
@@ -1875,6 +2442,7 @@ def _reconcile_broker_side_close(
     latest_high: float,
     latest_low: float,
     now_utc: datetime,
+    client=None,
 ) -> None:
     """Detect and reconcile a broker-side SL/TP fill.
 
@@ -1978,9 +2546,26 @@ def _reconcile_broker_side_close(
     # Pips derived from (entry_price, exit_price_est) are currency-
     # agnostic and stay approximately correct even without
     # conversion.
-    open_trade.exit_timestamp = now_utc
+    # AFX-106: OANDA's own close time + price when available. The
+    # close time decides which candle re-entry is blocked on.
+    exit_ts = now_utc
+    if client is not None and getattr(open_trade, "broker_trade_id", None):
+        from agentfx.adapters.oanda import OandaError
+        from agentfx.services.paper_reconciler import _parse_oanda_time
+
+        try:
+            info = client.get_trade(str(open_trade.broker_trade_id))
+        except OandaError:
+            info = None
+        if isinstance(info, dict) and info.get("state") == "CLOSED":
+            exit_ts = _parse_oanda_time(info.get("close_time")) or now_utc
+            if info.get("average_close_price"):
+                exit_price_est = float(info["average_close_price"])
+    open_trade.exit_timestamp = exit_ts
     open_trade.exit_price = exit_price_est
     open_trade.exit_reason = classified
+    params = run.parameters if isinstance(run.parameters, dict) else {}
+    run.parameters = {**params, "last_broker_exit_at": exit_ts.isoformat()}
     # pnl / pnl_pct intentionally left NULL — see comment above.
     db.commit()
 
@@ -2012,7 +2597,7 @@ def _close_position_and_persist(
     now_utc: datetime,
     reason: str,
     exit_reason: str | None = None,
-) -> None:
+) -> dict:
     """Flatten the OANDA position, update matching open Trade rows,
     and write a `USER_POSITION_CLOSED` decision log.
 
@@ -2049,6 +2634,7 @@ def _close_position_and_persist(
     close_txn_id = result.get("long_fill_transaction_id") or result.get(
         "short_fill_transaction_id"
     )
+    close_fill_price = result.get("long_fill_price") or result.get("short_fill_price")
 
     # Update every open Trade row for this run — a normal single-side
     # position will have exactly one; the multi-fill / partial-close
@@ -2072,11 +2658,16 @@ def _close_position_and_persist(
                 (t.pnl / (t.entry_price * t.quantity)) * 100 if t.entry_price else 0.0
             )
             t.exit_timestamp = now_utc
-            # Exit price: derive from the pnl share + entry price. Not
-            # exact for JPY vs major pip differences but close enough
-            # for the UI. If this drifts noticeably we'll read the
-            # actual fill price from the OANDA response in v0.6.2.
-            t.exit_price = t.entry_price + (t.pnl / t.quantity if t.quantity else 0.0)
+            # AFX-106: the OANDA close fill price. The old pnl-derived
+            # fallback treats account-currency pnl as quote-currency
+            # price movement (~1.5x off on an AUD account trading
+            # AUD_USD); kept only for responses without a price.
+            if close_fill_price:
+                t.exit_price = float(close_fill_price)
+            else:
+                t.exit_price = t.entry_price + (
+                    t.pnl / t.quantity if t.quantity else 0.0
+                )
             if exit_reason is not None:
                 t.exit_reason = exit_reason
             # v0.6.1: accumulate financing + commission on this close.
@@ -2116,6 +2707,7 @@ def _close_position_and_persist(
     )
     # Position is now flat — snapshot equity without unrealized_pnl.
     _persist_equity_snapshot(db=db, run=run, position=None, now_utc=now_utc)
+    return result
 
 
 def _persist_equity_snapshot(
@@ -2364,6 +2956,114 @@ def _safe_txn_id(raw) -> str | None:
 # ─────────────────────────────────────────────────────────────────────
 # Credential recovery (T0.2 — Wilson UAT 2026-07-15)
 # ─────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class _AuthOutcome:
+    """What the health tick should do after a 401/403 (AFX-93)."""
+
+    kind: Literal["recovered", "deferred", "halt", "broker_error"]
+    client: object | None = None
+    balance: dict | None = None
+    error: Exception | None = None
+
+
+def _resolve_auth_failure(
+    db,
+    run,
+    exc: Exception,
+    *,
+    now: datetime,
+    prior_closed_failures: int,
+    heartbeat: Callable[..., None],
+) -> _AuthOutcome:
+    """Classify a 401/403 on the health-tick balance call.
+
+    Market open: refresh creds once and re-read the balance on the
+    fresh client; an auth error on either step halts (OANDA_AUTH_LOST).
+
+    Market closed (AFX-93): never halt, since no fill is possible. The
+    first failure of a closed-market streak logs a decision and tries
+    one refresh; later ones just defer, because the adapter already
+    rebuilds its session on every 401. A 401 that outlives the reopen
+    takes the market-open path on the next tick.
+
+    Every broker call here is preceded by a forced heartbeat so the
+    AFX-92 supervisor never sees a live runner as stale. Nothing in
+    here raises an `OandaError`: a non-auth error during the refresh
+    comes back as `broker_error` for the caller's retry budget.
+    """
+    from agentfx.adapters.oanda import OandaError
+    from agentfx.api.workers.market_calendar import market_closure_at
+
+    market_closed, closure = market_closure_at(now)
+    if market_closed:
+        logger.warning(
+            "paper runner: %s got auth error on balance while market closed "
+            "(%s, attempt %d): %s; deferring, not halting",
+            run.id,
+            closure,
+            prior_closed_failures + 1,
+            exc,
+        )
+        if prior_closed_failures > 0:
+            return _AuthOutcome("deferred")
+        _record_auth_deferred(db, run, exc, closure)
+    else:
+        logger.warning(
+            "paper runner: %s got 401 on balance; attempting cred refresh",
+            run.id,
+        )
+
+    heartbeat(phase="auth-refresh", force=True)
+    try:
+        fresh = _recover_from_auth_loss(db, run, exc)
+        if fresh is not None:
+            heartbeat(phase="auth-refresh-recheck", force=True)
+            balance = fresh.get_account_balance()
+            return _AuthOutcome("recovered", client=fresh, balance=balance)
+    except OandaError as refresh_exc:
+        if not _is_auth_error(refresh_exc):
+            logger.warning(
+                "paper runner: %s auth-refresh hit a broker error: %s",
+                run.id,
+                refresh_exc,
+            )
+            if market_closed:
+                return _AuthOutcome("deferred")
+            return _AuthOutcome("broker_error", error=refresh_exc)
+        logger.warning(
+            "paper runner: %s refreshed client still gets auth error: %s",
+            run.id,
+            refresh_exc,
+        )
+    return _AuthOutcome("deferred" if market_closed else "halt")
+
+
+def _record_auth_deferred(db, run, exc: Exception, closure: str) -> None:
+    """Write the once-per-streak USER_AUTH_DEFERRED_MARKET_CLOSED row."""
+    try:
+        _write_decision(
+            db,
+            run,
+            action=_AUTH_DEFERRED_ACTION,
+            reason=(
+                f"OANDA auth error while market closed ({closure}); "
+                "retrying with backoff instead of halting"
+            ),
+            outputs={
+                "paper_run_id": run.id,
+                "closure": closure,
+                "error": str(exc)[:500],
+            },
+        )
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        logger.exception(
+            "paper runner: %s failed to write %s decision",
+            run.id,
+            _AUTH_DEFERRED_ACTION,
+        )
 
 
 def _is_auth_error(exc: Exception) -> bool:
