@@ -104,7 +104,9 @@ class TrialMetrics(BaseModel):
     """Core backtest metrics."""
 
     sharpe: float = Field(..., description="Sharpe ratio")
-    max_drawdown: float = Field(..., description="Maximum drawdown (0.06 = 6%)")
+    max_drawdown: float = Field(
+        ..., description="Maximum drawdown, either sign (0.06 or -0.06 = 6%)"
+    )
     hit_rate: float = Field(..., description="Win rate (0.54 = 54%)")
     trade_count: int = Field(..., description="Total number of trades")
     total_return: float = Field(..., description="Total return (0.15 = 15%)")
@@ -337,9 +339,11 @@ def evaluate_gate_b(metrics: TrialMetrics) -> tuple[bool, list[str]]:
     if metrics.sharpe < GATE_B_THRESHOLDS.sharpe_min:
         failures.append(f"Sharpe {metrics.sharpe:.2f} < {GATE_B_THRESHOLDS.sharpe_min}")
 
-    if metrics.max_drawdown > GATE_B_THRESHOLDS.max_drawdown:
+    # Drawdown sign varies by source (metrics.py emits negative); judge magnitude.
+    max_dd = abs(metrics.max_drawdown)
+    if max_dd > GATE_B_THRESHOLDS.max_drawdown:
         failures.append(
-            f"Max DD {metrics.max_drawdown * 100:.1f}% > {GATE_B_THRESHOLDS.max_drawdown * 100}%"
+            f"Max DD {max_dd * 100:.1f}% > {GATE_B_THRESHOLDS.max_drawdown * 100}%"
         )
 
     if metrics.hit_rate < GATE_B_THRESHOLDS.hit_rate_min:
