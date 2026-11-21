@@ -458,6 +458,15 @@ class _FakeLinear:
         self.calls.append(("comment", ident, marker))
         return True
 
+    def current_state(self, ident):
+        return self.states.get(ident)
+
+    def has_comment_containing(self, ident, needle):
+        return False
+
+    def remove_label(self, ident, name):
+        return False
+
 
 def test_dispatch_success_moves_to_done_without_needs_wilson():
     fake = _FakeLinear({"AFX-70": "In Staging", "AFX-87": "In Staging"})
@@ -544,6 +553,386 @@ def test_dispatch_back_to_back_markers_do_not_cross_contaminate():
     assert markers[0] != markers[1]
     assert markers[0] == fsop.success_marker(sha_a)
     assert markers[1] == fsop.success_marker(sha_b)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# AFX-105: classify the Deploy run by job, not by workflow conclusion
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _job(name: str, conclusion: str | None) -> dict:
+    return {"name": name, "conclusion": conclusion}
+
+
+_RAILWAY = "Deploy Backend → Railway"
+_VERCEL = "Deploy Frontend → Vercel"
+_E2E = "E2E Tests"
+
+
+def test_classify_e2e_only_failure_is_not_a_deploy_failure():
+    """2026-11-19, run 44522928267: Railway + Vercel succeeded, E2E failed
+    on an apt 503. The old flow reported "Railway deploy failed"."""
+    jobs = [_job(_E2E, "failure"), _job(_RAILWAY, "success"), _job(_VERCEL, "success")]
+    assert fsop.classify_deploy_jobs(jobs) == (fsop.E2E_FAILED, [_E2E])
+
+
+def test_classify_railway_failure_is_a_deploy_failure():
+    jobs = [_job(_E2E, "success"), _job(_RAILWAY, "failure"), _job(_VERCEL, "success")]
+    assert fsop.classify_deploy_jobs(jobs) == (fsop.DEPLOY_FAILED, [_RAILWAY])
+
+
+def test_classify_vercel_failure_is_a_deploy_failure_even_when_e2e_also_fails():
+    jobs = [
+        _job(_E2E, "failure"),
+        _job(_RAILWAY, "success"),
+        _job(_VERCEL, "timed_out"),
+    ]
+    assert fsop.classify_deploy_jobs(jobs) == (fsop.DEPLOY_FAILED, [_VERCEL])
+
+
+def test_classify_all_green_is_success():
+    jobs = [_job(_E2E, "success"), _job(_RAILWAY, "success"), _job(_VERCEL, "success")]
+    assert fsop.classify_deploy_jobs(jobs) == ("success", [])
+
+
+def test_classify_skipped_deploy_job_is_not_reported_as_deployed():
+    """If `needs: e2e` is re-enabled, an E2E failure skips the deploy jobs:
+    nothing shipped, so this must not read as "deployed, E2E failed"."""
+    jobs = [_job(_E2E, "failure"), _job(_RAILWAY, "skipped"), _job(_VERCEL, "skipped")]
+    outcome, failed = fsop.classify_deploy_jobs(jobs)
+    assert outcome == fsop.UNKNOWN_FAILURE
+    assert failed == [_E2E]
+
+
+def test_classify_without_job_data_is_unknown_failure():
+    assert fsop.classify_deploy_jobs([]) == (fsop.UNKNOWN_FAILURE, [])
+
+
+def test_resolve_outcome_uses_jobs_only_for_failures(monkeypatch):
+    calls: list = []
+
+    def fake_fetch(repo, run_id):
+        calls.append((repo, run_id))
+        return [
+            _job(_E2E, "failure"),
+            _job(_RAILWAY, "success"),
+            _job(_VERCEL, "success"),
+        ]
+
+    monkeypatch.setattr(fsop, "fetch_deploy_jobs", fake_fetch)
+    assert fsop.resolve_outcome("success", "w/r", "44522928267") == ("success", [])
+    assert calls == []
+    assert fsop.resolve_outcome("failure", "w/r", "44522928267") == (
+        fsop.E2E_FAILED,
+        [_E2E],
+    )
+    assert calls == [("w/r", "44522928267")]
+
+
+def test_resolve_outcome_falls_back_to_unknown_when_jobs_lookup_fails(monkeypatch):
+    def boom(repo, run_id):
+        raise RuntimeError("HTTP 403")
+
+    monkeypatch.setattr(fsop, "fetch_deploy_jobs", boom)
+    assert fsop.resolve_outcome("failure", "w/r", "1") == (fsop.UNKNOWN_FAILURE, [])
+    # No run id (manual dispatch) → no lookup, unknown failure.
+    assert fsop.resolve_outcome("failure", "w/r", "") == (fsop.UNKNOWN_FAILURE, [])
+
+
+def test_resolve_outcome_passes_explicit_dispatch_outcomes_through():
+    assert fsop.resolve_outcome(fsop.E2E_FAILED, "w/r", "") == (fsop.E2E_FAILED, [])
+    assert fsop.resolve_outcome(fsop.DEPLOY_FAILED, "w/r", "") == (
+        fsop.DEPLOY_FAILED,
+        [],
+    )
+
+
+def test_deploy_failed_comment_names_the_failed_job():
+    body = fsop.failed_comment(_SHA, run_url="u", failed_jobs=[_VERCEL])
+    assert _VERCEL in body
+    assert "Railway" not in body
+
+
+def test_unknown_failure_comment_does_not_blame_railway():
+    body = fsop.failed_comment(_SHA, run_url="u", outcome=fsop.UNKNOWN_FAILURE)
+    assert "Railway" not in body
+    assert "Deploy workflow" in body
+    assert "Blocked" in body
+
+
+def test_e2e_failed_comment_says_deploy_succeeded_and_has_distinct_marker():
+    body = fsop.e2e_failed_comment(
+        _SHA, run_url="https://github.com/w/r/actions/runs/1"
+    )
+    assert "actions/runs/1" in body
+    assert "deployed" in body.lower()
+    assert "E2E" in body
+    assert "failed" in body.lower()
+    assert "do not re-attempt" not in body.lower()
+    assert "Blocked" not in body
+    assert fsop.e2e_failed_marker(_SHA) in body
+    assert fsop.e2e_failed_marker(_SHA) not in (
+        fsop.failed_marker(_SHA),
+        fsop.success_marker(_SHA),
+    )
+
+
+class _FakeLinearWithLabels(_FakeLinear):
+    def __init__(self, states, labels=None, comments=None):
+        super().__init__(states)
+        self.labels = {k: set(v) for k, v in (labels or {}).items()}
+        self.comments = comments or {}
+
+    def has_comment_containing(self, ident, needle):
+        return any(needle in b for b in self.comments.get(ident, []))
+
+    def add_label(self, ident, team_key, name):
+        if name in self.labels.setdefault(ident, set()):
+            return False
+        self.labels[ident].add(name)
+        self.calls.append(("add_label", ident, name))
+        return True
+
+    def comment_once(self, ident, body, marker):
+        bodies = self.comments.setdefault(ident, [])
+        if any(marker in b for b in bodies):
+            return False
+        bodies.append(body)
+        self.calls.append(("comment", ident, marker))
+        return True
+
+    def remove_label(self, ident, name):
+        if name not in self.labels.get(ident, set()):
+            return False
+        self.labels[ident].discard(name)
+        self.calls.append(("remove_label", ident, name))
+        return True
+
+
+def test_dispatch_e2e_failed_comments_without_blocking_or_needs_wilson():
+    fake = _FakeLinearWithLabels({"AFX-96": "In Staging", "AFX-93": "Blocked"})
+    fsop.dispatch(
+        fake,
+        ["AFX-96", "AFX-93"],
+        sha=_SHA,
+        outcome=fsop.E2E_FAILED,
+        run_url="https://github.com/w/r/actions/runs/44522928267",
+        team_key="AFX",
+        now=_NOW,
+    )
+    kinds = [c[0] for c in fake.calls]
+    assert "transition" not in kinds
+    assert "add_label" not in kinds
+    assert fake.states == {"AFX-96": "In Staging", "AFX-93": "Blocked"}
+    markers = [c[2] for c in fake.calls if c[0] == "comment"]
+    assert markers == [fsop.e2e_failed_marker(_SHA)] * 2
+
+
+def test_dispatch_e2e_failed_skips_tickets_outside_transitionable_states():
+    fake = _FakeLinearWithLabels({"AFX-96": "Done", "AFX-94": "Triage"})
+    fsop.dispatch(
+        fake,
+        ["AFX-96", "AFX-94"],
+        sha=_SHA,
+        outcome=fsop.E2E_FAILED,
+        run_url="u",
+        team_key="AFX",
+        now=_NOW,
+    )
+    assert fake.calls == []
+
+
+def test_dispatch_deploy_failed_blocks_and_adds_needs_wilson():
+    fake = _FakeLinearWithLabels({"AFX-70": "In Staging"})
+    fsop.dispatch(
+        fake,
+        ["AFX-70"],
+        sha=_SHA,
+        outcome=fsop.DEPLOY_FAILED,
+        run_url="u",
+        team_key="AFX",
+        now=_NOW,
+        failed_jobs=[_RAILWAY],
+    )
+    assert ("transition", "AFX-70", "Blocked") in fake.calls
+    assert ("add_label", "AFX-70", fsop.NEEDS_WILSON) in fake.calls
+
+
+def test_dispatch_success_removes_needs_wilson_left_by_an_earlier_failed_deploy():
+    """AFX-93 (2026-11-19): blocked + labelled by the failed run, then the
+    re-run succeeded and moved it to Done, but `needs-wilson` stayed."""
+    fake = _FakeLinearWithLabels(
+        {"AFX-93": "Blocked"},
+        labels={"AFX-93": {fsop.NEEDS_WILSON}},
+        comments={
+            "AFX-93": [
+                "oops " + fsop.failed_marker(_SHA) + fsop.NEEDS_WILSON_ADDED_MARKER
+            ]
+        },
+    )
+    fsop.dispatch(
+        fake,
+        ["AFX-93"],
+        sha=_SHA,
+        outcome="success",
+        run_url="u",
+        team_key="AFX",
+        now=_NOW,
+    )
+    assert ("transition", "AFX-93", "Done") in fake.calls
+    assert ("remove_label", "AFX-93", fsop.NEEDS_WILSON) in fake.calls
+
+
+def test_dispatch_success_keeps_needs_wilson_added_for_another_reason():
+    """needs-wilson set by a human / design question (no deploy-failed
+    comment from this workflow) is a real blocker; leave it alone."""
+    fake = _FakeLinearWithLabels(
+        {"AFX-93": "In Staging"},
+        labels={"AFX-93": {fsop.NEEDS_WILSON}},
+        comments={"AFX-93": ["Which approach should we take?"]},
+    )
+    fsop.dispatch(
+        fake,
+        ["AFX-93"],
+        sha=_SHA,
+        outcome="success",
+        run_url="u",
+        team_key="AFX",
+        now=_NOW,
+    )
+    assert ("remove_label", "AFX-93", fsop.NEEDS_WILSON) not in fake.calls
+    assert fake.labels["AFX-93"] == {fsop.NEEDS_WILSON}
+
+
+def test_remove_label_posts_mutation_and_updates_cache():
+    calls: list = []
+    linear = _linear_with_gql(calls, canned_responses=[{}])
+    linear._issues["AFX-93"] = _issue("Done", labels=("needs-wilson", "Bug"))
+
+    assert linear.remove_label("AFX-93", "needs-wilson") is True
+    assert "issueRemoveLabel" in calls[0]["query"]
+    assert calls[0]["variables"]["labelId"] == "lbl-needs-wilson"
+    names = [n["name"] for n in linear._issues["AFX-93"]["labels"]["nodes"]]
+    assert names == ["Bug"]
+    # Second call is a no-op.
+    assert linear.remove_label("AFX-93", "needs-wilson") is False
+    assert len(calls) == 1
+
+
+def test_has_comment_containing_matches_any_sha_failed_marker():
+    linear = _linear_with_gql([])
+    issue = _issue("Blocked")
+    issue["comment_bodies"] = ["x " + fsop.failed_marker("abcdef1" + "0" * 33)]
+    linear._issues["AFX-93"] = issue
+    assert linear.has_comment_containing("AFX-93", fsop.FAILED_MARKER_PREFIX)
+    assert not linear.has_comment_containing("AFX-93", "<!-- nope")
+
+
+def test_deploy_run_url_points_at_the_deploy_run_itself():
+    """The old workflow expression concatenated two run URLs:
+    `.../actions/runs/44522928267/widarecu/agentfx/actions/runs/44523992761`."""
+    url = fsop.deploy_run_url("https://github.com", "widarecu/agentfx", "44522928267")
+    assert url == "https://github.com/widarecu/agentfx/actions/runs/44522928267"
+    assert fsop.deploy_run_url("https://github.com", "widarecu/agentfx", "") == ""
+
+
+def test_workflow_passes_deploy_run_id_not_a_concatenated_url():
+    import yaml
+
+    wf = yaml.safe_load(
+        (
+            _REPO / ".github" / "workflows" / "agent-fleet-state-on-promote.yml"
+        ).read_text()
+    )
+    job = wf["jobs"]["transition"]
+    step = next(s for s in job["steps"] if s.get("name") == "Transition AFX tickets")
+    run = step["run"]
+    assert "github.event.workflow_run.id" in run
+    assert "--deploy-run-id" in run
+    # The old broken pattern: `${{ html_url || server_url }}/${{ repo }}/...`
+    assert "}}/${{" not in run
+    # Jobs API needs actions: read on the token that queries it.
+    assert job["permissions"] == {"actions": "read"}
+    assert "ACTIONS_TOKEN" in step["env"]
+
+
+def test_deploy_workflow_job_names_match_classifier():
+    """`classify_deploy_jobs` matches jobs by display name; a rename in
+    deploy.yml would silently turn every deploy failure into UNKNOWN."""
+    import yaml
+
+    wf = yaml.safe_load((_REPO / ".github" / "workflows" / "deploy.yml").read_text())
+    names = {job["name"] for job in wf["jobs"].values()}
+    assert set(fsop.DEPLOY_JOB_NAMES) <= names
+
+
+def test_deploy_workflow_retries_playwright_install():
+    import yaml
+
+    wf = yaml.safe_load((_REPO / ".github" / "workflows" / "deploy.yml").read_text())
+    step = next(
+        s
+        for s in wf["jobs"]["e2e"]["steps"]
+        if s.get("name") == "Install Playwright browsers"
+    )
+    assert "for attempt in" in step["run"]
+    assert "playwright install --with-deps" in step["run"]
+
+
+def test_failed_deploy_then_green_rerun_keeps_pre_existing_needs_wilson():
+    """needs-wilson was already on the ticket (real blocker) when the deploy
+    failed: the green re-run must not clear it."""
+    fake = _FakeLinearWithLabels(
+        {"AFX-93": "In Staging"}, labels={"AFX-93": {fsop.NEEDS_WILSON}}
+    )
+    for outcome in (fsop.DEPLOY_FAILED, "success"):
+        fsop.dispatch(
+            fake,
+            ["AFX-93"],
+            sha=_SHA,
+            outcome=outcome,
+            run_url="u",
+            team_key="AFX",
+            now=_NOW,
+        )
+    assert fsop.NEEDS_WILSON_ADDED_MARKER not in fake.comments["AFX-93"][0]
+    assert ("remove_label", "AFX-93", fsop.NEEDS_WILSON) not in fake.calls
+    assert fake.labels["AFX-93"] == {fsop.NEEDS_WILSON}
+
+
+def test_failed_deploy_then_green_rerun_clears_needs_wilson_it_added():
+    fake = _FakeLinearWithLabels({"AFX-93": "In Staging"})
+    for outcome in (fsop.DEPLOY_FAILED, "success"):
+        fsop.dispatch(
+            fake,
+            ["AFX-93"],
+            sha=_SHA,
+            outcome=outcome,
+            run_url="u",
+            team_key="AFX",
+            now=_NOW,
+        )
+    assert fsop.NEEDS_WILSON_ADDED_MARKER in fake.comments["AFX-93"][0]
+    assert fake.states["AFX-93"] == "Done"
+    assert fake.labels["AFX-93"] == set()
+
+
+def test_repeat_failure_same_sha_records_label_ownership_when_label_re_added():
+    """needs-wilson pre-existed at the first failure (not ours), Wilson
+    cleared it, the re-run failed again and this workflow re-added it. The
+    failed comment is deduped, so ownership must be recorded separately or
+    the green re-run leaves the label on a Done ticket."""
+    fake = _FakeLinearWithLabels(
+        {"AFX-93": "In Staging"}, labels={"AFX-93": {fsop.NEEDS_WILSON}}
+    )
+    kw = {"sha": _SHA, "run_url": "u", "team_key": "AFX", "now": _NOW}
+    fsop.dispatch(fake, ["AFX-93"], outcome=fsop.DEPLOY_FAILED, **kw)
+    fake.labels["AFX-93"].discard(fsop.NEEDS_WILSON)  # Wilson clears it
+    fsop.dispatch(fake, ["AFX-93"], outcome=fsop.DEPLOY_FAILED, **kw)
+    assert fake.labels["AFX-93"] == {fsop.NEEDS_WILSON}
+    fsop.dispatch(fake, ["AFX-93"], outcome="success", **kw)
+    assert fake.states["AFX-93"] == "Done"
+    assert fake.labels["AFX-93"] == set()
 
 
 def test_main_finds_afx_106_on_promote_143(monkeypatch):
