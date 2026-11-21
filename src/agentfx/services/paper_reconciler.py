@@ -60,6 +60,15 @@ class ReconcileResult:
     trades_updated: int
     new_last_transaction_id: str | None
     notes: list[str]
+    # AFX-104: OANDA force-closed positions because the account ran out
+    # of margin. The only loss guardrail on paper; the runner ends the
+    # run with `stop_reason=MARGIN_CLOSEOUT`.
+    margin_closeout: bool = False
+
+
+_MARGIN_CLOSEOUT_FILL_REASONS = frozenset(
+    {"MARKET_ORDER_MARGIN_CLOSEOUT", "MARGIN_CLOSEOUT"}
+)
 
 
 def _classify_exit_reason(txn_reason: str | None) -> str:
@@ -165,9 +174,16 @@ def reconcile_broker_transactions(*, db, run, client) -> ReconcileResult:
     new_last = resp.get("lastTransactionID") or run.last_transaction_id
     notes: list[str] = []
     updated = 0
+    margin_closeout = False
 
     for txn in txns:
         txn_type = txn.get("type")
+        if (
+            txn_type == "ORDER_FILL"
+            and txn.get("reason") in _MARGIN_CLOSEOUT_FILL_REASONS
+        ):
+            margin_closeout = True
+            notes.append(f"margin closeout fill txn={txn.get('id')}")
         if txn_type == "DAILY_FINANCING":
             # Overnight rollover — walk positionFinancings[]/
             # openTradeFinancings[] and accumulate the per-trade
@@ -285,6 +301,14 @@ def reconcile_broker_transactions(*, db, run, client) -> ReconcileResult:
                 )
             trade.exit_reason = _classify_exit_reason(txn.get("reason"))
             trade.broker_close_transaction_id = str(txn.get("id") or "")
+            # AFX-106: the signal tick blocks re-entry on the candle
+            # this broker-side close happened in (backtest parity).
+            params = getattr(run, "parameters", None)
+            params = params if isinstance(params, dict) else {}
+            run.parameters = {
+                **params,
+                "last_broker_exit_at": trade.exit_timestamp.isoformat(),
+            }
             updated += 1
             notes.append(
                 f"reconciled trade {trade.id} broker_trade_id={broker_tid} "
@@ -326,6 +350,7 @@ def reconcile_broker_transactions(*, db, run, client) -> ReconcileResult:
         trades_updated=updated,
         new_last_transaction_id=new_last,
         notes=notes,
+        margin_closeout=margin_closeout,
     )
 
 

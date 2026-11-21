@@ -244,14 +244,20 @@ class TestIsTransientStopReason:
     def test_loss_cap_hit_is_not_transient(self):
         from agentfx.api.workers.paper_runner import _is_transient_stop_reason
 
-        # LOSS_CAP_HIT means a risk gate tripped — operator should
+        # Legacy (pre AFX-104) risk-gate halt — operator should
         # review the strategy, not blind-restart.
         assert _is_transient_stop_reason("LOSS_CAP_HIT") is False
+
+    def test_margin_closeout_is_not_transient(self):
+        from agentfx.api.workers.paper_runner import _is_transient_stop_reason
+
+        # AFX-104: OANDA margin call ended the run — never blind-restart.
+        assert _is_transient_stop_reason("MARGIN_CLOSEOUT") is False
 
     def test_broker_circuit_is_not_transient(self):
         from agentfx.api.workers.paper_runner import _is_transient_stop_reason
 
-        # Kill-switch DD — same as LOSS_CAP_HIT, needs review.
+        # OANDA circuit breaker open — needs review.
         assert _is_transient_stop_reason("BROKER_CIRCUIT") is False
 
     def test_oanda_auth_lost_is_not_transient(self):

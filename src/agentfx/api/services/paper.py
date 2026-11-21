@@ -813,9 +813,8 @@ def _reject_if_account_has_active_run(
       as a side-effect, triggering the broker-side SL/TP misclassifier.
     - Balance-derived sizing double-counts capital (each run sizes
       off the shared balance independently).
-    - Risk gates (`loss_cap_pct`, `kill_switch_dd_pct`) fire on the
-      SHARED balance delta — a profitable run gets halted for the
-      other run's loss.
+    - P&L is read off the SHARED balance delta, so one run's loss
+      shows up on the other run's equity curve.
 
     Two paper runs must be deployed to DIFFERENT sub-accounts. This
     guard makes the intent explicit at the API layer; the frontend
@@ -923,6 +922,9 @@ def _link_to_evolution_run_id(genome: models.StrategyGenome) -> str | None:
 _PAPER_DECISION_ACTIONS: tuple[str, ...] = (
     "USER_ORDER_PLACED",
     "USER_ORDER_REJECTED",
+    "USER_ORDER_DUPLICATE_SKIPPED",
+    "USER_EXIT_ORDERS_PLACED",
+    "USER_EXIT_ORDERS_REJECTED",
     "USER_POSITION_CLOSED",
     "USER_CLOSE_REJECTED",
     "USER_SIGNAL_SKIPPED_STALE",

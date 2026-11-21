@@ -139,6 +139,61 @@ def _wire_trade_lookup(db: MagicMock, by_broker_id: dict):
 
 
 class TestReconcile:
+    @pytest.mark.parametrize(
+        "reason", ["MARKET_ORDER_MARGIN_CLOSEOUT", "MARGIN_CLOSEOUT"]
+    )
+    def test_margin_closeout_fill_is_flagged(self, reason):
+        """AFX-104: the runner ends the run on a margin closeout."""
+        db = MagicMock()
+        run = _make_run(last_txn_id="100")
+        client = MagicMock()
+        client.get_transactions_since.return_value = {
+            "transactions": [
+                {
+                    "id": "160",
+                    "type": "ORDER_FILL",
+                    "reason": reason,
+                    "time": "2026-07-15T13:35:00.000000Z",
+                    "price": "1.09000",
+                    "pl": "-6000.00",
+                    "tradeClosed": {
+                        "tradeID": "broker-42",
+                        "realizedPL": "-6000.00",
+                    },
+                }
+            ],
+            "lastTransactionID": "160",
+        }
+        trade = _make_trade(broker_trade_id="broker-42")
+        _wire_trade_lookup(db, {"broker-42": trade})
+
+        result = reconcile_broker_transactions(db=db, run=run, client=client)
+
+        assert result.margin_closeout is True
+        assert trade.exit_reason == "broker_other"
+        assert trade.pnl == pytest.approx(-6000.00)
+
+    def test_ordinary_fill_is_not_margin_closeout(self):
+        db = MagicMock()
+        run = _make_run(last_txn_id="100")
+        client = MagicMock()
+        client.get_transactions_since.return_value = {
+            "transactions": [
+                {
+                    "id": "150",
+                    "type": "ORDER_FILL",
+                    "reason": "STOP_LOSS_ORDER",
+                    "tradeClosed": {"tradeID": "broker-42", "realizedPL": "-1"},
+                }
+            ],
+            "lastTransactionID": "150",
+        }
+        _wire_trade_lookup(db, {"broker-42": _make_trade("broker-42")})
+
+        result = reconcile_broker_transactions(db=db, run=run, client=client)
+
+        assert result.margin_closeout is False
+
     def test_no_last_transaction_id_is_noop(self):
         db = MagicMock()
         run = _make_run(last_txn_id=None)
@@ -184,6 +239,9 @@ class TestReconcile:
         assert trade.broker_close_transaction_id == "150"
         assert trade.exit_timestamp is not None
         assert run.last_transaction_id == "150"
+        # AFX-106: fill time recorded so the signal tick blocks
+        # re-entry on that candle.
+        assert run.parameters["last_broker_exit_at"].startswith("2026-07-15T13:35:00")
         db.commit.assert_called()
 
     def test_take_profit_fill_updates_trade(self):

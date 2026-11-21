@@ -200,40 +200,35 @@ def compute_position_units(
     )
 
 
+FAILSAFE_SL_STOP_MULTIPLE = 3
+
+
 def compute_failsafe_sl_pips(
     *,
-    balance: float,
-    units: int,
-    pip_value_account: float,
-    kill_switch_dd_pct: float,
+    stop_pips: float | None,
+    multiple: int = FAILSAFE_SL_STOP_MULTIPLE,
     min_pips: int = 100,
 ) -> int:
     """Broker-side fail-safe stop-loss distance in pips.
 
-    Sized so a full stop-out costs `kill_switch_dd_pct` of the current
-    balance — matches the run's hard-halt loss cap. This is only a
-    safety net for a paper-runner crash: the strategy's own DSL
-    `stop_pips` is enforced by the walk state machine on bar close.
-    The broker SL only fires if the runner is dead (or so lagged that
+    `multiple` × the genome's own `stop_pips`, floored at `min_pips`.
+    This is only a safety net for a paper-runner crash: the genome's
+    `stop_pips` is enforced by the walk state machine on bar close, and
+    the broker SL only fires if the runner is dead (or so lagged that
     the walk misses a bar).
 
-    Floor at `min_pips` so we can never accidentally pass a broker SL
-    tighter than the DSL's own stop distance — that would let the
-    broker fire on an intra-bar wick before the walk gets a chance,
-    which is exactly the touch-vs-close divergence this fix exists to
-    eliminate (see Wilson 2026-08-15 audit).
+    The floor keeps the broker SL well clear of the DSL stop so an
+    intra-bar wick can't fire it before the walk gets a chance — that
+    touch-vs-close divergence is why the broker no longer carries the
+    DSL stop itself (Wilson 2026-08-15 audit).
 
-    Wilson 2026-08-15: previously the runner passed the DSL's
-    `stop_pips` straight to `stopLossOnFill`, which turned every
-    strategy's close-based SL into a touch-based SL at the broker.
-    That silently changed the strategy's payoff distribution vs its
-    validated backtest. Fail-safe wide-SL semantics restore parity.
+    AFX-104: previously sized so a full stop-out cost the run's
+    `kill_switch_dd_pct`. Paper no longer has loss-based halts, so the
+    distance now follows the genome (Wilson 2026-11-20).
     """
-    if units <= 0 or pip_value_account <= 0 or kill_switch_dd_pct <= 0:
+    if not stop_pips or stop_pips <= 0:
         return min_pips
-    max_loss_account = balance * kill_switch_dd_pct / 100.0
-    pips_at_max_loss = max_loss_account / (units * pip_value_account)
-    return max(min_pips, int(pips_at_max_loss))
+    return max(min_pips, int(round(stop_pips * multiple)))
 
 
 __all__ = ["SizingBreakdown", "compute_failsafe_sl_pips", "compute_position_units"]

@@ -216,6 +216,17 @@ def _pips_to_price_distance(instrument: str, pips: float) -> str:
     return f"{pips * pip_size:.5f}"
 
 
+def _format_price(instrument: str, price: float) -> str:
+    """Format an absolute price at the instrument's quote precision.
+
+    OANDA rejects prices with more decimals than the instrument's
+    `displayPrecision` (5 for majors, 3 for JPY quotes). Same two-tier
+    heuristic as `_pips_to_price_distance`.
+    """
+    _, quote = instrument.split("_")
+    return f"{price:.3f}" if quote == "JPY" else f"{price:.5f}"
+
+
 #: Mapping from user-supplied environment name to OANDA v20 REST host.
 #: Kept explicit so a typo in `environment` fails at client construction
 #: rather than pointing at the wrong endpoint.
@@ -676,6 +687,7 @@ class OandaClient:
             # `trades.broker_open_transaction_id`). Distinct from
             # `order_id` (the MARKET_ORDER creation transaction).
             "fill_transaction_id": fill.get("id"),
+            "fill_time": fill.get("time"),
             "fill_price": float(fill["price"]) if "price" in fill else None,
             "units": (
                 int(trade_opened["units"]) if "units" in trade_opened else int(units)
@@ -874,6 +886,98 @@ class OandaClient:
             # (before the 2026-07-26 fix) skip the trade entirely.
             "long_fill_transaction_id": str(long_fill.get("id") or "") or None,
             "short_fill_transaction_id": str(short_fill.get("id") or "") or None,
+            # AFX-106: the actual close fill price (quote currency).
+            # `pl` is in ACCOUNT currency, so it can't be turned back
+            # into a price without the home conversion factor.
+            "long_fill_price": (
+                float(long_fill["price"]) if "price" in long_fill else None
+            ),
+            "short_fill_price": (
+                float(short_fill["price"]) if "price" in short_fill else None
+            ),
+            # Raw OANDA ISO time of the fill transaction.
+            "long_fill_time": long_fill.get("time"),
+            "short_fill_time": short_fill.get("time"),
+        }
+
+    def get_trade(
+        self,
+        trade_id: str,
+        *,
+        account_id: str | None = None,
+    ) -> dict:
+        """Return one trade's state and, once closed, its close time
+        (raw OANDA ISO string) and average close price."""
+        aid = self._resolve_account_id(account_id)
+        resp = self._request("GET", f"/accounts/{aid}/trades/{trade_id}")
+        raw = resp.get("trade") or {}
+        avg_close = raw.get("averageClosePrice")
+        return {
+            "trade_id": raw.get("id"),
+            "state": raw.get("state"),
+            "close_time": raw.get("closeTime"),
+            "average_close_price": float(avg_close) if avg_close else None,
+        }
+
+    def set_trade_exit_orders(
+        self,
+        trade_id: str,
+        instrument: str,
+        *,
+        stop_loss_price: float | None,
+        take_profit_price: float | None,
+        account_id: str | None = None,
+    ) -> dict:
+        """Create or replace the resting SL / TP orders on an open trade.
+
+        `PUT /accounts/{id}/trades/{trade_id}/orders`. A new stopLoss
+        replaces any existing one on the trade (e.g. the wide
+        fail-safe placed at entry). Prices are absolute, GTC.
+
+        Raises `OandaOrderRejected` when OANDA returns a reject
+        transaction for either order, `OandaError` on other HTTP
+        failures. Returns the created order ids and whether OANDA
+        filled either order immediately (price already past it).
+        """
+        aid = self._resolve_account_id(account_id)
+        body: dict[str, dict] = {}
+        if stop_loss_price is not None:
+            body["stopLoss"] = {
+                "price": _format_price(instrument, stop_loss_price),
+                "timeInForce": "GTC",
+            }
+        if take_profit_price is not None:
+            body["takeProfit"] = {
+                "price": _format_price(instrument, take_profit_price),
+                "timeInForce": "GTC",
+            }
+        resp = self._request(
+            "PUT",
+            f"/accounts/{aid}/trades/{trade_id}/orders",
+            json_body=body,
+        )
+        for key, order_type in (
+            ("stopLossOrderRejectTransaction", "STOP_LOSS"),
+            ("takeProfitOrderRejectTransaction", "TAKE_PROFIT"),
+        ):
+            reject = resp.get(key) or {}
+            if reject:
+                raise OandaOrderRejected(
+                    reject.get("rejectReason", "UNKNOWN"),
+                    transaction_id=reject.get("id"),
+                    order_type=order_type,
+                )
+        return {
+            "stop_loss_order_id": (resp.get("stopLossOrderTransaction") or {}).get(
+                "id"
+            ),
+            "take_profit_order_id": (resp.get("takeProfitOrderTransaction") or {}).get(
+                "id"
+            ),
+            "filled": bool(
+                resp.get("stopLossOrderFillTransaction")
+                or resp.get("takeProfitOrderFillTransaction")
+            ),
         }
 
     # ─────────────────────────────────────────────────────────────

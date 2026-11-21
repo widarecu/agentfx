@@ -34,6 +34,7 @@ halted with zero trades because of that gap. US-024 closes it.
 from __future__ import annotations
 
 import logging
+import os
 import time
 import traceback
 import uuid
@@ -369,6 +370,29 @@ def _ensure_started_at(run) -> None:
         run.started_at = datetime.now(UTC)
 
 
+def _claim_runner(db, run) -> bool:
+    """AFX-50: atomically move the run APPROVED -> RUNNING for this process.
+
+    Every scheduling path (approve, resume, boot recovery, auto-restart)
+    sets APPROVED before spawning a runner. If two runners get spawned
+    for one run, only the first flips the row; the second sees zero
+    rows updated and must exit before it can trade.
+    """
+    from agentfx.api.models import Run, RunStatus
+
+    claimed = (
+        db.query(Run)
+        .filter(Run.id == run.id, Run.status == RunStatus.APPROVED)
+        .update(
+            {Run.status: RunStatus.RUNNING, Run.process_pid: os.getpid()},
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    db.refresh(run)
+    return claimed == 1
+
+
 def run_paper_run(
     run_id: str,
 ) -> None:  # pragma: no cover — exercised via subprocess in PR-G integration tests only
@@ -457,7 +481,14 @@ def run_paper_run(
                 )
                 strategy = None
 
-        run.status = RunStatus.RUNNING
+        if not _claim_runner(db, run):
+            logger.warning(
+                "paper runner: run %s is no longer APPROVED (status=%s); "
+                "another runner already claimed it, exiting without trading",
+                run_id,
+                run.status,
+            )
+            return
         _ensure_started_at(run)
         db.commit()
 
@@ -667,11 +698,6 @@ def _execute_loop(
     """
     from agentfx.adapters.oanda import OandaCircuitOpen
     from agentfx.api.models import RunStatus
-    from agentfx.services.paper_policy import (
-        RiskState,
-        check_kill_switch_dd,
-        check_loss_cap,
-    )
 
     if now_fn is None:  # pragma: no cover — trivial
 
@@ -874,34 +900,10 @@ def _execute_loop(
         # too so a fresh subprocess registers a heartbeat immediately.
         _heartbeat()
 
-        # Evaluate risk gates against the current balance. The health
-        # tick only checks halt-gates (kill_switch, loss cap);
-        # position-size gating happens at order-placement time inside
-        # `_signal_tick` where the real proposed units are known.
-        # v0.6.2 (Wilson UAT 2026-07-19): previously called
-        # `evaluate_all(state, proposed_units=state.max_position_size_units)`
-        # which compared max against itself — a no-op check that
-        # forced legacy runs to carry a stale `max_position_size_units`
-        # value even though sizing is fully dynamic.
-        risk_cfg = run.risk_config or {}
-        state = RiskState(
-            snapshot_balance=run.snapshot_balance or 0.0,
-            current_balance=run.current_balance,
-            max_position_size_units=int(
-                risk_cfg.get("max_position_size_units") or 10_000_000
-            ),
-            loss_cap_pct=float(risk_cfg.get("loss_cap_pct", 2.0)),
-            kill_switch_dd_pct=float(risk_cfg.get("kill_switch_dd_pct", 5.0)),
-        )
-        for check in (check_kill_switch_dd(state), check_loss_cap(state)):
-            if not check.ok:
-                logger.info(
-                    "paper runner: gate refused on %s (%s); halting",
-                    run.id,
-                    check.reason,
-                )
-                _flatten_and_halt(db, run, client, reason=check.reason)
-                return
+        # AFX-104: paper has no loss-based auto-halts (CLAUDE.md rule
+        # 11). Stored `loss_cap_pct` / `kill_switch_dd_pct` on legacy
+        # `risk_config` blobs are ignored; OANDA's margin closeout is the
+        # only loss guardrail (see `_halt_on_margin_closeout`).
 
         # ─── Broker transaction reconciliation (T1 — every 12 ticks) ─
         # Every ~60s, poll OANDA's authoritative transaction log for
@@ -924,9 +926,16 @@ def _execute_loop(
                         result.transactions_seen,
                     )
             except Exception:  # noqa: BLE001
+                result = None
                 logger.exception(
                     "reconciler: failed on run %s (will retry next tick)", run.id
                 )
+            if result is not None and result.margin_closeout:
+                logger.warning(
+                    "paper runner: %s OANDA margin closeout; halting", run.id
+                )
+                _flatten_and_halt(db, run, client, reason="MARGIN_CLOSEOUT")
+                return
 
         # ─── Signal tick (only when past the boundary) ───────────────
         now = now_fn()
@@ -1404,6 +1413,7 @@ def _signal_tick(
         _reconcile_broker_side_close(
             db=db,
             run=run,
+            client=client,
             strategy=strategy,
             latest_close=float(df["close"].iloc[-1]),
             latest_high=float(df["high"].iloc[-1]),
@@ -1466,8 +1476,15 @@ def _signal_tick(
     # pass unconditionally when available so the walk decides.
     high_series = df["high"].astype(float) if "high" in df.columns else None
     low_series = df["low"].astype(float) if "low" in df.columns else None
+    open_series = df["open"].astype(float) if "open" in df.columns else None
 
     # ── Walk ─────────────────────────────────────────────────────
+    # Backtest parity (AFX-106): candles that started before a broker
+    # SL/TP fill were HELD in the backtest, and the fill candle is
+    # consumed by the exit, so none of them may open from flat. The
+    # fill can land in a candle that isn't complete yet (fill between
+    # the boundary and this delayed tick), hence a time cutoff rather
+    # than a candle lookup.
     result = walk(
         raw_entries=raw_entries,
         close_series=close_series,
@@ -1477,6 +1494,8 @@ def _signal_tick(
         pip_size=pip_size,
         high_series=high_series,
         low_series=low_series,
+        open_series=open_series,
+        no_entry_through_ts=_broker_exit_cutoff(run),
     )
 
     # ── Advance bookmark UNCONDITIONALLY on any successful tick ──
@@ -1520,6 +1539,223 @@ def _signal_tick(
         broker_position=position,
         exit_rules=exit_rules_full,
         risk_cfg=risk_cfg,
+    )
+    _sync_broker_exit_orders(
+        db=db,
+        run=run,
+        client=client,
+        strategy=strategy,
+        instrument=instrument,
+        granularity=granularity,
+        granularity_seconds=granularity_seconds,
+        final_state=result.final_state,
+        now_utc=now_utc,
+    )
+
+
+def _broker_exit_cutoff(run) -> datetime | None:
+    """Time of the last broker-side (or hold-ending market) SL/TP fill,
+    or None. Written by `_reconcile_broker_side_close`, the
+    transaction reconciler, or `_sync_broker_exit_orders`, whichever
+    records the fill first."""
+    params = (
+        run.parameters if isinstance(getattr(run, "parameters", None), dict) else {}
+    )
+    raw = params.get("last_broker_exit_at")
+    if not raw:
+        return None
+    exit_ts = datetime.fromisoformat(raw)
+    if exit_ts.tzinfo is None:
+        exit_ts = exit_ts.replace(tzinfo=UTC)
+    return exit_ts
+
+
+def _sync_broker_exit_orders(
+    *,
+    db,
+    run,
+    client,
+    strategy,
+    instrument: str,
+    granularity: str,
+    granularity_seconds: int,
+    final_state,
+    now_utc: datetime,
+) -> None:
+    """Wick-mode genomes: rest the DSL's exact SL / TP at OANDA once
+    `min_hold_bars` has elapsed (AFX-106).
+
+    Backtest wick mode fills a stop/target the moment a bar's wick
+    touches the level. A bar-close poll can't reproduce that — it
+    fills at the next close, often several pips past the level — so
+    the levels must live at the broker. They are attached after the
+    bar that ends the hold closes, so they are live for exactly the
+    bars the backtest checks (`bars_held >= min_hold_bars`).
+
+    Bars held are counted from the trade's real entry time, not the
+    walk's projected entry: a catch-up walk can open on an old candle
+    but the broker order is only placed now.
+
+    If the current executable quote (bid for a long, ask for a short)
+    is already past a level when the hold ends, close at market now:
+    the backtest fills that case at the next bar's open, which is
+    where price is right now. A resting order can't be placed on the
+    wrong side of the market. No quote → retry next tick; a completed
+    candle is not a substitute (it can predate the entry fill).
+
+    Close-mode genomes are untouched: wide fail-safe SL at OANDA,
+    DSL levels enforced by the walk on bar close.
+    """
+    from agentfx.adapters.oanda import OandaError
+    from agentfx.api.models import Trade
+
+    spec = getattr(strategy, "spec", None)
+    exit_block = getattr(spec, "exit", None) if spec is not None else None
+    if exit_block is None or getattr(exit_block, "eval_mode", "close") != "wick":
+        return
+    if final_state.in_position == 0:
+        return
+    min_hold = int(getattr(exit_block, "min_hold_bars", 0) or 0)
+
+    open_trade = (
+        db.query(Trade)
+        .filter(Trade.run_id == run.id, Trade.exit_timestamp.is_(None))
+        .order_by(Trade.entry_timestamp.asc())
+        .first()
+    )
+    if open_trade is None or not getattr(open_trade, "broker_trade_id", None):
+        return
+    is_long = open_trade.side == "buy"
+    if is_long != (final_state.in_position == 1):
+        return  # walk and DB disagree; leave it to the next tick
+    params = getattr(run, "parameters", None) or {}
+    broker_trade_id = str(open_trade.broker_trade_id)
+    if params.get("broker_exit_orders_trade_id") == broker_trade_id:
+        return  # already attached for this trade
+
+    # Same count the walk uses (`_count_bars_since` + 1 per walked
+    # candle), anchored on the real entry. Shifting the anchor back
+    # one bar counts the candle the entry landed in.
+    entry_ts = open_trade.entry_timestamp
+    if entry_ts.tzinfo is None:
+        entry_ts = entry_ts.replace(tzinfo=UTC)
+    if entry_ts >= now_utc:
+        bars_held = 0  # opened on this tick
+    else:
+        bars_held = _count_bars_since(
+            db=db,
+            instrument=instrument,
+            granularity=granularity,
+            entry_ts=entry_ts - timedelta(seconds=granularity_seconds),
+            now_utc=now_utc,
+        )
+    if bars_held < min_hold - 1:
+        return
+
+    try:
+        quotes = client.get_pricing(instrument)
+        quote = quotes[0] if quotes else {}
+        px = float(quote.get("bid" if is_long else "ask") or 0.0)
+    except (OandaError, AttributeError, IndexError, TypeError, ValueError):
+        px = 0.0
+    if px <= 0.0:
+        return
+
+    pip_size = float(getattr(strategy, "pip_size", 0.0001) or 0.0001)
+    entry = float(open_trade.entry_price)
+    stop_dist = float(exit_block.stop_pips) * pip_size
+    target_dist = float(exit_block.target_pips) * pip_size
+    if is_long:
+        sl_price, tp_price = entry - stop_dist, entry + target_dist
+        past_sl, past_tp = px <= sl_price, px >= tp_price
+    else:
+        sl_price, tp_price = entry + stop_dist, entry - target_dist
+        past_sl, past_tp = px >= sl_price, px <= tp_price
+
+    if past_sl or past_tp:
+        exit_reason = "stop" if past_sl else "target"
+        # +1ms: the transition step already wrote an (open-position)
+        # equity sample at now_utc; the flat one must sort after it.
+        close_result = _close_position_and_persist(
+            db=db,
+            run=run,
+            client=client,
+            instrument=instrument,
+            now_utc=now_utc + timedelta(milliseconds=1),
+            reason=(
+                f"min_hold ended with price {px:.5f} already past "
+                f"{exit_reason} level "
+                f"{sl_price if past_sl else tp_price:.5f}"
+            ),
+            exit_reason=exit_reason,
+        )
+        # This fill is stamped on the trade, so the transaction
+        # reconciler skips it: record the re-entry cutoff here, at the
+        # broker fill time (not the synthetic +1ms).
+        from agentfx.services.paper_reconciler import _parse_oanda_time
+
+        close_result = close_result if isinstance(close_result, dict) else {}
+        fill_ts = (
+            _parse_oanda_time(
+                close_result.get("long_fill_time")
+                or close_result.get("short_fill_time")
+            )
+            or now_utc
+        )
+        params_now = run.parameters if isinstance(run.parameters, dict) else {}
+        run.parameters = {**params_now, "last_broker_exit_at": fill_ts.isoformat()}
+        db.commit()
+        return
+
+    try:
+        result = client.set_trade_exit_orders(
+            broker_trade_id,
+            instrument,
+            stop_loss_price=sl_price,
+            take_profit_price=tp_price,
+        )
+    except OandaError as exc:
+        # Walk still enforces the levels on bar close, and the
+        # fail-safe SL stays on the trade; retried next tick.
+        _write_decision(
+            db,
+            run,
+            action="USER_EXIT_ORDERS_REJECTED",
+            reason=(
+                f"OANDA refused SL {sl_price:.5f} / TP {tp_price:.5f} on "
+                f"trade {broker_trade_id}: {exc}"
+            ),
+            outputs={
+                "paper_run_id": run.id,
+                "broker_trade_id": broker_trade_id,
+                "stop_loss_price": sl_price,
+                "take_profit_price": tp_price,
+                "error": str(exc),
+                "reject_reason": getattr(exc, "reject_reason", None),
+            },
+        )
+        return
+
+    run.parameters = {**params, "broker_exit_orders_trade_id": broker_trade_id}
+    db.commit()
+    _write_decision(
+        db,
+        run,
+        action="USER_EXIT_ORDERS_PLACED",
+        reason=(
+            f"min_hold elapsed — resting SL {sl_price:.5f} "
+            f"({exit_block.stop_pips} pips) / TP {tp_price:.5f} "
+            f"({exit_block.target_pips} pips) on trade {broker_trade_id}"
+        ),
+        outputs={
+            "paper_run_id": run.id,
+            "broker_trade_id": broker_trade_id,
+            "stop_loss_price": sl_price,
+            "take_profit_price": tp_price,
+            "stop_loss_order_id": result.get("stop_loss_order_id"),
+            "take_profit_order_id": result.get("take_profit_order_id"),
+            "filled_immediately": result.get("filled", False),
+        },
     )
 
 
@@ -1584,6 +1820,8 @@ def _open_position_and_persist(
     exit_rules,  # spec.exit chain; the caller has already resolved to spec
     risk_cfg: dict,
     position_snapshot,
+    signal_bar_ts: datetime,
+    order_row=None,
 ) -> None:
     """Size + place a market order + persist the trade + write the
     decision log. Extracted from `_signal_tick` verbatim so the walk-
@@ -1598,6 +1836,10 @@ def _open_position_and_persist(
       exit block — matches the pre-extract naming).
     - `position_snapshot` is the broker position dict at the start of
       the tick; only used for the final equity snapshot.
+    - `signal_bar_ts` is the bar the signal fired on. Together with the
+      run and side it is the order's idempotency key (AFX-50).
+    - `order_row` is a claim the caller already won (the flip path
+      claims before closing); when None this function claims itself.
 
     Returns None. On sizing failure, broker rejection, or other
     recoverable errors, writes an appropriate decision log entry and
@@ -1612,9 +1854,9 @@ def _open_position_and_persist(
     # backtest — every wick that would have recovered becomes a
     # locked loss.
     #
-    # The broker order now carries only a WIDE fail-safe SL sized
-    # from `kill_switch_dd_pct` (matches the run's hard-halt loss
-    # cap), and NO broker-side TP. The walk enforces the strategy's
+    # The broker order now carries only a WIDE fail-safe SL
+    # (`FAILSAFE_SL_STOP_MULTIPLE` × the DSL stop, at least 100 pips)
+    # and NO broker-side TP. The walk enforces the strategy's
     # real SL + TP on close each tick; the broker SL only fires if
     # the runner is dead. See `compute_failsafe_sl_pips` for the
     # sizing formula.
@@ -1683,24 +1925,42 @@ def _open_position_and_persist(
                 "sizing": sizing.__dict__,
             },
         )
+        if order_row is not None:
+            order_row.status = "canceled"
+            db.commit()
         return
     signed_units = (
         sizing.capped_units if signal_direction == "long" else -sizing.capped_units
     )
 
-    # Broker fail-safe SL, sized from the run's hard-halt loss cap
-    # (kill_switch_dd_pct). Wide enough that normal price action never
-    # touches it; only fires if the runner is dead. Walk enforces the
-    # DSL's real SL + TP on bar close each tick.
-    kill_switch_dd_pct = float(risk_cfg.get("kill_switch_dd_pct", 5.0))
-    failsafe_sl_pips = compute_failsafe_sl_pips(
-        balance=sizing.balance,
-        units=sizing.capped_units,
-        pip_value_account=sizing.pip_value_account,
-        kill_switch_dd_pct=kill_switch_dd_pct,
-    )
+    # Broker fail-safe SL, sized from the DSL stop. Wide enough that
+    # normal price action never touches it; only fires if the runner
+    # is dead. Walk enforces the DSL's real SL + TP on bar close.
+    failsafe_sl_pips = compute_failsafe_sl_pips(stop_pips=sl_pips_dsl)
 
     from agentfx.adapters.oanda import OandaOrderRejected
+
+    if order_row is None:
+        order_row = _claim_order_slot(
+            db,
+            run,
+            signal_bar_ts=signal_bar_ts,
+            side="buy" if signed_units > 0 else "sell",
+            units=abs(signed_units),
+        )
+        if order_row is None:
+            _write_duplicate_skip(
+                db,
+                run,
+                instrument=instrument,
+                signal_direction=signal_direction,
+                signal_bar_ts=signal_bar_ts,
+                position_snapshot=position_snapshot,
+                now_utc=now_utc,
+            )
+            return
+    else:
+        order_row.quantity = float(abs(signed_units))
 
     try:
         result = client.place_market_order(
@@ -1710,6 +1970,8 @@ def _open_position_and_persist(
             take_profit_pips=None,
         )
     except OandaOrderRejected as exc:
+        order_row.status = "rejected"
+        db.commit()
         # Broker refused to fill (INSUFFICIENT_MARGIN, MARKET_HALTED,
         # POSITION_LOCKED, NO_FILL_TRANSACTION_RETURNED, etc.). Log
         # with the specific reject reason so the operator sees why —
@@ -1740,6 +2002,14 @@ def _open_position_and_persist(
     filled_units = int(result.get("units") or signed_units)
     trade_id = result.get("trade_id")
     fill_transaction_id = result.get("fill_transaction_id")
+    order_row.status = "filled"
+    from agentfx.services.paper_reconciler import _parse_oanda_time
+
+    order_row.filled_at = _parse_oanda_time(result.get("fill_time")) or datetime.now(
+        UTC
+    )
+    order_row.filled_quantity = abs(filled_units)
+    order_row.average_fill_price = fill_price
     # Pass the candles DataFrame so `_signal_reason` can compute
     # actual indicator values at the trigger bar. Wilson's UAT
     # feedback (2026-07-13): "the indicator on the graph didn't seem
@@ -1747,7 +2017,7 @@ def _open_position_and_persist(
     # verifiable at a glance.
     signal_reason = _signal_reason(strategy, signal_direction, df)
 
-    _persist_trade_entry(
+    trade = _persist_trade_entry(
         db=db,
         run=run,
         instrument=instrument,
@@ -1761,6 +2031,8 @@ def _open_position_and_persist(
         entry_financing=float(result.get("financing") or 0.0),
         entry_commission=float(result.get("commission") or 0.0),
     )
+    order_row.trade_id = trade.id
+    db.commit()
     # Sizing trace so the operator can audit `why this many units` at
     # a glance — surface balance × risk_pct / (stop × pip_value) plus
     # the account currency and conversion rate used. Full breakdown
@@ -1779,8 +2051,7 @@ def _open_position_and_persist(
         reason=(
             f"{signal_direction.upper()} {abs(filled_units)} {instrument} "
             f"@ {fill_price:.5f} ({signal_reason}) | sizing: {sizing_note} | "
-            f"broker failsafe SL: {failsafe_sl_pips} pips "
-            f"({kill_switch_dd_pct}% of balance)"
+            f"broker failsafe SL: {failsafe_sl_pips} pips"
         ),
         outputs={
             "paper_run_id": run.id,
@@ -1808,6 +2079,88 @@ def _open_position_and_persist(
     _persist_equity_snapshot(
         db=db, run=run, position=position_snapshot, now_utc=now_utc
     )
+
+
+def _iso(ts) -> str:
+    return ts.isoformat() if isinstance(ts, datetime) else str(ts)
+
+
+def _order_idempotency_key(run_id: str, signal_bar_ts, side: str) -> str:
+    return f"paper:{run_id}:{_iso(signal_bar_ts)}:{side}"
+
+
+def _write_duplicate_skip(
+    db,
+    run,
+    *,
+    instrument: str,
+    signal_direction: str,
+    signal_bar_ts,
+    position_snapshot,
+    now_utc: datetime,
+) -> None:
+    side = "buy" if signal_direction == "long" else "sell"
+    _write_decision(
+        db,
+        run,
+        action="USER_ORDER_DUPLICATE_SKIPPED",
+        reason=(
+            f"{signal_direction.upper()} {instrument} for bar "
+            f"{_iso(signal_bar_ts)} was already submitted by another "
+            "runner for this run; not sending a second order"
+        ),
+        outputs={
+            "paper_run_id": run.id,
+            "instrument": instrument,
+            "signal_direction": signal_direction,
+            "signal_bar_ts": _iso(signal_bar_ts),
+            "idempotency_key": _order_idempotency_key(run.id, signal_bar_ts, side),
+        },
+    )
+    _persist_equity_snapshot(
+        db=db, run=run, position=position_snapshot, now_utc=now_utc
+    )
+
+
+def _claim_order_slot(db, run, *, signal_bar_ts, side: str, units: int):
+    """AFX-50: claim the right to send the order for this run, bar and
+    side, before OANDA sees it.
+
+    The claim is an `orders` row whose primary key is the idempotency
+    key, committed before the broker call. Two runners on the same
+    run (deploy overlap, a double schedule) both see the account flat
+    and both reach here; Postgres lets only one insert win. The loser
+    gets None and must not place the order.
+
+    The claim is kept even if OANDA then rejects the order: the bar
+    bookmark has already moved on, so the bar is never retried anyway.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from agentfx.api.models import Order
+
+    key = _order_idempotency_key(run.id, signal_bar_ts, side)
+    order_row = Order(
+        id=key,
+        run_id=run.id,
+        order_type="market",
+        side=side,
+        quantity=float(units),
+        status="new",
+        metadata_={"signal_bar_ts": _iso(signal_bar_ts)},
+    )
+    db.add(order_row)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        logger.warning(
+            "paper runner: duplicate order for run %s suppressed (key=%s)",
+            run.id,
+            key,
+        )
+        return None
+    return order_row
 
 
 def _execute_walk_transitions(
@@ -1918,6 +2271,28 @@ def _execute_walk_transitions(
         # market order) mirroring the pre-refactor opposite_flip
         # behaviour. If the close leg fails, don't open the new side —
         # the retry on the next tick will handle it.
+        signal_direction = "long" if last_t.direction > 0 else "short"
+        # AFX-50: claim the whole reversal before the close. A second
+        # runner that also decided to flip must not close the position
+        # the first runner just opened.
+        order_row = _claim_order_slot(
+            db,
+            run,
+            signal_bar_ts=last_t.bar_ts,
+            side="buy" if last_t.direction > 0 else "sell",
+            units=0,
+        )
+        if order_row is None:
+            _write_duplicate_skip(
+                db,
+                run,
+                instrument=instrument,
+                signal_direction=signal_direction,
+                signal_bar_ts=last_t.bar_ts,
+                position_snapshot=broker_position,
+                now_utc=now_utc,
+            )
+            return
         try:
             _close_position_and_persist(
                 db=db,
@@ -1948,12 +2323,17 @@ def _execute_walk_transitions(
                     "close_context": "opposite_flip",
                 },
             )
+            order_row.status = "canceled"
+            order_row.metadata_ = {
+                **(order_row.metadata_ or {}),
+                "canceled_reason": "flip_close_rejected",
+            }
+            db.commit()
             _persist_equity_snapshot(
                 db=db, run=run, position=broker_position, now_utc=now_utc
             )
             return
         # Close succeeded — open the new side.
-        signal_direction = "long" if last_t.direction > 0 else "short"
         _open_position_and_persist(
             db=db,
             run=run,
@@ -1966,6 +2346,8 @@ def _execute_walk_transitions(
             exit_rules=exit_rules,
             risk_cfg=risk_cfg,
             position_snapshot=broker_position,
+            signal_bar_ts=last_t.bar_ts,
+            order_row=order_row,
         )
         return
 
@@ -1984,6 +2366,7 @@ def _execute_walk_transitions(
             exit_rules=exit_rules,
             risk_cfg=risk_cfg,
             position_snapshot=broker_position,
+            signal_bar_ts=last_t.bar_ts,
         )
         return
 
@@ -2017,7 +2400,7 @@ def _persist_trade_entry(
     broker_open_transaction_id: str | None = None,
     entry_financing: float = 0.0,
     entry_commission: float = 0.0,
-) -> None:
+):
     """Insert a new Trade row for a placed order.
 
     Side convention on the Trade table is 'buy' / 'sell' (legacy). Map
@@ -2047,6 +2430,7 @@ def _persist_trade_entry(
     )
     db.add(trade)
     db.commit()
+    return trade
 
 
 def _reconcile_broker_side_close(
@@ -2058,6 +2442,7 @@ def _reconcile_broker_side_close(
     latest_high: float,
     latest_low: float,
     now_utc: datetime,
+    client=None,
 ) -> None:
     """Detect and reconcile a broker-side SL/TP fill.
 
@@ -2161,9 +2546,26 @@ def _reconcile_broker_side_close(
     # Pips derived from (entry_price, exit_price_est) are currency-
     # agnostic and stay approximately correct even without
     # conversion.
-    open_trade.exit_timestamp = now_utc
+    # AFX-106: OANDA's own close time + price when available. The
+    # close time decides which candle re-entry is blocked on.
+    exit_ts = now_utc
+    if client is not None and getattr(open_trade, "broker_trade_id", None):
+        from agentfx.adapters.oanda import OandaError
+        from agentfx.services.paper_reconciler import _parse_oanda_time
+
+        try:
+            info = client.get_trade(str(open_trade.broker_trade_id))
+        except OandaError:
+            info = None
+        if isinstance(info, dict) and info.get("state") == "CLOSED":
+            exit_ts = _parse_oanda_time(info.get("close_time")) or now_utc
+            if info.get("average_close_price"):
+                exit_price_est = float(info["average_close_price"])
+    open_trade.exit_timestamp = exit_ts
     open_trade.exit_price = exit_price_est
     open_trade.exit_reason = classified
+    params = run.parameters if isinstance(run.parameters, dict) else {}
+    run.parameters = {**params, "last_broker_exit_at": exit_ts.isoformat()}
     # pnl / pnl_pct intentionally left NULL — see comment above.
     db.commit()
 
@@ -2195,7 +2597,7 @@ def _close_position_and_persist(
     now_utc: datetime,
     reason: str,
     exit_reason: str | None = None,
-) -> None:
+) -> dict:
     """Flatten the OANDA position, update matching open Trade rows,
     and write a `USER_POSITION_CLOSED` decision log.
 
@@ -2232,6 +2634,7 @@ def _close_position_and_persist(
     close_txn_id = result.get("long_fill_transaction_id") or result.get(
         "short_fill_transaction_id"
     )
+    close_fill_price = result.get("long_fill_price") or result.get("short_fill_price")
 
     # Update every open Trade row for this run — a normal single-side
     # position will have exactly one; the multi-fill / partial-close
@@ -2255,11 +2658,16 @@ def _close_position_and_persist(
                 (t.pnl / (t.entry_price * t.quantity)) * 100 if t.entry_price else 0.0
             )
             t.exit_timestamp = now_utc
-            # Exit price: derive from the pnl share + entry price. Not
-            # exact for JPY vs major pip differences but close enough
-            # for the UI. If this drifts noticeably we'll read the
-            # actual fill price from the OANDA response in v0.6.2.
-            t.exit_price = t.entry_price + (t.pnl / t.quantity if t.quantity else 0.0)
+            # AFX-106: the OANDA close fill price. The old pnl-derived
+            # fallback treats account-currency pnl as quote-currency
+            # price movement (~1.5x off on an AUD account trading
+            # AUD_USD); kept only for responses without a price.
+            if close_fill_price:
+                t.exit_price = float(close_fill_price)
+            else:
+                t.exit_price = t.entry_price + (
+                    t.pnl / t.quantity if t.quantity else 0.0
+                )
             if exit_reason is not None:
                 t.exit_reason = exit_reason
             # v0.6.1: accumulate financing + commission on this close.
@@ -2299,6 +2707,7 @@ def _close_position_and_persist(
     )
     # Position is now flat — snapshot equity without unrealized_pnl.
     _persist_equity_snapshot(db=db, run=run, position=None, now_utc=now_utc)
+    return result
 
 
 def _persist_equity_snapshot(
