@@ -544,3 +544,82 @@ def test_dispatch_back_to_back_markers_do_not_cross_contaminate():
     assert markers[0] != markers[1]
     assert markers[0] == fsop.success_marker(sha_a)
     assert markers[1] == fsop.success_marker(sha_b)
+
+
+def test_main_finds_afx_106_on_promote_143(monkeypatch):
+    """AFX-113 regression, end to end: promote #143 (merge a7c78c3) named
+    AFX-106 only in PR #137's title and #139/#141's branches, so the Done
+    step found AFX-104 and AFX-50 but left AFX-106 In Staging."""
+    commits = {
+        "d755622": (
+            "fix(paper,backtest): wick-mode broker SL/TP after min_hold (#137)",
+            _pr(
+                137,
+                "fix(paper,backtest): AFX-106 wick-mode broker SL/TP after min_hold",
+                "agent/AFX-106-wick-stop-fidelity",
+            ),
+        ),
+        "c25dd35": (
+            "fix(paper): remove loss-cap and drawdown auto-halts (AFX-104) (#138)",
+            _pr(
+                138, "fix(paper): remove paper auto-halts (AFX-104)", "agent/AFX-104-x"
+            ),
+        ),
+        "95a76ee": (
+            "fix(paper): address PR #137 review (#139)",
+            _pr(139, "fix(paper): address #137 review", "agent/AFX-106-review-fixes"),
+        ),
+        "57a865b": (
+            "fix(paper): claim each order atomically (AFX-50) (#140)",
+            _pr(140, "fix(paper): one order per signal bar (AFX-50)", "devin/1-afx50"),
+        ),
+        "5c5d723": (
+            "fix(paper): re-entry cutoff by broker fill time (#141)",
+            _pr(
+                141,
+                "fix(paper): re-entry cutoff (#139 review)",
+                "agent/AFX-106-review-fixes-2",
+            ),
+        ),
+        "069abbd": (
+            "Merge pull request #135 from widarecu/main",
+            _pr(135, "Back-merge main → feat/agent-fleet (AFX-63)", "main"),
+        ),
+    }
+    pulls = {sha: [pr] for sha, (_, pr) in commits.items()}
+    pulls["a7c78c3"] = [
+        _pr(143, "Promote feat/agent-fleet → main (AFX-1)", "feat/agent-fleet")
+    ]
+
+    def fake_gh_json(*args):
+        path = args[1]
+        if path == "repos/w/r/commits/a7c78c3":
+            return {
+                "sha": "a7c78c3",
+                "commit": {
+                    "message": "Merge pull request #143 from widarecu/feat/agent-fleet"
+                },
+                "parents": [{"sha": "c826fe1"}, {"sha": "a0e34f4"}],
+            }
+        if path == "repos/w/r/compare/c826fe1...a0e34f4":
+            return {
+                "commits": [
+                    {"sha": sha, "commit": {"message": subject}}
+                    for sha, (subject, _) in commits.items()
+                ]
+            }
+        if path.endswith("/pulls"):
+            return pulls.get(path.split("/")[-2], [])
+        raise AssertionError(f"unexpected gh call: {path}")
+
+    dispatched = []
+    monkeypatch.setattr(fsop, "_gh_json", fake_gh_json)
+    monkeypatch.setattr(fsop, "Linear", lambda api_key: object())
+    monkeypatch.setattr(
+        fsop, "dispatch", lambda linear, idents, **kw: dispatched.append((idents, kw))
+    )
+    monkeypatch.setenv("LINEAR_API_KEY", "test")
+
+    assert fsop.main(["--sha", "a7c78c3", "--outcome", "success", "--repo", "w/r"]) == 0
+    assert [idents for idents, _ in dispatched] == [["AFX-104", "AFX-50", "AFX-106"]]
+    assert dispatched[0][1]["outcome"] == "success"
