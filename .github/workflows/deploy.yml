@@ -152,6 +152,9 @@ jobs:
     # needs: e2e  # Temporarily disabled until deployment is stable
     runs-on: ubuntu-latest
     environment: production
+    # Above the wait in scripts/railway_deploy.py (25 min) so the script,
+    # not the runner, reports a stuck deploy.
+    timeout-minutes: 35
 
     steps:
       - name: Checkout code
@@ -168,10 +171,18 @@ jobs:
         # ${var} substitution on line 145 — exit code 2 even though the
         # binary actually lands. The official npm package is the
         # canonical, shell-portable alternative.
-        run: npm install --global @railway/cli
+        #
+        # Pinned: scripts/railway_deploy.py parses the `--json` output of
+        # `railway up` and `railway deployment list`.
+        run: npm install --global @railway/cli@5.75.0
 
+      # `railway up --detach` returns once the code is uploaded, before
+      # Railway builds the image and passes the /health check, so on its own
+      # it goes green for deploys that later fail (AFX-112). The script starts
+      # the deploy, then polls that deployment until Railway reports SUCCESS
+      # (exit 0) or FAILED / CRASHED / timeout (exit 1).
       - name: Deploy to Railway
-        run: railway up --detach --service agentfx
+        run: python3 scripts/railway_deploy.py --service agentfx
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
 
