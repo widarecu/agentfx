@@ -191,8 +191,20 @@ class Git:
             == 0
         )
 
+    def shares_history(self, a: str, b: str) -> bool:
+        return self._run("merge-base", a, b).returncode == 0
+
     def changed_files(self, base: str, head: str) -> list[str]:
-        out = self._out("diff", "--name-only", base, head)
+        # --no-renames: a move lists both paths, so moving a file out of a
+        # deployed directory still counts as a change to that component.
+        out = self._out("diff", "--no-renames", "--name-only", base, head)
+        return [line for line in out.splitlines() if line.strip()]
+
+    def touched_files(self, base: str, head: str) -> list[str]:
+        """Files any commit in `base..head` changed, even if later reverted."""
+        out = self._out(
+            "log", "--no-renames", "--name-only", "--format=", f"{base}..{head}"
+        )
         return [line for line in out.splitlines() if line.strip()]
 
     def last_commit(self, ref: str, paths: Sequence[str]) -> str | None:
@@ -212,8 +224,9 @@ def relation(git: Git, target: str, tag_sha: str | None) -> str:
     """How `target` relates to the last verified deploy.
 
     `first` (no tag), `same`, `newer` (tag is an ancestor), `stale` (target is
-    an ancestor of the tag: deploying it would regress staging) or
-    `unrelated` (rewritten history).
+    an ancestor of the tag: deploying it would regress staging), `diverged`
+    (neither contains the other, so deploying would drop commits staging
+    runs) or `unrelated` (no shared history: main was rewritten).
     """
     if not tag_sha:
         return "first"
@@ -223,7 +236,16 @@ def relation(git: Git, target: str, tag_sha: str | None) -> str:
         return "newer"
     if git.is_ancestor(target, tag_sha):
         return "stale"
+    if git.shares_history(tag_sha, target):
+        return "diverged"
     return "unrelated"
+
+
+def diverged_problem(target: str, tag_sha: str | None) -> str:
+    return (
+        f"{target} does not contain {TAG} ({tag_sha}); deploying it would drop "
+        "commits staging already runs. Deploy a commit on main that contains both"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -271,13 +293,20 @@ def resolve_target(git: Git, ref: str, main_ref: str) -> str:
 def make_plan(git: Git, target: str, tag_sha: str | None) -> Plan:
     rel = relation(git, target, tag_sha)
     base = tag_sha or ""
+    if rel == "diverged":
+        raise DeployError(diverged_problem(target, tag_sha))
     if rel in ("first", "unrelated"):
         return Plan(target, base, rel, rel, True, True)
     if rel in ("same", "stale"):
         kind = "already-deployed" if rel == "same" else "stale"
         return Plan(target, base, rel, kind, False, False)
 
-    files = git.changed_files(tag_sha, target)  # type: ignore[arg-type]
+    # Union with every commit's files: after a partial deploy, a later revert
+    # leaves no net diff but the live component may still run the reverted code.
+    files = sorted(
+        set(git.changed_files(tag_sha, target))  # type: ignore[arg-type]
+        | set(git.touched_files(tag_sha, target))  # type: ignore[arg-type]
+    )
     changed = components_changed(files)
     if changed == {BACKEND, FRONTEND}:
         kind = "both"
@@ -336,7 +365,10 @@ def guard(
     backend_url: str = DEFAULT_BACKEND_URL,
 ) -> str:
     """Return "" when deploying `target` is safe, else why it is not."""
-    if relation(git, target, tag_sha) == "stale":
+    rel = relation(git, target, tag_sha)
+    if rel == "diverged":
+        return diverged_problem(target, tag_sha)
+    if rel == "stale":
         return (
             f"{TAG} is already at {tag_sha}, which contains {target}; "
             "deploying the older commit would regress staging"
@@ -502,6 +534,8 @@ def record(
             tag_sha or "",
             f"{TAG} is at {tag_sha}, which already contains {target}; left unchanged",
         )
+    if rel == "diverged":
+        raise DeployError(diverged_problem(target, tag_sha))
     if tag_sha:
         # Kept first so ticket sync can still find the start of the range.
         _write_ref(

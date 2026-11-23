@@ -260,6 +260,58 @@ def test_unrelated_tag_history_deploys_both(repo):
     assert (plan.kind, plan.backend, plan.frontend) == ("unrelated", True, True)
 
 
+def test_revert_after_a_partial_deploy_still_redeploys_the_component(repo):
+    """The live backend may run the reverted code; no net diff is not enough."""
+    repo.commit({"src/agentfx/api/main.py": "app = 2\n"})
+    sha = repo.commit({"src/agentfx/api/main.py": "app = 1\n"}, "revert")
+    plan = ds.make_plan(repo.g, sha, repo.initial)
+    assert (plan.kind, plan.backend, plan.frontend) == ("backend", True, False)
+
+
+def test_moving_a_file_out_of_a_component_deploys_it(repo):
+    repo.git("mv", "src/agentfx/api/main.py", "planning/main.py")
+    sha = repo.commit({}, "move")
+    plan = ds.make_plan(repo.g, sha, repo.initial)
+    assert plan.backend is True
+    assert "src/agentfx/api/main.py" in plan.files
+
+
+def _diverged(repo):
+    """Tag on a main-only hotfix; target a fleet commit without it."""
+    repo.git("checkout", "-q", "-b", "fleet")
+    fleet = repo.commit({"src/agentfx/api/main.py": "fleet\n"}, "fleet")
+    repo.git("checkout", "-q", "main")
+    hotfix = repo.commit({"portal/web/src/App.tsx": "hotfix\n"}, "hotfix")
+    repo.git("merge", "-q", "--no-edit", "fleet")
+    return fleet, hotfix
+
+
+def test_diverged_target_cannot_drop_a_deployed_hotfix(repo):
+    fleet, hotfix = _diverged(repo)
+    assert ds.relation(repo.g, fleet, hotfix) == "diverged"
+    with pytest.raises(ds.DeployError, match="does not contain"):
+        ds.make_plan(repo.g, fleet, hotfix)
+    assert "does not contain" in ds.guard(
+        repo.g, fleet, "frontend", hotfix, fetch=FakeHttp({})
+    )
+    gh = FakeGh()
+    with pytest.raises(ds.DeployError, match="does not contain"):
+        ds.record(repo.g, fleet, hotfix, None, repo="o/r", runner=gh)
+    assert gh.calls == []
+
+
+def test_plan_cli_fails_for_a_diverged_target(repo, tmp_path, monkeypatch, capsys):
+    fleet, hotfix = _diverged(repo)
+    repo.tag(hotfix)
+    monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "out"))
+    code = ds.main(
+        ["--repo-dir", str(repo.path), "plan", "--sha", fleet, "--main-ref", "main"]
+    )
+    assert code == 1
+    assert "does not contain" in capsys.readouterr().out
+    assert not (tmp_path / "out").exists()
+
+
 def test_target_must_be_on_main(repo):
     repo.git("checkout", "-q", "-b", "side")
     side = repo.commit({"src/agentfx/api/main.py": "side\n"})
