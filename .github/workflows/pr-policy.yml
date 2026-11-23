@@ -1,0 +1,103 @@
+name: PR policy
+
+# `pr-policy` (AFX-120): a PR into `main` must name exactly one AFX ticket
+# (title + branch), that ticket must be In Progress or In Review, and a
+# Money-path ticket needs Wilson's approval of the latest commit. The
+# result is the `pr-policy` commit status on the PR head; the logic lives
+# in scripts/pr_policy.py.
+#
+# Trust: both triggers run this file and the script from `main`, never
+# the PR's code, so the Linear key and the fleet-bot token never meet
+# untrusted code. pull_request_target covers PR events; reviews can't
+# reach secrets or the `fleet-bot` environment from their own event, so
+# pr-review-relay.yml (no permissions, no checkout) fires a workflow_run
+# here. Event-driven only: no polling cron.
+#
+# Scope until the cutover (AFX-125): PRs into `main` only. The fleet
+# flow (agent-fleet-ci.yml, promote PRs, back-merges) is unchanged.
+# Making `pr-policy` a required check is a settings change in AFX-125.
+on:
+  pull_request_target:
+    branches:
+      - main
+    types: [opened, edited, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  workflow_run:
+    workflows: ["PR review relay"]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: pr-policy-${{ github.event.pull_request.number || github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: Evaluate PR policy
+    if: >-
+      github.event_name == 'pull_request_target'
+      || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    outputs:
+      eligible: ${{ steps.check.outputs.eligible }}
+      pr: ${{ steps.check.outputs.pr }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Exit 1 (policy failed) is reported through the `pr-policy` status,
+      # so the job stays green; exit 2 (GitHub/Linear unreachable) fails it.
+      - name: Check ticket state and Money-path approval
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [ -n "$PR_NUMBER" ]; then
+            target=(--pr "$PR_NUMBER")
+          else
+            target=(--head-sha "$HEAD_SHA")
+          fi
+          rc=0
+          python3 scripts/pr_policy.py "${target[@]}" || rc=$?
+          [ "$rc" -le 1 ]
+
+  auto-merge:
+    name: Enable auto-merge
+    needs: policy
+    if: needs.policy.outputs.eligible == 'true'
+    runs-on: ubuntu-latest
+    environment: fleet-bot
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      # An App token, not GITHUB_TOKEN, so the merge to `main` triggers the
+      # push workflows (deploy) that GITHUB_TOKEN merges would not start.
+      - name: Mint fleet-bot token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.FLEET_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.FLEET_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Enable auto-merge (squash)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ needs.policy.outputs.pr }}
+          REPO: ${{ github.repository }}
+        run: gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --auto

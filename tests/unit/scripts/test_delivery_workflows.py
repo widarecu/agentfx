@@ -117,6 +117,83 @@ class TestLegacyFleetGate:
         assert "fast-gate" in fleet["jobs"]
 
 
+class TestPrPolicyWorkflow:
+    """`pr-policy.yml` + `pr-review-relay.yml` (AFX-120): trusted code only,
+    review re-runs, fleet-bot auto-merge, no polling."""
+
+    @pytest.fixture(scope="class")
+    def policy(self) -> dict:
+        return _load("pr-policy.yml")
+
+    @pytest.fixture(scope="class")
+    def relay(self) -> dict:
+        return _load("pr-review-relay.yml")
+
+    def test_runs_on_main_prs_and_review_relay(self, policy):
+        on = _triggers(policy)
+        assert on["pull_request_target"]["branches"] == ["main"]
+        assert on["workflow_run"]["workflows"] == ["PR review relay"]
+        assert "schedule" not in on and "pull_request" not in on
+
+    def test_relay_reruns_on_every_review_change(self, relay):
+        assert set(_triggers(relay)["pull_request_review"]["types"]) == {
+            "submitted",
+            "edited",
+            "dismissed",
+        }
+
+    def test_relay_has_no_permissions_or_code(self, relay):
+        assert relay["permissions"] == {}
+        steps = relay["jobs"]["relay"]["steps"]
+        assert not any("uses" in s for s in steps)
+        assert "secrets." not in (_WORKFLOWS / "pr-review-relay.yml").read_text()
+
+    def test_never_checks_out_pr_code(self, policy):
+        text = (_WORKFLOWS / "pr-policy.yml").read_text()
+        assert "pull_request.head" not in text
+        assert "workflow_run.head_branch" not in text
+        checkouts = [
+            s
+            for job in policy["jobs"].values()
+            for s in job["steps"]
+            if "actions/checkout" in s.get("uses", "")
+        ]
+        assert checkouts and all(
+            s["with"]["ref"] == "${{ github.event.repository.default_branch }}"
+            and s["with"]["persist-credentials"] is False
+            for s in checkouts
+        )
+
+    def test_untrusted_values_reach_shell_only_via_env(self, policy):
+        for job in policy["jobs"].values():
+            assert "${{" not in _runs(job)
+
+    def test_policy_job_has_least_privilege(self, policy):
+        assert policy["permissions"] == {}
+        assert policy["jobs"]["policy"]["permissions"] == {
+            "contents": "read",
+            "pull-requests": "read",
+            "statuses": "write",
+        }
+        assert "environment" not in policy["jobs"]["policy"]
+
+    def test_auto_merge_uses_fleet_bot_token(self, policy):
+        job = policy["jobs"]["auto-merge"]
+        assert job["needs"] == "policy"
+        assert job["if"] == "needs.policy.outputs.eligible == 'true'"
+        assert job["environment"] == "fleet-bot"
+        assert job["permissions"] == {}
+        assert any("create-github-app-token" in s.get("uses", "") for s in job["steps"])
+        assert "gh pr merge" in _runs(job) and "--auto" in _runs(job)
+        merge = job["steps"][-1]
+        assert merge["env"]["GH_TOKEN"] == "${{ steps.app-token.outputs.token }}"
+
+    def test_fleet_gate_untouched(self):
+        fleet = _load("agent-fleet-ci.yml")
+        assert _triggers(fleet)["pull_request"]["branches"] == ["feat/agent-fleet"]
+        assert "auto-merge" in fleet["jobs"]
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Deploy: verified staging deploys (AFX-121)
 #
