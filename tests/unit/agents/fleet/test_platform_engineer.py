@@ -229,6 +229,41 @@ class TestHappyPath:
 # ─────────────────────────────────────────────────────────────────────
 
 
+class TestMergedPrGuard:
+    """AFX-134: a Ready ticket whose PR already merged is never redone."""
+
+    def _run(self, db, monkeypatch, issue, find):
+        _patch_list_candidates(monkeypatch, [issue])
+        monkeypatch.setattr(platform_engineer, "find_merged_pr", find)
+        adapter = _RecordingAdapter(_StubAdapterResult())
+        _patch_adapter(monkeypatch, adapter)
+        platform_engineer.scan_and_dispatch(db=db)
+        return adapter
+
+    def test_merged_pr_is_not_claimed_or_dispatched(
+        self, db, monkeypatch, linear_recorder
+    ):
+        issue = _issue(identifier="AFX-121")
+        issue.pr_urls = ["https://github.com/widarecu/agentfx/pull/161"]
+        adapter = self._run(db, monkeypatch, issue, lambda urls: urls[0])
+        assert adapter.calls == []
+        assert linear_recorder["transitions_to_in_progress"] == []
+
+    def test_pr_check_failure_skips_without_claiming(
+        self, db, monkeypatch, linear_recorder
+    ):
+        def _boom(_urls):
+            raise RuntimeError("github down")
+
+        adapter = self._run(db, monkeypatch, _issue(), _boom)
+        assert adapter.calls == []
+        assert linear_recorder["transitions_to_in_progress"] == []
+
+    def test_unmerged_pr_still_dispatches(self, db, monkeypatch, linear_recorder):
+        adapter = self._run(db, monkeypatch, _issue(), lambda _urls: None)
+        assert len(adapter.calls) == 1
+
+
 class TestFailureBranches:
     def test_transition_fails_skips_issue_no_row(
         self, db, monkeypatch, linear_recorder
