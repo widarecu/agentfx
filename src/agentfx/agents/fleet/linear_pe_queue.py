@@ -248,29 +248,47 @@ def list_ready_dispatch_candidates(limit: int) -> list[ReadyIssue]:
 _GITHUB_PR_URL_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
 
 
-def find_merged_pr(pr_urls: list[str]) -> str | None:
-    """The first linked GitHub PR that is already merged, else None.
+_DELIVERY_REPO = "widarecu/agentfx"
+_DELIVERY_BASES = {"feat/agent-fleet", "main"}
+
+
+def find_merged_pr(identifier: str, pr_urls: list[str]) -> str | None:
+    """The first linked PR that delivered this ticket and has merged, else None.
 
     A Ready ticket with a merged PR was shipped and put back (e.g. by an
     old PE reclaim); dispatching it would redo finished work (AFX-134).
-    Raises on a GitHub API failure so the caller skips rather than guesses.
+    Only a PR in the delivery repo, into a delivery branch, whose title or
+    branch names the ticket counts: a merged PR attached for context
+    doesn't (AFX-135). Raises on a GitHub API failure so the caller skips
+    rather than guesses.
     """
     token = (getattr(settings, "GITHUB_TOKEN", "") or "").strip()
     headers = {"Accept": "application/vnd.github+json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    names_ticket = re.compile(
+        rf"(?<![A-Za-z0-9]){re.escape(identifier)}(?![0-9])", re.IGNORECASE
+    )
     for url in pr_urls:
         m = _GITHUB_PR_URL_RE.match(url or "")
         if not m:
             continue
         owner, repo, number = m.groups()
+        if f"{owner}/{repo}".lower() != _DELIVERY_REPO:
+            continue
         resp = requests.get(
             f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}",
             headers=headers,
             timeout=10,
         )
         resp.raise_for_status()
-        if resp.json().get("merged_at"):
+        pr = resp.json()
+        if not pr.get("merged_at"):
+            continue
+        if (pr.get("base") or {}).get("ref") not in _DELIVERY_BASES:
+            continue
+        head_ref = (pr.get("head") or {}).get("ref") or ""
+        if names_ticket.search(pr.get("title") or "") or names_ticket.search(head_ref):
             return url
     return None
 

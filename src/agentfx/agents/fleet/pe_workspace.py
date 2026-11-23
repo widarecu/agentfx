@@ -57,6 +57,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 import requests
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from agentfx.api.core.config import settings
@@ -1035,6 +1036,11 @@ def resolve_adapter(spec: WorkspaceTaskSpec | None = None) -> WorkspaceAdapter:
 
 _STUCK_RUN_TTL_HOURS = 4
 
+# A Devin session can keep working (and spending) after it opens its PR;
+# its PR_OPEN row is re-polled for cost until the session ends, for at
+# most this long — longer than the UTC day the daily $ cap counts.
+_PR_OPEN_COST_REFRESH_HOURS = 24
+
 
 def _max_tokens_per_session() -> int:
     """Per-session cap, applied separately to input and output
@@ -1472,9 +1478,22 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
         has_anthropic = False
 
     try:
+        refresh_cutoff = now - timedelta(hours=_PR_OPEN_COST_REFRESH_HOURS)
         rows = (
             db.query(AgentWorkspaceRun)
-            .filter(AgentWorkspaceRun.status == AgentWorkspaceRunStatus.RUNNING)
+            .filter(
+                or_(
+                    AgentWorkspaceRun.status == AgentWorkspaceRunStatus.RUNNING,
+                    # Devin session still live after its PR opened: keep
+                    # its cost current for the daily $ cap (AFX-135).
+                    and_(
+                        AgentWorkspaceRun.adapter == "devin",
+                        AgentWorkspaceRun.status == AgentWorkspaceRunStatus.PR_OPEN,
+                        AgentWorkspaceRun.ended_at.is_(None),
+                        AgentWorkspaceRun.created_at >= refresh_cutoff,
+                    ),
+                )
+            )
             .filter(AgentWorkspaceRun.provider_run_id.isnot(None))
             .filter(AgentWorkspaceRun.adapter.in_(("managed_agents", "devin")))
             .all()
@@ -1493,8 +1512,9 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
     # client is cheap. Updates go through `_poll_devin_row`.
     for row in devin_rows:
         counts["checked"] += 1
+        was_running = row.status == AgentWorkspaceRunStatus.RUNNING
         outcome = _poll_devin_row(row, now=now)
-        if outcome == "pr_open":
+        if outcome == "pr_open" and was_running:
             counts["pr_open"] += 1
         elif outcome == "tests_failed":
             counts["tests_failed"] += 1
@@ -1651,6 +1671,11 @@ def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
         return "poll_error"
 
     if resp.status_code == 404:
+        if row.status == AgentWorkspaceRunStatus.PR_OPEN:
+            # The PR already shipped; the session just aged out. Stop
+            # refreshing its cost but keep the outcome.
+            row.ended_at = now
+            return "pr_open"
         # Session gone (Devin TTL passed, or wrong org id). Mark failed
         # so the row doesn't poll forever.
         row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
@@ -1687,8 +1712,10 @@ def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
     # A session that opened its PR has delivered, even while it idles in a
     # non-terminal status (blocked, suspended) waiting on review (AFX-134).
     has_pr = bool(pr_url and isinstance(pr_url, str))
-    if status_enum and status_enum not in _DEVIN_TERMINAL_STATUSES and not has_pr:
+    session_done = not status_enum or status_enum in _DEVIN_TERMINAL_STATUSES
+    if not session_done and not has_pr:
         return "still_running"
+    first_report = row.status != AgentWorkspaceRunStatus.PR_OPEN
 
     # Terminal or PR opened — record PR url + ACU consumed if present.
     acu_consumed = data.get("acu_consumed")
@@ -1707,8 +1734,12 @@ def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
         },
         default=str,
     )
-    row.summary = (row.summary or "") + "\n[devin-poll] " + summary_tail
-    row.ended_at = now
+    if first_report or session_done:
+        row.summary = (row.summary or "") + "\n[devin-poll] " + summary_tail
+    # A session still live after its PR keeps ended_at unset, so the
+    # poller refreshes its cost until it ends (AFX-135).
+    if session_done:
+        row.ended_at = now
 
     if has_pr:
         row.status = AgentWorkspaceRunStatus.PR_OPEN

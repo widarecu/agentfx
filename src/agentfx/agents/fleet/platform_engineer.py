@@ -65,6 +65,9 @@ from agentfx.api.models.agent_workspace_run import (
 
 logger = logging.getLogger(__name__)
 
+# Ready tickets examined per scan; the Linear query fetches up to 2x this.
+_CANDIDATE_SCAN_LIMIT = 25
+
 
 # The dispatch budget cap lives on the adapter
 # (`AGENT_PE_WORKSPACE_MAX_PER_DAY`) and is enforced by
@@ -120,7 +123,10 @@ def scan_and_dispatch(*, db: Session, now: datetime | None = None) -> tuple[int,
 
     try:
         max_per_scan = getattr(settings, "PE_LINEAR_MAX_DISPATCH_PER_SCAN", 3)
-        candidates = list_ready_dispatch_candidates(limit=max_per_scan)
+        # The per-scan cap counts dispatches, not candidates looked at:
+        # skipped tickets (merged PR, GitHub down, retry gate) stay Ready
+        # and must not hold the slots of lower-ranked work (AFX-135).
+        candidates = list_ready_dispatch_candidates(limit=_CANDIDATE_SCAN_LIMIT)
     except Exception:
         logger.exception("pe_agent: Linear candidate scan failed")
         return (0, 0)
@@ -132,6 +138,8 @@ def scan_and_dispatch(*, db: Session, now: datetime | None = None) -> tuple[int,
     attempted = 0
 
     for issue in candidates:
+        if attempted >= max_per_scan:
+            break
         try:
             # Per-candidate re-check: a successful dispatch earlier in
             # this scan may have consumed the last budget slot, and
@@ -147,7 +155,7 @@ def scan_and_dispatch(*, db: Session, now: datetime | None = None) -> tuple[int,
             if _should_skip_due_to_retry_gate(db, issue):
                 continue
             try:
-                merged_pr = find_merged_pr(issue.pr_urls)
+                merged_pr = find_merged_pr(issue.identifier, issue.pr_urls)
             except Exception:
                 logger.warning(
                     "pe_agent: skipping %s — could not check its linked PRs. "
