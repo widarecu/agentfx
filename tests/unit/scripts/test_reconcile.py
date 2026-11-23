@@ -335,9 +335,11 @@ class TestDedupe:
         gh.pr_states = {}
         lin.issues["AFX-3"].attachments = [_url(404)]
         a = dr.Finding(
-            dr.UNCHECKED, "AFX-3", "PR #404 state unavailable: x", "pr-state"
+            dr.UNCHECKED, "AFX-3", "PR #404 state unavailable: x", "pr-state #404"
         )
         assert first.findings[0].fingerprint_key == a.fingerprint_key
+        lin.issues["AFX-3"].attachments = [_url(405)]
+        assert _run(gh, lin).state["fingerprint"] != first.state["fingerprint"]
 
     def test_fingerprint_is_order_independent(self):
         a = dr.Finding(dr.STALE, "AFX-1", "x")

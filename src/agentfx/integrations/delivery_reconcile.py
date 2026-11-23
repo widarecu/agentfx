@@ -166,7 +166,7 @@ def _review_drift(gh, ident: str, prs: list[int]) -> list[Finding]:
                     UNCHECKED,
                     ident,
                     f"PR #{number} state unavailable: {exc}",
-                    "pr-state",
+                    f"pr-state #{number}",
                 )
             ]
     if "open" in states.values():
