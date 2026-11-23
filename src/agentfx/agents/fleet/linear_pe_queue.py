@@ -593,22 +593,6 @@ def should_file_for_attention(prior_failed_summaries: list[str]) -> bool:
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _issue_update(client: requests.Session, *, issue_id: str, state_id: str) -> bool:
-    mutation = """
-    mutation RollbackIssue($id: String!, $stateId: String!) {
-      issueUpdate(id: $id, input: { stateId: $stateId }) {
-        success
-      }
-    }
-    """
-    try:
-        data = _gql(client, mutation, {"id": issue_id, "stateId": state_id})
-        return bool((data.get("issueUpdate") or {}).get("success"))
-    except Exception:
-        logger.exception("linear_pe_queue: _issue_update failed for %s", issue_id)
-        return False
-
-
 def _comment(client: requests.Session, *, issue_id: str, body: str) -> bool:
     mutation = """
     mutation CommentOnIssue($issueId: String!, $body: String!) {

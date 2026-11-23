@@ -630,11 +630,6 @@ class TestHandleStuckSessionFailure:
         )
         monkeypatch.setattr(
             linear_pe_queue,
-            "_issue_update",
-            lambda _c, **kw: calls.append(("state", kw)) or True,
-        )
-        monkeypatch.setattr(
-            linear_pe_queue,
             "_add_label",
             lambda _c, **kw: calls.append(("label", kw)) or True,
         )
