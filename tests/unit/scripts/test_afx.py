@@ -290,3 +290,7 @@ def test_workflow_expressions_are_not_interpolated_into_run(jobs):
     for name in ("deploy-sync-record", "deploy-sync"):
         for step in jobs[name]["steps"]:
             assert "${{" not in step.get("run", "")
+
+
+def test_sync_job_can_read_pull_requests(jobs):
+    assert jobs["deploy-sync"]["permissions"]["pull-requests"] == "read"
