@@ -1,21 +1,19 @@
 name: CI
 
-# `paths-ignore` skips the whole workflow when EVERY changed path matches
-# one of the patterns. A PR that touches planning docs AND code still runs
-# CI (as it should); a PR that ONLY changes docs skips the ~4-min CI cost.
-# The workflow files themselves are deliberately NOT ignored so edits to
-# ci.yml re-run to verify the new config.
+# Full PR gate for `main` (AFX-119): lint (src + tests), backend unit and
+# integration, frontend unit, type check, build and E2E. Every job must
+# pass for `CI required` to go green.
+#
+# PRs have NO paths-ignore: a skipped workflow never reports its checks,
+# so docs-only PRs would sit on "Expected" once these checks are required.
+# Pushes to `main` keep paths-ignore; the PR already ran the suite.
+# The legacy fleet fast gate (agent-fleet-ci.yml) is unchanged until the
+# cutover (AFX-125).
 on:
   pull_request:
     branches:
       - main
       - "feature/**"
-    paths-ignore:
-      - 'planning/**'
-      - '**/*.md'
-      - 'LICENSE'
-      - '.gitignore'
-      - 'portal/web/wireframes/**'
   push:
     branches:
       - main
@@ -80,13 +78,13 @@ jobs:
       # Linting
       # ruff check: flags code errors and style violations.
       # ruff format --check: verifies formatting without modifying files.
-      # Both target src/ to match the pyproject.toml [tool.ruff] src setting.
+      # Both cover src/ and tests/.
       # ------------------------------------------------------------------
       - name: Lint — ruff check
-        run: ruff check src/
+        run: ruff check src/ tests/
 
       - name: Lint — ruff format check
-        run: ruff format --check src/
+        run: ruff format --check src/ tests/
 
       # ------------------------------------------------------------------
       # Parity-fixture staleness guard
@@ -200,3 +198,86 @@ jobs:
       # redundant but harmless and makes intent explicit in CI logs.
       - name: Type check
         run: npx tsc --noEmit
+
+  # ---------------------------------------------------------------------------
+  # E2E: `make e2e` against the disposable Docker `test` profile only
+  # (scripts/run-e2e-tests.sh refuses any other profile). The runner is
+  # thrown away after the job, so no dev/uat volume exists to delete.
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: E2E
+    # Pinned: Playwright 1.57.0 ships deps for <= ubuntu 24.04 (see deploy.yml).
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: portal/web/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: portal/web
+
+      - name: Link E2E test dependencies
+        run: ln -s ${{ github.workspace }}/portal/web/node_modules ${{ github.workspace }}/tests/e2e/node_modules
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+        working-directory: portal/web
+
+      # The test profile reads `.env.test`, which is not committed. Build a
+      # throwaway one on the runner from `.env.example` with test values.
+      - name: Write runner-only .env.test
+        run: |
+          cp .env.example .env.test
+          {
+            echo "ENVIRONMENT=test"
+            echo "SECRET_KEY=ci-e2e-secret-key"
+            echo "OANDA_ENV=practice"
+            echo "OANDA_API_KEY=${OANDA_API_KEY}"
+            echo "OANDA_ACCOUNT_ID=${OANDA_ACCOUNT_ID}"
+            echo "INGESTION_ENABLED=false"
+          } >> .env.test
+        env:
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+          OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID }}
+
+      - name: Run E2E (Docker test profile)
+        run: make e2e
+        env:
+          E2E_PROFILE: test
+          NODE_PATH: ${{ github.workspace }}/portal/web/node_modules
+
+      - name: Upload E2E artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results
+          path: test-results/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Single required check for branch protection: green only when every
+  # job above passed (a skipped or failed job fails this one).
+  # ---------------------------------------------------------------------------
+  ci-required:
+    name: CI required
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [backend, frontend, e2e]
+
+    steps:
+      - name: All required jobs passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for r in $RESULTS; do
+            [ "$r" = "success" ] || { echo "::error ::a required job did not pass ($r)"; exit 1; }
+          done
