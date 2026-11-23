@@ -93,7 +93,11 @@ class FakeGitHub:
             runs = [] if conclusion == "missing" else [{"conclusion": conclusion}]
             body = {"check_runs": runs}
         elif m := re.fullmatch(r"/commits/([^/]+)/pulls", path):
-            body = [p for p in self.pulls.values() if p["head"]["sha"] == m[1]]
+            body = [
+                p
+                for p in self.pulls.values()
+                if m[1] == p["head"]["sha"] or m[1] in p.get("commits", ())
+            ]
         elif m := re.fullmatch(r"/statuses/([^/]+)", path):
             self.statuses.append((m[1], json.loads(req.data)))
             body = {}
@@ -440,6 +444,19 @@ class TestMergeTiming:
         assert _outputs(out)["eligible"] == "false"
         assert _outputs(out)["disable"] == ""
 
+    def test_no_auto_merge_while_a_review_is_requested(self, gh, lin, tmp_path):
+        gh.pulls[7]["requested_reviewers"] = [{"login": "widarecu"}]
+        out = tmp_path / "out"
+        assert _run(gh, lin, "--pr", "7", output=out) == pp.EXIT_OK
+        assert _outputs(out)["eligible"] == "false"
+        gh.pulls[7]["requested_reviewers"] = []
+        lin.issues["AFX-1"].state = "Blocked"
+        assert _run(gh, lin, "--pr", "7", output=out) == pp.EXIT_FAILED
+        assert _outputs(out)["eligible"] == "false"
+        lin.issues["AFX-1"].state = "In Review"
+        assert _run(gh, lin, "--pr", "7", output=out) == pp.EXIT_OK
+        assert _outputs(out)["pr"] == "7"
+
     def test_ci_not_queried_when_policy_fails(self, gh, lin):
         lin.issues["AFX-1"].state = "Blocked"
         _run(gh, lin, "--pr", "7")
@@ -460,6 +477,17 @@ class TestSharedHead:
         assert _outputs(out)["eligible"] == "false"
         assert _outputs(out)["disable"] == "8"
 
+    def test_pr_stacked_on_this_head_is_not_a_shared_head(self, gh, lin):
+        lin.add("AFX-1", "In Progress")
+        lin.add("AFX-2", "In Progress")
+        gh.add_pr(7)
+        gh.add_pr(8, head={"ref": "agent/AFX-2-next", "sha": "f" * 40})
+        gh.pulls[8]["commits"] = [HEAD]
+        assert _run(gh, lin, "--pr", "7") == pp.EXIT_OK
+        assert gh.last["state"] == "success"
+        assert _run(gh, lin, "--head-sha", HEAD) == pp.EXIT_OK
+        assert [sha for sha, _ in gh.statuses] == [HEAD, HEAD]
+
 
 class TestFailsClosed:
     def test_linear_down_sets_error_status(self, gh, lin, tmp_path):
@@ -479,6 +507,16 @@ class TestFailsClosed:
         gh.add_pr()
         gh.fail_on = "/pulls/7"
         assert _run(gh, lin, "--pr", "7") == pp.EXIT_ERROR
+
+    def test_error_disables_armed_auto_merge(self, gh, lin, tmp_path):
+        lin.fail_with = urllib.error.URLError("down")
+        gh.add_pr()
+        gh.pulls[7]["auto_merge"] = {"merge_method": "squash"}
+        out = tmp_path / "out"
+        assert _run(gh, lin, "--pr", "7", output=out) == pp.EXIT_ERROR
+        assert gh.last["state"] == "error"
+        assert _outputs(out)["disable"] == "7"
+        assert _outputs(out)["eligible"] == "false"
 
     def test_ci_unreadable_sets_error_status(self, gh, lin):
         lin.add("AFX-1", "In Progress")

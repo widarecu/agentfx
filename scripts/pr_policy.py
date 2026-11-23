@@ -146,9 +146,12 @@ class MergeAction:
 def merge_action(
     pr: dict, decision: Decision, repo: str, ci_passed: bool
 ) -> MergeAction:
-    """Enable only on a fresh pass with CI already green, so the merge
-    follows this check; turn off any auto-merge this check didn't grant."""
-    if auto_merge_eligible(pr, decision, repo) and ci_passed:
+    """Enable only on a fresh pass with CI already green and no review
+    still requested, so the merge follows this check (an approval re-runs
+    it via the review relay); turn off any auto-merge this check didn't
+    grant."""
+    awaiting_review = bool(pr.get("requested_reviewers") or pr.get("requested_teams"))
+    if auto_merge_eligible(pr, decision, repo) and ci_passed and not awaiting_review:
         return MergeAction(enable=not pr.get("auto_merge"), sha=pr["head"]["sha"])
     return MergeAction(disable=bool(pr.get("auto_merge")))
 
@@ -219,7 +222,12 @@ class GitHub:
 
     def pulls_for_sha(self, sha: str) -> list[int]:
         pulls = self._call("GET", f"/commits/{sha}/pulls") or []
-        return [p["number"] for p in pulls if p.get("state") == "open"]
+        # The endpoint also lists PRs that merely contain the commit.
+        return [
+            p["number"]
+            for p in pulls
+            if p.get("state") == "open" and (p.get("head") or {}).get("sha") == sha
+        ]
 
     def ci_passed(self, sha: str) -> bool:
         """The latest `CI required` run on `sha` concluded success."""
@@ -262,7 +270,8 @@ def check(
         ci_passed = decision.ok and github.ci_passed(sha)
     except (ld.LinearError, GitHubError) as err:
         github.set_status(sha, "error", f"could not check, re-run: {err}")
-        raise
+        print(f"#{number}: pr-policy error: {err}", file=sys.stderr)
+        return EXIT_ERROR, MergeAction(disable=bool(pr.get("auto_merge")))
     github.set_status(sha, "success" if decision.ok else "failure", decision.reason)
     print(f"#{number}: {'pass' if decision.ok else 'FAIL'}: {decision.reason}")
     action = merge_action(pr, decision, repo, ci_passed)
