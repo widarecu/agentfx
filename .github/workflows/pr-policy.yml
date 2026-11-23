@@ -13,6 +13,13 @@ name: PR policy
 # pr-review-relay.yml (no permissions, no checkout) fires a workflow_run
 # here. Event-driven only: no polling cron.
 #
+# Merge timing (AFX-130): auto-merge is only enabled by a run that passed
+# after `CI required` went green on that head, pinned with
+# --match-head-commit, so the merge happens seconds after a fresh check
+# (a Linear move or a push since an older pass can't ride on it). The CI
+# workflow_run is the run that normally does this. A failing run, or an
+# auto-merge enabled by anyone else, gets auto-merge turned off.
+#
 # Scope until the cutover (AFX-125): PRs into `main` only. The fleet
 # flow (agent-fleet-ci.yml, promote PRs, back-merges) is unchanged.
 # Making `pr-policy` a required check is a settings change in AFX-125.
@@ -20,9 +27,17 @@ on:
   pull_request_target:
     branches:
       - main
-    types: [opened, edited, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+      - unlabeled
+      - auto_merge_enabled
   workflow_run:
-    workflows: ["PR review relay"]
+    workflows: ["PR review relay", "CI"]
     types: [completed]
 
 permissions: {}
@@ -43,9 +58,12 @@ jobs:
       contents: read
       pull-requests: read
       statuses: write
+      checks: read
     outputs:
       eligible: ${{ steps.check.outputs.eligible }}
       pr: ${{ steps.check.outputs.pr }}
+      sha: ${{ steps.check.outputs.sha }}
+      disable: ${{ steps.check.outputs.disable }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -76,9 +94,11 @@ jobs:
           [ "$rc" -le 1 ]
 
   auto-merge:
-    name: Enable auto-merge
+    name: Set auto-merge
     needs: policy
-    if: needs.policy.outputs.eligible == 'true'
+    if: >-
+      always()
+      && (needs.policy.outputs.eligible == 'true' || needs.policy.outputs.disable != '')
     runs-on: ubuntu-latest
     environment: fleet-bot
     timeout-minutes: 5
@@ -95,9 +115,18 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
-      - name: Enable auto-merge (squash)
+      - name: Set auto-merge (squash, pinned to the checked commit)
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_NUMBER: ${{ needs.policy.outputs.pr }}
+          HEAD_SHA: ${{ needs.policy.outputs.sha }}
+          DISABLE: ${{ needs.policy.outputs.disable }}
           REPO: ${{ github.repository }}
-        run: gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --auto
+        run: |
+          for n in $DISABLE; do
+            gh pr merge "$n" --repo "$REPO" --disable-auto
+          done
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --auto \
+              --match-head-commit "$HEAD_SHA"
+          fi
