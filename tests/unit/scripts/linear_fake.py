@@ -28,6 +28,15 @@ STATES = [
 ]
 
 
+STATE_TYPES = {
+    "Triage": "triage",
+    "Backlog": "backlog",
+    "Ready": "unstarted",
+    "Done": "completed",
+    "Canceled": "canceled",
+}
+
+
 @dataclass
 class FakeIssue:
     identifier: str
@@ -57,6 +66,7 @@ class FakeLinear:
         viewer: str = "user-pe",
         states: list[str] | None = None,
         labels: list[str] | None = None,
+        workspace_labels: list[str] | None = None,
     ) -> None:
         self.page_size = page_size
         self.viewer = viewer
@@ -64,6 +74,7 @@ class FakeLinear:
         self.labels = list(
             ["needs-wilson", "agent-filed"] if labels is None else labels
         )
+        self.workspace_labels = list(workspace_labels or [])
         self.issues: dict[str, FakeIssue] = {}
         self.calls: list[str] = []
         self.mutations: list[tuple[str, dict]] = []
@@ -104,6 +115,13 @@ class FakeLinear:
             nodes = [{"id": f"{prefix}-{n}", "name": n} for n in names]
             key = "states" if "states(" in query else "labels"
             return {"team": {key: self._page(nodes, v.get("after"))}}
+        if "issueLabels(" in query:
+            nodes = [
+                {"id": f"label-{n}", "name": n, "team": None}
+                for n in self.workspace_labels
+                if n == v["name"]
+            ]
+            return {"issueLabels": self._page(nodes, v.get("after"))}
         issue = self._find(v["id"])
         if issue is None:
             return {"issue": None}
@@ -116,7 +134,10 @@ class FakeLinear:
             "issue": {
                 "id": issue.id,
                 "identifier": issue.identifier,
-                "state": {"name": issue.state},
+                "state": {
+                    "name": issue.state,
+                    "type": STATE_TYPES.get(issue.state, "started"),
+                },
                 "team": {"id": TEAM},
                 "labels": {
                     "nodes": [{"id": f"label-{n}", "name": n} for n in issue.labels]
@@ -147,6 +168,14 @@ class FakeLinear:
             self.mutations.append(("label", {"issue": issue.identifier, "label": name}))
             issue.labels.append(name)
             return {"issueAddLabel": {"success": True}}
+        if "issueRemoveLabel" in query:
+            issue = self._find(v["id"])
+            name = v["labelId"].removeprefix("label-")
+            self.mutations.append(
+                ("unlabel", {"issue": issue.identifier, "label": name})
+            )
+            issue.labels.remove(name)
+            return {"issueRemoveLabel": {"success": True}}
         if "commentCreate" in query:
             issue = self._find(v["id"])
             self.mutations.append(("comment", {"issue": issue.identifier}))

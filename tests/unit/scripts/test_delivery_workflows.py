@@ -223,8 +223,9 @@ def test_only_the_record_job_can_write_and_only_after_verify():
         for name, job in _deploy_jobs().items()
         if job.get("permissions", {}).get("contents") == "write"
     ]
-    assert writers == ["record"]
-    assert set(_deploy_needs("record")) == {"plan", "verify"}
+    # The AFX-122 ticket-sync jobs write only deploy-sync/baseline/* tags.
+    assert sorted(writers) == ["deploy-sync", "deploy-sync-record", "record"]
+    assert set(_deploy_needs("record")) == {"plan", "verify", "deploy-sync-record"}
     assert "needs.verify.result == 'success'" in _deploy_jobs()["record"]["if"]
     assert "scripts/deploy_staging.py record" in _deploy_runs("record")
     for name in _deploy_jobs():
