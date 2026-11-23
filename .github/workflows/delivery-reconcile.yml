@@ -1,0 +1,70 @@
+name: Delivery reconcile
+
+# Daily delivery reconcile (AFX-123): replays a missed deploy ticket sync for
+# the current `deployed/staging` (inert dry-run until the cutover sets
+# `vars.AFX_DEPLOY_SYNC_MODE`), then publishes one drift digest as this run's
+# job summary. Drift is reported, never fixed: no human-owned status moves.
+# `digest.json` (artifact) carries the window and a fingerprint so an
+# unchanged or empty report is one line, not a repeated digest.
+# Schedules only run from the default branch, so this starts after promote.
+on:
+  schedule:
+    - cron: "17 21 * * *" # 08:17 Sydney (AEDT)
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: delivery-reconcile
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    name: Reconcile and publish drift digest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Same as deploy-sync: prune deploy-sync/baseline/* records in apply mode.
+      contents: write
+      pull-requests: read
+      # Read the previous run's digest artifact.
+      actions: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch previous digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          prev=$(gh run list --repo "$REPO" --workflow delivery-reconcile.yml \
+            --status success --limit 1 --json databaseId -q '.[0].databaseId // empty')
+          if [ -n "$prev" ]; then
+            gh run download "$prev" --repo "$REPO" -n reconcile-digest -D previous \
+              || echo "::notice ::no digest artifact on run $prev"
+          fi
+
+      - name: Reconcile
+        run: >-
+          python3 scripts/afx.py reconcile
+          --run-url "$RUN_URL"
+          --previous previous/digest.json
+          --state-out digest.json
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          AFX_DEPLOY_SYNC_MODE: ${{ vars.AFX_DEPLOY_SYNC_MODE || 'dry-run' }}
+          AFX_WILSON_LINEAR_EMAIL: ${{ vars.AFX_WILSON_LINEAR_EMAIL }}
+
+      - name: Keep digest marker
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reconcile-digest
+          path: digest.json
+          retention-days: 30
+          if-no-files-found: ignore

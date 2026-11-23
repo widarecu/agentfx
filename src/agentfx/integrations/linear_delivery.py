@@ -32,6 +32,8 @@ from typing import Any
 LINEAR_URL = "https://api.linear.app/graphql"
 DEFAULT_TIMEOUT_SECONDS = 20.0
 PAGE_SIZE = 100
+# Smaller pages for the reconcile issue list: each node carries attachments.
+RECONCILE_PAGE_SIZE = 50
 
 READY = "Ready"
 IN_PROGRESS = "In Progress"
@@ -247,6 +249,39 @@ class LinearClient:
             return None
         latest = max(moves, key=lambda n: n.get("createdAt") or "")
         return (latest.get("actor") or {}).get("id")
+
+    def team_issues(
+        self, team_key: str, *, states: list[str], updated_since: str
+    ) -> list[dict]:
+        """Issues of the team that are in `states` or changed since
+        `updated_since` (ISO 8601), with their linked PR/attachment URLs."""
+        return self.paginate(
+            "query($team: String!, $states: [String!], "
+            "$since: DateTimeOrDuration!, $after: String) { issues("
+            f"first: {RECONCILE_PAGE_SIZE}, after: $after, filter: {{ "
+            "team: { key: { eq: $team } }, or: [ "
+            "{ state: { name: { in: $states } } }, "
+            "{ updatedAt: { gte: $since } } ] }) { nodes { id identifier "
+            "startedAt completedAt updatedAt state { name } "
+            "attachments(first: 25) { nodes { url } } } "
+            "pageInfo { hasNextPage endCursor } } }",
+            {"team": team_key, "states": states, "since": updated_since},
+            ["issues"],
+        )
+
+    def state_moves(self, issue_id: str) -> list[dict]:
+        """Status changes, oldest first: createdAt, actor (id, name, email;
+        None for integrations), fromState and toState names."""
+        nodes = self.paginate(
+            "query($id: String!, $after: String) { issue(id: $id) { "
+            f"history(first: {PAGE_SIZE}, after: $after) {{ nodes {{ createdAt "
+            "actor { id name email } fromState { name } toState { name } } "
+            "pageInfo { hasNextPage endCursor } } } }",
+            {"id": issue_id},
+            ["issue", "history"],
+        )
+        moves = [n for n in nodes if n.get("toState")]
+        return sorted(moves, key=lambda n: n.get("createdAt") or "")
 
     # Writes
 

@@ -618,6 +618,15 @@ class GhCli:
                 return status, commits
             page += 1
 
+    def pull_state(self, number: int) -> str:
+        """`open`, `merged` or `closed` (closed without merging)."""
+        pr = self._get(f"pulls/{number}")
+        if pr is None:
+            raise GitHubError(f"PR #{number} not found", 404)
+        if pr.get("state") == "open":
+            return "open"
+        return "merged" if pr.get("merged_at") else "closed"
+
     def commit_pulls(self, sha: str) -> list[dict]:
         pulls: list[dict] = []
         page = 1
