@@ -337,6 +337,18 @@ def test_duplicate_runs_are_idempotent_on_every_path():
         assert len(linear.issues["AFX-10"]["comments"]) == 1
 
 
+def test_ticket_reopened_after_this_deploy_is_not_reclosed():
+    gh = _two_pr_range()
+    linear = FakeLinear({"AFX-10": _issue("AFX-10"), "AFX-11": _issue("AFX-11")})
+    _run(gh, linear, OK)
+    linear.issues["AFX-10"]["state"] = {"name": "In Progress", "type": "started"}
+    writes = len(linear.writes)
+    report = _run(gh, linear, OK)
+    assert linear.issues["AFX-10"]["state"]["name"] == "In Progress"
+    assert len(linear.writes) == writes
+    assert any("AFX-10: reopened" in line for line in report.lines)
+
+
 def test_cancelled_deploy_changes_nothing():
     gh = _two_pr_range()
     linear = FakeLinear({"AFX-10": _issue("AFX-10")})
