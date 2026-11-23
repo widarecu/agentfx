@@ -18,32 +18,47 @@ team:
 
 # Workflow states. `type` is Linear's category:
 # triage | backlog | unstarted | started | completed | canceled | duplicate
+#
+# One owner per status (AFX-117). The descriptions are what agents and
+# Wilson see in Linear, so they name the owner. Bootstrap only creates and
+# updates states; it never archives one. In Staging and Needs Input are
+# transitional: Wilson moves the tickets off them and archives them by
+# hand (planning/runbooks/delivery-cutover-checklist.md).
 states:
   - name: Triage
     type: triage
-    description: Proposed, not approved. Agents file every new issue here.
+    description: Proposed, not approved. Anyone files new issues here.
   - name: Backlog
     type: backlog
-    description: Approved by Wilson as worth doing, not yet scheduled.
+    description: "Owner: Wilson. Approved as worth doing, not yet scheduled."
   - name: Ready
     rename_from: Todo
     type: unstarted
-    description: Approved and prioritised. The ONLY state agents may pick work from.
+    description: "Owner: Wilson. Approved and prioritised. The ONLY state agents may pick work from."
   - name: In Progress
     type: started
-    description: An agent is working on it on branch agent/AFX-<n>-<slug>.
+    description: "Owner: `afx start AFX-n`. An agent is working on it on branch agent/AFX-<n>-<slug>."
   - name: In Review
     type: started
-    description: PR open; CI and review in progress.
+    description: "Owner: Linear GitHub integration, when the PR opens. CI and review in progress."
+  - name: Blocked
+    type: started
+    description: "Owner: `afx block AFX-n` or a failed staging deploy (with needs-wilson). Waiting on Wilson."
   - name: Done
     type: completed
-    description: Merged.
+    description: "Owner: deploy sync. Verified running on staging (paper), not just merged."
   - name: Canceled
     type: canceled
-    description: Declined by Wilson.
+    description: "Owner: Wilson. Declined."
   - name: Duplicate
     type: duplicate
     description: Same as another issue.
+  - name: In Staging
+    type: started
+    description: "Transitional, retiring at cutover: merged to feat/agent-fleet, waiting for promotion to main. Wilson clears and archives it."
+  - name: Needs Input
+    type: started
+    description: "Transitional, retiring at cutover: use Blocked + needs-wilson instead. Wilson clears and archives it."
 
 # Workspace-level labels (shared by any future team). Groups are
 # exclusive: an issue carries at most one label per group.
@@ -93,7 +108,7 @@ label_groups:
     color: "#C52828"
     labels:
       - name: Money-path
-        description: Order execution, sizing, kill switch, credentials, deploy gates. PR never auto-merges; Wilson approves.
+        description: "Order execution, sizing, kill switch, credentials, deploy gates. After cutover: PR into main needs Wilson's approval before it merges. Until then: auto-merges into feat/agent-fleet; Wilson reviews on the promote PR."
       - { name: Normal }
 
 # Ungrouped flags (several allowed per issue).

@@ -4,3 +4,10 @@
 # rulesets for feat/agent-fleet and main.
 /.github/                    @widarecu
 /scripts/fleet_promote_pr.py @widarecu
+# The merge gate and the delivery automation that moves Linear statuses
+# (AFX-130): an agent PR must not weaken them and auto-merge itself.
+/scripts/pr_policy.py                            @widarecu
+/scripts/afx.py                                  @widarecu
+/src/agentfx/integrations/linear_delivery.py     @widarecu
+/src/agentfx/integrations/deploy_sync.py         @widarecu
+/src/agentfx/integrations/delivery_reconcile.py  @widarecu

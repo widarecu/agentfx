@@ -1,0 +1,23 @@
+name: PR review relay
+
+# Review events can't reach secrets or the `fleet-bot` environment, so this
+# does nothing itself: finishing fires pr-policy.yml (workflow_run), which
+# re-checks the PR from `main`'s context (AFX-120). No permissions, no
+# checkout.
+on:
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions: {}
+
+jobs:
+  relay:
+    name: Relay review to pr-policy
+    if: github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Hand off to PR policy
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: echo "Review on PR #$PR_NUMBER; PR policy re-runs from main."

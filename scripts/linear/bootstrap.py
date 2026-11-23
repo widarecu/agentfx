@@ -28,6 +28,8 @@ API_URL = "https://api.linear.app/graphql"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = REPO_ROOT / "config" / "linear"
 KEY_FILE = Path.home() / ".config" / "agentfx" / "linear_api_key"
+# Additive only: states with tickets on them (e.g. In Staging) must survive.
+FORBIDDEN_MUTATIONS = ("Archive", "Delete")
 
 
 def load_api_key() -> str:
@@ -60,6 +62,8 @@ class Linear:
     def mutate(
         self, describe: str, q: str, variables: dict[str, Any]
     ) -> dict[str, Any]:
+        if any(word in q for word in FORBIDDEN_MUTATIONS):
+            raise RuntimeError(f"bootstrap never archives or deletes: {describe}")
         print(f"  {'[dry-run] ' if self.dry_run else ''}{describe}")
         if self.dry_run:
             return {}

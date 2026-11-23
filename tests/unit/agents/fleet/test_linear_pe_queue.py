@@ -7,9 +7,10 @@ underlying `_gql` function so no HTTP is attempted, and assert:
   (team key, Ready state id, agent-filed label, no needs-wilson,
   assignee null), honors the sort, and maps GraphQL nodes to the
   `ReadyIssue` dataclass.
-- `transition_to_in_progress` calls `issueUpdate` with the right
-  state id and returns True/False from the mutation's success flag.
-- `rollback_to_ready` transitions back to Ready AND posts a comment.
+- `transition_to_in_progress` claims through the shared
+  `linear_delivery.start` and returns False when not Ready.
+- `rollback_to_ready` only undoes the PE's own claim with no
+  workspace started, and comments only when it did.
 - `file_for_attention` posts a formatted comment AND adds the
   `needs-wilson` label without stripping other labels.
 - `failure_signature` is stable across hex id / timestamp noise.
@@ -28,9 +29,11 @@ from agentfx.agents.fleet.linear_pe_queue import (
     failure_signature,
     file_for_attention,
     list_ready_dispatch_candidates,
+    rollback_to_ready,
     should_file_for_attention,
     transition_to_in_progress,
 )
+from agentfx.integrations import linear_delivery
 
 pytestmark = pytest.mark.unit
 
@@ -474,53 +477,98 @@ class TestFileForAttentionIdempotency:
         )
 
 
+class _FakeDeliveryClient:
+    """Records shared-client calls the PE makes (AFX-118)."""
+
+    def __init__(self):
+        self.comments: list[tuple[str, str]] = []
+
+    def comment(self, issue_id, body):
+        self.comments.append((issue_id, body))
+
+
+def _result(ok: bool, reason: str = "") -> linear_delivery.TransitionResult:
+    return linear_delivery.TransitionResult(
+        ok=ok, changed=ok, identifier="AFX-700", reason=reason
+    )
+
+
 class TestTransitionToInProgress:
-    def test_success_calls_issueUpdate_with_state_id(self, monkeypatch):
+    """The PE claims through `linear_delivery.start` (AFX-118)."""
+
+    @pytest.fixture(autouse=True)
+    def _enable(self, monkeypatch):
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
         monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
-        captured = {}
 
-        def _mock_gql(client, query, variables):
-            captured["query"] = query
-            captured["variables"] = variables
-            return {
-                "issueUpdate": {
-                    "success": True,
-                    "issue": {
-                        "id": variables["id"],
-                        "identifier": "AFX-700",
-                        "state": {"name": "In Progress"},
-                    },
-                }
-            }
+    def test_success_uses_shared_start(self, monkeypatch):
+        seen = {}
 
-        with patch("agentfx.agents.fleet.linear_pe_queue._gql", side_effect=_mock_gql):
-            ok = transition_to_in_progress("uuid-afx-700")
+        def _start(client, ident):
+            seen["ident"] = ident
+            return _result(True)
 
-        assert ok is True
-        assert captured["variables"]["id"] == "uuid-afx-700"
-        assert (
-            captured["variables"]["stateId"]
-            == linear_pe_queue.settings.PE_LINEAR_IN_PROGRESS_STATE_ID
+        monkeypatch.setattr(linear_delivery, "start", _start)
+        assert transition_to_in_progress("uuid-afx-700") is True
+        assert seen["ident"] == "uuid-afx-700"
+
+    def test_not_ready_returns_false(self, monkeypatch):
+        """Already claimed by another scan or agent: no duplicate work."""
+        monkeypatch.setattr(
+            linear_delivery, "start", lambda c, i: _result(False, "In Progress")
         )
-
-    def test_graphql_reports_no_success_returns_false(self, monkeypatch):
-        monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
-        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
-        with patch(
-            "agentfx.agents.fleet.linear_pe_queue._gql",
-            return_value={"issueUpdate": {"success": False}},
-        ):
-            assert transition_to_in_progress("uuid-x") is False
+        assert transition_to_in_progress("uuid-x") is False
 
     def test_exception_returns_false(self, monkeypatch):
+        def _boom(client, ident):
+            raise linear_delivery.LinearError("linear 500")
+
+        monkeypatch.setattr(linear_delivery, "start", _boom)
+        assert transition_to_in_progress("uuid-x") is False
+
+    def test_disabled_is_noop(self, monkeypatch):
+        monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", False)
+        assert transition_to_in_progress("uuid-x") is False
+
+
+class TestRollbackToReady:
+    """Only the PE's own claim, only when no workspace started."""
+
+    @pytest.fixture(autouse=True)
+    def _enable(self, monkeypatch):
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
         monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
-        with patch(
-            "agentfx.agents.fleet.linear_pe_queue._gql",
-            side_effect=RuntimeError("linear 500"),
-        ):
-            assert transition_to_in_progress("uuid-x") is False
+        self.client = _FakeDeliveryClient()
+        monkeypatch.setattr(linear_pe_queue, "_delivery_client", lambda: self.client)
+
+    def test_releases_own_claim_and_comments(self, monkeypatch):
+        seen = {}
+
+        def _release(client, ident, *, workspace_started):
+            seen["workspace_started"] = workspace_started
+            return _result(True)
+
+        monkeypatch.setattr(linear_delivery, "release_own_claim", _release)
+        assert rollback_to_ready("uuid-1", reason_summary="adapter_refused") is True
+        assert seen["workspace_started"] is False
+        assert len(self.client.comments) == 1
+        assert "adapter_refused" in self.client.comments[0][1]
+
+    def test_refused_release_leaves_issue_and_stays_quiet(self, monkeypatch):
+        monkeypatch.setattr(
+            linear_delivery,
+            "release_own_claim",
+            lambda c, i, *, workspace_started: _result(False, "another actor"),
+        )
+        assert rollback_to_ready("uuid-1", reason_summary="x") is False
+        assert self.client.comments == []
+
+    def test_exception_returns_false(self, monkeypatch):
+        def _boom(c, i, *, workspace_started):
+            raise linear_delivery.LinearError("down")
+
+        monkeypatch.setattr(linear_delivery, "release_own_claim", _boom)
+        assert rollback_to_ready("uuid-1", reason_summary="x") is False
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -582,11 +630,6 @@ class TestHandleStuckSessionFailure:
         )
         monkeypatch.setattr(
             linear_pe_queue,
-            "_issue_update",
-            lambda _c, **kw: calls.append(("state", kw)) or True,
-        )
-        monkeypatch.setattr(
-            linear_pe_queue,
             "_add_label",
             lambda _c, **kw: calls.append(("label", kw)) or True,
         )
@@ -597,17 +640,15 @@ class TestHandleStuckSessionFailure:
         )
         return calls
 
-    def test_first_failure_rolls_back_to_ready_and_comments(self, monkeypatch):
+    def test_first_failure_keeps_claim_and_flags(self, monkeypatch):
+        """The session had started, so the claim is never rolled back."""
         calls = self._record(monkeypatch)
         ok = linear_pe_queue.handle_stuck_session_failure(
             "AFX-40", comment_body="reclaimed", escalate=False
         )
         assert ok is True
         kinds = [k for k, _ in calls]
-        assert kinds == ["state", "comment"]
-        assert (
-            calls[0][1]["state_id"] == linear_pe_queue.settings.PE_LINEAR_READY_STATE_ID
-        )
+        assert kinds == ["label", "comment"]
         assert calls[1][1] == {"issue_id": "uuid-AFX-40", "body": "reclaimed"}
 
     def test_escalation_adds_needs_wilson_and_keeps_state(self, monkeypatch):
