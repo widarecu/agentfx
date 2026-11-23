@@ -128,8 +128,9 @@ def paper_run_with_candles(db_session: Session):
     # 200 EUR_USD M1 candles with a strong uptrend in the last 50 bars
     # so the SMA(5) > SMA(20) condition holds at the newest bar. The
     # newest bar's timestamp is what we anchor the test clock against
-    # (stale-candle guard is 2× granularity_seconds = 120s).
-    now = datetime.now(UTC).replace(microsecond=0)
+    # (stale-candle guard is 2× granularity_seconds = 120s). Align to
+    # minute boundaries so the just-closed-bar check is clock-independent.
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
     candles: list[Candle] = []
     base = 1.0800
     for i in range(200):
