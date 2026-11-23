@@ -797,6 +797,17 @@ class Settings(BaseSettings):
         ),
     )
 
+    SOURCE_SHA: str = Field(
+        default="",
+        env="SOURCE_SHA",
+        description=(
+            "Git commit the running backend was built from, reported by "
+            "/health so the Deploy workflow can verify staging. Leave unset: "
+            "the deploy writes src/agentfx/SOURCE_SHA into the image. Set it "
+            "only to override that file."
+        ),
+    )
+
     @property
     def instruments_list(self) -> list[str]:
         """Parse CANDLE_INSTRUMENTS into a list."""
