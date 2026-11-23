@@ -17,6 +17,7 @@ import pytest
 
 from agentfx.integrations import deploy_sync as ds
 from agentfx.integrations import linear_delivery as ld
+from tests.unit.scripts.linear_fake import FakeLinear as LinearFake
 
 BASE = "b" * 40
 SHA = "a" * 40
@@ -620,110 +621,57 @@ def test_gh_missing_tag_is_none_and_annotated_tag_is_dereferenced():
     assert gh.get_tag_sha(ds.record_tag(SHA)) is None
 
 
-# ── Linear client ────────────────────────────────────────────────────
+# ── Linear adapter (real LinearClient over linear_fake) ──────────────
 
 
-def _fake_urlopen(responses, seen):
-    def urlopen(req, timeout):
-        seen.append(json.loads(req.data))
-        item = responses.pop(0)
-        if isinstance(item, Exception):
-            raise item
-        return io.BytesIO(json.dumps(item).encode())
-
-    return urlopen
+def _adapter(fake):
+    return ld.DeployIssues(ld.LinearClient("k", opener=fake.opener))
 
 
-def test_linear_comment_bodies_paginate(monkeypatch):
-    seen: list[dict] = []
-    page = lambda nodes, more, cur: {  # noqa: E731
-        "data": {
-            "issue": {
-                "comments": {
-                    "nodes": nodes,
-                    "pageInfo": {"hasNextPage": more, "endCursor": cur},
-                }
-            }
-        }
-    }
-    responses = [
-        page([{"body": "one"}], True, "c1"),
-        page([{"body": "two"}], False, None),
-    ]
-    monkeypatch.setattr(ld.urllib.request, "urlopen", _fake_urlopen(responses, seen))
-    client = ld.LinearDelivery(ld.http_transport("key"))
-    assert client.comment_bodies({"id": "u1"}) == ["one", "two"]
-    assert seen[1]["variables"]["after"] == "c1"
+def test_adapter_end_to_end_success_and_failure():
+    fake = LinearFake(page_size=1)
+    fake.add("AFX-10", "In Staging")
+    fake.add("AFX-11", "Canceled")
+    gh = _two_pr_range()
+    assert _run(gh, _adapter(fake), FRONT_FAIL).exit_code == 0
+    a10 = fake.issues["AFX-10"]
+    assert a10.state == "Blocked" and a10.labels == ["needs-wilson"]
+    assert ds.LABEL_ADDED_MARKER in a10.comments[-1]
+    assert fake.issues["AFX-11"].state == "Canceled"  # Wilson's call stands
+
+    before = list(fake.mutations)
+    assert _run(gh, _adapter(fake), FRONT_FAIL).exit_code == 0
+    assert fake.mutations == before  # duplicate run, comments paginated
+
+    assert _run(gh, _adapter(fake), OK).exit_code == 0
+    assert a10.state == "Done" and a10.labels == []
+    assert ds.LABEL_CLEARED_MARKER in a10.comments[-1]
 
 
-def test_linear_http_error_surfaces_body_and_not_found_is_none(monkeypatch):
-    err = urllib.error.HTTPError(
-        ld.LINEAR_URL,
-        400,
-        "Bad Request",
-        {},
-        io.BytesIO(b'{"errors": [{"message": "boom"}]}'),
-    )
-    missing = {"errors": [{"message": "Entity not found: Issue"}]}
-    monkeypatch.setattr(ld.urllib.request, "urlopen", _fake_urlopen([err, missing], []))
-    client = ld.LinearDelivery(ld.http_transport("key"))
+def test_adapter_missing_issue_is_none():
+    assert _adapter(LinearFake()).issue("AFX-404") is None
+
+
+def test_adapter_http_error_raises():
+    fake = LinearFake()
+    fake.http_error = (400, {"errors": [{"message": "boom"}]})
     with pytest.raises(ld.LinearError, match="boom"):
-        client.issue("AFX-1")
-    assert client.issue("AFX-2") is None
+        _adapter(fake).issue("AFX-1")
 
 
-def test_linear_state_and_label_resolve_by_name():
-    calls: list[tuple[str, dict]] = []
-
-    def transport(query, variables):
-        calls.append((query, variables))
-        if "workflowStates" in query:
-            return {"workflowStates": {"nodes": [{"id": "s-done", "name": "Done"}]}}
-        if "issueLabels" in query:
-            return {
-                "issueLabels": {
-                    "nodes": [
-                        {
-                            "id": "l-other",
-                            "name": "needs-wilson",
-                            "team": {"key": "XYZ"},
-                        },
-                        {"id": "l-afx", "name": "needs-wilson", "team": {"key": "AFX"}},
-                    ]
-                }
-            }
-        return {"issueUpdate": {"success": True}, "issueAddLabel": {"success": True}}
-
-    client = ld.LinearDelivery(transport, team_key="AFX")
-    issue = {
-        "id": "u1",
-        "identifier": "AFX-1",
-        "state": {"name": "In Review"},
-        "labels": {"nodes": []},
-    }
-    assert client.set_state(issue, "Done") is True
-    assert client.set_state(issue, "Done") is False  # idempotent
-    assert client.add_label(issue, "needs-wilson") is True
-    assert client.has_label(issue, "needs-wilson")
-    assert calls[-1][1]["labelId"] == "l-afx"
-    assert sum("workflowStates" in q for q, _ in calls) == 1  # cached
+def test_adapter_unknown_state_raises():
+    fake = LinearFake(states=["Ready"])
+    fake.add("AFX-1", "Ready")
+    adapter = _adapter(fake)
+    with pytest.raises(ld.NotFoundError, match="Blocked"):
+        adapter.set_state(adapter.issue("AFX-1"), "Blocked")
 
 
-def test_linear_rejected_write_raises():
-    def transport(query, variables):
-        if "workflowStates" in query:
-            return {"workflowStates": {"nodes": [{"id": "s-done", "name": "Done"}]}}
-        return {"issueUpdate": {"success": False}}
+def test_client_rejected_remove_label_raises():
+    def opener(req, timeout=None):
+        return io.BytesIO(
+            json.dumps({"data": {"issueRemoveLabel": {"success": False}}}).encode()
+        )
 
-    client = ld.LinearDelivery(transport)
-    issue = {"id": "u1", "identifier": "AFX-1", "state": {"name": "In Review"}}
-    with pytest.raises(ld.LinearError, match="rejected"):
-        client.set_state(issue, "Done")
-    assert issue["state"]["name"] == "In Review"
-
-
-def test_linear_unknown_state_raises():
-    client = ld.LinearDelivery(lambda q, v: {"workflowStates": {"nodes": []}})
-    issue = {"id": "u1", "identifier": "AFX-1", "state": {"name": "In Review"}}
-    with pytest.raises(ld.LinearError, match="Blocked"):
-        client.set_state(issue, "Blocked")
+    with pytest.raises(ld.LinearError, match="issueRemoveLabel"):
+        ld.LinearClient("k", opener=opener).remove_label("u1", "l1")

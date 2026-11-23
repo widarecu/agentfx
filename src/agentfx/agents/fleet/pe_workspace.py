@@ -1159,7 +1159,11 @@ def _render_stuck_session_comment(
             "Remove the label and move it to Ready to retry."
         )
     else:
-        next_step = "Moved back to **Ready**; the next PE scan retries automatically."
+        next_step = (
+            "Left In Progress and labelled `needs-wilson`: the session had "
+            "started, so the PE does not roll it back. Remove the label and "
+            "move it to Ready to retry."
+        )
     lines = [
         "**PE session reclaimed.**",
         "",

@@ -1,37 +1,122 @@
-"""`afx deploy-sync` CLI and Deploy workflow wiring (AFX-122).
+"""`scripts/afx.py` CLI: start/block (AFX-118) and deploy-sync (AFX-122).
 
-GitHub and Linear are fakes; nothing here talks to a real API.
-"""
+No network: start/block use the real `LinearClient` wired to
+`linear_fake.FakeLinear`; deploy-sync uses in-memory GitHub/Linear fakes."""
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 
 import pytest
 import yaml
 
 from agentfx.integrations import deploy_sync as ds
+from agentfx.integrations import linear_delivery as ld
+from tests.unit.scripts.linear_fake import FakeLinear
 
 _REPO = Path(__file__).resolve().parents[3]
+_SCRIPT = _REPO / "scripts" / "afx.py"
 _WORKFLOW = _REPO / ".github" / "workflows" / "deploy.yml"
 
+_spec = importlib.util.spec_from_file_location("afx_cli", _SCRIPT)
+assert _spec is not None and _spec.loader is not None
+afx = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = afx
+_spec.loader.exec_module(afx)
 
-def _load(name: str):
-    spec = importlib.util.spec_from_file_location(
-        name, _REPO / "scripts" / f"{name}.py"
+_ds_spec = importlib.util.spec_from_file_location(
+    "deploy_staging", _REPO / "scripts" / "deploy_staging.py"
+)
+assert _ds_spec is not None and _ds_spec.loader is not None
+deploy_staging = importlib.util.module_from_spec(_ds_spec)
+sys.modules[_ds_spec.name] = deploy_staging
+_ds_spec.loader.exec_module(deploy_staging)
+
+
+@pytest.fixture
+def fake() -> FakeLinear:
+    return FakeLinear()
+
+
+def _run(fake: FakeLinear, *argv: str) -> int:
+    return afx.main(list(argv), client=ld.LinearClient("k", opener=fake.opener))
+
+
+def test_start_ready_exits_zero(fake, capsys):
+    fake.add("AFX-1", "Ready")
+    assert _run(fake, "start", "AFX-1") == afx.EXIT_OK
+    assert fake.issues["AFX-1"].state == "In Progress"
+    assert "Ready -> In Progress" in capsys.readouterr().out
+
+
+def test_second_start_refused(fake, capsys):
+    fake.add("AFX-1", "Ready")
+    _run(fake, "start", "AFX-1")
+    assert _run(fake, "start", "AFX-1") == afx.EXIT_REFUSED
+    assert "refused" in capsys.readouterr().err
+
+
+def test_start_wrong_state_refused(fake):
+    fake.add("AFX-1", "Backlog")
+    assert _run(fake, "start", "AFX-1") == afx.EXIT_REFUSED
+    assert fake.mutations == []
+
+
+def test_start_missing_issue_errors(fake, capsys):
+    assert _run(fake, "start", "AFX-404") == afx.EXIT_ERROR
+    assert "not found" in capsys.readouterr().err
+
+
+def test_block_then_repeat(fake, capsys):
+    fake.add("AFX-1", "In Progress")
+    assert _run(fake, "block", "AFX-1", "Which pair?") == afx.EXIT_OK
+    assert _run(fake, "block", "AFX-1", "Which pair?") == afx.EXIT_OK
+    assert "nothing to do" in capsys.readouterr().out
+    assert len(fake.issues["AFX-1"].comments) == 1
+
+
+def test_block_ready_refused(fake):
+    fake.add("AFX-1", "Ready")
+    assert _run(fake, "block", "AFX-1", "q") == afx.EXIT_REFUSED
+    assert fake.issues["AFX-1"].state == "Ready"
+
+
+def test_block_empty_question_errors(fake):
+    fake.add("AFX-1", "In Progress")
+    assert _run(fake, "block", "AFX-1", "  ") == afx.EXIT_ERROR
+
+
+def test_api_failure_errors(fake):
+    fake.fail_with = urllib.error.URLError("down")
+    assert _run(fake, "start", "AFX-1") == afx.EXIT_ERROR
+
+
+def test_missing_key_errors(monkeypatch, capsys):
+    monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+    assert afx.main(["start", "AFX-1"]) == afx.EXIT_ERROR
+    assert "LINEAR_API_KEY" in capsys.readouterr().err
+
+
+def test_runs_as_standalone_script_without_backend_env():
+    """The CLI must import with only the repo on disk: no PYTHONPATH,
+    no ENVIRONMENT, no LINEAR_API_KEY (fails cleanly, exit 2)."""
+    proc = subprocess.run(
+        [sys.executable, str(_SCRIPT), "start", "AFX-1"],
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin"},
+        timeout=30,
     )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+    assert proc.returncode == afx.EXIT_ERROR, proc.stderr
+    assert "LINEAR_API_KEY" in proc.stderr
 
 
-afx = _load("afx")
-deploy_staging = _load("deploy_staging")
+# ── deploy-sync ──────────────────────────────────────────────────────
 
 BASE = "b" * 40
 SHA = "a" * 40
@@ -70,7 +155,7 @@ class FakeGitHub:
         ]
 
 
-class FakeLinear:
+class FakeDeployLinear:
     def __init__(self):
         self.issue_obj = {
             "id": "i7",
@@ -116,12 +201,12 @@ class FakeLinear:
         return True
 
 
-def _run(argv, gh, linear, monkeypatch, mode=None):
+def _sync_cli(argv, gh, linear, monkeypatch, mode=None):
     if mode is None:
         monkeypatch.delenv("AFX_DEPLOY_SYNC_MODE", raising=False)
     else:
         monkeypatch.setenv("AFX_DEPLOY_SYNC_MODE", mode)
-    args = afx.build_parser().parse_args(argv)
+    args = afx._parser().parse_args(argv)
     return afx.deploy_sync(args, gh=gh, linear=linear)
 
 
@@ -142,24 +227,24 @@ RUN_OK = [
 
 
 def test_default_mode_is_dry_run_and_writes_nothing(monkeypatch, capsys):
-    gh, linear = FakeGitHub({ds.STAGING_TAG: BASE}), FakeLinear()
-    assert _run(RUN_OK, gh, linear, monkeypatch) == 0
+    gh, linear = FakeGitHub({ds.STAGING_TAG: BASE}), FakeDeployLinear()
+    assert _sync_cli(RUN_OK, gh, linear, monkeypatch) == 0
     assert linear.writes == []
     out = capsys.readouterr().out
     assert "dry-run" in out and "AFX-7: would move In Staging -> Done" in out
 
 
 def test_apply_mode_moves_ticket_to_done(monkeypatch):
-    gh, linear = FakeGitHub({ds.STAGING_TAG: BASE}), FakeLinear()
-    assert _run(RUN_OK, gh, linear, monkeypatch, mode="apply") == 0
+    gh, linear = FakeGitHub({ds.STAGING_TAG: BASE}), FakeDeployLinear()
+    assert _sync_cli(RUN_OK, gh, linear, monkeypatch, mode="apply") == 0
     assert ("state", "Done") in linear.writes
 
 
 def test_apply_failure_blocks_with_needs_wilson(monkeypatch):
-    gh, linear = FakeGitHub({ds.STAGING_TAG: BASE}), FakeLinear()
+    gh, linear = FakeGitHub({ds.STAGING_TAG: BASE}), FakeDeployLinear()
     argv = [*RUN_OK]
     argv[argv.index("--backend") + 1] = "failure"
-    assert _run(argv, gh, linear, monkeypatch, mode="apply") == 0
+    assert _sync_cli(argv, gh, linear, monkeypatch, mode="apply") == 0
     assert ("state", "Blocked") in linear.writes
     assert ("label+", "needs-wilson") in linear.writes
 
@@ -167,16 +252,18 @@ def test_apply_failure_blocks_with_needs_wilson(monkeypatch):
 def test_apply_without_linear_key_fails(monkeypatch, capsys):
     monkeypatch.delenv("LINEAR_API_KEY", raising=False)
     gh = FakeGitHub({ds.STAGING_TAG: BASE})
-    assert _run(RUN_OK, gh, None, monkeypatch, mode="apply") == 1
+    assert _sync_cli(RUN_OK, gh, None, monkeypatch, mode="apply") == 1
     assert "LINEAR_API_KEY" in capsys.readouterr().out
 
 
 def test_record_dry_run_and_apply(monkeypatch):
     gh = FakeGitHub({ds.STAGING_TAG: BASE})
-    assert _run(["deploy-sync", "record", "--sha", SHA], gh, None, monkeypatch) == 0
+    assert (
+        _sync_cli(["deploy-sync", "record", "--sha", SHA], gh, None, monkeypatch) == 0
+    )
     assert gh.created == []
     assert (
-        _run(
+        _sync_cli(
             ["deploy-sync", "record", "--sha", SHA], gh, None, monkeypatch, mode="apply"
         )
         == 0
@@ -186,14 +273,17 @@ def test_record_dry_run_and_apply(monkeypatch):
 
 def test_recover_replays_recorded_range(monkeypatch):
     gh = FakeGitHub({ds.STAGING_TAG: SHA, ds.record_tag(SHA): BASE})
-    linear = FakeLinear()
-    assert _run(["deploy-sync", "recover"], gh, linear, monkeypatch, mode="apply") == 0
+    linear = FakeDeployLinear()
+    assert (
+        _sync_cli(["deploy-sync", "recover"], gh, linear, monkeypatch, mode="apply")
+        == 0
+    )
     assert ("state", "Done") in linear.writes
 
 
 def test_component_outcome_is_required():
     with pytest.raises(SystemExit):
-        afx.build_parser().parse_args(
+        afx._parser().parse_args(
             ["deploy-sync", "run", "--sha", SHA, "--backend", "success"]
         )
 
@@ -286,7 +376,7 @@ def test_record_never_blocks_deploy(jobs):
         assert "deploy-sync-record" not in (jobs[name].get("needs") or [])
 
 
-def test_workflow_expressions_are_not_interpolated_into_run(jobs):
+def test_workflow_expressions_are_not_interpolated_into_sync_cli(jobs):
     for name in ("deploy-sync-record", "deploy-sync"):
         for step in jobs[name]["steps"]:
             assert "${{" not in step.get("run", "")
