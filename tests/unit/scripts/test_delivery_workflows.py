@@ -1,4 +1,4 @@
-"""Workflow contract for the `main` PR gate (AFX-119).
+"""Workflow contracts: the `main` PR gate (AFX-119) and Deploy (AFX-121).
 
 Pins what `.github/workflows/ci.yml` must keep doing: run the whole
 required suite on every PR into `main` (docs-only included), fail the
@@ -115,3 +115,149 @@ class TestLegacyFleetGate:
         fleet = _load("agent-fleet-ci.yml")
         assert "feat/agent-fleet" in _triggers(fleet)["pull_request"]["branches"]
         assert "fast-gate" in fleet["jobs"]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Deploy: verified staging deploys (AFX-121)
+#
+# Every push to main runs (docs-only included), retries accept a SHA,
+# components deploy independently, only a verified deploy moves
+# `deployed/staging`, and an always-run summary exposes the outcomes.
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _deploy() -> dict:
+    return _load("deploy.yml")
+
+
+def _deploy_triggers() -> dict:
+    return _triggers(_deploy())
+
+
+def _deploy_jobs() -> dict:
+    return _deploy()["jobs"]
+
+
+def _deploy_runs(job: str) -> str:
+    return "\n".join(step.get("run", "") for step in _deploy_jobs()[job]["steps"])
+
+
+def _deploy_needs(job: str) -> list[str]:
+    needs = _deploy_jobs()[job].get("needs", [])
+    return [needs] if isinstance(needs, str) else needs
+
+
+def test_every_push_to_main_runs_including_docs_only():
+    push = _deploy_triggers()["push"]
+    assert push["branches"] == ["main"]
+    assert "paths-ignore" not in push and "paths" not in push
+
+
+def test_manual_dispatch_accepts_a_sha():
+    sha = _deploy_triggers()["workflow_dispatch"]["inputs"]["sha"]
+    assert sha["required"] is False
+    plan = _deploy_jobs()["plan"]["steps"][-1]
+    assert plan["env"]["TARGET_SHA"] == "${{ inputs.sha || github.sha }}"
+    assert '"$TARGET_SHA"' in plan["run"]  # never interpolated into the script
+
+
+def test_deploys_are_serialized_without_cancelling_in_flight():
+    concurrency = _deploy()["concurrency"]
+    assert "${{" not in concurrency["group"]
+    assert concurrency["cancel-in-progress"] is False
+
+
+def test_plan_compares_with_the_tag_using_full_history():
+    plan = _deploy_jobs()["plan"]
+    assert plan["steps"][0]["with"]["fetch-depth"] == 0
+    assert "scripts/deploy_staging.py plan" in _deploy_runs("plan")
+    assert {"sha", "backend", "frontend", "kind", "base_sha", "stale"} <= set(
+        plan["outputs"]
+    )
+
+
+def test_components_deploy_only_when_needed_and_independently():
+    for job, component in (
+        ("deploy-backend", "backend"),
+        ("deploy-frontend", "frontend"),
+    ):
+        assert _deploy_needs(job) == ["plan"]
+        assert _deploy_jobs()[job]["if"] == f"needs.plan.outputs.{component} == 'true'"
+        assert f'guard --sha "$TARGET_SHA" --component {component}' in _deploy_runs(job)
+    assert "railway_deploy.py" in _deploy_runs("deploy-backend")
+    assert "vercel deploy --prod" in _deploy_runs("deploy-frontend")
+
+
+def test_guard_runs_before_the_deploy_and_backend_stamps_its_sha():
+    for job, deploy_marker in (
+        ("deploy-backend", 'railway_deploy.py" --service'),
+        ("deploy-frontend", "vercel deploy --prod"),
+    ):
+        runs = [step.get("run", "") for step in _deploy_jobs()[job]["steps"]]
+        guard = next(i for i, r in enumerate(runs) if "deploy_staging.py guard" in r)
+        deploy = next(i for i, r in enumerate(runs) if deploy_marker in r)
+        assert guard < deploy
+    assert 'echo "$TARGET_SHA" > src/agentfx/SOURCE_SHA' in _deploy_runs(
+        "deploy-backend"
+    )
+
+
+def test_verify_runs_after_successful_or_skipped_deploys_only():
+    verify = _deploy_jobs()["verify"]
+    assert set(_deploy_needs("verify")) == {"plan", "deploy-backend", "deploy-frontend"}
+    cond = verify["if"]
+    assert "!cancelled()" in cond
+    assert "needs.plan.outputs.stale != 'true'" in cond
+    for job in ("deploy-backend", "deploy-frontend"):
+        assert (
+            f"needs.{job}.result == 'success' || needs.{job}.result == 'skipped'"
+            in cond
+        )
+    assert "scripts/deploy_staging.py verify" in _deploy_runs("verify")
+
+
+def test_only_the_record_job_can_write_and_only_after_verify():
+    assert _deploy()["permissions"] == {"contents": "read"}
+    writers = [
+        name
+        for name, job in _deploy_jobs().items()
+        if job.get("permissions", {}).get("contents") == "write"
+    ]
+    assert writers == ["record"]
+    assert set(_deploy_needs("record")) == {"plan", "verify"}
+    assert "needs.verify.result == 'success'" in _deploy_jobs()["record"]["if"]
+    assert "scripts/deploy_staging.py record" in _deploy_runs("record")
+    for name in _deploy_jobs():
+        if name != "record":
+            assert "deploy_staging.py record" not in _deploy_runs(name)
+
+
+def test_deploy_has_no_e2e_job():
+    """E2E runs at PR time (ci.yml, AFX-119); it never gates a deploy."""
+    assert "e2e" not in _deploy_jobs()
+    assert "e2e" in _load("ci.yml")["jobs"]
+
+
+def test_summary_always_runs_and_exposes_outcomes():
+    summary = _deploy_jobs()["summary"]
+    assert summary["if"] == "always()"
+    assert set(_deploy_needs("summary")) == {
+        "plan",
+        "deploy-backend",
+        "deploy-frontend",
+        "verify",
+        "record",
+    }
+    assert {
+        "outcome",
+        "backend",
+        "frontend",
+        "verify",
+        "tag",
+        "previous_sha",
+        "deployed_sha",
+    } <= set(summary["outputs"])
+    upload = next(s for s in summary["steps"] if "upload-artifact" in s.get("uses", ""))
+    assert upload["if"] == "always()"
+    assert upload["with"]["name"] == "deploy-result"
+    assert upload["with"]["overwrite"] is True  # re-runs replace the result

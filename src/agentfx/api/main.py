@@ -1,8 +1,11 @@
 import asyncio
 import logging
 import logging.handlers
+import os
+import re
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -256,7 +259,31 @@ async def root():
     return {"message": "Welcome to AgentFX API"}
 
 
+_SOURCE_SHA_FILE = Path(__file__).resolve().parents[1] / "SOURCE_SHA"
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def deployed_source_sha() -> str | None:
+    """Commit the running backend was built from, or None when unknown.
+
+    The Deploy workflow writes `src/agentfx/SOURCE_SHA` before uploading to
+    Railway. `SOURCE_SHA` overrides it; Railway's own GitHub builds set
+    `RAILWAY_GIT_COMMIT_SHA`.
+    """
+    candidates = [settings.SOURCE_SHA]
+    try:
+        candidates.append(_SOURCE_SHA_FILE.read_text(encoding="utf-8"))
+    except OSError:
+        pass
+    candidates.append(os.getenv("RAILWAY_GIT_COMMIT_SHA", ""))
+    for candidate in candidates:
+        sha = (candidate or "").strip().lower()
+        if _SHA_RE.match(sha):
+            return sha
+    return None
+
+
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy"}
+    """Health check endpoint; `source_sha` lets Deploy verify staging."""
+    return {"status": "healthy", "source_sha": deployed_source_sha()}
