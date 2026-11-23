@@ -134,6 +134,7 @@ class TestPrPolicyWorkflow:
         assert on["pull_request_target"]["branches"] == ["main"]
         assert on["workflow_run"]["workflows"] == ["PR review relay", "CI"]
         assert "auto_merge_enabled" in on["pull_request_target"]["types"]
+        assert "review_request_removed" in on["pull_request_target"]["types"]
         assert "schedule" not in on and "pull_request" not in on
 
     def test_relay_reruns_on_every_review_change(self, relay):

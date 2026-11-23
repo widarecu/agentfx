@@ -36,6 +36,7 @@ on:
       - labeled
       - unlabeled
       - auto_merge_enabled
+      - review_request_removed
   workflow_run:
     workflows: ["PR review relay", "CI"]
     types: [completed]
