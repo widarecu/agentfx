@@ -169,24 +169,26 @@ def collect_tickets(
 
 
 def resolve_baseline(
-    gh: GitHub, attempted: str, explicit: str | None = None
-) -> tuple[str | None, str, list[str]]:
-    """(baseline, how it was found, attempts whose records this range covers).
+    gh: GitHub, attempted: str, explicit: str | None = None, *, extend: bool = False
+) -> tuple[str | None, str, list[str], list[str]]:
+    """(baseline, how it was found, records this range covers, extra commits).
 
-    A record is only pruned after a successful sync covered it, so a baseline
-    that still has a record is an earlier deploy whose sync may have been
-    missed: the range is extended back through it."""
+    A record is only pruned after a successful sync covered it, so with
+    `extend` (success only) a baseline that still has a record is an earlier
+    deploy whose sync may have been missed: the range is extended back
+    through it. A failure never extends, so shipped work is never Blocked.
+    A self-pointing record is a first deploy: its own commit is the extra."""
     if explicit:
-        return explicit, "explicit --baseline", []
+        return explicit, "explicit --baseline", [], []
     recorded = gh.get_tag_sha(record_tag(attempted))
     if recorded == attempted:
-        return None, "first deploy (recorded)", []
+        return None, "first deploy (recorded)", [], []
     if recorded:
         base, source = recorded, f"recorded {record_tag(attempted)}"
     else:
         tag = gh.get_tag_sha(STAGING_TAG)
         if tag is None:
-            return None, f"first deploy: no {STAGING_TAG} tag", []
+            return None, f"first deploy: no {STAGING_TAG} tag", [], []
         if tag == attempted:
             raise BaselineUnknownError(
                 f"{STAGING_TAG} already points at {attempted[:7]} and no "
@@ -195,14 +197,18 @@ def resolve_baseline(
             )
         base, source = tag, f"{STAGING_TAG} tag"
     covered: list[str] = []
-    while base is not None and base not in covered:
+    extra: list[str] = []
+    while extend and base not in covered:
         earlier = gh.get_tag_sha(record_tag(base))
         if not earlier:
             break
         covered.append(base)
         source += f", extended over {base[:7]}"
-        base = None if earlier == base else earlier
-    return base, source, covered
+        if earlier == base:
+            extra.append(base)
+            break
+        base = earlier
+    return base, source, covered, extra
 
 
 def range_commits(gh: GitHub, baseline: str | None, attempted: str) -> list[str]:
@@ -412,8 +418,10 @@ def sync(
         report.info(f"deploy outcome not final ({verdict.detail}); no ticket changed")
         return report
     try:
-        base, source, covered = resolve_baseline(gh, attempted, baseline)
-        commits = range_commits(gh, base, attempted)
+        base, source, covered, extra = resolve_baseline(
+            gh, attempted, baseline, extend=verdict.kind == "success"
+        )
+        commits = extra + range_commits(gh, base, attempted)
         tickets, skipped = collect_tickets(gh, commits) if commits else ({}, [])
     except BaselineUnknownError as exc:
         report.error(str(exc))

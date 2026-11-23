@@ -528,6 +528,30 @@ def test_missed_sync_is_covered_by_the_next_deploy():
     assert gh.tags[ds.record_tag(s2)] == s1
 
 
+def test_second_deploy_after_first_deploy_covers_both():
+    gh, linear, s1, s2 = _consecutive_deploys()
+    gh.tags.pop(ds.STAGING_TAG)
+    ds.record(gh, s1, apply=True)  # first deploy: self-pointing record
+    gh.tags[ds.STAGING_TAG] = s1  # its sync missed
+    ds.record(gh, s2, apply=True)
+    gh.tags[ds.STAGING_TAG] = s2
+    assert _run(gh, linear, OK, sha=s2).exit_code == 0
+    assert linear.issues["AFX-10"]["state"]["name"] == "Done"
+    assert linear.issues["AFX-11"]["state"]["name"] == "Done"
+    assert ds.record_tag(s1) not in gh.tags
+
+
+def test_failure_after_missed_success_does_not_block_shipped_tickets():
+    gh, linear, s1, s2 = _consecutive_deploys()
+    ds.record(gh, s1, apply=True)
+    gh.tags[ds.STAGING_TAG] = s1  # s1 shipped, its sync missed
+    ds.record(gh, s2, apply=True)
+    _run(gh, linear, FRONT_FAIL, sha=s2)
+    assert linear.issues["AFX-10"]["state"]["name"] == "In Staging"
+    assert linear.issues["AFX-11"]["state"]["name"] == "Blocked"
+    assert ds.record_tag(s1) in gh.tags  # still owed a Done by the next success
+
+
 def test_consecutive_deploys_do_not_recomment_done_tickets():
     gh, linear, s1, s2 = _consecutive_deploys()
     ds.record(gh, s1, apply=True)
@@ -646,6 +670,13 @@ def test_adapter_end_to_end_success_and_failure():
     assert _run(gh, _adapter(fake), OK).exit_code == 0
     assert a10.state == "Done" and a10.labels == []
     assert ds.LABEL_CLEARED_MARKER in a10.comments[-1]
+
+
+def test_adapter_falls_back_to_workspace_label():
+    fake = LinearFake(labels=[], workspace_labels=["needs-wilson"])
+    fake.add("AFX-10", "In Staging")
+    assert _run(_two_pr_range(), _adapter(fake), FRONT_FAIL).exit_code == 0
+    assert fake.issues["AFX-10"].labels == ["needs-wilson"]
 
 
 def test_adapter_missing_issue_is_none():
