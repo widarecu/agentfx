@@ -121,9 +121,11 @@ def test_only_the_record_job_can_write_and_only_after_verify():
             assert "deploy_staging.py record" not in _runs(name)
 
 
-def test_e2e_cannot_block_the_tag():
-    for job in ("verify", "record"):
+def test_e2e_cannot_block_the_tag_or_fail_the_run():
+    for job in ("verify", "record", "summary"):
         assert "e2e" not in _needs(job)
+    # The run conclusion still drives Linear transitions on promote.
+    assert _jobs()["e2e"]["continue-on-error"] is True
 
 
 def test_summary_always_runs_and_exposes_outcomes():

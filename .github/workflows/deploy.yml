@@ -74,8 +74,11 @@ jobs:
   e2e:
     name: E2E Tests
     # Informational: not needed by verify/record, so it cannot block the
-    # `deployed/staging` tag. Removed once PR-time E2E covers merges to main.
+    # `deployed/staging` tag, and continue-on-error keeps a failure from
+    # failing the run (whose conclusion Linear transitions still read).
+    # Removed once PR-time E2E covers merges to main.
     needs: plan
+    continue-on-error: true
     if: needs.plan.outputs.backend == 'true' || needs.plan.outputs.frontend == 'true'
     # Pinned to 24.04: GitHub's `ubuntu-latest` rolled to 26.04 in late
     # October 2026, and Playwright 1.57.0 only ships deps for ≤24.04.
