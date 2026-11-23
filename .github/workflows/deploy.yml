@@ -19,6 +19,8 @@ name: Deploy
 #   run when staging is not verified, so the conclusion is the deploy result.
 # * `deploy-sync-record` / `deploy-sync` (AFX-122) move the Linear tickets
 #   of the deployed range; dry-run until `vars.AFX_DEPLOY_SYNC_MODE=apply`.
+#   In dry-run a sync failure never turns the run red (AFX-133): the legacy
+#   state workflow reads this run's conclusion as the deploy result.
 # * Recovery: "Re-run failed jobs", or "Run workflow" with the SHA to retry.
 #   The Vercel GitHub integration is separately gated by `ignoreCommand` in
 #   portal/web/vercel.json.
@@ -344,10 +346,12 @@ jobs:
 
   deploy-sync:
     name: Sync tickets
-    needs: [plan, deploy-sync-record, summary]
+    needs: [plan, deploy-sync-record, record, summary]
     # Runs after every outcome (success, failure, skip) so failed tickets
     # are Blocked and a later success moves them to Done.
     if: always()
+    # Dry-run only reports; a failure there must not fail a verified deploy.
+    continue-on-error: ${{ (vars.AFX_DEPLOY_SYNC_MODE || 'dry-run') != 'apply' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -374,9 +378,12 @@ jobs:
           python3 scripts/afx.py deploy-sync run
           --sha "$TARGET_SHA"
           --backend "$BACKEND" --frontend "$FRONTEND" --verify "$VERIFY"
-          --run-url "$RUN_URL"
+          --previous-sha "$PREVIOUS_SHA" --run-url "$RUN_URL"
         env:
           TARGET_SHA: ${{ needs.plan.outputs.sha || inputs.sha || github.sha }}
+          # The tag `record` replaced: the range start when no baseline
+          # record exists (dry-run, or a failed Record deploy range).
+          PREVIOUS_SHA: ${{ needs.record.outputs.previous_sha }}
           BACKEND: ${{ steps.outcomes.outputs.backend }}
           FRONTEND: ${{ steps.outcomes.outputs.frontend }}
           VERIFY: ${{ steps.outcomes.outputs.verify }}

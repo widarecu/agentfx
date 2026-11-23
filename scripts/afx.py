@@ -157,6 +157,12 @@ def _add_deploy_sync(sub) -> None:
     run.add_argument(
         "--baseline", default=None, help="Override the previous successful SHA"
     )
+    run.add_argument(
+        "--previous-sha",
+        default=None,
+        help="SHA this run's deployed/staging move replaced; used only when "
+        "the tag is already at --sha and no baseline record exists",
+    )
     for component in ds.COMPONENTS:
         run.add_argument(f"--{component}", choices=OUTCOMES, required=True)
 
@@ -191,6 +197,7 @@ def deploy_sync(args, *, gh=None, linear=None) -> int:
                 staging_url=args.staging_url,
                 apply=apply,
                 baseline=args.baseline,
+                previous=args.previous_sha or None,
             )
         else:
             report = ds.recover(
