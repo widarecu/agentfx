@@ -377,4 +377,5 @@ class TestDeliveryReconcileWorkflow:
             if "upload-artifact" in s.get("uses", "")
         )
         assert upload["with"]["name"] == "reconcile-digest"
+        assert upload["with"]["overwrite"] is True
         assert upload["if"] == "always()"

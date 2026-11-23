@@ -68,3 +68,5 @@ jobs:
           path: digest.json
           retention-days: 30
           if-no-files-found: ignore
+          # A re-run attempt replaces the earlier attempt's digest.
+          overwrite: true
