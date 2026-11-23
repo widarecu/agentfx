@@ -1,164 +1,106 @@
 name: Deploy
 
-# `paths-ignore` skips the entire deploy job (E2E + Railway + Vercel-via-Actions)
-# when every changed path in a merge to main is docs. Prevents Railway backend
-# rebuilds and Vercel frontend rebuilds for planning-only merges. The Vercel
-# GitHub integration (Preview + Production) is separately gated by the
-# `ignoreCommand` in portal/web/vercel.json.
+# Deploys `main` to staging and records the last verified commit (AFX-121).
+#
+#   plan → deploy-backend (Railway) ┐
+#        → deploy-frontend (Vercel) ┴→ verify → record → summary (always)
+#
+# * Every push to main runs, docs-only included: `plan` compares the commit
+#   with the `deployed/staging` tag and deploys only the components whose
+#   source changed. Nothing to deploy is an explicit success after verify.
+# * `verify` checks backend /health reports the deployed source SHA (or, for
+#   an unchanged backend, a SHA with the same backend source) and that the
+#   frontend URL serves.
+# * `record` moves `deployed/staging` only after a verified deploy, keeping
+#   the previous SHA in `deployed/staging-previous`. It never moves the tag
+#   backwards, so stale retries cannot regress it.
+# * `summary` always runs and exposes backend / frontend / verify / tag
+#   outcomes as job outputs and the `deploy-result` artifact. It fails the
+#   run when staging is not verified, so the conclusion is the deploy result.
+# * `deploy-sync-record` / `deploy-sync` (AFX-122) move the Linear tickets
+#   of the deployed range; dry-run until `vars.AFX_DEPLOY_SYNC_MODE=apply`.
+# * Recovery: "Re-run failed jobs", or "Run workflow" with the SHA to retry.
+#   The Vercel GitHub integration is separately gated by `ignoreCommand` in
+#   portal/web/vercel.json.
 on:
   push:
     branches:
       - main
-    paths-ignore:
-      - 'planning/**'
-      - '**/*.md'
-      - 'LICENSE'
-      - '.gitignore'
-      - 'portal/web/wireframes/**'
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit on main to deploy (default: the selected branch head)"
+        required: false
+        default: ""
 
+permissions:
+  contents: read
+
+# One deploy at a time; an in-flight deploy is never cancelled.
 concurrency:
   group: deploy-production
   cancel-in-progress: false
 
+env:
+  BACKEND_URL: https://agentfx-staging.up.railway.app
+  FRONTEND_URL: https://agentfx-liart.vercel.app
+
 jobs:
-  # ---------------------------------------------------------------------------
-  # E2E tests: full-stack validation before deployment
-  # Starts backend + frontend, runs Playwright against real PostgreSQL.
-  # ---------------------------------------------------------------------------
-  e2e:
-    name: E2E Tests
-    # Pinned to 24.04: GitHub's `ubuntu-latest` rolled to 26.04 in late
-    # October 2026, and Playwright 1.57.0 only ships deps for ≤24.04.
-    # Attempting `--with-deps` on 26.04 bails with:
-    #   "ERROR: Playwright does not support chromium on ubuntu26.04-x64"
-    # Bump the pin when `@playwright/test` is upgraded to a release
-    # that officially supports 26.04.
-    runs-on: ubuntu-24.04
-
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: test_user
-          POSTGRES_PASSWORD: test_password
-          POSTGRES_DB: agentfx_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U test_user -d agentfx_test"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
+  plan:
+    name: Plan (changes since deployed/staging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.plan.outputs.sha }}
+      base_sha: ${{ steps.plan.outputs.base_sha }}
+      kind: ${{ steps.plan.outputs.kind }}
+      backend: ${{ steps.plan.outputs.backend }}
+      frontend: ${{ steps.plan.outputs.frontend }}
+      stale: ${{ steps.plan.outputs.stale }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-api.txt
+          fetch-depth: 0
 
-      - name: Install backend dependencies
-        run: pip install -r requirements.txt -r requirements-api.txt
-
-      - name: Run migrations and seed data
-        run: |
-          alembic upgrade head
-          python scripts/seed_instruments.py
-          python scripts/seed_test_data.py
-          python scripts/seed_test_candles.py
+      - name: Decide what to deploy
+        id: plan
+        run: python3 scripts/deploy_staging.py plan --sha "$TARGET_SHA"
         env:
-          ENVIRONMENT: test
-          PYTHONPATH: src
-          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/agentfx_test
-
-      - name: Start backend server
-        run: |
-          nohup uvicorn agentfx.api.main:app --host 0.0.0.0 --port 8000 > /tmp/backend.log 2>&1 &
-          # Wait for backend to be ready
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:8000/health && break || sleep 1
-          done
-          # Verify backend is responding
-          curl -sf http://localhost:8000/health || (cat /tmp/backend.log && exit 1)
-        env:
-          ENVIRONMENT: test
-          PYTHONPATH: src
-          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/agentfx_test
-          SECRET_KEY: test-secret-key-for-e2e
-          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
-          OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID }}
-          OANDA_ENV: practice
-          INGESTION_ENABLED: "false"
-
-      - name: Set up Node.js 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: portal/web/package-lock.json
-
-      - name: Install frontend dependencies
-        run: npm ci
-        working-directory: portal/web
-
-      - name: Start frontend server
-        run: |
-          npm run dev:test &
-          # Wait for frontend to be ready
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:5173 && break || sleep 1
-          done
-        working-directory: portal/web
-        env:
-          VITE_API_BASE_URL: http://localhost:8000/api/v1
-
-      - name: Link E2E test dependencies
-        run: ln -s ${{ github.workspace }}/portal/web/node_modules ${{ github.workspace }}/tests/e2e/node_modules
-
-      - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium
-        working-directory: portal/web
-
-      - name: Run E2E tests
-        run: npx playwright test
-        working-directory: portal/web
-        env:
-          NODE_PATH: ${{ github.workspace }}/portal/web/node_modules
-          # Override Playwright defaults (Docker test profile ports 5174/8001)
-          # because this CI job runs uvicorn/vite directly on 5173/8000 without
-          # docker-compose. Once CI migrates to docker-compose these can be removed.
-          PLAYWRIGHT_BASE_URL: http://localhost:5173
-          API_BASE_URL: http://localhost:8000/api/v1
-
-      - name: Upload E2E artifacts on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: e2e-results
-          path: test-results/
-          retention-days: 7
+          TARGET_SHA: ${{ inputs.sha || github.sha }}
 
   # ---------------------------------------------------------------------------
-  # Deploy backend to Railway (only after E2E passes)
+  # Deploy backend to Railway (only when its source changed)
   # ---------------------------------------------------------------------------
   deploy-backend:
     name: Deploy Backend → Railway
-    # needs: e2e  # Temporarily disabled until deployment is stable
+    needs: plan
+    if: needs.plan.outputs.backend == 'true'
     runs-on: ubuntu-latest
     environment: production
     # Above the wait in scripts/railway_deploy.py (25 min) so the script,
     # not the runner, reports a stuck deploy.
     timeout-minutes: 35
+    env:
+      TARGET_SHA: ${{ needs.plan.outputs.sha }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Refuse to deploy an older commit than staging runs
+        run: python3 scripts/deploy_staging.py guard --sha "$TARGET_SHA" --component backend --backend-url "$BACKEND_URL"
+
+      # The deploy tooling comes from this workflow's commit, so a manual
+      # retry of an older SHA still uses the current scripts. The SOURCE_SHA
+      # file is copied into the image and reported by /health.
+      - name: Check out the commit to deploy
+        run: |
+          cp scripts/railway_deploy.py "$RUNNER_TEMP/railway_deploy.py"
+          git checkout --detach "$TARGET_SHA"
+          echo "$TARGET_SHA" > src/agentfx/SOURCE_SHA
 
       - name: Set up Node.js 20
         uses: actions/setup-node@v4
@@ -182,26 +124,34 @@ jobs:
       # the deploy, then polls that deployment until Railway reports SUCCESS
       # (exit 0) or FAILED / CRASHED / timeout (exit 1).
       - name: Deploy to Railway
-        run: python3 scripts/railway_deploy.py --service agentfx
+        run: python3 "$RUNNER_TEMP/railway_deploy.py" --service agentfx
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
 
   # ---------------------------------------------------------------------------
-  # Deploy frontend to Vercel (only after E2E passes)
+  # Deploy frontend to Vercel (only when its source changed)
   # ---------------------------------------------------------------------------
   deploy-frontend:
     name: Deploy Frontend → Vercel
-    # needs: e2e  # Temporarily disabled until deployment is stable
+    needs: plan
+    if: needs.plan.outputs.frontend == 'true'
     runs-on: ubuntu-latest
     environment: production
-
-    defaults:
-      run:
-        working-directory: portal/web
+    timeout-minutes: 30
+    env:
+      TARGET_SHA: ${{ needs.plan.outputs.sha }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Refuse to deploy an older commit than staging runs
+        run: python3 scripts/deploy_staging.py guard --sha "$TARGET_SHA" --component frontend
+
+      - name: Check out the commit to deploy
+        run: git checkout --detach "$TARGET_SHA"
 
       - name: Set up Node.js 20
         uses: actions/setup-node@v4
@@ -212,6 +162,7 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+        working-directory: portal/web
 
       - name: Install Vercel CLI
         run: npm install --global vercel@latest
@@ -225,26 +176,154 @@ jobs:
       # paired with a refreshed VERCEL_TOKEN secret the same day.
       - name: Pull Vercel project settings
         run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
-        working-directory: .
         env:
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
 
+      # `vercel deploy` waits for the build and exits non-zero if it fails.
       - name: Deploy to Vercel (production)
         run: vercel deploy --prod --token=${{ secrets.VERCEL_TOKEN }}
-        working-directory: .
         env:
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+  # ---------------------------------------------------------------------------
+  # Verify staging runs the commit: deployed components report it, unchanged
+  # ones report their last applicable source. Skipped after a failed deploy.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Verify staging
+    needs: [plan, deploy-backend, deploy-frontend]
+    if: >-
+      !cancelled() &&
+      needs.plan.result == 'success' &&
+      needs.plan.outputs.stale != 'true' &&
+      (needs.deploy-backend.result == 'success' || needs.deploy-backend.result == 'skipped') &&
+      (needs.deploy-frontend.result == 'success' || needs.deploy-frontend.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      backend_detail: ${{ steps.verify.outputs.backend_detail }}
+      backend_live_sha: ${{ steps.verify.outputs.backend_live_sha }}
+      frontend_detail: ${{ steps.verify.outputs.frontend_detail }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify backend /health SHA and frontend URL
+        id: verify
+        run: >-
+          python3 scripts/deploy_staging.py verify --sha "$TARGET_SHA"
+          --backend-deployed "$BACKEND_DEPLOYED" --frontend-deployed "$FRONTEND_DEPLOYED"
+          --backend-url "$BACKEND_URL" --frontend-url "$FRONTEND_URL"
+        env:
+          TARGET_SHA: ${{ needs.plan.outputs.sha }}
+          BACKEND_DEPLOYED: ${{ needs.plan.outputs.backend }}
+          FRONTEND_DEPLOYED: ${{ needs.plan.outputs.frontend }}
+
+  # ---------------------------------------------------------------------------
+  # Move deployed/staging (fast-forward only) after a verified deploy.
+  # ---------------------------------------------------------------------------
+  record:
+    name: Record deployed/staging
+    # deploy-sync-record first, so a ticket range survives the tag move.
+    needs: [plan, verify, deploy-sync-record]
+    if: "!cancelled() && needs.verify.result == 'success'"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      recorded: ${{ steps.record.outputs.recorded }}
+      previous_sha: ${{ steps.record.outputs.previous_sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Move deployed/staging
+        id: record
+        run: python3 scripts/deploy_staging.py record --sha "$TARGET_SHA"
+        env:
+          TARGET_SHA: ${{ needs.plan.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+
+  # ---------------------------------------------------------------------------
+  # Always-run outcome: read these outputs (or the deploy-result artifact)
+  # instead of inferring the deploy result from the workflow conclusion.
+  # ---------------------------------------------------------------------------
+  summary:
+    name: Deploy summary
+    needs: [plan, deploy-backend, deploy-frontend, verify, record]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.summary.outputs.sha }}
+      outcome: ${{ steps.summary.outputs.outcome }}
+      backend: ${{ steps.summary.outputs.backend }}
+      frontend: ${{ steps.summary.outputs.frontend }}
+      verify: ${{ steps.summary.outputs.verify }}
+      tag: ${{ steps.summary.outputs.tag }}
+      previous_sha: ${{ steps.summary.outputs.previous_sha }}
+      deployed_sha: ${{ steps.summary.outputs.deployed_sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Summarize backend / frontend / verify outcomes
+        id: summary
+        run: >-
+          python3 scripts/deploy_staging.py summary --sha "$TARGET_SHA"
+          --plan-result "$PLAN_RESULT" --kind "$KIND" --base-sha "$BASE_SHA"
+          --backend-planned "$BACKEND_PLANNED" --frontend-planned "$FRONTEND_PLANNED"
+          --backend-result "$BACKEND_RESULT" --frontend-result "$FRONTEND_RESULT"
+          --verify-result "$VERIFY_RESULT" --backend-detail "$BACKEND_DETAIL"
+          --frontend-detail "$FRONTEND_DETAIL" --record-result "$RECORD_RESULT"
+          --recorded "$RECORDED" --previous-sha "$PREVIOUS_SHA" --run-url "$RUN_URL"
+          --json-out deploy-result.json
+        env:
+          TARGET_SHA: ${{ needs.plan.outputs.sha || inputs.sha || github.sha }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          KIND: ${{ needs.plan.outputs.kind }}
+          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+          BACKEND_PLANNED: ${{ needs.plan.outputs.backend }}
+          FRONTEND_PLANNED: ${{ needs.plan.outputs.frontend }}
+          BACKEND_RESULT: ${{ needs.deploy-backend.result }}
+          FRONTEND_RESULT: ${{ needs.deploy-frontend.result }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          BACKEND_DETAIL: ${{ needs.verify.outputs.backend_detail }}
+          FRONTEND_DETAIL: ${{ needs.verify.outputs.frontend_detail }}
+          RECORD_RESULT: ${{ needs.record.result }}
+          RECORDED: ${{ needs.record.outputs.recorded }}
+          PREVIOUS_SHA: ${{ needs.record.outputs.previous_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Upload deploy-result.json
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-result
+          path: deploy-result.json
+          overwrite: true
+          if-no-files-found: warn
 
   # ---------------------------------------------------------------------------
   # Ticket sync (AFX-122). Inert until cutover: `vars.AFX_DEPLOY_SYNC_MODE`
   # is unset, so both jobs run as dry-run and only log what they would do.
   # agent-fleet-state-on-promote.yml stays the status owner until then.
+  # They write only `deploy-sync/baseline/*` tags, never `deployed/staging`.
   # ---------------------------------------------------------------------------
   deploy-sync-record:
     name: Record deploy range
+    needs: plan
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     # A GitHub API blip here must never block a deploy.
     continue-on-error: true
     permissions:
@@ -254,21 +333,23 @@ jobs:
         uses: actions/checkout@v4
 
       # Persists the previous successful deployed/staging SHA for this
-      # attempt before anything can move the tag, so a missed sync can be
+      # attempt before `record` can move the tag, so a missed sync can be
       # recovered with `afx deploy-sync recover`.
       - name: Record baseline
-        run: python3 scripts/afx.py deploy-sync record --sha "$GITHUB_SHA"
+        run: python3 scripts/afx.py deploy-sync record --sha "$TARGET_SHA"
         env:
+          TARGET_SHA: ${{ needs.plan.outputs.sha }}
           GH_TOKEN: ${{ github.token }}
           AFX_DEPLOY_SYNC_MODE: ${{ vars.AFX_DEPLOY_SYNC_MODE || 'dry-run' }}
 
   deploy-sync:
     name: Sync tickets
-    needs: [deploy-sync-record, e2e, deploy-backend, deploy-frontend]
+    needs: [plan, deploy-sync-record, summary]
     # Runs after every outcome (success, failure, skip) so failed tickets
     # are Blocked and a later success moves them to Done.
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
       # GET /commits/{sha}/pulls maps merge commits to their PRs.
@@ -279,17 +360,23 @@ jobs:
 
       - name: Component outcomes
         id: outcomes
-        run: python3 scripts/deploy_staging.py outcomes --needs-json "$NEEDS_JSON"
+        run: >-
+          python3 scripts/deploy_staging.py ticket-outcomes --outcome "$OUTCOME"
+          --backend "$BACKEND" --frontend "$FRONTEND" --verify "$VERIFY"
         env:
-          NEEDS_JSON: ${{ toJSON(needs) }}
+          OUTCOME: ${{ needs.summary.outputs.outcome }}
+          BACKEND: ${{ needs.summary.outputs.backend }}
+          FRONTEND: ${{ needs.summary.outputs.frontend }}
+          VERIFY: ${{ needs.summary.outputs.verify }}
 
       - name: Sync Linear tickets
         run: >-
           python3 scripts/afx.py deploy-sync run
-          --sha "$GITHUB_SHA"
+          --sha "$TARGET_SHA"
           --backend "$BACKEND" --frontend "$FRONTEND" --verify "$VERIFY"
           --run-url "$RUN_URL"
         env:
+          TARGET_SHA: ${{ needs.plan.outputs.sha || inputs.sha || github.sha }}
           BACKEND: ${{ steps.outcomes.outputs.backend }}
           FRONTEND: ${{ steps.outcomes.outputs.frontend }}
           VERIFY: ${{ steps.outcomes.outputs.verify }}

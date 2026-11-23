@@ -288,59 +288,55 @@ def test_component_outcome_is_required():
         )
 
 
-# ── deploy_staging.outcomes ──────────────────────────────────────────
+# ── deploy_staging.ticket_outcomes ───────────────────────────────────
 
 
-def _needs(**results):
-    return {
-        job.replace("_", "-"): {"result": r, "outputs": {}}
-        for job, r in results.items()
-    }
+def _ticket(outcome, backend, frontend, verify):
+    return deploy_staging.ticket_outcomes(outcome, backend, frontend, verify)
 
 
-def test_outcomes_map_jobs_to_components():
-    got = deploy_staging.outcomes(
-        _needs(
-            deploy_backend="success",
-            deploy_frontend="failure",
-            verify_staging="success",
-            e2e="success",
-            deploy_sync_record="failure",
-        )
+def test_ticket_outcomes_success():
+    got = _ticket("success", "deployed", "unchanged", "passed")
+    assert got == {"backend": "success", "frontend": "skipped", "verify": "success"}
+    assert ds.classify(got).kind == "success"
+
+
+def test_ticket_outcomes_docs_only_is_success():
+    got = _ticket("success", "unchanged", "unchanged", "passed")
+    assert ds.classify(got).kind == "success"
+
+
+def test_ticket_outcomes_failed_component_is_failure():
+    got = _ticket("failure", "deployed", "failed", "not-run")
+    assert got["frontend"] == "failure" and got["verify"] == ""
+    assert ds.classify(got).kind == "failure"
+    assert ds.classify(_ticket("failure", "deployed", "unchanged", "failed")).kind == (
+        "failure"
     )
-    assert got == {"backend": "success", "frontend": "failure", "verify": "success"}
 
 
-def test_outcomes_missing_verify_job_is_not_final():
-    got = deploy_staging.outcomes(
-        _needs(deploy_backend="success", deploy_frontend="success", e2e="success")
-    )
-    assert got["verify"] == ""
+@pytest.mark.parametrize("outcome", ["stale", "", "unknown"])
+def test_ticket_outcomes_not_final_changes_nothing(outcome):
+    got = _ticket(outcome, "deployed", "deployed", "passed")
     assert ds.classify(got).kind == "indeterminate"
 
 
-def test_outcomes_failed_gate_is_a_verify_failure():
-    got = deploy_staging.outcomes(
-        _needs(deploy_backend="skipped", deploy_frontend="skipped", e2e="failure")
-    )
-    assert ds.classify(got).kind == "failure"
-    assert got["verify"] == "failure"
+def test_ticket_outcomes_not_run_plan_changes_nothing():
+    got = _ticket("failure", "not-run", "not-run", "not-run")
+    assert ds.classify(got).kind == "indeterminate"
 
 
-def test_outcomes_docs_only_is_success():
-    assert ds.classify(deploy_staging.outcomes({}, docs_only=True)).kind == "success"
-
-
-def test_outcomes_cli_writes_github_output(tmp_path, monkeypatch, capsys):
+def test_ticket_outcomes_cli_writes_github_output(tmp_path, monkeypatch):
     out = tmp_path / "out"
     monkeypatch.setenv("GITHUB_OUTPUT", str(out))
-    needs = json.dumps(_needs(deploy_backend="success", deploy_frontend="skipped"))
-    assert deploy_staging.main(["outcomes", "--needs-json", needs]) == 0
-    assert out.read_text().splitlines() == [
+    argv = ["ticket-outcomes", "--outcome", "success", "--backend", "deployed"]
+    argv += ["--frontend", "unchanged", "--verify", "passed"]
+    assert deploy_staging.main(argv) == 0
+    assert set(out.read_text().split()) >= {
         "backend=success",
         "frontend=skipped",
-        "verify=",
-    ]
+        "verify=success",
+    }
 
 
 # ── workflow wiring ──────────────────────────────────────────────────
@@ -354,9 +350,7 @@ def jobs():
 def test_sync_job_runs_after_every_deploy_outcome(jobs):
     sync = jobs["deploy-sync"]
     assert sync["if"] == "always()"
-    assert {"deploy-backend", "deploy-frontend", "e2e", "deploy-sync-record"} <= set(
-        sync["needs"]
-    )
+    assert {"plan", "summary", "deploy-sync-record"} <= set(sync["needs"])
     run = " ".join(s.get("run", "") for s in sync["steps"])
     assert "scripts/afx.py deploy-sync run" in run
     assert "--backend" in run and "--frontend" in run and "--verify" in run
@@ -372,8 +366,12 @@ def test_sync_jobs_are_inert_until_cutover(jobs):
 
 def test_record_never_blocks_deploy(jobs):
     assert jobs["deploy-sync-record"]["continue-on-error"] is True
-    for name in ("deploy-backend", "deploy-frontend"):
+    for name in ("deploy-backend", "deploy-frontend", "verify"):
         assert "deploy-sync-record" not in (jobs[name].get("needs") or [])
+    # The tag moves only after the range is recorded; record's own gate is
+    # verify, so a failed range record cannot stop it.
+    assert "deploy-sync-record" in jobs["record"]["needs"]
+    assert jobs["record"]["if"].startswith("!cancelled()")
 
 
 def test_workflow_expressions_are_not_interpolated_into_sync_cli(jobs):

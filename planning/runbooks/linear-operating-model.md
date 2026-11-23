@@ -120,7 +120,7 @@ Done:
 - Linear MCP server: user-level config plus project `.mcp.json`, so cloud sessions get it too.
 
 Wilson, still to do:
-- Connect the GitHub integration (Settings → Integrations → GitHub), with PR opened → In Review and PR merged to `feat/agent-fleet` → In Staging. Done is set only by `agent-fleet-state-on-promote.yml` after a successful deploy (see `branch-flow.md`).
+- Connect the GitHub integration (Settings → Integrations → GitHub), with PR opened → In Review and PR merged to `feat/agent-fleet` → In Staging. Done is set only by `agent-fleet-state-on-promote.yml` after a successful deploy (see `branch-flow.md`). At the AFX-117 cutover the merge rule is turned off: see `delivery-cutover-checklist.md`.
 - Install the mobile app and turn on notifications for Triage and "assigned to me".
 - Revoke the `bootstrap` personal API key once structure changes settle. Re-create it when the YAML changes.
 

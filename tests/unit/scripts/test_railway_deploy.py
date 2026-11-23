@@ -113,9 +113,14 @@ def _deploy_backend_job():
 
 def test_deploy_backend_job_does_not_finish_on_upload():
     """Reproduces AFX-112: a bare `railway up --detach` step ends the job on upload."""
-    runs = [step.get("run", "") for step in _deploy_backend_job()["steps"]]
+    steps = _deploy_backend_job()["steps"]
+    runs = [step.get("run", "") for step in steps]
     assert not any("railway up" in run for run in runs), runs
-    assert any("scripts/railway_deploy.py" in run for run in runs), runs
+    deploy = next(step for step in steps if step.get("name") == "Deploy to Railway")
+    # Run from $RUNNER_TEMP: the workflow's copy, so retries of older SHAs
+    # still wait for Railway's verdict (AFX-121).
+    assert "railway_deploy.py" in deploy["run"], deploy
+    assert any("cp scripts/railway_deploy.py" in run for run in runs), runs
 
 
 def test_railway_cli_is_pinned_for_the_json_contract():
