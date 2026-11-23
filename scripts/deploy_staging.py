@@ -17,6 +17,8 @@ tag, the record of the last commit fully running on staging:
   `deployed/staging-previous`, then fast-forward `deployed/staging`.
 * `summary` — always runs: one backend / frontend / verify / tag outcome,
   as job outputs, `deploy-result.json` and the run summary page.
+* `ticket-outcomes` — map the summary outcomes to the component outcomes
+  `afx deploy-sync run` takes (AFX-122).
 
 Stdlib only, plus `git` and `gh` (`gh api`, authenticated by `GH_TOKEN`):
 
@@ -625,6 +627,26 @@ def summarize(
     }
 
 
+_TICKET_OUTCOME = {
+    "deployed": "success",
+    "unchanged": "skipped",
+    "passed": "success",
+    "failed": "failure",
+    "cancelled": "cancelled",
+}
+
+
+def ticket_outcomes(
+    outcome: str, backend: str, frontend: str, verify: str
+) -> dict[str, str]:
+    """Summary outcomes as `afx deploy-sync run` outcomes. Anything not final
+    (not-run, unknown, a stale retry) is empty, so no ticket changes."""
+    if outcome not in ("success", "failure"):
+        return dict.fromkeys((BACKEND, FRONTEND, "verify"), "")
+    parts = {BACKEND: backend, FRONTEND: frontend, "verify": verify}
+    return {name: _TICKET_OUTCOME.get(value, "") for name, value in parts.items()}
+
+
 def summary_markdown(result: dict) -> str:
     sha = result["sha"][:12] or "unknown"
     lines = [
@@ -740,7 +762,15 @@ def main(
     p_sum.add_argument("--run-url", default="")
     p_sum.add_argument("--json-out", default="deploy-result.json")
 
+    p_tick = sub.add_parser("ticket-outcomes")
+    for name in ("outcome", BACKEND, FRONTEND, "verify"):
+        p_tick.add_argument(f"--{name}", default="")
+
     args = parser.parse_args(argv)
+    if args.command == "ticket-outcomes":
+        result = ticket_outcomes(args.outcome, args.backend, args.frontend, args.verify)
+        write_outputs(result)
+        return 0
     git = Git(args.repo_dir, runner)
 
     try:

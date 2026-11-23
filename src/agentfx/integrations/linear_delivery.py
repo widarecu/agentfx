@@ -11,6 +11,8 @@ status (AFX-117):
 - `release_own_claim`: PE-only undo of its own In Progress claim when
   no workspace started. A started workspace or another actor's claim is
   never rolled back.
+- `DeployIssues`: the issue/label/comment surface `deploy_sync` (AFX-122)
+  uses to move deployed tickets to Done or Blocked.
 
 Standard library only so the CLI runs without the backend environment.
 State and label IDs are resolved by name per team, never hard-coded.
@@ -194,8 +196,23 @@ class LinearClient:
             for n in nodes:
                 self._label_ids.setdefault((team_id, n["name"]), n["id"])
             if key not in self._label_ids:
-                raise NotFoundError(f"label {name!r} not found")
+                workspace = self._workspace_label_id(name)
+                if workspace is None:
+                    raise NotFoundError(f"label {name!r} not found")
+                self._label_ids[key] = workspace
         return self._label_ids[key]
+
+    def _workspace_label_id(self, name: str) -> str | None:
+        """Workspace-level label (no team), as `scripts/linear/bootstrap.py`
+        provisions `needs-wilson`."""
+        nodes = self.paginate(
+            "query($name: String!, $after: String) { issueLabels(filter: "
+            f"{{ name: {{ eq: $name }} }}, first: {PAGE_SIZE}, after: $after) "
+            "{ nodes { id name team { id } } pageInfo { hasNextPage endCursor } } }",
+            {"name": name},
+            ["issueLabels"],
+        )
+        return next((n["id"] for n in nodes if not n.get("team")), None)
 
     def comment_bodies(self, issue_id: str) -> list[str]:
         nodes = self.paginate(
@@ -250,6 +267,15 @@ class LinearClient:
         )
         if not (data.get("issueAddLabel") or {}).get("success"):
             raise LinearError(f"issueAddLabel failed for {issue_id}")
+
+    def remove_label(self, issue_id: str, label_id: str) -> None:
+        data = self.gql(
+            "mutation($id: String!, $labelId: String!) { "
+            "issueRemoveLabel(id: $id, labelId: $labelId) { success } }",
+            {"id": issue_id, "labelId": label_id},
+        )
+        if not (data.get("issueRemoveLabel") or {}).get("success"):
+            raise LinearError(f"issueRemoveLabel failed for {issue_id}")
 
     def comment(self, issue_id: str, body: str) -> None:
         data = self.gql(
@@ -374,8 +400,83 @@ def release_own_claim(
     )
 
 
+class DeployIssues:
+    """`LinearClient` as the dict-based surface `deploy_sync` uses. Issues
+    carry the state type (started, completed, canceled...) so the sync can
+    tell delivery work from Wilson-canceled or not-yet-started tickets.
+    Comment bodies are cached per issue for one sync run."""
+
+    def __init__(self, client: LinearClient) -> None:
+        self.client = client
+
+    def issue(self, ident: str) -> dict | None:
+        try:
+            data = self.client.gql(
+                "query($id: String!) { issue(id: $id) { id identifier "
+                "state { name type } team { id } "
+                "labels(first: 100) { nodes { id name } } } }",
+                {"id": ident},
+            )
+        except LinearError as exc:
+            if "not found" in str(exc).lower():
+                return None
+            raise
+        node = data.get("issue")
+        if not node:
+            return None
+        return {
+            "id": node["id"],
+            "identifier": node["identifier"],
+            "team_id": (node.get("team") or {}).get("id") or "",
+            "state": node.get("state") or {},
+            "labels": {"nodes": list((node.get("labels") or {}).get("nodes") or [])},
+        }
+
+    def comment_bodies(self, issue: dict) -> list[str]:
+        if "comment_bodies" not in issue:
+            issue["comment_bodies"] = self.client.comment_bodies(issue["id"])
+        return issue["comment_bodies"]
+
+    def set_state(self, issue: dict, name: str) -> bool:
+        if issue["state"].get("name") == name:
+            return False
+        self.client.set_state(issue["id"], self.client.state_id(issue["team_id"], name))
+        issue["state"] = {"name": name, "type": None}
+        return True
+
+    @staticmethod
+    def has_label(issue: dict, name: str) -> bool:
+        return any(n.get("name") == name for n in issue["labels"]["nodes"])
+
+    def add_label(self, issue: dict, name: str) -> bool:
+        if self.has_label(issue, name):
+            return False
+        label_id = self.client.label_id(issue["team_id"], name)
+        self.client.add_label(issue["id"], label_id)
+        issue["labels"]["nodes"].append({"id": label_id, "name": name})
+        return True
+
+    def remove_label(self, issue: dict, name: str) -> bool:
+        nodes = issue["labels"]["nodes"]
+        match = next((n for n in nodes if n.get("name") == name), None)
+        if match is None:
+            return False
+        self.client.remove_label(issue["id"], match["id"])
+        nodes.remove(match)
+        return True
+
+    def comment_once(self, issue: dict, body: str, marker: str) -> bool:
+        bodies = self.comment_bodies(issue)
+        if any(marker in b for b in bodies):
+            return False
+        self.client.comment(issue["id"], body)
+        bodies.append(body)
+        return True
+
+
 __all__ = [
     "BLOCKED",
+    "DeployIssues",
     "IN_PROGRESS",
     "Issue",
     "LinearClient",

@@ -24,6 +24,7 @@ Only `main` deploys to staging (Railway backend, Vercel frontend). "Merged" is a
 **Linear state:**
 - Merge to `feat/agent-fleet` → **In Staging** (Linear's branch-specific PR automation).
 - When the `Deploy` workflow finishes after a push to `main`, [agent-fleet-state-on-promote.yml](../../.github/workflows/agent-fleet-state-on-promote.yml) (AFX-70) reads the result. Success moves each `AFX-<n>` in the merge to **Done** with a staging-link comment. Failure moves them to **Blocked**, adds `needs-wilson` and posts a warning comment.
+- `afx deploy-sync` (AFX-122) runs in the `Deploy` workflow in dry-run until cutover sets the repo variable `AFX_DEPLOY_SYNC_MODE=apply` and retires the workflow above. It syncs tickets of the PRs merged since the last successful `deployed/staging` SHA, so a failed deploy's tickets go to Done on the next good deploy. A missed sync is replayed with `python3 scripts/afx.py deploy-sync recover --mode apply`.
 - Linear's own PR automation never sets Done.
 
 ## Checking what is unpromoted
