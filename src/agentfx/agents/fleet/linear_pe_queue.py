@@ -25,9 +25,10 @@ Flow:
     3. sessions.create via Managed Agents adapter
     4a. Success → row=RUNNING; session runs; PR opens → Linear's
          own GitHub integration moves issue to In Review.
-    4b. Workspace failure → row=WORKSPACE_FAILED; rollback the
-         Linear issue to Ready (via `rollback_to_ready`); next
-         scan picks it up unless the retry gate stops it.
+    4b. Workspace failure → row=WORKSPACE_FAILED; the PE undoes its
+         own claim (Ready, via `rollback_to_ready`) because no
+         workspace started; next scan picks it up unless the retry
+         gate stops it. A started session is never rolled back.
 
 Retry gate: if an issue has ≥2 WORKSPACE_FAILED rows and the last
 two share a failure signature (same error class + message prefix,
@@ -46,6 +47,7 @@ from typing import Any
 import requests
 
 from agentfx.api.core.config import settings
+from agentfx.integrations import linear_delivery
 from agentfx.integrations.linear_client import _build_client, _gql
 
 logger = logging.getLogger(__name__)
@@ -234,12 +236,15 @@ def list_ready_dispatch_candidates(limit: int) -> list[ReadyIssue]:
     return issues[:limit]
 
 
-def transition_to_in_progress(issue_id: str) -> bool:
-    """Flip an issue's state to In Progress. Returns True on success.
+def _delivery_client() -> linear_delivery.LinearClient:
+    return linear_delivery.LinearClient(settings.LINEAR_API_KEY)
 
-    This is the atomic lock — two parallel scan ticks can't both
-    pick the same issue because the second one sees `In Progress`
-    on the next list and filters it out.
+
+def transition_to_in_progress(issue_id: str) -> bool:
+    """Claim a Ready issue (Ready -> In Progress) through the shared
+    `linear_delivery.start`. Returns True only when this call made the
+    claim; an issue that is no longer Ready (another scan or agent got
+    there first) returns False so no duplicate workspace starts.
 
     Never raises; on failure returns False and the caller skips
     this issue (next scan tick retries).
@@ -248,42 +253,26 @@ def transition_to_in_progress(issue_id: str) -> bool:
     if not ok:
         logger.info("linear_pe_queue: transition_to_in_progress skipped — %s", reason)
         return False
-
-    client = _build_client(settings.LINEAR_API_KEY)
     try:
-        mutation = """
-        mutation TransitionIssue($id: String!, $stateId: String!) {
-          issueUpdate(id: $id, input: { stateId: $stateId }) {
-            success
-            issue { id identifier state { name } }
-          }
-        }
-        """
-        data = _gql(
-            client,
-            mutation,
-            {"id": issue_id, "stateId": settings.PE_LINEAR_IN_PROGRESS_STATE_ID},
-        )
-        update = data.get("issueUpdate") or {}
-        if not update.get("success"):
-            logger.warning(
-                "linear_pe_queue: issueUpdate reported no success for %s", issue_id
-            )
-            return False
-        return True
+        result = linear_delivery.start(_delivery_client(), issue_id)
     except Exception:
         logger.exception(
             "linear_pe_queue: transition_to_in_progress failed for %s", issue_id
         )
         return False
+    if not result.ok:
+        logger.info("linear_pe_queue: not claiming %s — %s", issue_id, result.reason)
+    return result.ok
 
 
 def rollback_to_ready(issue_id: str, *, reason_summary: str) -> bool:
-    """Flip an In Progress issue back to Ready after a
-    WORKSPACE_FAILED dispatch, so the next scan tick retries.
+    """Undo the PE's own In Progress claim after a dispatch that never
+    started a workspace (adapter refused, or sessions.create failed),
+    so the next scan tick retries.
 
-    Also posts a short comment describing the failure so Wilson has
-    an audit trail without having to hunt in logs.
+    Goes through `linear_delivery.release_own_claim`: if the issue is
+    no longer In Progress or the claim was made by another actor, the
+    issue is left untouched. Posts a comment only when it rolled back.
 
     Never raises; failure is logged (the DB row carries the full
     error anyway).
@@ -292,22 +281,25 @@ def rollback_to_ready(issue_id: str, *, reason_summary: str) -> bool:
     if not ok:
         logger.info("linear_pe_queue: rollback_to_ready skipped — %s", reason)
         return False
-
-    client = _build_client(settings.LINEAR_API_KEY)
-    ok_transition = _issue_update(
-        client,
-        issue_id=issue_id,
-        state_id=settings.PE_LINEAR_READY_STATE_ID,
-    )
-    _comment(
-        client,
-        issue_id=issue_id,
-        body=(
+    try:
+        client = _delivery_client()
+        result = linear_delivery.release_own_claim(
+            client, issue_id, workspace_started=False
+        )
+        if not result.ok:
+            logger.warning(
+                "linear_pe_queue: not rolling back %s — %s", issue_id, result.reason
+            )
+            return False
+        client.comment(
+            issue_id,
             "**PE dispatch failed — rolled back to Ready for retry.**\n\n"
-            f"Reason: `{reason_summary[:400]}`"
-        ),
-    )
-    return ok_transition
+            f"Reason: `{reason_summary[:400]}`",
+        )
+        return True
+    except Exception:
+        logger.exception("linear_pe_queue: rollback_to_ready failed for %s", issue_id)
+        return False
 
 
 _FILE_FOR_ATTENTION_MARKER = "<!-- pe:file_for_attention -->"
@@ -536,10 +528,10 @@ def handle_stuck_session_failure(
 ) -> bool:
     """Linear hygiene for a reclaimed PE session (AFX-72).
 
-    `escalate=False` (first stuck failure): move the issue back to
-    Ready so the next scan tick retries, and post `comment_body`.
-    `escalate=True` (second consecutive stuck failure): leave it In
-    Progress, add `needs-wilson`, and post `comment_body`.
+    The session had started, so the claim is never rolled back to
+    Ready (AFX-118): the issue stays In Progress, gets `needs-wilson`
+    and `comment_body`. `escalate` (second consecutive stuck failure)
+    only changes the comment the caller renders.
 
     Accepts the identifier ("AFX-40") the workspace row carries.
     Never raises; returns True when the state/label change succeeded.
@@ -561,18 +553,11 @@ def handle_stuck_session_failure(
                 issue_identifier,
             )
             return False
-        if escalate:
-            changed = _add_label(
-                client,
-                issue_id=issue_uuid,
-                label_id=settings.PE_LINEAR_NEEDS_WILSON_LABEL_ID,
-            )
-        else:
-            changed = _issue_update(
-                client,
-                issue_id=issue_uuid,
-                state_id=settings.PE_LINEAR_READY_STATE_ID,
-            )
+        changed = _add_label(
+            client,
+            issue_id=issue_uuid,
+            label_id=settings.PE_LINEAR_NEEDS_WILSON_LABEL_ID,
+        )
         _comment(client, issue_id=issue_uuid, body=comment_body)
         return changed
     except Exception:
