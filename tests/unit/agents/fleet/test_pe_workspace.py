@@ -579,6 +579,29 @@ class TestDevinPollRow:
         assert outcome == "still_running"
         assert row.status == AgentWorkspaceRunStatus.RUNNING
 
+    def test_idle_session_with_pr_flips_pr_open(self, monkeypatch):
+        """AFX-134: a session waiting after its PR is done, not running."""
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+
+        class _Resp:
+            status_code = 200
+            text = "{}"
+
+            def json(self_inner):
+                return {
+                    "status_enum": "blocked",
+                    "pull_request": {
+                        "url": "https://github.com/widarecu/agentfx/pull/161"
+                    },
+                }
+
+        monkeypatch.setattr(pe_workspace.requests, "get", lambda *a, **k: _Resp())
+        row = self._row()
+        outcome = pe_workspace._poll_devin_row(row, now=datetime.now(UTC))
+        assert outcome == "pr_open"
+        assert row.status == AgentWorkspaceRunStatus.PR_OPEN
+        assert row.pr_number == 161
+
     def test_finished_with_pr_url_flips_pr_open(self, monkeypatch):
         monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
         monkeypatch.setattr(pe_workspace.settings, "DEVIN_ACU_USD_RATE", 2.5)
@@ -1322,6 +1345,122 @@ class TestSessionHygiene:
         assert "Dispatched:" in body and "Duration: 5h" in body
         assert "does not roll it back" in body
         assert "needs-wilson" in body
+
+    def _seed_devin(self, db, monkeypatch, body):
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+
+        class _Resp:
+            status_code = 200
+            text = "{}"
+
+            def json(self_inner):
+                return body
+
+        monkeypatch.setattr(pe_workspace.requests, "get", lambda *a, **k: _Resp())
+        row = self._seed(
+            db,
+            row_id="devin-stuck",
+            session_id="5598f3b0",
+            identifier="AFX-121",
+            started_at=datetime.now(UTC) - timedelta(hours=5),
+        )
+        row.adapter = "devin"
+        db.commit()
+
+    def test_sweep_spares_devin_session_whose_pr_opened(self, db, monkeypatch):
+        """AFX-134: AFX-121/122 were reclaimed 4h after their PRs merged."""
+        calls = self._patch_linear(monkeypatch)
+        self._seed_devin(
+            db,
+            monkeypatch,
+            {
+                "status_enum": "blocked",
+                "pull_request": {"url": "https://github.com/widarecu/agentfx/pull/161"},
+            },
+        )
+        assert pe_workspace.sweep_stuck_runs(db) == 0
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.PR_OPEN
+        assert calls == []
+
+    def test_sweep_still_reclaims_devin_session_without_pr(self, db, monkeypatch):
+        calls = self._patch_linear(monkeypatch)
+        self._seed_devin(db, monkeypatch, {"status_enum": "working"})
+        assert pe_workspace.sweep_stuck_runs(db) == 1
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert [c["identifier"] for c in calls] == ["AFX-121"]
+
+    def test_pr_open_session_cost_refreshes_until_it_ends(self, db, monkeypatch):
+        """AFX-135: spend after the PR opens still counts toward the cap."""
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_ACU_USD_RATE", 2.0)
+        pr = {"url": "https://github.com/widarecu/agentfx/pull/9"}
+        replies = iter(
+            [
+                {"status_enum": "working", "pull_request": pr, "acu_consumed": 1},
+                {"status_enum": "blocked", "pull_request": pr, "acu_consumed": 3},
+                {"status_enum": "finished", "pull_request": pr, "acu_consumed": 4},
+            ]
+        )
+
+        class _Resp:
+            status_code = 200
+            text = "{}"
+
+            def __init__(self):
+                self.body = next(replies)
+
+            def json(self_inner):
+                return self_inner.body
+
+        monkeypatch.setattr(pe_workspace.requests, "get", lambda *a, **k: _Resp())
+        row = self._seed(
+            db,
+            row_id="devin-pr",
+            session_id="5598f3b0",
+            identifier="AFX-140",
+            started_at=datetime.now(UTC),
+        )
+        row.adapter = "devin"
+        db.commit()
+
+        assert pe_workspace.poll_running_dispatches(db)["pr_open"] == 1
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.PR_OPEN
+        assert row.llm_usd == 2.0 and row.ended_at is None
+
+        assert pe_workspace.poll_running_dispatches(db)["pr_open"] == 0
+        assert db.query(AgentWorkspaceRun).one().llm_usd == 6.0
+
+        pe_workspace.poll_running_dispatches(db)
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.llm_usd == 8.0 and row.ended_at is not None
+        assert row.status == AgentWorkspaceRunStatus.PR_OPEN
+        assert pe_workspace.poll_running_dispatches(db)["checked"] == 0
+
+    def test_pr_open_session_gone_keeps_pr_open(self, db, monkeypatch):
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+
+        class _Resp:
+            status_code = 404
+            text = ""
+
+        monkeypatch.setattr(pe_workspace.requests, "get", lambda *a, **k: _Resp())
+        row = self._seed(
+            db,
+            row_id="devin-gone",
+            session_id="5598f3b1",
+            identifier="AFX-141",
+            started_at=datetime.now(UTC),
+        )
+        row.adapter = "devin"
+        row.status = AgentWorkspaceRunStatus.PR_OPEN
+        db.commit()
+        pe_workspace.poll_running_dispatches(db)
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.PR_OPEN
+        assert row.ended_at is not None
 
     def test_sweep_prefers_sessions_cancel_when_sdk_has_it(self, db, monkeypatch):
         from unittest.mock import MagicMock

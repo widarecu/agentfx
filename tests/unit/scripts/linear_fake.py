@@ -36,6 +36,14 @@ STATE_TYPES = {
     "Canceled": "canceled",
 }
 
+STATE_TYPES = {
+    "Triage": "triage",
+    "Backlog": "backlog",
+    "Ready": "unstarted",
+    "Done": "completed",
+    "Canceled": "canceled",
+}
+
 
 @dataclass
 class FakeIssue:
@@ -44,6 +52,10 @@ class FakeIssue:
     labels: list[str] = field(default_factory=list)
     comments: list[str] = field(default_factory=list)
     history: list[dict] = field(default_factory=list)
+    started_at: str | None = None
+    completed_at: str | None = None
+    updated_at: str = "2026-11-23T00:00:00.000Z"
+    attachments: list[str] = field(default_factory=list)
 
     @property
     def id(self) -> str:
@@ -122,6 +134,21 @@ class FakeLinear:
                 if n == v["name"]
             ]
             return {"issueLabels": self._page(nodes, v.get("after"))}
+        if "issues(" in query:
+            nodes = [
+                {
+                    "id": i.id,
+                    "identifier": i.identifier,
+                    "state": {"name": i.state},
+                    "startedAt": i.started_at,
+                    "completedAt": i.completed_at,
+                    "updatedAt": i.updated_at,
+                    "attachments": {"nodes": [{"url": u} for u in i.attachments]},
+                }
+                for i in self.issues.values()
+                if i.state in v["states"] or i.updated_at >= v["since"]
+            ]
+            return {"issues": self._page(nodes, v.get("after"))}
         issue = self._find(v["id"])
         if issue is None:
             return {"issue": None}

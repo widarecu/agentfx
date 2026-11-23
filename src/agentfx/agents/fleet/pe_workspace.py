@@ -57,6 +57,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 import requests
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from agentfx.api.core.config import settings
@@ -1035,6 +1036,11 @@ def resolve_adapter(spec: WorkspaceTaskSpec | None = None) -> WorkspaceAdapter:
 
 _STUCK_RUN_TTL_HOURS = 4
 
+# A Devin session can keep working (and spending) after it opens its PR;
+# its PR_OPEN row is re-polled for cost until the session ends, for at
+# most this long — longer than the UTC day the daily $ cap counts.
+_PR_OPEN_COST_REFRESH_HOURS = 24
+
 
 def _max_tokens_per_session() -> int:
     """Per-session cap, applied separately to input and output
@@ -1247,7 +1253,22 @@ def sweep_stuck_runs(db: Session, *, now: datetime | None = None) -> int:
         client = None
         if any(r.adapter == "managed_agents" and r.provider_run_id for r in rows):
             client = _managed_client_or_none()
+        reclaimed = 0
         for row in rows:
+            # A Devin session that opened its PR is done, not stuck: one
+            # last poll records it instead of flagging the ticket (AFX-134).
+            if (
+                row.adapter == "devin"
+                and row.provider_run_id
+                and _poll_devin_row(row, now=now) == "pr_open"
+            ):
+                logger.info(
+                    "pe_workspace: not reclaiming row id=%s — its PR is open (%s)",
+                    row.id,
+                    row.pr_url,
+                )
+                continue
+            reclaimed += 1
             logger.warning(
                 "pe_workspace: reclaiming stuck RUNNING row id=%s started_at=%s",
                 row.id,
@@ -1266,7 +1287,7 @@ def sweep_stuck_runs(db: Session, *, now: datetime | None = None) -> int:
             )
         if rows:
             db.commit()
-        return len(rows)
+        return reclaimed
     except Exception:
         logger.exception("pe_workspace: sweep_stuck_runs failed")
         return 0
@@ -1457,9 +1478,22 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
         has_anthropic = False
 
     try:
+        refresh_cutoff = now - timedelta(hours=_PR_OPEN_COST_REFRESH_HOURS)
         rows = (
             db.query(AgentWorkspaceRun)
-            .filter(AgentWorkspaceRun.status == AgentWorkspaceRunStatus.RUNNING)
+            .filter(
+                or_(
+                    AgentWorkspaceRun.status == AgentWorkspaceRunStatus.RUNNING,
+                    # Devin session still live after its PR opened: keep
+                    # its cost current for the daily $ cap (AFX-135).
+                    and_(
+                        AgentWorkspaceRun.adapter == "devin",
+                        AgentWorkspaceRun.status == AgentWorkspaceRunStatus.PR_OPEN,
+                        AgentWorkspaceRun.ended_at.is_(None),
+                        AgentWorkspaceRun.created_at >= refresh_cutoff,
+                    ),
+                )
+            )
             .filter(AgentWorkspaceRun.provider_run_id.isnot(None))
             .filter(AgentWorkspaceRun.adapter.in_(("managed_agents", "devin")))
             .all()
@@ -1478,8 +1512,9 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
     # client is cheap. Updates go through `_poll_devin_row`.
     for row in devin_rows:
         counts["checked"] += 1
+        was_running = row.status == AgentWorkspaceRunStatus.RUNNING
         outcome = _poll_devin_row(row, now=now)
-        if outcome == "pr_open":
+        if outcome == "pr_open" and was_running:
             counts["pr_open"] += 1
         elif outcome == "tests_failed":
             counts["tests_failed"] += 1
@@ -1636,6 +1671,11 @@ def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
         return "poll_error"
 
     if resp.status_code == 404:
+        if row.status == AgentWorkspaceRunStatus.PR_OPEN:
+            # The PR already shipped; the session just aged out. Stop
+            # refreshing its cost but keep the outcome.
+            row.ended_at = now
+            return "pr_open"
         # Session gone (Devin TTL passed, or wrong org id). Mark failed
         # so the row doesn't poll forever.
         row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
@@ -1667,12 +1707,17 @@ def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
         return "poll_error"
 
     status_enum = (data.get("status_enum") or data.get("status") or "").lower()
-    if status_enum and status_enum not in _DEVIN_TERMINAL_STATUSES:
-        return "still_running"
-
-    # Terminal — extract PR url + ACU consumed if present.
     pr_block = data.get("pull_request") or {}
     pr_url = pr_block.get("url") if isinstance(pr_block, dict) else None
+    # A session that opened its PR has delivered, even while it idles in a
+    # non-terminal status (blocked, suspended) waiting on review (AFX-134).
+    has_pr = bool(pr_url and isinstance(pr_url, str))
+    session_done = not status_enum or status_enum in _DEVIN_TERMINAL_STATUSES
+    if not session_done and not has_pr:
+        return "still_running"
+    first_report = row.status != AgentWorkspaceRunStatus.PR_OPEN
+
+    # Terminal or PR opened — record PR url + ACU consumed if present.
     acu_consumed = data.get("acu_consumed")
     rate = float(getattr(settings, "DEVIN_ACU_USD_RATE", 2.25) or 2.25)
     cost_usd = None
@@ -1689,10 +1734,14 @@ def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
         },
         default=str,
     )
-    row.summary = (row.summary or "") + "\n[devin-poll] " + summary_tail
-    row.ended_at = now
+    if first_report or session_done:
+        row.summary = (row.summary or "") + "\n[devin-poll] " + summary_tail
+    # A session still live after its PR keeps ended_at unset, so the
+    # poller refreshes its cost until it ends (AFX-135).
+    if session_done:
+        row.ended_at = now
 
-    if pr_url and isinstance(pr_url, str):
+    if has_pr:
         row.status = AgentWorkspaceRunStatus.PR_OPEN
         row.pr_url = pr_url
         m = re.search(r"/pull/(\d+)", pr_url)

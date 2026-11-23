@@ -229,6 +229,78 @@ class TestHappyPath:
 # ─────────────────────────────────────────────────────────────────────
 
 
+class TestMergedPrGuard:
+    """AFX-134: a Ready ticket whose PR already merged is never redone."""
+
+    def _run(self, db, monkeypatch, issue, find):
+        _patch_list_candidates(monkeypatch, [issue])
+        monkeypatch.setattr(platform_engineer, "find_merged_pr", find)
+        adapter = _RecordingAdapter(_StubAdapterResult())
+        _patch_adapter(monkeypatch, adapter)
+        platform_engineer.scan_and_dispatch(db=db)
+        return adapter
+
+    def test_merged_pr_is_not_claimed_or_dispatched(
+        self, db, monkeypatch, linear_recorder
+    ):
+        issue = _issue(identifier="AFX-121")
+        issue.pr_urls = ["https://github.com/widarecu/agentfx/pull/161"]
+        adapter = self._run(db, monkeypatch, issue, lambda _id, urls: urls[0])
+        assert adapter.calls == []
+        assert linear_recorder["transitions_to_in_progress"] == []
+
+    def test_pr_check_failure_skips_without_claiming(
+        self, db, monkeypatch, linear_recorder
+    ):
+        def _boom(_id, _urls):
+            raise RuntimeError("github down")
+
+        adapter = self._run(db, monkeypatch, _issue(), _boom)
+        assert adapter.calls == []
+        assert linear_recorder["transitions_to_in_progress"] == []
+
+    def test_unmerged_pr_still_dispatches(self, db, monkeypatch, linear_recorder):
+        adapter = self._run(db, monkeypatch, _issue(), lambda _id, _urls: None)
+        assert len(adapter.calls) == 1
+
+    def test_skipped_tickets_do_not_hold_the_scan_slots(
+        self, db, monkeypatch, linear_recorder
+    ):
+        """AFX-135: three shipped tickets ranked first, then real work."""
+        monkeypatch.setattr(
+            platform_engineer.settings, "PE_LINEAR_MAX_DISPATCH_PER_SCAN", 3
+        )
+        shipped = [_issue(identifier=f"AFX-12{i}") for i in range(3)]
+        for s in shipped:
+            s.pr_urls = ["https://github.com/widarecu/agentfx/pull/1"]
+        todo = _issue(identifier="AFX-140")
+        _patch_list_candidates(monkeypatch, [*shipped, todo])
+        monkeypatch.setattr(
+            platform_engineer,
+            "find_merged_pr",
+            lambda _id, urls: urls[0] if urls else None,
+        )
+        adapter = _RecordingAdapter(_StubAdapterResult())
+        _patch_adapter(monkeypatch, adapter)
+        platform_engineer.scan_and_dispatch(db=db)
+        assert [c["spec"].linear_issue_identifier for c in adapter.calls] == ["AFX-140"]
+
+    def test_per_scan_cap_still_limits_dispatches(
+        self, db, monkeypatch, linear_recorder
+    ):
+        monkeypatch.setattr(
+            platform_engineer.settings, "PE_LINEAR_MAX_DISPATCH_PER_SCAN", 1
+        )
+        _patch_list_candidates(
+            monkeypatch, [_issue(identifier="AFX-141"), _issue(identifier="AFX-142")]
+        )
+        monkeypatch.setattr(platform_engineer, "find_merged_pr", lambda *_a: None)
+        adapter = _RecordingAdapter(_StubAdapterResult())
+        _patch_adapter(monkeypatch, adapter)
+        platform_engineer.scan_and_dispatch(db=db)
+        assert len(adapter.calls) == 1
+
+
 class TestFailureBranches:
     def test_transition_fails_skips_issue_no_row(
         self, db, monkeypatch, linear_recorder

@@ -630,6 +630,11 @@ class TestHandleStuckSessionFailure:
         )
         monkeypatch.setattr(
             linear_pe_queue,
+            "_issue_state",
+            lambda _c, _i: {"name": "In Progress", "type": "started"},
+        )
+        monkeypatch.setattr(
+            linear_pe_queue,
             "_add_label",
             lambda _c, **kw: calls.append(("label", kw)) or True,
         )
@@ -663,6 +668,35 @@ class TestHandleStuckSessionFailure:
             linear_pe_queue.settings.PE_LINEAR_NEEDS_WILSON_LABEL_ID
         )
 
+    @pytest.mark.parametrize(
+        "state",
+        [
+            {"name": "In Review", "type": "started"},
+            {"name": "In Staging", "type": "started"},
+            {"name": "Done", "type": "completed"},
+            {"name": "Canceled", "type": "canceled"},
+        ],
+    )
+    def test_delivered_ticket_is_left_alone(self, monkeypatch, state):
+        """AFX-134: a reclaim after the PR opened must not flag the ticket."""
+        calls = self._record(monkeypatch)
+        monkeypatch.setattr(linear_pe_queue, "_issue_state", lambda _c, _i: state)
+        ok = linear_pe_queue.handle_stuck_session_failure(
+            "AFX-121", comment_body="reclaimed", escalate=False
+        )
+        assert ok is False and calls == []
+
+    @pytest.mark.parametrize(
+        "state", [{"name": "In Progress", "type": "started"}, None]
+    )
+    def test_in_progress_or_unknown_state_is_flagged(self, monkeypatch, state):
+        calls = self._record(monkeypatch)
+        monkeypatch.setattr(linear_pe_queue, "_issue_state", lambda _c, _i: state)
+        linear_pe_queue.handle_stuck_session_failure(
+            "AFX-40", comment_body="reclaimed", escalate=False
+        )
+        assert [k for k, _ in calls] == ["label", "comment"]
+
     def test_never_raises(self, monkeypatch):
         def _boom(_k):
             raise RuntimeError("down")
@@ -683,3 +717,115 @@ class TestHandleStuckSessionFailure:
             )
             is False
         )
+
+
+class TestFindMergedPr:
+    """AFX-134/135: the dispatcher's merged-PR check."""
+
+    def _get(self, monkeypatch, payloads, *, status=200):
+        seen: list[str] = []
+
+        class _Resp:
+            def __init__(self, body):
+                self.body = body
+
+            def raise_for_status(self):
+                if status >= 400:
+                    raise linear_pe_queue.requests.HTTPError(str(status))
+
+            def json(self):
+                return self.body
+
+        def _fake(url, **_kw):
+            seen.append(url)
+            return _Resp(payloads[url.rsplit("/", 1)[-1]])
+
+        monkeypatch.setattr(linear_pe_queue.requests, "get", _fake)
+        return seen
+
+    @staticmethod
+    def _pr(*, merged=True, base="feat/agent-fleet", title="", head="x"):
+        return {
+            "merged_at": "2026-11-23T00:00:00Z" if merged else None,
+            "base": {"ref": base},
+            "head": {"ref": head},
+            "title": title,
+        }
+
+    _URL = "https://github.com/widarecu/agentfx/pull/{}"
+
+    def test_returns_the_merged_pr_that_names_the_ticket(self, monkeypatch):
+        seen = self._get(
+            monkeypatch,
+            {
+                "1": self._pr(merged=False, title="AFX-121: open"),
+                "2": self._pr(title="AFX-121: make deploy verify staging"),
+            },
+        )
+        urls = [
+            "https://linear.app/agentfx/issue/AFX-1",
+            self._URL.format(1),
+            self._URL.format(2),
+        ]
+        assert linear_pe_queue.find_merged_pr("AFX-121", urls) == urls[2]
+        assert seen == [
+            "https://api.github.com/repos/widarecu/agentfx/pulls/1",
+            "https://api.github.com/repos/widarecu/agentfx/pulls/2",
+        ]
+
+    def test_branch_naming_the_ticket_counts(self, monkeypatch):
+        self._get(monkeypatch, {"3": self._pr(head="devin/afx-122-sync-tickets")})
+        assert linear_pe_queue.find_merged_pr("AFX-122", [self._URL.format(3)])
+
+    def test_context_link_to_another_tickets_pr_does_not_count(self, monkeypatch):
+        """AFX-129 had the merged #161 (AFX-121) attached as background."""
+        self._get(
+            monkeypatch,
+            {"161": self._pr(title="AFX-121: verify", head="agent/AFX-121-verify")},
+        )
+        assert (
+            linear_pe_queue.find_merged_pr("AFX-129", [self._URL.format(161)]) is None
+        )
+        assert linear_pe_queue.find_merged_pr("AFX-12", [self._URL.format(161)]) is None
+
+    def test_other_repo_is_never_fetched(self, monkeypatch):
+        seen = self._get(monkeypatch, {})
+        url = "https://github.com/psf/requests/pull/9"
+        assert linear_pe_queue.find_merged_pr("AFX-5", [url]) is None
+        assert seen == []
+
+    def test_non_delivery_base_does_not_count(self, monkeypatch):
+        self._get(monkeypatch, {"7": self._pr(base="some-feature", title="AFX-5: x")})
+        assert linear_pe_queue.find_merged_pr("AFX-5", [self._URL.format(7)]) is None
+
+    def test_no_prs_return_none(self, monkeypatch):
+        self._get(monkeypatch, {})
+        assert linear_pe_queue.find_merged_pr("AFX-5", []) is None
+
+    def test_api_failure_raises(self, monkeypatch):
+        self._get(monkeypatch, {"4": {}}, status=502)
+        with pytest.raises(linear_pe_queue.requests.HTTPError):
+            linear_pe_queue.find_merged_pr("AFX-5", [self._URL.format(4)])
+
+    def test_candidates_carry_linked_urls(self, monkeypatch):
+        monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
+        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
+        node = {
+            "id": "u",
+            "identifier": "AFX-121",
+            "title": "t",
+            "description": "",
+            "url": "https://linear.app/agentfx/issue/AFX-121",
+            "priority": 0,
+            "createdAt": "2026-11-22T00:00:00Z",
+            "labels": {"nodes": [{"name": "agent-filed"}]},
+            "attachments": {
+                "nodes": [{"url": "https://github.com/widarecu/agentfx/pull/161"}]
+            },
+        }
+        with patch(
+            "agentfx.agents.fleet.linear_pe_queue._gql",
+            return_value={"issues": {"nodes": [node]}},
+        ):
+            (issue,) = list_ready_dispatch_candidates(limit=5)
+        assert issue.pr_urls == ["https://github.com/widarecu/agentfx/pull/161"]

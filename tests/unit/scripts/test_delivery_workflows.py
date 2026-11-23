@@ -363,3 +363,43 @@ def test_summary_always_runs_and_exposes_outcomes():
     assert upload["if"] == "always()"
     assert upload["with"]["name"] == "deploy-result"
     assert upload["with"]["overwrite"] is True  # re-runs replace the result
+
+
+class TestDeliveryReconcileWorkflow:
+    """`delivery-reconcile.yml` (AFX-123): daily + manual, one digest."""
+
+    @pytest.fixture(scope="class")
+    def wf(self) -> dict:
+        return _load("delivery-reconcile.yml")
+
+    def test_daily_and_manual_only(self, wf):
+        on = _triggers(wf)
+        assert set(on) == {"schedule", "workflow_dispatch"}
+        assert len(on["schedule"]) == 1
+
+    def test_least_privilege(self, wf):
+        assert wf["permissions"] == {}
+        assert wf["jobs"]["reconcile"]["permissions"] == {
+            "contents": "write",
+            "pull-requests": "read",
+            "actions": "read",
+        }
+
+    def test_runs_reconcile_inert_until_cutover(self, wf):
+        job = wf["jobs"]["reconcile"]
+        assert "scripts/afx.py reconcile" in _runs(job)
+        step = next(s for s in job["steps"] if "afx.py reconcile" in s.get("run", ""))
+        assert "|| 'dry-run'" in step["env"]["AFX_DEPLOY_SYNC_MODE"]
+
+    def test_expressions_reach_shell_only_via_env(self, wf):
+        assert "${{" not in _runs(wf["jobs"]["reconcile"])
+
+    def test_digest_marker_is_kept(self, wf):
+        upload = next(
+            s
+            for s in wf["jobs"]["reconcile"]["steps"]
+            if "upload-artifact" in s.get("uses", "")
+        )
+        assert upload["with"]["name"] == "reconcile-digest"
+        assert upload["with"]["overwrite"] is True
+        assert upload["if"] == "always()"

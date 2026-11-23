@@ -20,4 +20,5 @@ jobs:
       - name: Hand off to PR policy
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: echo "Review on PR #$PR_NUMBER; PR policy re-runs from main."
+        run: |
+          echo "Review on PR #$PR_NUMBER; PR policy re-runs from main."

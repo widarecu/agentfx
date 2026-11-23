@@ -337,6 +337,18 @@ def test_duplicate_runs_are_idempotent_on_every_path():
         assert len(linear.issues["AFX-10"]["comments"]) == 1
 
 
+def test_ticket_reopened_after_this_deploy_is_not_reclosed():
+    gh = _two_pr_range()
+    linear = FakeLinear({"AFX-10": _issue("AFX-10"), "AFX-11": _issue("AFX-11")})
+    _run(gh, linear, OK)
+    linear.issues["AFX-10"]["state"] = {"name": "In Progress", "type": "started"}
+    writes = len(linear.writes)
+    report = _run(gh, linear, OK)
+    assert linear.issues["AFX-10"]["state"]["name"] == "In Progress"
+    assert len(linear.writes) == writes
+    assert any("AFX-10: reopened" in line for line in report.lines)
+
+
 def test_cancelled_deploy_changes_nothing():
     gh = _two_pr_range()
     linear = FakeLinear({"AFX-10": _issue("AFX-10")})
@@ -470,6 +482,73 @@ def test_tag_at_sha_without_record_fails_closed():
     # An explicit baseline recovers it.
     assert _run(gh, linear, OK, baseline=BASE).exit_code == 0
     assert linear.issues["AFX-10"]["state"]["name"] == "Done"
+
+
+def test_dry_run_record_then_tag_move_then_sync_reports_the_range():
+    """AFX-133: dry-run writes no record, the tag still moves, and sync
+    uses the SHA the move replaced instead of failing the deploy."""
+    gh = _two_pr_range()
+    ds.record(gh, SHA, apply=False)
+    assert gh.created == []
+    previous = gh.tags[ds.STAGING_TAG]
+    gh.tags[ds.STAGING_TAG] = SHA  # Record deployed/staging
+    linear = FakeLinear({"AFX-10": _issue("AFX-10"), "AFX-11": _issue("AFX-11")})
+    report = ds.sync(
+        gh,
+        linear,
+        attempted=SHA,
+        verdict=ds.classify(OK),
+        run_url=RUN_URL,
+        staging_url=STAGING,
+        apply=False,
+        previous=previous,
+    )
+    out = "\n".join(report.lines)
+    assert report.exit_code == 0 and linear.writes == [] and gh.created == []
+    assert f"{BASE[:7]}..{SHA[:7]}" in out and "from this run's tag move" in out
+    assert "AFX-10: would move In Staging -> Done" in out
+    assert "AFX-11: would move In Staging -> Done" in out
+
+
+def test_failed_record_in_apply_mode_falls_back_to_the_replaced_tag():
+    gh = _two_pr_range()
+    gh.tags[ds.STAGING_TAG] = SHA  # record job failed, tag moved anyway
+    linear = FakeLinear({"AFX-10": _issue("AFX-10"), "AFX-11": _issue("AFX-11")})
+    report = ds.sync(
+        gh,
+        linear,
+        attempted=SHA,
+        verdict=ds.classify(OK),
+        run_url=RUN_URL,
+        staging_url=STAGING,
+        apply=True,
+        previous=BASE,
+    )
+    assert report.exit_code == 0
+    assert linear.issues["AFX-10"]["state"]["name"] == "Done"
+    assert linear.issues["AFX-11"]["state"]["name"] == "Done"
+
+
+def test_recorded_baseline_wins_over_previous():
+    gh = _two_pr_range()
+    ds.record(gh, SHA, apply=True)
+    gh.tags[ds.STAGING_TAG] = SHA
+    base, source, _, _ = ds.resolve_baseline(gh, SHA, previous=_sha(99))
+    assert base == BASE and source.startswith("recorded")
+
+
+@pytest.mark.parametrize("previous", [None, "", SHA])
+def test_tag_at_sha_without_usable_previous_still_fails_closed(previous):
+    gh = _two_pr_range()
+    gh.tags[ds.STAGING_TAG] = SHA
+    with pytest.raises(ds.BaselineUnknownError):
+        ds.resolve_baseline(gh, SHA, previous=previous)
+
+
+def test_previous_is_ignored_while_the_tag_is_behind():
+    gh = _two_pr_range()  # tag still at BASE (failed deploy, tag not moved)
+    base, source, _, _ = ds.resolve_baseline(gh, SHA, previous=_sha(99))
+    assert base == BASE and source == f"{ds.STAGING_TAG} tag"
 
 
 def test_first_deploy_without_tag_syncs_only_the_attempted_commit():
