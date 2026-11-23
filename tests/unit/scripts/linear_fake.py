@@ -66,6 +66,7 @@ class FakeLinear:
         viewer: str = "user-pe",
         states: list[str] | None = None,
         labels: list[str] | None = None,
+        workspace_labels: list[str] | None = None,
     ) -> None:
         self.page_size = page_size
         self.viewer = viewer
@@ -73,6 +74,7 @@ class FakeLinear:
         self.labels = list(
             ["needs-wilson", "agent-filed"] if labels is None else labels
         )
+        self.workspace_labels = list(workspace_labels or [])
         self.issues: dict[str, FakeIssue] = {}
         self.calls: list[str] = []
         self.mutations: list[tuple[str, dict]] = []
@@ -113,6 +115,13 @@ class FakeLinear:
             nodes = [{"id": f"{prefix}-{n}", "name": n} for n in names]
             key = "states" if "states(" in query else "labels"
             return {"team": {key: self._page(nodes, v.get("after"))}}
+        if "issueLabels(" in query:
+            nodes = [
+                {"id": f"label-{n}", "name": n, "team": None}
+                for n in self.workspace_labels
+                if n == v["name"]
+            ]
+            return {"issueLabels": self._page(nodes, v.get("after"))}
         issue = self._find(v["id"])
         if issue is None:
             return {"issue": None}

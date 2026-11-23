@@ -196,8 +196,23 @@ class LinearClient:
             for n in nodes:
                 self._label_ids.setdefault((team_id, n["name"]), n["id"])
             if key not in self._label_ids:
-                raise NotFoundError(f"label {name!r} not found")
+                workspace = self._workspace_label_id(name)
+                if workspace is None:
+                    raise NotFoundError(f"label {name!r} not found")
+                self._label_ids[key] = workspace
         return self._label_ids[key]
+
+    def _workspace_label_id(self, name: str) -> str | None:
+        """Workspace-level label (no team), as `scripts/linear/bootstrap.py`
+        provisions `needs-wilson`."""
+        nodes = self.paginate(
+            "query($name: String!, $after: String) { issueLabels(filter: "
+            f"{{ name: {{ eq: $name }} }}, first: {PAGE_SIZE}, after: $after) "
+            "{ nodes { id name team { id } } pageInfo { hasNextPage endCursor } } }",
+            {"name": name},
+            ["issueLabels"],
+        )
+        return next((n["id"] for n in nodes if not n.get("team")), None)
 
     def comment_bodies(self, issue_id: str) -> list[str]:
         nodes = self.paginate(
