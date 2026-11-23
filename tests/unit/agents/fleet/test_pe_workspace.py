@@ -1320,7 +1320,8 @@ class TestSessionHygiene:
         assert "sesn_01Gu" in body
         assert "TTL" in body
         assert "Dispatched:" in body and "Duration: 5h" in body
-        assert "retries automatically" in body
+        assert "does not roll it back" in body
+        assert "needs-wilson" in body
 
     def test_sweep_prefers_sessions_cancel_when_sdk_has_it(self, db, monkeypatch):
         from unittest.mock import MagicMock
