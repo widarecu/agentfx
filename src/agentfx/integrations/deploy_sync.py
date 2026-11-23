@@ -318,6 +318,11 @@ def _apply_success(
     ):
         report.info(f"{ident}: already reported Done")
         return
+    if state.get("type") == "started" and any(done_marker(sha) in b for b in bodies):
+        # Reported Done for this deploy, then reopened by a person: a
+        # re-run or reconcile replay of the same deploy must not re-close it.
+        report.info(f"{ident}: reopened after this deploy's sync; left alone")
+        return
     if not apply:
         report.info(
             f"{ident}: would move {state['name']} -> Done"
@@ -617,6 +622,15 @@ class GhCli:
             if not batch or len(commits) >= int(data.get("total_commits") or 0):
                 return status, commits
             page += 1
+
+    def pull_state(self, number: int) -> str:
+        """`open`, `merged` or `closed` (closed without merging)."""
+        pr = self._get(f"pulls/{number}")
+        if pr is None:
+            raise GitHubError(f"PR #{number} not found", 404)
+        if pr.get("state") == "open":
+            return "open"
+        return "merged" if pr.get("merged_at") else "closed"
 
     def commit_pulls(self, sha: str) -> list[dict]:
         pulls: list[dict] = []
