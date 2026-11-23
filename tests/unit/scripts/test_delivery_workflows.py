@@ -132,7 +132,9 @@ class TestPrPolicyWorkflow:
     def test_runs_on_main_prs_and_review_relay(self, policy):
         on = _triggers(policy)
         assert on["pull_request_target"]["branches"] == ["main"]
-        assert on["workflow_run"]["workflows"] == ["PR review relay"]
+        assert on["workflow_run"]["workflows"] == ["PR review relay", "CI"]
+        assert "auto_merge_enabled" in on["pull_request_target"]["types"]
+        assert "review_request_removed" in on["pull_request_target"]["types"]
         assert "schedule" not in on and "pull_request" not in on
 
     def test_relay_reruns_on_every_review_change(self, relay):
@@ -174,19 +176,41 @@ class TestPrPolicyWorkflow:
             "contents": "read",
             "pull-requests": "read",
             "statuses": "write",
+            "checks": "read",
         }
         assert "environment" not in policy["jobs"]["policy"]
 
     def test_auto_merge_uses_fleet_bot_token(self, policy):
         job = policy["jobs"]["auto-merge"]
         assert job["needs"] == "policy"
-        assert job["if"] == "needs.policy.outputs.eligible == 'true'"
+        assert "needs.policy.outputs.eligible == 'true'" in job["if"]
+        assert "needs.policy.outputs.disable != ''" in job["if"]
         assert job["environment"] == "fleet-bot"
         assert job["permissions"] == {}
         assert any("create-github-app-token" in s.get("uses", "") for s in job["steps"])
         assert "gh pr merge" in _runs(job) and "--auto" in _runs(job)
         merge = job["steps"][-1]
         assert merge["env"]["GH_TOKEN"] == "${{ steps.app-token.outputs.token }}"
+        assert '--match-head-commit "$HEAD_SHA"' in merge["run"]
+        assert "--disable-auto" in merge["run"]
+        assert merge["env"]["HEAD_SHA"] == "${{ needs.policy.outputs.sha }}"
+
+    def test_ci_workflow_name_matches_trigger(self):
+        assert _load("ci.yml")["name"] == "CI"
+        assert "ci-required" in _load("ci.yml")["jobs"]
+
+    def test_codeowners_cover_the_merge_gate(self):
+        owners = (_WORKFLOWS.parent / "CODEOWNERS").read_text()
+        for path in (
+            "/scripts/pr_policy.py",
+            "/scripts/afx.py",
+            "/src/agentfx/integrations/linear_delivery.py",
+            "/src/agentfx/integrations/deploy_sync.py",
+            "/src/agentfx/integrations/delivery_reconcile.py",
+        ):
+            assert any(
+                line.split()[:2] == [path, "@widarecu"] for line in owners.splitlines()
+            ), path
 
     def test_fleet_gate_untouched(self):
         fleet = _load("agent-fleet-ci.yml")

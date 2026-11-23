@@ -7,10 +7,16 @@ A PR passes when:
   3. if the ticket carries the Money-path label, Wilson's latest review
      is an approval of the PR's current head commit.
 
-Anything missing, ambiguous, unknown or unreachable fails closed. The
-result is written as the `pr-policy` commit status on the PR head, so a
-re-run from a review event (which runs in `main`'s context, not the PR's)
-updates the same check. Only trusted code from `main` runs this script;
+Anything missing, ambiguous, unknown or unreachable fails closed, and so
+does a head commit shared by more than one open PR (one commit status
+can't hold two decisions). The result is written as the `pr-policy`
+commit status on the PR head, so a re-run from a review event (which
+runs in `main`'s context, not the PR's) updates the same check.
+
+Auto-merge (AFX-130) is only turned on from a fresh pass once `CI
+required` has passed on that exact head, pinned to it, so GitHub merges
+within seconds of the check, not on a pass from before a Linear move or
+a later push. Any other auto-merge request on the PR is turned off. Only trusted code from `main` runs this script;
 PR titles and branch names are read through the API, never executed.
 
     python scripts/pr_policy.py --repo widarecu/agentfx --pr 123
@@ -27,6 +33,7 @@ import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -42,6 +49,7 @@ EXIT_FAILED = 1
 EXIT_ERROR = 2
 
 CONTEXT = "pr-policy"
+CI_CHECK = "CI required"
 TARGET_BRANCH = "main"
 ALLOWED_STATES = (ld.IN_PROGRESS, ld.IN_REVIEW)
 MONEY_PATH_LABEL = "Money-path"
@@ -126,6 +134,28 @@ def evaluate(
     return Decision(True, f"{ident} is {issue.state}", ident, money_path=money)
 
 
+@dataclass
+class MergeAction:
+    """What the workflow does with auto-merge after a check."""
+
+    enable: bool = False
+    disable: bool = False
+    sha: str = ""
+
+
+def merge_action(
+    pr: dict, decision: Decision, repo: str, ci_passed: bool
+) -> MergeAction:
+    """Enable only on a fresh pass with CI already green and no review
+    still requested, so the merge follows this check (an approval re-runs
+    it via the review relay); turn off any auto-merge this check didn't
+    grant."""
+    awaiting_review = bool(pr.get("requested_reviewers") or pr.get("requested_teams"))
+    if auto_merge_eligible(pr, decision, repo) and ci_passed and not awaiting_review:
+        return MergeAction(enable=not pr.get("auto_merge"), sha=pr["head"]["sha"])
+    return MergeAction(disable=bool(pr.get("auto_merge")))
+
+
 def auto_merge_eligible(pr: dict, decision: Decision, repo: str) -> bool:
     """Normal auto-merge: passed, not a draft, and not from a fork."""
     head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
@@ -192,7 +222,22 @@ class GitHub:
 
     def pulls_for_sha(self, sha: str) -> list[int]:
         pulls = self._call("GET", f"/commits/{sha}/pulls") or []
-        return [p["number"] for p in pulls if p.get("state") == "open"]
+        # The endpoint also lists PRs that merely contain the commit.
+        return [
+            p["number"]
+            for p in pulls
+            if p.get("state") == "open" and (p.get("head") or {}).get("sha") == sha
+        ]
+
+    def ci_passed(self, sha: str) -> bool:
+        """The latest `CI required` run on `sha` concluded success."""
+        body = self._call(
+            "GET",
+            f"/commits/{sha}/check-runs"
+            f"?check_name={urllib.parse.quote(CI_CHECK)}&filter=latest",
+        )
+        runs = (body or {}).get("check_runs") or []
+        return any(r.get("conclusion") == "success" for r in runs)
 
     def set_status(self, sha: str, state: str, description: str) -> None:
         self._call(
@@ -204,26 +249,33 @@ class GitHub:
 
 def check(
     number: int, github: GitHub, linear: ld.LinearClient, approver: str, repo: str
-) -> tuple[int, bool]:
-    """Check one PR and record the status. Returns (exit code, eligible)."""
+) -> tuple[int, MergeAction]:
+    """Check one PR and record the status. Returns (exit code, merge action)."""
     pr = github.pull(number)
     if pr.get("state") != "open" or (pr.get("base") or {}).get("ref") != TARGET_BRANCH:
         print(f"#{number}: not an open PR into {TARGET_BRANCH}, nothing to check")
-        return EXIT_OK, False
+        return EXIT_OK, MergeAction()
     head_ref = pr["head"].get("ref") or ""
     if head_ref in LEGACY_PROMOTE_HEADS or head_ref.startswith(LEGACY_PROMOTE_PREFIX):
         print(f"#{number}: legacy promote PR from {head_ref}, not checked")
-        return EXIT_OK, False
+        return EXIT_OK, MergeAction()
     sha = pr["head"]["sha"]
     try:
-        decision = evaluate(pr, github.reviews(number), linear, approver)
+        sharing = sorted(set(github.pulls_for_sha(sha)) - {number})
+        if sharing:
+            others = ", ".join(f"#{n}" for n in sharing)
+            decision = Decision(False, f"head commit is also the head of {others}")
+        else:
+            decision = evaluate(pr, github.reviews(number), linear, approver)
+        ci_passed = decision.ok and github.ci_passed(sha)
     except (ld.LinearError, GitHubError) as err:
         github.set_status(sha, "error", f"could not check, re-run: {err}")
-        raise
+        print(f"#{number}: pr-policy error: {err}", file=sys.stderr)
+        return EXIT_ERROR, MergeAction(disable=bool(pr.get("auto_merge")))
     github.set_status(sha, "success" if decision.ok else "failure", decision.reason)
     print(f"#{number}: {'pass' if decision.ok else 'FAIL'}: {decision.reason}")
-    eligible = auto_merge_eligible(pr, decision, repo)
-    return (EXIT_OK if decision.ok else EXIT_FAILED), eligible
+    action = merge_action(pr, decision, repo, ci_passed)
+    return (EXIT_OK if decision.ok else EXIT_FAILED), action
 
 
 def _write_outputs(path: str | None, **values: str) -> None:
@@ -258,20 +310,26 @@ def main(
         github = github or GitHub(os.environ.get("GH_TOKEN", "").strip(), args.repo)
         linear = linear or ld.LinearClient.from_env()
         numbers = [args.pr] if args.pr else github.pulls_for_sha(args.head_sha)
-        code, eligible_pr = EXIT_OK, ""
+        code, enable, sha, disable = EXIT_OK, "", "", []
         for number in numbers:
-            result, eligible = check(number, github, linear, args.approver, args.repo)
+            result, action = check(number, github, linear, args.approver, args.repo)
             code = max(code, result)
-            if eligible and not eligible_pr:
-                eligible_pr = str(number)
+            if action.enable and not enable:
+                enable, sha = str(number), action.sha
+            if action.disable:
+                disable.append(str(number))
     except (ld.LinearError, GitHubError) as err:
         print(f"pr-policy error: {err}", file=sys.stderr)
-        _write_outputs(args.output, eligible="false", pr="")
+        _write_outputs(args.output, eligible="false", pr="", sha="", disable="")
         return EXIT_ERROR
     if not numbers:
         print(f"no open PR has head {args.head_sha}, nothing to check")
     _write_outputs(
-        args.output, eligible="true" if eligible_pr else "false", pr=eligible_pr
+        args.output,
+        eligible="true" if enable else "false",
+        pr=enable,
+        sha=sha,
+        disable=" ".join(disable),
     )
     return code
 
