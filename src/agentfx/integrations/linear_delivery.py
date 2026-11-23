@@ -71,6 +71,13 @@ class LinearDelivery:
         self._state_ids: dict[str, str] = {}
         self._label_ids: dict[str, str] = {}
 
+    def _mutate(self, query: str, variables: dict) -> None:
+        """Run a mutation; Linear reports a rejected write as `success: false`."""
+        data = self._gql(query, variables) or {}
+        results = [v for v in data.values() if isinstance(v, dict)]
+        if not results or not all(r.get("success") for r in results):
+            raise LinearError(f"linear rejected write: {data}")
+
     def issue(self, identifier: str) -> dict | None:
         """The issue with state (name, type) and labels, or None if missing."""
         if identifier not in self._issues:
@@ -142,7 +149,7 @@ class LinearDelivery:
         if (issue.get("state") or {}).get("name") == name:
             return False
         state_id = self.state_id(name)
-        self._gql(
+        self._mutate(
             "mutation($id: String!, $stateId: String!) { issueUpdate(id: $id, "
             "input: { stateId: $stateId }) { success } }",
             {"id": issue["id"], "stateId": state_id},
@@ -159,7 +166,7 @@ class LinearDelivery:
         if self.has_label(issue, name):
             return False
         label_id = self.label_id(name)
-        self._gql(
+        self._mutate(
             "mutation($id: String!, $labelId: String!) { "
             "issueAddLabel(id: $id, labelId: $labelId) { success } }",
             {"id": issue["id"], "labelId": label_id},
@@ -173,7 +180,7 @@ class LinearDelivery:
         if not self.has_label(issue, name):
             return False
         label_id = self.label_id(name)
-        self._gql(
+        self._mutate(
             "mutation($id: String!, $labelId: String!) { "
             "issueRemoveLabel(id: $id, labelId: $labelId) { success } }",
             {"id": issue["id"], "labelId": label_id},
@@ -188,7 +195,7 @@ class LinearDelivery:
         bodies = self.comment_bodies(issue)
         if any(marker in b for b in bodies):
             return False
-        self._gql(
+        self._mutate(
             "mutation($id: String!, $body: String!) { "
             "commentCreate(input: { issueId: $id, body: $body }) { success } }",
             {"id": issue["id"], "body": body},
