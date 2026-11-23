@@ -481,7 +481,63 @@ def test_first_deploy_without_tag_syncs_only_the_attempted_commit():
     assert linear.issues["AFX-11"]["state"]["name"] == "Done"
     assert any("first deploy" in line for line in report.lines)
     ds.record(gh, SHA, apply=True)
-    assert gh.created == []  # no baseline to persist, nothing guessed
+    # Self-pointing record: "no earlier deploy", nothing guessed.
+    assert gh.created == [(ds.record_tag(SHA), SHA)]
+
+
+def test_first_tag_created_before_sync_still_syncs_own_pr():
+    gh = FakeGitHub(
+        pulls={SHA: [_pr(11, title="AFX-11: b", head="agent/afx-11", merge_sha=SHA)]},
+    )
+    ds.record(gh, SHA, apply=True)
+    gh.tags[ds.STAGING_TAG] = SHA  # Deploy creates the first tag before sync
+    linear = FakeLinear({"AFX-11": _issue("AFX-11")})
+    report = _run(gh, linear, OK)
+    assert report.exit_code == 0
+    assert linear.issues["AFX-11"]["state"]["name"] == "Done"
+    assert ds.recover(gh, linear, run_url=RUN_URL, apply=True).exit_code == 0
+
+
+def _consecutive_deploys():
+    s1, s2 = _sha(1), SHA
+    gh = FakeGitHub(
+        tags={ds.STAGING_TAG: BASE},
+        commits={(BASE, s1): [s1], (s1, s2): [s2], (BASE, s2): [s1, s2]},
+        pulls={
+            s1: [_pr(10, title="AFX-10: a", head="agent/afx-10", merge_sha=s1)],
+            s2: [_pr(11, title="AFX-11: b", head="agent/afx-11", merge_sha=s2)],
+        },
+    )
+    linear = FakeLinear({"AFX-10": _issue("AFX-10"), "AFX-11": _issue("AFX-11")})
+    return gh, linear, s1, s2
+
+
+def test_missed_sync_is_covered_by_the_next_deploy():
+    gh, linear, s1, s2 = _consecutive_deploys()
+    ds.record(gh, s1, apply=True)
+    gh.tags[ds.STAGING_TAG] = s1  # s1 deployed, its ticket sync never ran
+    ds.record(gh, s2, apply=True)
+    gh.tags[ds.STAGING_TAG] = s2
+    report = _run(gh, linear, OK, sha=s2)
+    assert report.exit_code == 0
+    assert linear.issues["AFX-10"]["state"]["name"] == "Done"
+    assert linear.issues["AFX-11"]["state"]["name"] == "Done"
+    # s1's record goes only now that a success covered it.
+    assert ds.record_tag(s1) not in gh.tags
+    assert gh.tags[ds.record_tag(s2)] == s1
+
+
+def test_consecutive_deploys_do_not_recomment_done_tickets():
+    gh, linear, s1, s2 = _consecutive_deploys()
+    ds.record(gh, s1, apply=True)
+    gh.tags[ds.STAGING_TAG] = s1
+    _run(gh, linear, OK, sha=s1)
+    before = len(linear.issues["AFX-10"]["comments"])
+    ds.record(gh, s2, apply=True)
+    gh.tags[ds.STAGING_TAG] = s2
+    _run(gh, linear, OK, sha=s2)
+    assert len(linear.issues["AFX-10"]["comments"]) == before
+    assert linear.issues["AFX-11"]["state"]["name"] == "Done"
 
 
 # ── outages and partial failure ──────────────────────────────────────
@@ -651,6 +707,19 @@ def test_linear_state_and_label_resolve_by_name():
     assert client.has_label(issue, "needs-wilson")
     assert calls[-1][1]["labelId"] == "l-afx"
     assert sum("workflowStates" in q for q, _ in calls) == 1  # cached
+
+
+def test_linear_rejected_write_raises():
+    def transport(query, variables):
+        if "workflowStates" in query:
+            return {"workflowStates": {"nodes": [{"id": "s-done", "name": "Done"}]}}
+        return {"issueUpdate": {"success": False}}
+
+    client = ld.LinearDelivery(transport)
+    issue = {"id": "u1", "identifier": "AFX-1", "state": {"name": "In Review"}}
+    with pytest.raises(ld.LinearError, match="rejected"):
+        client.set_state(issue, "Done")
+    assert issue["state"]["name"] == "In Review"
 
 
 def test_linear_unknown_state_raises():

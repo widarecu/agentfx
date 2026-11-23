@@ -77,8 +77,11 @@ def record_tag(attempted: str) -> str:
     return f"{RECORD_PREFIX}{attempted}"
 
 
+_DONE_PREFIX = "<!-- afx-deploy-sync:done "
+
+
 def done_marker(sha: str) -> str:
-    return f"<!-- afx-deploy-sync:done {sha} -->"
+    return f"{_DONE_PREFIX}{sha} -->"
 
 
 def blocked_marker(sha: str) -> str:
@@ -167,22 +170,39 @@ def collect_tickets(
 
 def resolve_baseline(
     gh: GitHub, attempted: str, explicit: str | None = None
-) -> tuple[str | None, str]:
+) -> tuple[str | None, str, list[str]]:
+    """(baseline, how it was found, attempts whose records this range covers).
+
+    A record is only pruned after a successful sync covered it, so a baseline
+    that still has a record is an earlier deploy whose sync may have been
+    missed: the range is extended back through it."""
     if explicit:
-        return explicit, "explicit --baseline"
+        return explicit, "explicit --baseline", []
     recorded = gh.get_tag_sha(record_tag(attempted))
+    if recorded == attempted:
+        return None, "first deploy (recorded)", []
     if recorded:
-        return recorded, f"recorded {record_tag(attempted)}"
-    tag = gh.get_tag_sha(STAGING_TAG)
-    if tag is None:
-        return None, f"first deploy: no {STAGING_TAG} tag"
-    if tag == attempted:
-        raise BaselineUnknownError(
-            f"{STAGING_TAG} already points at {attempted[:7]} and no "
-            f"{record_tag(attempted)} record exists, so the previous successful "
-            "SHA is unknown. No ticket was changed. Re-run with --baseline <sha>."
-        )
-    return tag, f"{STAGING_TAG} tag"
+        base, source = recorded, f"recorded {record_tag(attempted)}"
+    else:
+        tag = gh.get_tag_sha(STAGING_TAG)
+        if tag is None:
+            return None, f"first deploy: no {STAGING_TAG} tag", []
+        if tag == attempted:
+            raise BaselineUnknownError(
+                f"{STAGING_TAG} already points at {attempted[:7]} and no "
+                f"{record_tag(attempted)} record exists, so the previous successful "
+                "SHA is unknown. No ticket was changed. Re-run with --baseline <sha>."
+            )
+        base, source = tag, f"{STAGING_TAG} tag"
+    covered: list[str] = []
+    while base is not None and base not in covered:
+        earlier = gh.get_tag_sha(record_tag(base))
+        if not earlier:
+            break
+        covered.append(base)
+        source += f", extended over {base[:7]}"
+        base = None if earlier == base else earlier
+    return base, source, covered
 
 
 def range_commits(gh: GitHub, baseline: str | None, attempted: str) -> list[str]:
@@ -283,7 +303,15 @@ def _apply_success(
     if state.get("type") not in ("started", "completed"):
         report.info(f"{ident}: {state['name']} is not in delivery; left alone")
         return
-    owned = _owns_label(linear.comment_bodies(issue))
+    bodies = linear.comment_bodies(issue)
+    owned = _owns_label(bodies)
+    if (
+        state.get("type") == "completed"
+        and not owned
+        and any(_DONE_PREFIX in b for b in bodies)
+    ):
+        report.info(f"{ident}: already reported Done")
+        return
     if not apply:
         report.info(
             f"{ident}: would move {state['name']} -> Done"
@@ -346,8 +374,13 @@ def record(gh: GitHub, attempted: str, *, apply: bool) -> Report:
             report.info(f"baseline already recorded: {existing[:7]}..{attempted[:7]}")
             return report
         tag = gh.get_tag_sha(STAGING_TAG)
-        if tag is None:
-            report.info(f"first deploy: no {STAGING_TAG} tag, nothing to record")
+        if tag is None and not apply:
+            report.info(f"dry-run: would record first deploy {record_tag(attempted)}")
+        elif tag is None:
+            # Points at itself: "no earlier deploy", so a tag created before
+            # sync still resolves to just this commit's PR.
+            gh.create_tag_ref(record_tag(attempted), attempted)
+            report.info(f"first deploy: recorded {record_tag(attempted)}")
         elif tag == attempted:
             report.warn(
                 f"{STAGING_TAG} already at {attempted[:7]}; not recording an empty range"
@@ -379,7 +412,7 @@ def sync(
         report.info(f"deploy outcome not final ({verdict.detail}); no ticket changed")
         return report
     try:
-        base, source = resolve_baseline(gh, attempted, baseline)
+        base, source, covered = resolve_baseline(gh, attempted, baseline)
         commits = range_commits(gh, base, attempted)
         tickets, skipped = collect_tickets(gh, commits) if commits else ({}, [])
     except BaselineUnknownError as exc:
@@ -437,15 +470,16 @@ def sync(
             report.error(f"{ident}: Linear API failed: {exc}")
 
     if apply and verdict.kind == "success" and not report.errors:
-        _prune_records(gh, attempted, {*commits, *([base] if base else [])}, report)
+        _prune_records(gh, attempted, {*commits, *covered}, report)
     return report
 
 
 def _prune_records(
     gh: GitHub, attempted: str, deployed: set[str], report: Report
 ) -> None:
-    """Drop records of attempts this success superseded; keep the current one
-    so a duplicate run or reconcile can replay it."""
+    """Drop records of attempts this success covered (failed attempts in the
+    range, earlier deploys it extended over); keep the current one so a
+    duplicate run or reconcile can replay it."""
     try:
         for name in gh.list_tag_refs(RECORD_PREFIX):
             sha = name[len(RECORD_PREFIX) :]
@@ -479,7 +513,6 @@ def recover(
         run_url=run_url,
         staging_url=staging_url,
         apply=apply,
-        baseline=recorded,
     )
 
 
