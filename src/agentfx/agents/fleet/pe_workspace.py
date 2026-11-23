@@ -1247,7 +1247,22 @@ def sweep_stuck_runs(db: Session, *, now: datetime | None = None) -> int:
         client = None
         if any(r.adapter == "managed_agents" and r.provider_run_id for r in rows):
             client = _managed_client_or_none()
+        reclaimed = 0
         for row in rows:
+            # A Devin session that opened its PR is done, not stuck: one
+            # last poll records it instead of flagging the ticket (AFX-134).
+            if (
+                row.adapter == "devin"
+                and row.provider_run_id
+                and _poll_devin_row(row, now=now) == "pr_open"
+            ):
+                logger.info(
+                    "pe_workspace: not reclaiming row id=%s — its PR is open (%s)",
+                    row.id,
+                    row.pr_url,
+                )
+                continue
+            reclaimed += 1
             logger.warning(
                 "pe_workspace: reclaiming stuck RUNNING row id=%s started_at=%s",
                 row.id,
@@ -1266,7 +1281,7 @@ def sweep_stuck_runs(db: Session, *, now: datetime | None = None) -> int:
             )
         if rows:
             db.commit()
-        return len(rows)
+        return reclaimed
     except Exception:
         logger.exception("pe_workspace: sweep_stuck_runs failed")
         return 0
@@ -1667,12 +1682,15 @@ def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
         return "poll_error"
 
     status_enum = (data.get("status_enum") or data.get("status") or "").lower()
-    if status_enum and status_enum not in _DEVIN_TERMINAL_STATUSES:
-        return "still_running"
-
-    # Terminal — extract PR url + ACU consumed if present.
     pr_block = data.get("pull_request") or {}
     pr_url = pr_block.get("url") if isinstance(pr_block, dict) else None
+    # A session that opened its PR has delivered, even while it idles in a
+    # non-terminal status (blocked, suspended) waiting on review (AFX-134).
+    has_pr = bool(pr_url and isinstance(pr_url, str))
+    if status_enum and status_enum not in _DEVIN_TERMINAL_STATUSES and not has_pr:
+        return "still_running"
+
+    # Terminal or PR opened — record PR url + ACU consumed if present.
     acu_consumed = data.get("acu_consumed")
     rate = float(getattr(settings, "DEVIN_ACU_USD_RATE", 2.25) or 2.25)
     cost_usd = None
@@ -1692,7 +1710,7 @@ def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
     row.summary = (row.summary or "") + "\n[devin-poll] " + summary_tail
     row.ended_at = now
 
-    if pr_url and isinstance(pr_url, str):
+    if has_pr:
         row.status = AgentWorkspaceRunStatus.PR_OPEN
         row.pr_url = pr_url
         m = re.search(r"/pull/(\d+)", pr_url)

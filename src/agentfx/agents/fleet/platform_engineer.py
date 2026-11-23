@@ -51,6 +51,7 @@ from sqlalchemy.orm import Session
 from agentfx.agents.fleet.linear_pe_queue import (
     ReadyIssue,
     file_for_attention,
+    find_merged_pr,
     list_ready_dispatch_candidates,
     rollback_to_ready,
     should_file_for_attention,
@@ -144,6 +145,23 @@ def scan_and_dispatch(*, db: Session, now: datetime | None = None) -> tuple[int,
                 )
                 break
             if _should_skip_due_to_retry_gate(db, issue):
+                continue
+            try:
+                merged_pr = find_merged_pr(issue.pr_urls)
+            except Exception:
+                logger.warning(
+                    "pe_agent: skipping %s — could not check its linked PRs. "
+                    "Next scan retries.",
+                    issue.identifier,
+                    exc_info=True,
+                )
+                continue
+            if merged_pr:
+                logger.info(
+                    "pe_agent: skipping %s — its PR %s is already merged",
+                    issue.identifier,
+                    merged_pr,
+                )
                 continue
             if not transition_to_in_progress(issue.id):
                 logger.info(

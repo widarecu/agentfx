@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import requests
@@ -76,6 +76,7 @@ class ReadyIssue:
         str
     ]  # label NAMES (not ids) — e.g. ["agent-filed", "Bug", "Paper runner"]
     created_at: str  # ISO timestamp, for FIFO tie-breaking
+    pr_urls: list[str] = field(default_factory=list)  # linked attachment URLs
 
     @property
     def is_money_path(self) -> bool:
@@ -173,6 +174,9 @@ def list_ready_dispatch_candidates(limit: int) -> list[ReadyIssue]:
               labels(first: 50) {
                 nodes { id name }
               }
+              attachments(first: 25) {
+                nodes { url }
+              }
             }
           }
         }
@@ -221,6 +225,11 @@ def list_ready_dispatch_candidates(limit: int) -> list[ReadyIssue]:
             priority=n.get("priority") or 0,
             labels=[lbl["name"] for lbl in (n.get("labels") or {}).get("nodes") or []],
             created_at=n["createdAt"],
+            pr_urls=[
+                a["url"]
+                for a in (n.get("attachments") or {}).get("nodes") or []
+                if a.get("url")
+            ],
         )
         for n in filtered_nodes
     ]
@@ -234,6 +243,36 @@ def list_ready_dispatch_candidates(limit: int) -> list[ReadyIssue]:
 
     issues.sort(key=_sort_key)
     return issues[:limit]
+
+
+_GITHUB_PR_URL_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
+
+
+def find_merged_pr(pr_urls: list[str]) -> str | None:
+    """The first linked GitHub PR that is already merged, else None.
+
+    A Ready ticket with a merged PR was shipped and put back (e.g. by an
+    old PE reclaim); dispatching it would redo finished work (AFX-134).
+    Raises on a GitHub API failure so the caller skips rather than guesses.
+    """
+    token = (getattr(settings, "GITHUB_TOKEN", "") or "").strip()
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    for url in pr_urls:
+        m = _GITHUB_PR_URL_RE.match(url or "")
+        if not m:
+            continue
+        owner, repo, number = m.groups()
+        resp = requests.get(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}",
+            headers=headers,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        if resp.json().get("merged_at"):
+            return url
+    return None
 
 
 def _delivery_client() -> linear_delivery.LinearClient:
@@ -553,6 +592,17 @@ def handle_stuck_session_failure(
                 issue_identifier,
             )
             return False
+        state = _issue_state(client, issue_uuid)
+        if state and (
+            state.get("type") in ("completed", "canceled")
+            or state.get("name") in _DELIVERED_STATES
+        ):
+            logger.info(
+                "linear_pe_queue: %s is %s; reclaim leaves the ticket alone",
+                issue_identifier,
+                state.get("name"),
+            )
+            return False
         changed = _add_label(
             client,
             issue_id=issue_uuid,
@@ -566,6 +616,24 @@ def handle_stuck_session_failure(
             issue_identifier,
         )
         return False
+
+
+# The PR exists, so a reclaimed session has delivered (AFX-134).
+_DELIVERED_STATES = {"In Review", "In Staging", "Done"}
+
+
+def _issue_state(client: requests.Session, issue_id: str) -> dict | None:
+    """The issue's state {name, type}, or None when the read fails."""
+    try:
+        data = _gql(
+            client,
+            "query IssueState($id: String!) { issue(id: $id) { state { name type } } }",
+            {"id": issue_id},
+        )
+        return (data.get("issue") or {}).get("state") or None
+    except Exception:
+        logger.exception("linear_pe_queue: state read failed for %s", issue_id)
+        return None
 
 
 def should_file_for_attention(prior_failed_summaries: list[str]) -> bool:
@@ -658,6 +726,7 @@ __all__ = [
     "flag_needs_design",
     "handle_stuck_session_failure",
     "list_ready_dispatch_candidates",
+    "find_merged_pr",
     "rollback_to_ready",
     "should_file_for_attention",
     "stuck_session_signature",
