@@ -720,7 +720,7 @@ class TestHandleStuckSessionFailure:
 
 
 class TestFindMergedPr:
-    """AFX-134: the dispatcher's merged-PR check."""
+    """AFX-134/135: the dispatcher's merged-PR check."""
 
     def _get(self, monkeypatch, payloads, *, status=200):
         seen: list[str] = []
@@ -743,37 +743,69 @@ class TestFindMergedPr:
         monkeypatch.setattr(linear_pe_queue.requests, "get", _fake)
         return seen
 
-    def test_returns_the_merged_pr(self, monkeypatch):
+    @staticmethod
+    def _pr(*, merged=True, base="feat/agent-fleet", title="", head="x"):
+        return {
+            "merged_at": "2026-11-23T00:00:00Z" if merged else None,
+            "base": {"ref": base},
+            "head": {"ref": head},
+            "title": title,
+        }
+
+    _URL = "https://github.com/widarecu/agentfx/pull/{}"
+
+    def test_returns_the_merged_pr_that_names_the_ticket(self, monkeypatch):
         seen = self._get(
-            monkeypatch, {"1": {"merged_at": None}, "2": {"merged_at": "2026-11-23"}}
+            monkeypatch,
+            {
+                "1": self._pr(merged=False, title="AFX-121: open"),
+                "2": self._pr(title="AFX-121: make deploy verify staging"),
+            },
         )
         urls = [
             "https://linear.app/agentfx/issue/AFX-1",
-            "https://github.com/widarecu/agentfx/pull/1",
-            "https://github.com/widarecu/agentfx/pull/2",
+            self._URL.format(1),
+            self._URL.format(2),
         ]
-        assert linear_pe_queue.find_merged_pr(urls) == urls[2]
+        assert linear_pe_queue.find_merged_pr("AFX-121", urls) == urls[2]
         assert seen == [
             "https://api.github.com/repos/widarecu/agentfx/pulls/1",
             "https://api.github.com/repos/widarecu/agentfx/pulls/2",
         ]
 
-    def test_open_or_no_prs_return_none(self, monkeypatch):
-        self._get(monkeypatch, {"3": {"merged_at": None}})
-        assert linear_pe_queue.find_merged_pr([]) is None
-        assert (
-            linear_pe_queue.find_merged_pr(
-                ["https://github.com/widarecu/agentfx/pull/3"]
-            )
-            is None
+    def test_branch_naming_the_ticket_counts(self, monkeypatch):
+        self._get(monkeypatch, {"3": self._pr(head="devin/afx-122-sync-tickets")})
+        assert linear_pe_queue.find_merged_pr("AFX-122", [self._URL.format(3)])
+
+    def test_context_link_to_another_tickets_pr_does_not_count(self, monkeypatch):
+        """AFX-129 had the merged #161 (AFX-121) attached as background."""
+        self._get(
+            monkeypatch,
+            {"161": self._pr(title="AFX-121: verify", head="agent/AFX-121-verify")},
         )
+        assert (
+            linear_pe_queue.find_merged_pr("AFX-129", [self._URL.format(161)]) is None
+        )
+        assert linear_pe_queue.find_merged_pr("AFX-12", [self._URL.format(161)]) is None
+
+    def test_other_repo_is_never_fetched(self, monkeypatch):
+        seen = self._get(monkeypatch, {})
+        url = "https://github.com/psf/requests/pull/9"
+        assert linear_pe_queue.find_merged_pr("AFX-5", [url]) is None
+        assert seen == []
+
+    def test_non_delivery_base_does_not_count(self, monkeypatch):
+        self._get(monkeypatch, {"7": self._pr(base="some-feature", title="AFX-5: x")})
+        assert linear_pe_queue.find_merged_pr("AFX-5", [self._URL.format(7)]) is None
+
+    def test_no_prs_return_none(self, monkeypatch):
+        self._get(monkeypatch, {})
+        assert linear_pe_queue.find_merged_pr("AFX-5", []) is None
 
     def test_api_failure_raises(self, monkeypatch):
         self._get(monkeypatch, {"4": {}}, status=502)
         with pytest.raises(linear_pe_queue.requests.HTTPError):
-            linear_pe_queue.find_merged_pr(
-                ["https://github.com/widarecu/agentfx/pull/4"]
-            )
+            linear_pe_queue.find_merged_pr("AFX-5", [self._URL.format(4)])
 
     def test_candidates_carry_linked_urls(self, monkeypatch):
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
