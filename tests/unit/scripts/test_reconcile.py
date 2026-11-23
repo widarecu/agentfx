@@ -8,7 +8,7 @@ import importlib.util
 import json
 import sys
 import urllib.error
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -239,6 +239,21 @@ class TestDriftClasses:
         ]
 
 
+class TestReopened:
+    def test_replay_leaves_a_reopened_ticket_alone(self, lin):
+        lin.add("AFX-9", "In Progress", comments=[ds.done_marker(SHA)])
+        gh = FakeGitHub(
+            tags={ds.STAGING_TAG: SHA, ds.record_tag(SHA): BASE},
+            commits={(BASE, SHA): [SHA]},
+            pulls={
+                SHA: [_pr(50, title="AFX-9: fix", head="agent/AFX-9", merge_sha=SHA)]
+            },
+        )
+        _run(gh, lin, apply=True)
+        assert lin.issues["AFX-9"].state == "In Progress"
+        assert lin.mutations == []
+
+
 class TestMissedSync:
     def _missed(self, lin):
         lin.add("AFX-9", "In Staging")
@@ -298,10 +313,35 @@ class TestDedupe:
         assert "## Delivery drift digest" in second.summary
         assert second.state["fingerprint"] != first.state["fingerprint"]
 
-    def test_fingerprint_ignores_growing_age(self):
-        a = dr.Finding(dr.STALE, "AFX-1", "In Progress for 4 days")
-        b = dr.Finding(dr.STALE, "AFX-1", "In Progress for 5 days")
-        assert dr.fingerprint([a]) != dr.fingerprint([b])
+    def test_a_ticket_ageing_a_day_is_not_new_drift(self, gh, lin):
+        lin.add("AFX-1", "In Progress", started_at=OLD)
+        first = _run(gh, lin)
+        next_day = dr.reconcile(
+            gh,
+            ld.LinearClient("k", opener=lin.opener),
+            repo=REPO,
+            now=NOW + timedelta(days=1),
+            wilson_email=WILSON,
+            run_url=RUN,
+            apply=False,
+            previous=first.state,
+        )
+        assert "14 days" in next_day.findings[0].detail
+        assert "not repeated" in next_day.summary
+
+    def test_changing_error_text_is_not_new_drift(self, gh, lin):
+        lin.add("AFX-3", "In Review", attachments=[_url(404)])
+        first = _run(gh, lin)
+        gh.pr_states = {}
+        lin.issues["AFX-3"].attachments = [_url(404)]
+        a = dr.Finding(
+            dr.UNCHECKED, "AFX-3", "PR #404 state unavailable: x", "pr-state"
+        )
+        assert first.findings[0].fingerprint_key == a.fingerprint_key
+
+    def test_fingerprint_is_order_independent(self):
+        a = dr.Finding(dr.STALE, "AFX-1", "x")
+        b = dr.Finding(dr.REVIEW, "AFX-2", "y")
         assert dr.fingerprint([a, b]) == dr.fingerprint([b, a])
 
     def test_window_marker_is_in_every_summary(self, gh, lin):

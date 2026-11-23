@@ -58,7 +58,7 @@ class Finding:
     kind: str
     ident: str
     detail: str
-    key: str = ""  # stable identity for dedupe; detail may carry ages
+    key: str = ""  # stable identity for dedupe; detail may carry ages or errors
 
     @property
     def fingerprint_key(self) -> str:
@@ -126,14 +126,25 @@ def find_drift(
             started = _parse(issue.get("startedAt"))
             if started and now - started > STALE_AFTER and not prs:
                 days = (now - started).days
-                out.append(Finding(STALE, ident, f"In Progress for {days} days"))
+                out.append(
+                    Finding(
+                        STALE,
+                        ident,
+                        f"In Progress for {days} days",
+                        key=issue.get("startedAt") or "",
+                    )
+                )
         elif state == ld.IN_REVIEW:
             out.extend(_review_drift(gh, ident, prs))
         elif state == DONE and (_parse(issue.get("completedAt")) or now) >= since:
             try:
                 bodies = client.comment_bodies(issue["id"])
             except ld.LinearError as exc:
-                out.append(Finding(UNCHECKED, ident, f"comments unavailable: {exc}"))
+                out.append(
+                    Finding(
+                        UNCHECKED, ident, f"comments unavailable: {exc}", "comments"
+                    )
+                )
             else:
                 if not any(m in b for b in bodies for m in DEPLOY_MARKERS):
                     out.append(Finding(UNMARKED, ident, "no staging deploy recorded"))
@@ -150,7 +161,14 @@ def _review_drift(gh, ident: str, prs: list[int]) -> list[Finding]:
         try:
             states[number] = gh.pull_state(number)
         except ds.GitHubError as exc:
-            return [Finding(UNCHECKED, ident, f"PR #{number} state unavailable: {exc}")]
+            return [
+                Finding(
+                    UNCHECKED,
+                    ident,
+                    f"PR #{number} state unavailable: {exc}",
+                    "pr-state",
+                )
+            ]
     if "open" in states.values():
         return []
     listed = ", ".join(f"#{n} {s}" for n, s in states.items())
@@ -164,7 +182,7 @@ def _transition_drift(
     try:
         moves = client.state_moves(issue["id"])
     except ld.LinearError as exc:
-        return [Finding(UNCHECKED, ident, f"history unavailable: {exc}")]
+        return [Finding(UNCHECKED, ident, f"history unavailable: {exc}", "history")]
     out = []
     for move in moves:
         to = (move.get("toState") or {}).get("name")
