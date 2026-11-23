@@ -249,6 +249,21 @@ def test_apply_failure_blocks_with_needs_wilson(monkeypatch):
     assert ("label+", "needs-wilson") in linear.writes
 
 
+def test_previous_sha_lets_dry_run_sync_after_the_tag_moved(monkeypatch, capsys):
+    gh, linear = FakeGitHub({ds.STAGING_TAG: SHA}), FakeDeployLinear()
+    assert _sync_cli(RUN_OK, gh, linear, monkeypatch) == 1
+    capsys.readouterr()
+    argv = [*RUN_OK, "--previous-sha", BASE]
+    assert _sync_cli(argv, gh, linear, monkeypatch) == 0
+    assert linear.writes == []
+    assert "AFX-7: would move In Staging -> Done" in capsys.readouterr().out
+
+
+def test_empty_previous_sha_is_ignored(monkeypatch):
+    gh, linear = FakeGitHub({ds.STAGING_TAG: SHA}), FakeDeployLinear()
+    assert _sync_cli([*RUN_OK, "--previous-sha", ""], gh, linear, monkeypatch) == 1
+
+
 def test_apply_without_linear_key_fails(monkeypatch, capsys):
     monkeypatch.delenv("LINEAR_API_KEY", raising=False)
     gh = FakeGitHub({ds.STAGING_TAG: BASE})
@@ -362,6 +377,22 @@ def test_sync_jobs_are_inert_until_cutover(jobs):
             mode = (step.get("env") or {}).get("AFX_DEPLOY_SYNC_MODE")
             if "afx.py" in step.get("run", ""):
                 assert mode == "${{ vars.AFX_DEPLOY_SYNC_MODE || 'dry-run' }}"
+
+
+def test_sync_gets_the_replaced_tag_from_record(jobs):
+    sync = jobs["deploy-sync"]
+    assert "record" in sync["needs"]
+    step = next(s for s in sync["steps"] if "deploy-sync run" in s.get("run", ""))
+    assert '--previous-sha "$PREVIOUS_SHA"' in step["run"]
+    assert step["env"]["PREVIOUS_SHA"] == "${{ needs.record.outputs.previous_sha }}"
+
+
+def test_dry_run_sync_never_fails_the_deploy(jobs):
+    """AFX-133: the legacy state workflow reads Deploy's conclusion as the
+    deploy result, so a dry-run sync failure must not turn it red."""
+    assert jobs["deploy-sync"]["continue-on-error"] == (
+        "${{ (vars.AFX_DEPLOY_SYNC_MODE || 'dry-run') != 'apply' }}"
+    )
 
 
 def test_record_never_blocks_deploy(jobs):

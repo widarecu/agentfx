@@ -169,7 +169,12 @@ def collect_tickets(
 
 
 def resolve_baseline(
-    gh: GitHub, attempted: str, explicit: str | None = None, *, extend: bool = False
+    gh: GitHub,
+    attempted: str,
+    explicit: str | None = None,
+    *,
+    extend: bool = False,
+    previous: str | None = None,
 ) -> tuple[str | None, str, list[str], list[str]]:
     """(baseline, how it was found, records this range covers, extra commits).
 
@@ -177,7 +182,10 @@ def resolve_baseline(
     `extend` (success only) a baseline that still has a record is an earlier
     deploy whose sync may have been missed: the range is extended back
     through it. A failure never extends, so shipped work is never Blocked.
-    A self-pointing record is a first deploy: its own commit is the extra."""
+    A self-pointing record is a first deploy: its own commit is the extra.
+    `previous` is the SHA this run's tag move replaced: the baseline when the
+    tag already points at `attempted` and no record exists (dry-run never
+    writes one, and a failed record is tolerated)."""
     if explicit:
         return explicit, "explicit --baseline", [], []
     recorded = gh.get_tag_sha(record_tag(attempted))
@@ -189,13 +197,16 @@ def resolve_baseline(
         tag = gh.get_tag_sha(STAGING_TAG)
         if tag is None:
             return None, f"first deploy: no {STAGING_TAG} tag", [], []
-        if tag == attempted:
+        if tag == attempted and previous and previous != attempted:
+            base, source = previous, f"previous {STAGING_TAG} from this run's tag move"
+        elif tag == attempted:
             raise BaselineUnknownError(
                 f"{STAGING_TAG} already points at {attempted[:7]} and no "
                 f"{record_tag(attempted)} record exists, so the previous successful "
                 "SHA is unknown. No ticket was changed. Re-run with --baseline <sha>."
             )
-        base, source = tag, f"{STAGING_TAG} tag"
+        else:
+            base, source = tag, f"{STAGING_TAG} tag"
     covered: list[str] = []
     extra: list[str] = []
     while extend and base not in covered:
@@ -416,6 +427,7 @@ def sync(
     staging_url: str = STAGING_URL,
     apply: bool,
     baseline: str | None = None,
+    previous: str | None = None,
 ) -> Report:
     """Move the range's tickets for this deploy verdict. Safe to re-run."""
     report = Report()
@@ -424,7 +436,11 @@ def sync(
         return report
     try:
         base, source, covered, extra = resolve_baseline(
-            gh, attempted, baseline, extend=verdict.kind == "success"
+            gh,
+            attempted,
+            baseline,
+            extend=verdict.kind == "success",
+            previous=previous,
         )
         commits = extra + range_commits(gh, base, attempted)
         tickets, skipped = collect_tickets(gh, commits) if commits else ({}, [])
