@@ -364,6 +364,26 @@ def test_guard_runs_before_the_deploy_and_backend_stamps_its_sha():
     )
 
 
+def test_backend_applies_railway_settings_before_deploying():
+    steps = _deploy_jobs()["deploy-backend"]["steps"]
+    names = [step.get("name", "") for step in steps]
+    apply_at = next(
+        i
+        for i, name in enumerate(names)
+        if name.startswith("Apply Railway service settings")
+    )
+    assert apply_at < names.index("Deploy to Railway")
+    apply = steps[apply_at]
+    assert "railway config plan --detailed-exit-code" in apply["run"]
+    assert "railway config apply --yes" in apply["run"]
+    assert "--confirm-destructive" not in apply["run"]
+    assert apply["env"]["RAILWAY_TOKEN"] == "${{ secrets.RAILWAY_TOKEN }}"
+    node = next(
+        step for step in steps if step.get("uses", "").startswith("actions/setup-node")
+    )
+    assert int(node["with"]["node-version"]) >= 23
+
+
 def test_verify_runs_after_successful_or_skipped_deploys_only():
     verify = _deploy_jobs()["verify"]
     assert set(_deploy_needs("verify")) == {"plan", "deploy-backend", "deploy-frontend"}
@@ -464,3 +484,27 @@ class TestDeliveryReconcileWorkflow:
         assert upload["with"]["name"] == "reconcile-digest"
         assert upload["with"]["overwrite"] is True
         assert upload["if"] == "always()"
+
+
+def test_legacy_railway_toml_matches_the_iac_file():
+    """Until AFX-141 deletes railway.toml, Railway lets it override the
+    settings applied from .railway/railway.ts, so the two must agree."""
+    import re
+    import tomllib
+
+    root = _WORKFLOWS.parents[1]
+    toml = tomllib.loads((root / "railway.toml").read_text())
+    iac = (root / ".railway" / "railway.ts").read_text()
+
+    def ts(key: str) -> str:
+        match = re.search(rf'\b{key}: "?([^",\s}}]+)"?', iac)
+        assert match, key
+        return match.group(1)
+
+    assert toml["build"]["builder"] == ts("builder")
+    assert toml["build"]["dockerfilePath"] == ts("dockerfilePath")
+    assert toml["deploy"]["healthcheckPath"] == ts("healthcheck")
+    assert toml["deploy"]["restartPolicyType"] == ts("restartPolicyType")
+    assert toml["deploy"]["restartPolicyMaxRetries"] == int(
+        ts("restartPolicyMaxRetries")
+    )

@@ -159,6 +159,7 @@ def _outputs(path: Path) -> dict[str, str]:
         ("requirements.txt", {"backend"}),
         ("Dockerfile", {"backend"}),
         ("railway.toml", {"backend"}),
+        (".railway/railway.ts", {"backend"}),
         ("config/financing_fallback.yaml", {"backend"}),
         ("scripts/seed_instruments.py", {"backend"}),
         ("scripts/pr_policy.py", set()),
