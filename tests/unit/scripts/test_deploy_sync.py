@@ -562,7 +562,10 @@ def test_first_deploy_without_tag_syncs_only_the_attempted_commit():
     assert any("first deploy" in line for line in report.lines)
     ds.record(gh, SHA, apply=True)
     # Self-pointing record: "no earlier deploy", nothing guessed.
-    assert gh.created == [(ds.record_tag(SHA), SHA)]
+    assert gh.tags[ds.record_tag(SHA)] == SHA
+    assert [c for c in gh.created if c[0].startswith(ds.RECORD_PREFIX)] == [
+        (ds.record_tag(SHA), SHA)
+    ]
 
 
 def test_first_tag_created_before_sync_still_syncs_own_pr():
@@ -642,6 +645,64 @@ def test_consecutive_deploys_do_not_recomment_done_tickets():
     _run(gh, linear, OK, sha=s2)
     assert len(linear.issues["AFX-10"]["comments"]) == before
     assert linear.issues["AFX-11"]["state"]["name"] == "Done"
+
+
+def test_success_after_synced_success_syncs_only_its_own_commits():
+    gh, linear, s1, s2 = _consecutive_deploys()
+    ds.record(gh, s1, apply=True)
+    gh.tags[ds.STAGING_TAG] = s1
+    assert _run(gh, linear, OK, sha=s1).exit_code == 0
+    assert gh.tags[ds.synced_tag(s1)] == s1
+    ds.record(gh, s2, apply=True)
+    gh.tags[ds.STAGING_TAG] = s2
+    report = _run(gh, linear, OK, sha=s2)
+    assert report.exit_code == 0
+    assert any(f"{s1[:7]}..{s2[:7]}" in line for line in report.lines)
+    assert not any("extended" in line for line in report.lines)
+    assert not any("AFX-10" in line for line in report.lines)
+    assert linear.issues["AFX-11"]["state"]["name"] == "Done"
+    assert ds.record_tag(s1) not in gh.tags and ds.synced_tag(s1) not in gh.tags
+    assert gh.tags[ds.synced_tag(s2)] == s2
+
+
+def test_ticket_reopened_after_previous_deploy_is_not_reclosed():
+    gh, linear, s1, s2 = _consecutive_deploys()
+    ds.record(gh, s1, apply=True)
+    gh.tags[ds.STAGING_TAG] = s1
+    _run(gh, linear, OK, sha=s1)
+    assert linear.issues["AFX-10"]["state"]["name"] == "Done"
+    linear.issues["AFX-10"]["state"] = {"name": "In Progress", "type": "started"}
+    comments = len(linear.issues["AFX-10"]["comments"])
+    ds.record(gh, s2, apply=True)
+    gh.tags[ds.STAGING_TAG] = s2
+    assert _run(gh, linear, OK, sha=s2).exit_code == 0
+    assert linear.issues["AFX-10"]["state"]["name"] == "In Progress"
+    assert len(linear.issues["AFX-10"]["comments"]) == comments
+
+
+def test_rerun_and_recover_after_marking_synced_replay_the_same_range():
+    gh, linear, s1, s2 = _consecutive_deploys()
+    ds.record(gh, s1, apply=True)
+    gh.tags[ds.STAGING_TAG] = s1
+    _run(gh, linear, OK, sha=s1)
+    ds.record(gh, s2, apply=True)
+    gh.tags[ds.STAGING_TAG] = s2
+    _run(gh, linear, OK, sha=s2)
+    created = len(gh.created)
+    again = _run(gh, linear, OK, sha=s2)
+    assert any(f"{s1[:7]}..{s2[:7]}" in line for line in again.lines)
+    replay = ds.recover(gh, linear, run_url=RUN_URL, apply=True)
+    assert replay.exit_code == 0
+    assert any(f"{s1[:7]}..{s2[:7]}" in line for line in replay.lines)
+    assert len(gh.created) == created
+
+
+def test_dry_run_marks_nothing_synced():
+    gh, linear, s1, _ = _consecutive_deploys()
+    ds.record(gh, s1, apply=True)
+    gh.tags[ds.STAGING_TAG] = s1
+    _run(gh, linear, OK, sha=s1, apply=False)
+    assert ds.synced_tag(s1) not in gh.tags
 
 
 # ── outages and partial failure ──────────────────────────────────────

@@ -37,6 +37,7 @@ from agentfx.integrations.linear_delivery import LinearError
 
 STAGING_TAG = "deployed/staging"
 RECORD_PREFIX = "deploy-sync/baseline/"
+SYNCED_PREFIX = "deploy-sync/synced/"
 STAGING_URL = "https://agentfx-staging.up.railway.app"
 NEEDS_WILSON = "needs-wilson"
 
@@ -75,6 +76,10 @@ class GitHub(Protocol):
 
 def record_tag(attempted: str) -> str:
     return f"{RECORD_PREFIX}{attempted}"
+
+
+def synced_tag(deployed: str) -> str:
+    return f"{SYNCED_PREFIX}{deployed}"
 
 
 _DONE_PREFIX = "<!-- afx-deploy-sync:done "
@@ -178,10 +183,12 @@ def resolve_baseline(
 ) -> tuple[str | None, str, list[str], list[str]]:
     """(baseline, how it was found, records this range covers, extra commits).
 
-    A record is only pruned after a successful sync covered it, so with
-    `extend` (success only) a baseline that still has a record is an earlier
-    deploy whose sync may have been missed: the range is extended back
-    through it. A failure never extends, so shipped work is never Blocked.
+    A deploy whose success sync completed gets a `synced_tag`. With `extend`
+    (success only) a baseline that still has a record but no synced tag is an
+    earlier deploy whose sync was missed: the range is extended back through
+    it. A synced baseline stops the extension, so its tickets (possibly
+    reopened since) are left alone. A failure never extends, so shipped work
+    is never Blocked.
     A self-pointing record is a first deploy: its own commit is the extra.
     `previous` is the SHA this run's tag move replaced: the baseline when the
     tag already points at `attempted` and no record exists (dry-run never
@@ -210,6 +217,8 @@ def resolve_baseline(
     covered: list[str] = []
     extra: list[str] = []
     while extend and base not in covered:
+        if gh.get_tag_sha(synced_tag(base)):
+            break
         earlier = gh.get_tag_sha(record_tag(base))
         if not earlier:
             break
@@ -502,22 +511,34 @@ def sync(
             report.error(f"{ident}: Linear API failed: {exc}")
 
     if apply and verdict.kind == "success" and not report.errors:
-        _prune_records(gh, attempted, {*commits, *covered}, report)
+        _mark_synced(gh, attempted, report)
+        done = {*commits, *covered, *([base] if base else [])}
+        _prune_records(gh, attempted, done, report)
     return report
+
+
+def _mark_synced(gh: GitHub, attempted: str, report: Report) -> None:
+    try:
+        if not gh.get_tag_sha(synced_tag(attempted)):
+            gh.create_tag_ref(synced_tag(attempted), attempted)
+            report.info(f"marked {synced_tag(attempted)}")
+    except GitHubError as exc:
+        report.warn(f"could not mark {attempted[:7]} synced: {exc}")
 
 
 def _prune_records(
     gh: GitHub, attempted: str, deployed: set[str], report: Report
 ) -> None:
-    """Drop records of attempts this success covered (failed attempts in the
-    range, earlier deploys it extended over); keep the current one so a
-    duplicate run or reconcile can replay it."""
+    """Drop records and synced tags of deploys this success covered (failed
+    attempts in the range, earlier deploys it extended over, the baseline);
+    keep the current ones so a duplicate run or reconcile can replay it."""
     try:
-        for name in gh.list_tag_refs(RECORD_PREFIX):
-            sha = name[len(RECORD_PREFIX) :]
-            if sha != attempted and sha in deployed:
-                gh.delete_tag_ref(name)
-                report.info(f"pruned {name}")
+        for prefix in (RECORD_PREFIX, SYNCED_PREFIX):
+            for name in gh.list_tag_refs(prefix):
+                sha = name[len(prefix) :]
+                if sha != attempted and sha in deployed:
+                    gh.delete_tag_ref(name)
+                    report.info(f"pruned {name}")
     except GitHubError as exc:
         report.warn(f"could not prune old baseline records: {exc}")
 
