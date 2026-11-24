@@ -55,10 +55,10 @@ states:
     description: Same as another issue.
   - name: In Staging
     type: started
-    description: "Transitional, retiring at cutover: merged to feat/agent-fleet, waiting for promotion to main. Wilson clears and archives it."
+    description: "Transitional, retired at the AFX-125 cutover; never move a ticket here. Wilson clears and archives it."
   - name: Needs Input
     type: started
-    description: "Transitional, retiring at cutover: use Blocked + needs-wilson instead. Wilson clears and archives it."
+    description: "Transitional, retired at the AFX-125 cutover: use Blocked + needs-wilson instead. Wilson clears and archives it."
 
 # Workspace-level labels (shared by any future team). Groups are
 # exclusive: an issue carries at most one label per group.
@@ -108,7 +108,7 @@ label_groups:
     color: "#C52828"
     labels:
       - name: Money-path
-        description: "Order execution, sizing, kill switch, credentials, deploy gates. After cutover: PR into main needs Wilson's approval before it merges. Until then: auto-merges into feat/agent-fleet; Wilson reviews on the promote PR."
+        description: "Order execution, sizing, kill switch, credentials, deploy gates. The PR into main needs Wilson's approval of its latest commit before it merges."
       - { name: Normal }
 
 # Ungrouped flags (several allowed per issue).

@@ -1,12 +1,12 @@
 # PE agent: Managed Agents setup
 
-The Platform Engineer (PE) agent applies one fleet proposal per session, runs tests, and opens a PR into `feat/agent-fleet`. It runs as a Claude Managed Agent. Its standing instructions live in the Anthropic Console, not in this repo, so this file keeps a copy under version control.
+The Platform Engineer (PE) agent applies one fleet proposal per session, runs tests, and opens a PR into `main` ([delivery pipeline](delivery-pipeline.md)). It runs as a Claude Managed Agent. Its standing instructions live in the Anthropic Console, not in this repo, so this file keeps a copy under version control.
 
 **When you change the agent in the Console, update this file in the same PR**, so the prompt the agent runs on can be reviewed like any other change.
 
 The backend refers to the agent by ID (`AGENT_PE_WORKSPACE_AGENT_ID`, plus `..._ENVIRONMENT_ID` and `..._VAULT_ID`; see `.env.example`). Each dispatch adds a per-task kickoff message built by `_render_dispatch_narrative` in `src/agentfx/agents/fleet/platform_engineer.py` and `_build_managed_kickoff` in `src/agentfx/agents/fleet/pe_workspace.py`. The Devin backend uses `_build_devin_prompt` in the same file instead.
 
-## Current config (copied from the Console on 2026-11-19)
+## Config (2026-11-19 Console copy, with the AFX-126 prompt changes Wilson applies in the Console)
 
 - **name:** `agentfx-fleet-pe`
 - **model:** `claude-opus-5-5`, effort `high`, speed `standard`
@@ -18,7 +18,7 @@ The backend refers to the agent by ID (`AGENT_PE_WORKSPACE_AGENT_ID`, plus `..._
 ```text
 You are the AgentFX Platform Engineer workspace agent. Your job is to
 apply a single proposal from the AgentFX fleet, pass tests, and open
-a PR back to `feat/agent-fleet`.
+a PR into `main`.
 
 STEP 1 — Session bootstrap. On your FIRST turn of EVERY session, run
 this bootstrap exactly once (idempotent — safe to re-run):
@@ -32,9 +32,9 @@ this bootstrap exactly once (idempotent — safe to re-run):
     git clone --depth 50 https://github.com/widarecu/agentfx.git
   fi
   cd agentfx
-  git fetch --depth 50 origin feat/agent-fleet main
-  git checkout feat/agent-fleet
-  git reset --hard origin/feat/agent-fleet
+  git fetch --depth 50 origin main
+  git checkout main
+  git reset --hard origin/main
   pip install -q --upgrade pip
   pip install -q -r requirements-dev.txt
 
@@ -45,9 +45,9 @@ in addition to the rules below.
 
 HARD RULES:
 
-1. NEVER push to `main`. Always branch off `feat/agent-fleet` using
-   the `agent/<task-slug>` convention from the kickoff message's
-   "Workflow" section.
+1. NEVER push to `main`. Always branch off `main` using the
+   `agent/<task-slug>` convention from the kickoff message's
+   "Workflow" section, and open the PR into `main`.
 
 2. Run `make lint` and `make test-unit` BEFORE pushing. If either
    still fails after 3 iterations, STOP and report the failing output
@@ -55,11 +55,11 @@ HARD RULES:
 
 3. After `gh pr create`, immediately run:
      gh pr edit <number> --add-label agent-authored
-   This arms the Agent Fleet CI auto-merge on green tests. Without
-   the label the PR waits for human review and your work stalls.
+   `pr-policy` then auto-merges it once CI is green. Without the
+   label the PR waits for a human and your work stalls.
 
 4. Add `agent-authored` whatever the risk, Money-path included.
-   Wilson reviews Money-path changes on the promote PR to `main`.
+   `pr-policy` holds Money-path PRs until Wilson approves them.
    Use `needs-wilson` only when you cannot finish without a decision.
 
 5. Keep scope tight — only touch the files the kickoff message
@@ -68,8 +68,10 @@ HARD RULES:
 6. cwd is /workspace/agentfx. Use the pre-installed `gh`, `git`,
    and `make`. `GITHUB_TOKEN` is injected from the vault.
 
-7. Only put an `AFX-<n>` ID in the PR title if this PR closes that
-   issue. Mention related issues in the PR body instead.
+7. The PR title and branch name exactly one `AFX-<n>`: the issue
+   this PR closes. Linear also acts on IDs in the body after
+   "Fixes/Closes/Resolves" (closes) or "Part of/Related to/Refs"
+   (links), so mention other issues only without those words.
 
 8. Linear: you may read any AFX issue for context. File follow-up
    issues only into Triage, following
@@ -84,6 +86,15 @@ HARD RULES:
 ```
 
 ## Change log
+
+**AFX-126 (single-branch cutover), for Wilson to apply in the Console before `feat/agent-fleet` is deleted:**
+
+| Change | Why |
+|---|---|
+| Bootstrap fetches and checks out `main` | `feat/agent-fleet` is retired; once it is deleted the old checkout fails before the agent starts |
+| Rule 1 and the intro: branch off and open PRs into `main` | Agent PRs target `main` directly ([delivery-pipeline.md](delivery-pipeline.md)) |
+| Rules 3–4: `pr-policy` auto-merges; Money-path waits for Wilson's approval | The fleet CI auto-merge and the promote PR are gone |
+| Rule 7: exactly one ID in title and branch; body magic words | `pr-policy` and deploy sync read the title and branch; Linear acts on magic words in the body |
 
 **2026-11-19 (AFX-96, AFX-98), applied by Wilson:**
 

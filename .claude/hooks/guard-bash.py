@@ -7,7 +7,7 @@ message on stderr to Claude; exit 0 lets it through.
 
 Rules live here rather than in prose because prose can be skipped.
 Background: planning/runbooks/environments.md and
-planning/runbooks/branch-flow.md.
+planning/runbooks/delivery-pipeline.md.
 """
 
 from __future__ import annotations
@@ -121,8 +121,8 @@ def check_git_push(words: list[str]) -> str | None:
         targets = {current_branch()}
     if targets & PROTECTED_PUSH:
         return (
-            "Never push to `main`. Open a PR into `feat/agent-fleet`; Wilson "
-            "promotes to `main`."
+            "Never push to `main`. Push your `agent/AFX-<n>-<slug>` branch "
+            "and open a PR into `main`."
         )
     if force and targets & PROTECTED_FORCE_PUSH:
         return (

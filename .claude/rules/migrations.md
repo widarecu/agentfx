@@ -8,7 +8,7 @@ paths:
 # Database migrations
 
 - The backend container runs `alembic upgrade head` on start-up, so a broken migration stops the whole stack (symptom: `relation "users" does not exist`; check `make docker-logs PROFILE=test`).
-- **Keep a single head.** Before opening the PR, run `alembic heads` on your branch, then check the result still has one head when combined with `origin/main`. `feat/agent-fleet` and `main` both receive migrations (hotfixes go straight to `main`), so two heads can appear only at promote time:
+- **Keep a single head.** Before opening the PR, run `alembic heads` on your branch, then check the result still has one head when combined with `origin/main`. Another PR can merge a migration to `main` after your branch point, so two heads can appear when yours merges:
 
   ```bash
   git fetch origin main

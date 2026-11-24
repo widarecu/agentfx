@@ -51,7 +51,7 @@ make backtest-full PAIRS="AUDUSD,EURUSD" DAYS=2 STRATEGY=ma FAST=20 SLOW=50
 | Frontend | Vercel | https://agentfx-liart.vercel.app |
 | Database | Railway PostgreSQL | internal, via `DATABASE_URL` |
 
-A push to `main` runs `.github/workflows/deploy.yml`: E2E, then `railway up` for the backend and `vercel deploy --prod` for the frontend. Work lands on `feat/agent-fleet` first and is promoted to `main` by the operator; see [planning/runbooks/branch-flow.md](planning/runbooks/branch-flow.md).
+A push to `main` runs `.github/workflows/deploy.yml`: E2E, then `railway up` for the backend and `vercel deploy --prod` for the frontend. Every change reaches `main` through a PR, and every merge deploys to staging; see [planning/runbooks/delivery-pipeline.md](planning/runbooks/delivery-pipeline.md).
 
 The backend image (`Dockerfile`) runs migrations, seeds instrument metadata, then starts the API. Railway variables are set in its dashboard, notably `DATABASE_URL`, `OANDA_API_KEY`, `OANDA_ACCOUNT_ID`, `BACKEND_CORS_ORIGINS` (must include the Vercel domain), `BACKFILL_DAYS` and `DEBUG`. Every setting is listed in `.env.example`.
 
