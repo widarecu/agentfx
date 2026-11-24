@@ -5,7 +5,9 @@ import pytest
 from agentfx.api import models, schemas
 from agentfx.api.services.evolution import create_run
 from agentfx.api.workers import candle_ingestion, evolution_runner, paper_runner
+from agentfx.api.workers.ownership import worker_lock
 from sqlalchemy import event, text
+from sqlalchemy.orm import Session
 
 pytestmark = pytest.mark.integration
 
@@ -162,6 +164,23 @@ def test_child_holds_run_lock_while_executing(kind, test_engine, monkeypatch):
     assert calls == [run_id]
     with test_engine.begin() as challenger:
         assert challenger.scalar(lock, key)
+
+
+def test_owner_session_cannot_query_after_reconnecting(test_engine):
+    key = "agentfx:paper:run_disconnected_owner"
+    with worker_lock(test_engine, key) as (owned, connection):
+        assert owned
+        with Session(bind=connection) as db:
+            db.scalar(text("SELECT 1"))
+            connection.invalidate()
+            db.rollback()
+
+            with worker_lock(test_engine, key) as (successor_owned, _):
+                assert successor_owned
+                with pytest.raises(
+                    RuntimeError, match="Database session lost worker lock"
+                ):
+                    db.scalar(text("SELECT 1"))
 
 
 @pytest.mark.asyncio
