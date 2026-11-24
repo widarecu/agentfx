@@ -123,7 +123,7 @@ jobs:
         run: npm install --global @railway/cli@5.75.0
 
       # AFX-139: the service's build and health-check settings live in
-      # .railway/railway.ts (railway.toml is deprecated). Apply them before
+      # .railway/railway.ts. Apply them before
       # the deploy so it runs on the settings of the commit it ships. A failed
       # plan or apply fails this job, so deploy sync moves the tickets to
       # Blocked. Destructive changes are refused (no --confirm-destructive).

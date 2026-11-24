@@ -484,27 +484,3 @@ class TestDeliveryReconcileWorkflow:
         assert upload["with"]["name"] == "reconcile-digest"
         assert upload["with"]["overwrite"] is True
         assert upload["if"] == "always()"
-
-
-def test_legacy_railway_toml_matches_the_iac_file():
-    """Until AFX-141 deletes railway.toml, Railway lets it override the
-    settings applied from .railway/railway.ts, so the two must agree."""
-    import re
-    import tomllib
-
-    root = _WORKFLOWS.parents[1]
-    toml = tomllib.loads((root / "railway.toml").read_text())
-    iac = (root / ".railway" / "railway.ts").read_text()
-
-    def ts(key: str) -> str:
-        match = re.search(rf'\b{key}: "?([^",\s}}]+)"?', iac)
-        assert match, key
-        return match.group(1)
-
-    assert toml["build"]["builder"] == ts("builder")
-    assert toml["build"]["dockerfilePath"] == ts("dockerfilePath")
-    assert toml["deploy"]["healthcheckPath"] == ts("healthcheck")
-    assert toml["deploy"]["restartPolicyType"] == ts("restartPolicyType")
-    assert toml["deploy"]["restartPolicyMaxRetries"] == int(
-        ts("restartPolicyMaxRetries")
-    )
