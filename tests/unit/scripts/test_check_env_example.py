@@ -1,7 +1,7 @@
 """`.env.example` <-> config.py contract (AFX-80).
 
 `scripts/check_env_example.py` is the enforcement. Running it from the unit
-suite is what wires it into CI: ci.yml and agent-fleet-ci.yml both run
+suite is what wires it into CI: ci.yml runs
 `pytest tests/unit -m unit`, so a PR that adds a config.py setting without
 mirroring it into `.env.example` fails in that PR, not six months later.
 """

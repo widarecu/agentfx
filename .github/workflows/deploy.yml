@@ -316,9 +316,9 @@ jobs:
           if-no-files-found: warn
 
   # ---------------------------------------------------------------------------
-  # Ticket sync (AFX-122). Inert until cutover: `vars.AFX_DEPLOY_SYNC_MODE`
-  # is unset, so both jobs run as dry-run and only log what they would do.
-  # agent-fleet-state-on-promote.yml stays the status owner until then.
+  # Ticket sync (AFX-122): the only writer of Done/Blocked after a deploy
+  # once Wilson sets `vars.AFX_DEPLOY_SYNC_MODE=apply` (AFX-125 cutover).
+  # Unset, both jobs run as dry-run and only log what they would do.
   # They write only `deploy-sync/baseline/*` tags, never `deployed/staging`.
   # ---------------------------------------------------------------------------
   deploy-sync-record:

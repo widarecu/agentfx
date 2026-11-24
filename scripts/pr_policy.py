@@ -55,10 +55,6 @@ ALLOWED_STATES = (ld.IN_PROGRESS, ld.IN_REVIEW)
 MONEY_PATH_LABEL = "Money-path"
 DEFAULT_APPROVER = "widarecu"
 GITHUB_API = "https://api.github.com"
-# Promote PRs from the fleet branch stay Wilson-approved merge commits
-# until the cutover (AFX-125) retires them.
-LEGACY_PROMOTE_HEADS = ("feat/agent-fleet",)
-LEGACY_PROMOTE_PREFIX = "promote/"
 
 _TICKET = re.compile(r"(?<![A-Za-z0-9])AFX-(\d+)(?![0-9])", re.IGNORECASE)
 _REVIEW_VERDICTS = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
@@ -254,10 +250,6 @@ def check(
     pr = github.pull(number)
     if pr.get("state") != "open" or (pr.get("base") or {}).get("ref") != TARGET_BRANCH:
         print(f"#{number}: not an open PR into {TARGET_BRANCH}, nothing to check")
-        return EXIT_OK, MergeAction()
-    head_ref = pr["head"].get("ref") or ""
-    if head_ref in LEGACY_PROMOTE_HEADS or head_ref.startswith(LEGACY_PROMOTE_PREFIX):
-        print(f"#{number}: legacy promote PR from {head_ref}, not checked")
         return EXIT_OK, MergeAction()
     sha = pr["head"]["sha"]
     try:

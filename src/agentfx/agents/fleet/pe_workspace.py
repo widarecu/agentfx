@@ -9,7 +9,7 @@ Phase 2 is the step up: for HIGH-confidence proposals, instead of
 emailing, the fleet hands the proposal to an Anthropic Managed Agents
 workspace — a container Anthropic hosts for us — that reads the repo,
 writes the fix, runs `make test-unit` inside the container, and opens
-a GitHub PR against the `feat/agent-fleet` branch when tests pass.
+a GitHub PR against `main` when tests pass.
 Wilson only sees the result (a PR link in his inbox + GitHub
 notifications), not the step-by-step reasoning.
 
@@ -38,8 +38,8 @@ Guardrails baked into every adapter path:
 - Hard daily dispatch cap (settings-driven, default 2).
 - Daily $ cap on container-time + LLM cost (settings-driven,
   default $3; aborts dispatch if we'd exceed).
-- Target branch pinned to `feat/agent-fleet` — the adapter never
-  targets `main`. Wilson gates `feat/agent-fleet` → `main` manually.
+- PRs target `main` (AFX-125); nothing pushes to `main` directly.
+  `CI required` and `pr-policy` gate every merge.
 - Workspace TTL (adapter-enforced): abort any run that takes longer
   than the budget allows.
 - Only HIGH-confidence proposals dispatch; MEDIUM/LOW keep email
@@ -127,7 +127,7 @@ class WorkspaceTaskSpec:
     ]  # Repo-relative paths PE expects to edit (empty under Linear-driven).
     new_test_paths: list[str]
     estimated_profit_impact: str
-    target_branch: str = "feat/agent-fleet"
+    target_branch: str = "main"
     # "scan" (default) = autonomous PE scan-loop dispatch, subject to
     # both the daily count cap and the daily USD cap.
     # "webhook" = user-initiated via Linear delegation. Skips the count
@@ -888,7 +888,7 @@ def _build_devin_prompt(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str:
     pin the target repo via an @owner/repo reference token (so Devin's
     repo-indexer picks it up), and explicitly tell Devin to:
 
-    - Base its PR against `spec.target_branch` (NEVER main directly).
+    - Base its PR against `spec.target_branch` (never push to it).
     - Use `agent_branch` as the head branch name if possible, so our
       poll/tracking reconciles with the `agent/<slug>` convention
       established by the Managed Agents adapter.
@@ -904,7 +904,7 @@ def _build_devin_prompt(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str:
         "",
         "- Work in the `@widarecu/agentfx` repository.",
         f"- Base your PR against the `{spec.target_branch}` branch. "
-        "Do NOT target `main` directly.",
+        "Never push to it directly.",
     ]
     if agent_branch:
         lines.append(

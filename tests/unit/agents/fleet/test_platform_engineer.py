@@ -587,11 +587,11 @@ class TestDispatchNarrative:
         assert "--add-label agent-authored" in narrative
         assert "--add-label needs-wilson" not in narrative
         assert "INSTEAD" not in narrative
-        assert "promote PR" in narrative
+        assert "`pr-policy` holds the PR until Wilson approves" in narrative
 
     def test_agent_authored_regardless_of_risk(self):
-        """AFX-98: Money-path PRs auto-merge into feat/agent-fleet; the
-        review gate is the promote PR to main."""
+        """AFX-125: Money-path PRs still get agent-authored; pr-policy
+        holds them for Wilson's approval on `main`."""
         for labels in (["agent-filed", "Bug"], ["agent-filed", "Money-path"]):
             narrative = platform_engineer._render_dispatch_narrative(
                 issue=_issue(labels=labels)
@@ -639,4 +639,6 @@ class TestDispatchNarrative:
         iss = _issue()
         narrative = platform_engineer._render_dispatch_narrative(issue=iss)
         assert "Never push to `main`" in narrative
-        assert "feat/agent-fleet" in narrative
+        assert "Your PR targets `main`" in narrative
+        assert "--base main" in narrative
+        assert "feat/agent-fleet" not in narrative

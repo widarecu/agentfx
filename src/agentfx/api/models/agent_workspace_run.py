@@ -93,10 +93,10 @@ class AgentWorkspaceRun(Base):
     # on this column.
     linear_issue_identifier = Column(String(32), nullable=True, index=True)
 
-    # Target branch for the PR. v0.8.1 pins this to `feat/agent-fleet`
-    # per Wilson's approval model; recorded here so we can tell at a
-    # glance which branch a historical PR targeted.
-    target_branch = Column(String(80), nullable=False, default="feat/agent-fleet")
+    # Target branch for the PR: `main` since the AFX-125 cutover,
+    # `feat/agent-fleet` before it. Recorded so we can tell at a glance
+    # which branch a historical PR targeted.
+    target_branch = Column(String(80), nullable=False, default="main")
 
     # Agent's working sub-branch, pattern `agent/<yyyymmdd-slug>`.
     # Populated by the adapter once the workspace is created.

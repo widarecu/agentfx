@@ -364,10 +364,8 @@ class TestEligibilityAndScope:
         [
             {"base": {"ref": "feat/agent-fleet"}},
             {"state": "closed"},
-            {"head": {"ref": "feat/agent-fleet"}},
-            {"head": {"ref": "promote/2026-11-23"}},
         ],
-        ids=["fleet-pr", "closed", "promote-pr", "frozen-promote"],
+        ids=["fleet-pr", "closed"],
     )
     def test_out_of_scope_prs_are_left_alone(self, gh, lin, pr, tmp_path):
         gh.add_pr(**pr)
@@ -376,6 +374,13 @@ class TestEligibilityAndScope:
         assert gh.statuses == []
         assert lin.calls == []
         assert _outputs(out)["eligible"] == "false"
+
+    @pytest.mark.parametrize("head", ["feat/agent-fleet", "promote/2026-11-23"])
+    def test_former_promote_heads_are_checked(self, gh, lin, head):
+        """AFX-125: the promote exemption is gone with the fleet branch."""
+        gh.add_pr(head={"ref": head})
+        _run(gh, lin, "--pr", "7")
+        assert gh.statuses
 
     def test_unknown_sha_is_a_no_op(self, gh, lin):
         assert _run(gh, lin, "--head-sha", "nope") == pp.EXIT_OK

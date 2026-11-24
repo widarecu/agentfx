@@ -7,8 +7,8 @@ name: CI
 # PRs have NO paths-ignore: a skipped workflow never reports its checks,
 # so docs-only PRs would sit on "Expected" once these checks are required.
 # Pushes to `main` keep paths-ignore; the PR already ran the suite.
-# The legacy fleet fast gate (agent-fleet-ci.yml) is unchanged until the
-# cutover (AFX-125).
+# Since the cutover (AFX-125) this is the only PR gate: agent PRs target
+# `main` directly and `pr-policy` enables their auto-merge.
 on:
   pull_request:
     branches:

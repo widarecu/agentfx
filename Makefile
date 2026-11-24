@@ -121,7 +121,7 @@ test-file:
 test-pattern:
 	ENVIRONMENT=test PYTHONPATH=src $(VENV)/bin/pytest -v -k "$(PATTERN)" --ignore=tests/e2e
 
-# Mirrors the lint step in ci.yml / agent-fleet-ci.yml and the
+# Mirrors the lint step in ci.yml and the
 # pre-commit hooks, which use ruff for both checks and formatting.
 lint:
 	$(VENV)/bin/ruff check .

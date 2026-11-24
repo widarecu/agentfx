@@ -20,9 +20,8 @@ name: PR policy
 # workflow_run is the run that normally does this. A failing run, or an
 # auto-merge enabled by anyone else, gets auto-merge turned off.
 #
-# Scope until the cutover (AFX-125): PRs into `main` only. The fleet
-# flow (agent-fleet-ci.yml, promote PRs, back-merges) is unchanged.
-# Making `pr-policy` a required check is a settings change in AFX-125.
+# Scope: every PR into `main`. Since the cutover (AFX-125) there are no
+# promote PRs or back-merges; `pr-policy` is a required check on `main`.
 on:
   pull_request_target:
     branches:
