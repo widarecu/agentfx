@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import pytest
@@ -181,6 +182,47 @@ def test_owner_session_cannot_query_after_reconnecting(test_engine):
                     RuntimeError, match="Database session lost worker lock"
                 ):
                     db.scalar(text("SELECT 1"))
+
+
+def test_resumed_paper_child_waits_for_halted_owner(test_engine, monkeypatch):
+    from agentfx.api.core import database
+    from agentfx.services import paper_runner as paper_service_runner
+
+    run_id = "run_resume_during_halt"
+    with Session(test_engine) as db:
+        db.add(
+            models.Run(
+                id=run_id,
+                pair="EURUSD",
+                environment=models.RunEnvironment.PAPER,
+                status=models.RunStatus.APPROVED,
+                parameters={},
+            )
+        )
+        db.commit()
+    monkeypatch.setattr(database, "engine", test_engine)
+    try:
+        with (
+            ExitStack() as old_runner,
+            patch.object(paper_service_runner, "run_paper_run") as execute,
+        ):
+            owned, _ = old_runner.enter_context(
+                worker_lock(test_engine, f"agentfx:paper:{run_id}")
+            )
+            assert owned
+
+            def finish_halt_notification(_seconds):
+                execute.assert_not_called()
+                old_runner.close()
+
+            monkeypatch.setattr(paper_runner, "sleep", finish_halt_notification)
+            paper_runner._subprocess_entry(run_id)
+            execute.assert_called_once()
+            assert execute.call_args.args == (run_id,)
+    finally:
+        with Session(test_engine) as db:
+            db.delete(db.get(models.Run, run_id))
+            db.commit()
 
 
 @pytest.mark.asyncio

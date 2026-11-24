@@ -24,6 +24,9 @@ import signal
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from time import sleep
+
+from sqlalchemy import select
 
 from .ownership import try_recovery_lock, worker_lock
 
@@ -34,6 +37,7 @@ logger = logging.getLogger(__name__)
 _MP_CONTEXT = multiprocessing.get_context("spawn")
 
 _WATCHDOG_POLL_SECONDS = 5.0
+_OWNER_RETRY_SECONDS = 1.0
 
 # ─────────────────────────────────────────────────────────────────────
 # Auto-restart supervisor (Wilson 2026-08-23)
@@ -392,12 +396,19 @@ def _subprocess_entry(run_id: str) -> None:
 
     try:
         from agentfx.api.core.database import engine
+        from agentfx.api.models import Run, RunStatus
         from agentfx.services.paper_runner import run_paper_run
 
-        with worker_lock(engine, f"agentfx:paper:{run_id}") as (owned, connection):
-            if not owned:
-                return
-            run_paper_run(run_id, owner_connection=connection)
+        while True:
+            with worker_lock(engine, f"agentfx:paper:{run_id}") as (owned, connection):
+                if owned:
+                    run_paper_run(run_id, owner_connection=connection)
+                    return
+                assert connection is not None
+                status = connection.scalar(select(Run.status).where(Run.id == run_id))
+                if status != RunStatus.APPROVED:
+                    return
+            sleep(_OWNER_RETRY_SECONDS)
     except Exception as exc:  # noqa: BLE001
         logger.exception("paper-runner subprocess crashed for run %s", run_id)
         # Persist the traceback to `run.parameters.crash_detail` so the
