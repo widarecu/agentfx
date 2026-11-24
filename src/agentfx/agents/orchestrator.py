@@ -332,6 +332,7 @@ class OrchestratorAgent(BaseAgent):
         seed_specs: list[StrategySpec] | None = None,
         rng: Random | None = None,
         clock: Callable[[], float] = time.monotonic,
+        check_stop: Callable[[], None] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -352,6 +353,7 @@ class OrchestratorAgent(BaseAgent):
         self._seed_specs = seed_specs or SEED_SPECS
         self._rng = rng or Random(config.rng_seed)
         self._clock = clock
+        self._check_stop = check_stop
         # Accumulator for LLM-origin genomes across the run — fed back
         # into the next LLM call so the model can avoid re-proposing
         # shapes that already failed.
@@ -735,10 +737,14 @@ class OrchestratorAgent(BaseAgent):
         pending_llm_call_id: str | None = None
 
         while True:
+            if self._check_stop is not None:
+                self._check_stop()
             self._evaluate_population_fitness(
                 population, train_start, train_end, training_fold_ranges
             )
 
+            if self._check_stop is not None:
+                self._check_stop()
             # Persist generation + genomes (assigns IDs)
             best_in_gen = population.best()
             best_fitness_in_gen = (
@@ -1510,6 +1516,8 @@ class OrchestratorAgent(BaseAgent):
         best_oos_score: tuple[int, float, int] | None = None
         oos_champion: Genome | None = None
         for rank, genome in enumerate(top_k, start=1):
+            if self._check_stop is not None:
+                self._check_stop()
             if genome.id is None:
                 logger.warning(
                     "skipping validation for genome with no ID at rank %d "

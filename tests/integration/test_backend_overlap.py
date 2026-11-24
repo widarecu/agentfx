@@ -4,7 +4,12 @@ from unittest.mock import patch
 
 import pytest
 from agentfx.api import models, schemas
-from agentfx.api.services.evolution import create_run
+from agentfx.api.services.evolution import (
+    EvolutionRunStopped,
+    SqlAlchemyPersister,
+    create_run,
+    stop_run,
+)
 from agentfx.api.workers import candle_ingestion, evolution_runner, paper_runner
 from agentfx.api.workers.ownership import worker_lock
 from sqlalchemy import event, text
@@ -223,6 +228,35 @@ def test_resumed_paper_child_waits_for_halted_owner(test_engine, monkeypatch):
         with Session(test_engine) as db:
             db.delete(db.get(models.Run, run_id))
             db.commit()
+
+
+def test_remote_evolution_stop_cannot_be_overwritten_by_the_owner(test_engine):
+    with Session(test_engine) as owner, Session(test_engine) as api:
+        run = create_run(owner, schemas.EvolutionRunCreate(instrument="EUR_USD"))
+        run_id = run.id
+        try:
+            persister = SqlAlchemyPersister(owner)
+            persister.update_run(run_id, status="running")
+            assert run.status == models.EvolutionRunStatus.RUNNING
+            persister.check_stop(run_id)
+
+            stopped = stop_run(api, run_id)
+            assert stopped.status == models.EvolutionRunStatus.STOPPED
+            with pytest.raises(EvolutionRunStopped):
+                persister.check_stop(run_id)
+            with pytest.raises(EvolutionRunStopped):
+                persister.update_run(
+                    run_id, status="completed", stop_reason="max_generations"
+                )
+            owner.rollback()
+
+            api.refresh(stopped)
+            assert stopped.status == models.EvolutionRunStatus.STOPPED
+            assert stopped.stop_reason == "manual_stop"
+        finally:
+            owner.rollback()
+            api.delete(api.get(models.EvolutionRun, run_id))
+            api.commit()
 
 
 @pytest.mark.asyncio

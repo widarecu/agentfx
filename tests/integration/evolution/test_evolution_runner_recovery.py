@@ -97,17 +97,6 @@ class TestRecoveryHook:
         assert count == 3
 
 
-class TestSignalRunStop:
-    def test_returns_false_for_invalid_pid(self):
-        assert evolution_runner.signal_run_stop(0) is False
-        assert evolution_runner.signal_run_stop(-1) is False
-
-    def test_returns_false_for_nonexistent_pid(self):
-        # PID 99999999 is virtually guaranteed not to exist
-        result = evolution_runner.signal_run_stop(99_999_999)
-        assert result is False
-
-
 class TestWatchdogMarksRunFailed:
     """The watchdog's DB-update half. Verifies the cross-state flip
     (running OR queued → failed) that's the safety net for crashed
