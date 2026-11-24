@@ -16,10 +16,10 @@ Run from the repo root. All must pass before opening the PR.
 7. If you fixed a bug: a test reproduces it (fails before, passes after).
 8. Diff sanity:
    ```bash
-   git fetch origin feat/agent-fleet
-   git diff --stat origin/feat/agent-fleet...HEAD
+   git fetch origin main
+   git diff --stat origin/main...HEAD
    ```
    Only files the issue needs, plus their tests. No `.env.*` files except `.env.example`.
-9. PR targets `feat/agent-fleet`, never `main`. Title names only tickets this PR closes. Label it `agent-authored`, whatever the risk; `needs-wilson` is only for real blockers.
+9. PR targets `main` (never a direct push). Its title and branch name exactly one AFX ticket, the one it closes; other tickets appear in the body only without "Fixes/Closes/Resolves/Part of/Related to/Refs" in front. Label it `agent-authored`, whatever the risk; `needs-wilson` is only for real blockers. See `planning/runbooks/delivery-pipeline.md`.
 
 Report what you ran and the result. If something fails after three honest attempts, stop and report the failing output rather than pushing a red branch.

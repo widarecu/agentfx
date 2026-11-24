@@ -7,14 +7,14 @@ Success means **profitable, live-ready strategies**, not PRs merged or experimen
 ## Hard rules
 
 1. **Only the `test` Docker profile may be wiped.** Never run `make e2e` or `docker compose down -v` against `dev` or `uat`; uat holds Wilson's real data. ([environments](planning/runbooks/environments.md))
-2. **Never push to `main`.** Agent PRs target `feat/agent-fleet`; Wilson promotes. When reporting a merge, name the branch: "merged to `feat/agent-fleet`" or "to `main`". Only `main` deploys. ([branch flow](planning/runbooks/branch-flow.md))
-3. **Money-path changes** (order execution, sizing, kill switch, credentials, deploy gates) **are reviewed by Wilson on the promote PR to `main`**, not on `feat/agent-fleet`. Agent PRs into `feat/agent-fleet` get `agent-authored` and auto-merge on green CI whatever the risk. Don't add `needs-wilson` for risk alone; it is for real blockers.
+2. **One branch: `main`. Never push to it.** Claim with `python3 scripts/afx.py start AFX-<n>`, branch `agent/AFX-<n>-<slug>` off `main`, open one PR into `main` labelled `agent-authored`, then stop: merge, deploy and Done are automatic. Every merge to `main` deploys to staging. Blocked? `python3 scripts/afx.py block AFX-<n> "question"`. ([delivery pipeline](planning/runbooks/delivery-pipeline.md))
+3. **Money-path changes** (order execution, sizing, kill switch, credentials, deploy gates) **need Wilson's approval before they merge.** A Money-path ticket's PR waits in `pr-policy` for his approval of its latest commit, and any PR touching a path in `.github/CODEOWNERS` needs his code-owner review. Still add `agent-authored`; don't add `needs-wilson` for risk alone, it is for real blockers.
 4. **OANDA practice keys only.**
 5. **Never edit `.env.development`, `.env.test`, `.env.uat`.** Any new setting in `src/agentfx/api/core/config.py` goes into `.env.example` in the same PR.
 6. **Linear is the work tracker** (team `AFX`). Work only issues in **Ready**; file new issues only into **Triage**; never set priority or change approved scope. `planning/BACKLOG.md` is frozen. Skills: `work-issue`, `file-issue`.
-7. **Put a ticket ID in a PR title only if the PR closes it.** Linear closes every ID it finds in the title. Cross-references go in the body under "Related".
+7. **A PR names exactly one AFX ticket, the one it closes, in its title and branch.** `pr-policy` fails any other PR, and deploy sync closes the ticket the title names. Linear also reads the body: "Fixes/Closes/Resolves AFX-n" closes that ticket and "Part of/Related to/Refs AFX-n" links it, so mention other tickets only when needed, without those words.
 8. **Before PR:** `make lint` and `make test-unit` green (skill `pr-preflight`).
-9. **Blocked on a product decision?** Comment the question, add `needs-wilson`, stop. Don't guess.
+9. **Blocked on a product decision?** `python3 scripts/afx.py block AFX-<n> "question"` (Blocked + `needs-wilson` + the question), then stop. Don't guess.
 10. **Verify before you plan.** A ticket or doc saying "not done" is a starting point: grep the code first. Shipped features with stale tickets are common.
 11. **Paper trading is the aggressive sandbox.** No allocation caps or auto-halts on paper; the only guardrail there is OANDA's margin call. The risk limits in `planning/MVP_CONSTRAINTS.md` apply to live.
 
@@ -56,9 +56,9 @@ Claude Code loads the `.claude/rules/` files automatically when you touch matchi
 | Portal components, especially Settings | `.claude/rules/portal-ui-testing.md` |
 | Settings, `.env.example`, docker-compose, ingestion | `.claude/rules/ingestion-config.md` |
 | Migrations or ORM models | `.claude/rules/migrations.md` |
-| `.github/`, Dockerfile, deploy, promote scripts | `.claude/rules/ci-and-branch-flow.md`, `planning/runbooks/branch-flow.md` |
+| `.github/`, Dockerfile, deploy scripts | `.claude/rules/ci-and-branch-flow.md`, `planning/runbooks/delivery-pipeline.md` |
 | Docker profiles, local data | `planning/runbooks/environments.md` |
-| Linear workflow | `planning/runbooks/linear-operating-model.md` |
+| Linear workflow, ticket states | `planning/runbooks/delivery-pipeline.md`, `planning/runbooks/linear-operating-model.md` |
 | Strategy validation, risk limits | `planning/MVP_CONSTRAINTS.md` |
 | PE agent / Managed Agents setup | `planning/runbooks/pe-managed-agents-setup.md` |
 | Writing a user story | `planning/README.md` |

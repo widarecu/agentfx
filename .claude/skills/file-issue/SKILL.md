@@ -5,7 +5,7 @@ description: File a bug, finding, feature idea or test gap into Linear Triage wi
 
 # File a Linear issue
 
-Canonical rules: `planning/runbooks/linear-operating-model.md` §6–7.
+Canonical rules: `planning/runbooks/linear-operating-model.md` §6–7; delivery flow: `planning/runbooks/delivery-pipeline.md`.
 
 1. **Search first** (`list_issues`, team `AFX`, by keywords and by `Fingerprint:` if you have one). If an open issue covers it, add a comment with the new evidence instead.
 2. **Cap:** at most 5 new issues per agent per day.
@@ -23,3 +23,4 @@ Canonical rules: `planning/runbooks/linear-operating-model.md` §6–7.
    +++
    ```
 5. **Never** set priority, move the issue out of Triage, or edit the scope of an approved issue.
+6. **Don't fix it in the current PR.** A filed issue is worked only once Wilson moves it to Ready, through its own `afx start` and its own PR into `main`.
