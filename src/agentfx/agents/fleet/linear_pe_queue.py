@@ -637,7 +637,7 @@ def handle_stuck_session_failure(
 
 
 # The PR exists, so a reclaimed session has delivered (AFX-134).
-_DELIVERED_STATES = {"In Review", "In Staging", "Done"}
+_DELIVERED_STATES = {"In Review", "Done"}
 
 
 def _issue_state(client: requests.Session, issue_id: str) -> dict | None:

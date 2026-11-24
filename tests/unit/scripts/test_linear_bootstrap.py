@@ -100,7 +100,7 @@ _LIVE = [
 
 
 class TestWorkspaceYaml:
-    def test_target_states_in_order_with_transitional_states_kept(self):
+    def test_target_states_in_order(self):
         assert [s["name"] for s in _states()] == [
             "Triage",
             "Backlog",
@@ -111,8 +111,6 @@ class TestWorkspaceYaml:
             "Done",
             "Canceled",
             "Duplicate",
-            "In Staging",
-            "Needs Input",
         ]
 
     @pytest.mark.parametrize(
@@ -142,9 +140,8 @@ class TestWorkspaceYaml:
         assert blocked["type"] == "started"
 
     @pytest.mark.parametrize("state", ["In Staging", "Needs Input"])
-    def test_transitional_states_are_marked(self, state):
-        spec = next(s for s in _states() if s["name"] == state)
-        assert spec["description"].startswith("Transitional")
+    def test_retired_states_are_not_listed(self, state):
+        assert state not in {s["name"] for s in _states()}
 
 
 class TestApplyStates:

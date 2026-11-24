@@ -28,7 +28,7 @@ API_URL = "https://api.linear.app/graphql"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = REPO_ROOT / "config" / "linear"
 KEY_FILE = Path.home() / ".config" / "agentfx" / "linear_api_key"
-# Additive only: states with tickets on them (e.g. In Staging) must survive.
+# Additive only: states missing from workspace.yaml are left alone, never archived.
 FORBIDDEN_MUTATIONS = ("Archive", "Delete")
 
 
