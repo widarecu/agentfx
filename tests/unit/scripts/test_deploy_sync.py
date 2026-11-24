@@ -772,7 +772,8 @@ def test_code_failure_recovers_through_ready_and_a_fix_pr_on_the_same_ticket():
     a10 = fake.issues["AFX-10"]
     assert a10.state == "Blocked" and a10.labels == ["needs-wilson"]
 
-    a10.state = "Ready"  # Wilson's move
+    a10.labels.remove("needs-wilson")  # Wilson answers the block
+    a10.state = "Ready"
     client = ld.LinearClient("k", opener=fake.opener)
     assert ld.start(client, "AFX-10").ok
     assert a10.state == "In Progress"

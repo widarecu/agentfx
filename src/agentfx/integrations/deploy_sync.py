@@ -291,8 +291,9 @@ def failure_comment(
         f"**failed** in: {parts}. Moved to Blocked.",
         "",
         f"Fix: open the deploy run and press **Re-run failed jobs**: {run_url}",
-        "If it fails the same way, the change itself is at fault: move this ticket "
-        "to Ready so an agent can open a fix PR naming it.",
+        "If it fails the same way, the change itself is at fault: remove "
+        f"`{NEEDS_WILSON}` and move this ticket to Ready so an agent can open a "
+        "fix PR naming it.",
         "When a re-run or a later deploy succeeds, this ticket moves to Done "
         "automatically. No hand edits needed.",
         "",

@@ -75,7 +75,7 @@ A merge to `main` starts `deploy.yml`: plan, Railway + Vercel deploys, staging v
 - **Failed deploy:** each ticket → **Blocked** + `needs-wilson`, with the run link. The range isn't consumed: the next successful deploy covers it again and moves those tickets to Done.
 - Deploy sync writes only when the repo variable `AFX_DEPLOY_SYNC_MODE` is `apply`; otherwise it only logs what it would do.
 
-**Failed because of the change itself:** a re-run fails the same way, so the ticket needs a fix PR. Wilson moves it from Blocked to Ready; an agent claims it with `afx start` (Ready → In Progress) and opens a fix PR that names the same ticket. When that fix's deploy is verified, deploy sync covers the failed commit and the fix together, moves the ticket to Done and removes the `needs-wilson` it added. While the ticket carries `needs-wilson`, the PE leaves it alone in Ready.
+**Failed because of the change itself:** a re-run fails the same way, so the ticket needs a fix PR. Wilson removes `needs-wilson` and moves it from Blocked to Ready, which makes it an ordinary Ready ticket: agents and the PE leave `needs-wilson` tickets alone, so the label has to go for anyone to pick it up. An agent claims it with `afx start` (Ready → In Progress) and opens a fix PR that names the same ticket. When that fix's deploy is verified, deploy sync covers the failed commit and the fix together and moves the ticket to Done.
 
 **Retries:** re-run the failed Deploy jobs, or run "Deploy" by hand (`workflow_dispatch`) with the commit's `sha`. Never fix ticket states by hand. A sync that was missed after a deploy is replayed with `python3 scripts/afx.py deploy-sync recover --mode apply` (it needs the `deploy-sync/baseline/<sha>` record the deploy wrote).
 
