@@ -7,11 +7,12 @@ description: Pick up a Linear AFX issue and take it to an open PR into main. Use
 
 Canonical flow: `planning/runbooks/delivery-pipeline.md`. Use the Linear MCP tools to read issues.
 
-1. **Choose.** If no issue was named, list team `AFX` issues in state **Ready** and take the highest priority. Only work issues in Ready. If the named issue is not in Ready, stop and say so.
+1. **Choose.** If no issue was named, list team `AFX` issues in state **Ready** and take the highest priority. Only work issues in Ready. If the named issue is not in Ready, stop and say so (unless the PE dispatched you for it: see step 3).
 2. **Check it is still open in reality.** Grep the code for the feature before planning; shipped work with a stale ticket is common. If it is already done, comment the evidence and stop.
 3. **Claim it.**
    - **With `LINEAR_API_KEY`** (the PE, local runs): `python3 scripts/afx.py start AFX-<n>`. It moves Ready → In Progress and refuses any other state; if it refuses, stop.
    - **Without it** (Devin sessions): Linear MCP `get_issue`; if it isn't **Ready**, stop and report, otherwise `save_issue` with `state: "In Progress"` and `assignee: "me"`. The assignee also takes the ticket out of the PE queue, which only picks unassigned Ready tickets.
+   - **Dispatched by the PE?** The PE already claimed the ticket for you, so it is In Progress: skip the claim.
 4. **Branch** from `main`:
    ```bash
    git fetch origin main

@@ -130,6 +130,8 @@ def test_docs_teach_the_mcp_claim_for_devin_sessions(rel: str) -> None:
     assert "LINEAR_API_KEY" in text, rel
     assert "get_issue" in text, rel
     assert 'save_issue` with `state: "In Progress"` and `assignee: "me"`' in text, rel
+    # The PE claims a ticket before dispatching a session for it.
+    assert "PE already claimed" in text, rel
 
 
 @pytest.mark.parametrize("rel", _MCP_PATH_DOCS)

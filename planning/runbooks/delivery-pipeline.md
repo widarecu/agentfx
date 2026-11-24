@@ -16,6 +16,7 @@ Only `main` exists. Every merge to `main` deploys to staging (Railway backend, V
 2. **Claim** it, so a second agent can't start the same ticket:
    - **With `LINEAR_API_KEY`** (the PE, local runs): `python3 scripts/afx.py start AFX-<n>`. It moves Ready → In Progress and refuses any other state. If it refuses, stop.
    - **Without it** (Devin sessions, through the Linear MCP): Linear MCP `get_issue`; if it isn't **Ready**, stop and report, otherwise `save_issue` with `state: "In Progress"` and `assignee: "me"`. The read is the equivalent of `afx start`'s refusal. The assignee takes the ticket out of the PE queue (it only picks unassigned Ready tickets), and the PE's claim release never undoes a claim it didn't make.
+   - **Dispatched by the PE?** The PE already claimed the ticket for that session, so the session skips this step.
 3. **Branch** from `main`:
    ```bash
    git fetch origin main
