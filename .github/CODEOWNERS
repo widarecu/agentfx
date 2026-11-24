@@ -21,6 +21,7 @@
 /src/agentfx/services/paper_sizing.py            @widarecu
 /src/agentfx/api/workers/paper_runner.py         @widarecu
 /src/agentfx/api/services/paper.py               @widarecu
+/src/agentfx/api/routers/paper.py                @widarecu
 /src/agentfx/core/policy.py                      @widarecu
 /src/agentfx/core/gates.py                       @widarecu
 /src/agentfx/core/validation.py                  @widarecu
