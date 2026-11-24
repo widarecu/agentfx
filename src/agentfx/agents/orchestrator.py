@@ -383,6 +383,10 @@ class OrchestratorAgent(BaseAgent):
         # Inputs are validated at construction time. run() takes no kwargs.
         return True, []
 
+    def _ensure_not_stopped(self) -> None:
+        if self._check_stop is not None:
+            self._check_stop()
+
     # ── BaseAgent contract ─────────────────────────────────────────
 
     def run(self, **kwargs) -> AgentResult:
@@ -622,6 +626,8 @@ class OrchestratorAgent(BaseAgent):
             and self.llm_injector is not None
             and self.config.n_llm_gen0_proposals > 0
         ):
+            cost_per_trade_pips = self._cost_per_trade_pips()
+            self._ensure_not_stopped()
             result = self.llm_injector.inject(
                 instrument=self.config.instrument,
                 granularity=self.config.granularity,
@@ -629,7 +635,7 @@ class OrchestratorAgent(BaseAgent):
                 fitness_history=[],
                 top_genomes=[],
                 n_proposals=self.config.n_llm_gen0_proposals,
-                cost_per_trade_pips=self._cost_per_trade_pips(),
+                cost_per_trade_pips=cost_per_trade_pips,
                 is_gen_zero_seeding=True,
                 min_cagr_target=self.config.min_cagr_pct,
             )
@@ -737,14 +743,12 @@ class OrchestratorAgent(BaseAgent):
         pending_llm_call_id: str | None = None
 
         while True:
-            if self._check_stop is not None:
-                self._check_stop()
+            self._ensure_not_stopped()
             self._evaluate_population_fitness(
                 population, train_start, train_end, training_fold_ranges
             )
 
-            if self._check_stop is not None:
-                self._check_stop()
+            self._ensure_not_stopped()
             # Persist generation + genomes (assigns IDs)
             best_in_gen = population.best()
             best_fitness_in_gen = (
@@ -1184,6 +1188,8 @@ class OrchestratorAgent(BaseAgent):
             for g in self._all_llm_origin_genomes
         ]
 
+        cost_per_trade_pips = self._cost_per_trade_pips()
+        self._ensure_not_stopped()
         result: InjectionResult = self.llm_injector.inject(
             instrument=self.config.instrument,
             granularity=self.config.granularity,
@@ -1191,7 +1197,7 @@ class OrchestratorAgent(BaseAgent):
             fitness_history=best_fitness_history,
             top_genomes=top_10,
             n_proposals=self.config.n_llm_proposals,
-            cost_per_trade_pips=self._cost_per_trade_pips(),
+            cost_per_trade_pips=cost_per_trade_pips,
             prior_llm_proposals=prior_llm if prior_llm else None,
             min_cagr_target=self.config.min_cagr_pct,
         )
@@ -1516,8 +1522,7 @@ class OrchestratorAgent(BaseAgent):
         best_oos_score: tuple[int, float, int] | None = None
         oos_champion: Genome | None = None
         for rank, genome in enumerate(top_k, start=1):
-            if self._check_stop is not None:
-                self._check_stop()
+            self._ensure_not_stopped()
             if genome.id is None:
                 logger.warning(
                     "skipping validation for genome with no ID at rank %d "
