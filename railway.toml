@@ -1,3 +1,7 @@
+# Deprecated: Railway stops reading this file on 2026-12-01. The backend's
+# build and health-check settings now live in .railway/railway.ts (AFX-139).
+# Keep this file until those settings are applied in Railway.
+
 [build]
 # Use the Dockerfile at the repository root for all build steps.
 # Railway will pass DATABASE_URL and other service variables as build args

@@ -364,6 +364,26 @@ def test_guard_runs_before_the_deploy_and_backend_stamps_its_sha():
     )
 
 
+def test_backend_applies_railway_settings_before_deploying():
+    steps = _deploy_jobs()["deploy-backend"]["steps"]
+    names = [step.get("name", "") for step in steps]
+    apply_at = next(
+        i
+        for i, name in enumerate(names)
+        if name.startswith("Apply Railway service settings")
+    )
+    assert apply_at < names.index("Deploy to Railway")
+    apply = steps[apply_at]
+    assert "railway config plan --detailed-exit-code" in apply["run"]
+    assert "railway config apply --yes" in apply["run"]
+    assert "--confirm-destructive" not in apply["run"]
+    assert apply["env"]["RAILWAY_TOKEN"] == "${{ secrets.RAILWAY_TOKEN }}"
+    node = next(
+        step for step in steps if step.get("uses", "").startswith("actions/setup-node")
+    )
+    assert int(node["with"]["node-version"]) >= 23
+
+
 def test_verify_runs_after_successful_or_skipped_deploys_only():
     verify = _deploy_jobs()["verify"]
     assert set(_deploy_needs("verify")) == {"plan", "deploy-backend", "deploy-frontend"}

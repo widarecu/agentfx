@@ -104,10 +104,12 @@ jobs:
           git checkout --detach "$TARGET_SHA"
           echo "$TARGET_SHA" > src/agentfx/SOURCE_SHA
 
-      - name: Set up Node.js 20
+      # 24, not 20: `railway config` evaluates .railway/railway.ts with
+      # node --experimental-strip-types, which needs node >= 22.6.
+      - name: Set up Node.js 24
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Install Railway CLI
         # `curl https://railway.app/install.sh | sh` fails on ubuntu-latest
@@ -119,6 +121,33 @@ jobs:
         # Pinned: scripts/railway_deploy.py parses the `--json` output of
         # `railway up` and `railway deployment list`.
         run: npm install --global @railway/cli@5.75.0
+
+      # AFX-139: the service's build and health-check settings live in
+      # .railway/railway.ts (railway.toml is deprecated). Apply them before
+      # the deploy so it runs on the settings of the commit it ships. A failed
+      # plan or apply fails this job, so deploy sync moves the tickets to
+      # Blocked. Destructive changes are refused (no --confirm-destructive).
+      - name: Apply Railway service settings (.railway/railway.ts)
+        run: |
+          if [ ! -f .railway/railway.ts ]; then
+            echo "No .railway/railway.ts at $TARGET_SHA; nothing to apply."
+            exit 0
+          fi
+          npm ci --prefix .railway --no-audit --no-fund
+          set +e
+          railway config plan --detailed-exit-code
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "Railway service settings already match .railway/railway.ts."
+          elif [ "$status" -eq 2 ]; then
+            railway config apply --yes
+          else
+            echo "::error::railway config plan failed (exit $status)"
+            exit "$status"
+          fi
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
 
       # `railway up --detach` returns once the code is uploaded, before
       # Railway builds the image and passes the /health check, so on its own

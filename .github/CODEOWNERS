@@ -33,3 +33,4 @@
 /scripts/railway_deploy.py                       @widarecu
 /Dockerfile                                      @widarecu
 /railway.toml                                    @widarecu
+/.railway/                                       @widarecu

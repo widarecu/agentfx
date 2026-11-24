@@ -2,7 +2,7 @@
 """Deploy the backend to Railway and wait for Railway's verdict (AFX-112).
 
 `railway up --detach` returns as soon as the code is uploaded, before Railway
-has built the image or passed the `/health` check in `railway.toml`. Used on
+has built the image or passed the service's `/health` check (`.railway/railway.ts`). Used on
 its own it turns the Deploy workflow green for deploys that later fail.
 
 This script starts the deploy with `railway up --detach --json`, takes the
