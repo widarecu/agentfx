@@ -57,7 +57,8 @@ Do these after merge-driven automation is off, so nothing moves tickets back ont
 
 ### 4. Delete `feat/agent-fleet` (only after Wilson's explicit go)
 
-- [ ] Every open PR into `feat/agent-fleet` is retargeted to `main` (`gh pr edit <n> --base main`) or closed.
+- [ ] Every open PR into `feat/agent-fleet` is retargeted to `main` (`gh pr edit <n> --base main`) or closed. Retargeting does not start CI, so close and reopen each retargeted PR (`gh pr close <n> && gh pr reopen <n>`) to run `CI required`.
+- [ ] The PE Managed Agents system prompt (`planning/runbooks/pe-managed-agents-setup.md`, set in the Anthropic console) fetches and checks out `main`, not `feat/agent-fleet`. Otherwise every hosted PE session fails its bootstrap once the branch is gone.
 - [ ] `git diff origin/main origin/feat/agent-fleet` is empty, so no work is lost.
 - [ ] Tag the tip first: `git tag archive/feat-agent-fleet origin/feat/agent-fleet && git push origin archive/feat-agent-fleet`.
 - [ ] Wilson confirms the step 2 deploy and the retargets, then removes `feat/agent-fleet` from the `Delete Protection` ruleset (which blocks deleting it), deletes the `fleet-fast-gate` ruleset, and deletes the branch.
