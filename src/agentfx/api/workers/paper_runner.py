@@ -168,8 +168,7 @@ def recover_orphaned_paper_runs(
     Returns the number of runs (re-)scheduled.
     """
     from agentfx.api.core.database import SessionLocal
-    from agentfx.api.models import RunStatus
-    from agentfx.api.services import paper as paper_service
+    from agentfx.api.models import Run, RunEnvironment, RunStatus
 
     own_session = db is None
     if own_session:
@@ -178,46 +177,34 @@ def recover_orphaned_paper_runs(
     candidates = set(deferred or ()) if retry_only else None
     still_owned: set[str] = set()
     try:
-        orphaned = paper_service.find_orphaned_running_paper_runs(db)
+        recoverable = (RunStatus.RUNNING, RunStatus.APPROVED)
+        pending = db.query(Run).filter(
+            Run.environment == RunEnvironment.PAPER,
+            Run.status.in_(recoverable),
+        )
+        if candidates is not None:
+            pending = pending.filter(Run.id.in_(candidates))
+        run_ids = []
         reset = 0
-        for run in orphaned:
-            if candidates is not None and run.id not in candidates:
-                continue
+        for run in pending.all():
             if not try_recovery_lock(db, f"agentfx:paper:{run.id}"):
                 still_owned.add(run.id)
                 continue
             db.refresh(run)
-            if run.status != RunStatus.RUNNING:
+            if run.status not in recoverable:
                 continue
-            run.status = RunStatus.APPROVED
-            run.process_pid = None
-            reset += 1
+            if run.status == RunStatus.RUNNING:
+                run.status = RunStatus.APPROVED
+                run.process_pid = None
+                reset += 1
+            run_ids.append(run.id)
+        db.commit()
         if reset:
-            db.commit()
             logger.warning(
                 "reset %d orphaned RUNNING paper runs to APPROVED",
                 reset,
             )
 
-        from agentfx.api.models import Run, RunEnvironment
-
-        pending = (
-            db.query(Run)
-            .filter(
-                Run.environment == RunEnvironment.PAPER,
-                Run.status == RunStatus.APPROVED,
-            )
-            .all()
-        )
-        run_ids = []
-        for run in pending:
-            if candidates is not None and run.id not in candidates:
-                continue
-            if try_recovery_lock(db, f"agentfx:paper:{run.id}"):
-                run_ids.append(run.id)
-            else:
-                still_owned.add(run.id)
-        db.commit()
         for run_id in run_ids:
             schedule_paper_run(run_id)
         if deferred is not None:

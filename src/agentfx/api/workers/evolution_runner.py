@@ -207,8 +207,7 @@ def recover_queued_evolution_runs(
     # Lazy imports — the lifespan calls this *during* startup, before the
     # app is ready, but after settings/DB are initialized.
     from agentfx.api.core.database import SessionLocal
-    from agentfx.api.models import EvolutionRunStatus
-    from agentfx.api.services import evolution as evolution_service
+    from agentfx.api.models import EvolutionRun, EvolutionRunStatus
 
     own_session = db is None
     if own_session:
@@ -217,37 +216,35 @@ def recover_queued_evolution_runs(
     candidates = set(deferred or ()) if retry_only else None
     still_owned: set[str] = set()
     try:
-        orphaned = evolution_service.find_orphaned_running_runs(db)
+        recoverable = (EvolutionRunStatus.RUNNING, EvolutionRunStatus.QUEUED)
+        pending = (
+            db.query(EvolutionRun)
+            .filter(EvolutionRun.status.in_(recoverable))
+            .order_by(EvolutionRun.created_at)
+        )
+        if candidates is not None:
+            pending = pending.filter(EvolutionRun.id.in_(candidates))
+        run_ids = []
         reset = 0
-        for run in orphaned:
-            if candidates is not None and run.id not in candidates:
-                continue
+        for run in pending.all():
             if not try_recovery_lock(db, f"agentfx:evolution:{run.id}"):
                 still_owned.add(run.id)
                 continue
             db.refresh(run)
-            if run.status != EvolutionRunStatus.RUNNING:
+            if run.status not in recoverable:
                 continue
-            run.status = EvolutionRunStatus.QUEUED
-            run.process_pid = None
-            reset += 1
+            if run.status == EvolutionRunStatus.RUNNING:
+                run.status = EvolutionRunStatus.QUEUED
+                run.process_pid = None
+                reset += 1
+            run_ids.append(run.id)
+        db.commit()
         if reset:
-            db.commit()
             logger.warning(
                 "reset %d orphaned RUNNING evolution runs to QUEUED",
                 reset,
             )
 
-        queued = evolution_service.find_queued_runs(db)
-        run_ids = []
-        for run in queued:
-            if candidates is not None and run.id not in candidates:
-                continue
-            if try_recovery_lock(db, f"agentfx:evolution:{run.id}"):
-                run_ids.append(run.id)
-            else:
-                still_owned.add(run.id)
-        db.commit()
         for run_id in run_ids:
             schedule_run(run_id)
         if deferred is not None:

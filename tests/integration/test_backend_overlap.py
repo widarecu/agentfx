@@ -5,7 +5,7 @@ import pytest
 from agentfx.api import models, schemas
 from agentfx.api.services.evolution import create_run
 from agentfx.api.workers import candle_ingestion, evolution_runner, paper_runner
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 pytestmark = pytest.mark.integration
 
@@ -73,6 +73,63 @@ def test_startup_recovery_leaves_runs_owned_by_another_backend(db_session, test_
         schedule_paper.assert_called_once_with(paper_id)
         schedule_evolution.assert_called_once_with(evolution_id)
         assert not deferred_paper and not deferred_evolution
+
+
+@pytest.mark.parametrize("kind", ["paper", "evolution"])
+def test_recovery_tracks_a_deferred_run_starting_during_the_scan(
+    kind, db_session, test_engine, monkeypatch
+):
+    if kind == "paper":
+        run = models.Run(
+            id="run_deferred_start",
+            pair="EURUSD",
+            environment=models.RunEnvironment.PAPER,
+            status=models.RunStatus.APPROVED,
+            parameters={},
+        )
+        db_session.add(run)
+        recover = paper_runner.recover_orphaned_paper_runs
+        worker, schedule_attr = paper_runner, "schedule_paper_run"
+        running = models.RunStatus.RUNNING
+    else:
+        run = create_run(db_session, schemas.EvolutionRunCreate(instrument="EUR_USD"))
+        recover = evolution_runner.recover_queued_evolution_runs
+        worker, schedule_attr = evolution_runner, "schedule_run"
+        running = models.EvolutionRunStatus.RUNNING
+    db_session.flush()
+    run_id = run.id
+    deferred = {run_id}
+    connection = db_session.connection()
+    table = type(run).__table__
+    started = False
+
+    @event.listens_for(connection, "after_cursor_execute")
+    def start_after_first_select(conn, cursor, statement, *args):
+        nonlocal started
+        if (
+            not started
+            and statement.startswith("SELECT")
+            and f"FROM {table.name}" in statement
+        ):
+            started = True
+            conn.execute(
+                table.update().where(table.c.id == run_id).values(status=running)
+            )
+
+    scheduled = []
+    monkeypatch.setattr(worker, schedule_attr, scheduled.append)
+    try:
+        with test_engine.begin() as incumbent:
+            incumbent.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": f"agentfx:{kind}:{run_id}"},
+            )
+            assert recover(db=db_session, deferred=deferred, retry_only=True) == 0
+            assert started and deferred == {run_id}
+        assert recover(db=db_session, deferred=deferred, retry_only=True) == 1
+        assert not deferred and scheduled == [run_id]
+    finally:
+        event.remove(connection, "after_cursor_execute", start_after_first_select)
 
 
 @pytest.mark.parametrize("kind", ["paper", "evolution"])
