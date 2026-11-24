@@ -172,19 +172,24 @@ def test_canonical_runbook_names_an_owner_for_every_status() -> None:
     }
     workspace = yaml.safe_load(_read("config/linear/workspace.yaml"))
     states = {s["name"] for s in workspace["states"]}
-    retired = {"In Staging", "Needs Input", "Duplicate"}
-    missing = {s for s in states - retired if not any(s in row for row in rows)}
+    missing = {s for s in states - {"Duplicate"} if not any(s in row for row in rows)}
     assert not missing, f"no owner row for {missing}"
     assert "Done | Deploy sync only" in table
 
 
-def test_retired_states_are_described_as_retired() -> None:
+def test_retired_states_are_gone_from_the_workspace() -> None:
     workspace = yaml.safe_load(_read("config/linear/workspace.yaml"))
-    by_name = {s["name"]: s for s in workspace["states"]}
-    for name in ("In Staging", "Needs Input"):
-        assert "retired at the AFX-125 cutover" in by_name[name]["description"]
-        assert "Wilson" in by_name[name]["description"]
+    names = {s["name"] for s in workspace["states"]}
+    assert not names & {"In Staging", "Needs Input"}
     assert "In Staging" in _read(_CANONICAL) and "retired" in _read(_CANONICAL)
+
+
+def test_canonical_runbook_explains_failed_deploy_recovery() -> None:
+    text = _read(_CANONICAL)
+    section = text[text.index("## 6. Deploy and Done") : text.index("## 7.")]
+    assert "Blocked to Ready" in section
+    assert "afx start" in section
+    assert "same ticket" in section
 
 
 def test_no_doc_claims_body_references_are_safe() -> None:

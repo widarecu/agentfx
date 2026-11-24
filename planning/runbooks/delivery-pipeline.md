@@ -36,7 +36,7 @@ Only `main` exists. Every merge to `main` deploys to staging (Railway backend, V
 | Blocked + `needs-wilson` | `afx block`, or deploy sync after a failed staging deploy | Waiting on Wilson |
 | Done | Deploy sync only | The change is verified running on staging, not just merged |
 
-**In Staging** and **Needs Input** are retired. They exist only until Wilson moves their last tickets (In Staging → Done/In Review/Blocked, Needs Input → Blocked + `needs-wilson`) and archives them ([cutover checklist](delivery-cutover-checklist.md) step 3). Never move a ticket into either.
+**In Staging** and **Needs Input** were retired at the AFX-125 cutover and are archived by Wilson ([cutover checklist](delivery-cutover-checklist.md) step 3). They are no longer in `config/linear/workspace.yaml`. Never move a ticket into either.
 
 ## 3. PR rules
 
@@ -74,6 +74,8 @@ A merge to `main` starts `deploy.yml`: plan, Railway + Vercel deploys, staging v
 - **Verified deploy:** each PR's ticket → **Done**, with a staging link comment.
 - **Failed deploy:** each ticket → **Blocked** + `needs-wilson`, with the run link. The range isn't consumed: the next successful deploy covers it again and moves those tickets to Done.
 - Deploy sync writes only when the repo variable `AFX_DEPLOY_SYNC_MODE` is `apply`; otherwise it only logs what it would do.
+
+**Failed because of the change itself:** a re-run fails the same way, so the ticket needs a fix PR. Wilson removes `needs-wilson` and moves it from Blocked to Ready, which makes it an ordinary Ready ticket: agents and the PE leave `needs-wilson` tickets alone, so the label has to go for anyone to pick it up. An agent claims it with `afx start` (Ready → In Progress) and opens a fix PR that names the same ticket. When that fix's deploy is verified, deploy sync covers the failed commit and the fix together and moves the ticket to Done.
 
 **Retries:** re-run the failed Deploy jobs, or run "Deploy" by hand (`workflow_dispatch`) with the commit's `sha`. Never fix ticket states by hand. A sync that was missed after a deploy is replayed with `python3 scripts/afx.py deploy-sync recover --mode apply` (it needs the `deploy-sync/baseline/<sha>` record the deploy wrote).
 

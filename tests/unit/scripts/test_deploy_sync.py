@@ -751,6 +751,43 @@ def test_adapter_end_to_end_success_and_failure():
     assert ds.LABEL_CLEARED_MARKER in a10.comments[-1]
 
 
+def test_code_failure_recovers_through_ready_and_a_fix_pr_on_the_same_ticket():
+    """Blocked by a failed deploy -> Wilson moves it to Ready -> afx start ->
+    a fix PR naming the same ticket -> its verified deploy closes it."""
+    failed, fix = _sha(1), SHA
+    gh = FakeGitHub(
+        tags={ds.STAGING_TAG: BASE},
+        commits={(BASE, failed): [failed], (BASE, fix): [failed, fix]},
+        pulls={
+            failed: [
+                _pr(10, title="AFX-10: a", head="agent/AFX-10-a", merge_sha=failed)
+            ],
+            fix: [_pr(12, title="AFX-10: fix", head="agent/AFX-10-fix", merge_sha=fix)],
+        },
+    )
+    fake = LinearFake()
+    fake.add("AFX-10", "In Review")
+    ds.record(gh, failed, apply=True)
+    assert _run(gh, _adapter(fake), FRONT_FAIL, sha=failed).exit_code == 0
+    a10 = fake.issues["AFX-10"]
+    assert a10.state == "Blocked" and a10.labels == ["needs-wilson"]
+
+    a10.labels.remove("needs-wilson")  # Wilson answers the block
+    a10.state = "Ready"
+    client = ld.LinearClient("k", opener=fake.opener)
+    assert ld.start(client, "AFX-10").ok
+    assert a10.state == "In Progress"
+    a10.state = "In Review"  # the fix PR opens
+
+    ds.record(gh, fix, apply=True)
+    gh.tags[ds.STAGING_TAG] = fix
+    report = _run(gh, _adapter(fake), OK, sha=fix)
+    assert report.exit_code == 0
+    assert a10.state == "Done" and a10.labels == []
+    assert ds.LABEL_CLEARED_MARKER in a10.comments[-1]
+    assert ds.record_tag(failed) not in gh.tags
+
+
 def test_adapter_falls_back_to_workspace_label():
     fake = LinearFake(labels=[], workspace_labels=["needs-wilson"])
     fake.add("AFX-10", "In Staging")

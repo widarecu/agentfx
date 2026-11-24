@@ -268,7 +268,7 @@ def _search_open_by_fingerprint(
     `Fingerprint: <fingerprint>`, or None.
 
     "Open" = any non-terminal state (Triage / Backlog / Ready /
-    In Progress / In Review / In Staging). We treat Done / Canceled /
+    In Progress / In Review / Blocked). We treat Done / Canceled /
     Duplicate as closed — a historical Done issue should not block a
     fresh report of the same problem.
 

@@ -672,7 +672,6 @@ class TestHandleStuckSessionFailure:
         "state",
         [
             {"name": "In Review", "type": "started"},
-            {"name": "In Staging", "type": "started"},
             {"name": "Done", "type": "completed"},
             {"name": "Canceled", "type": "canceled"},
         ],

@@ -21,9 +21,9 @@ team:
 #
 # One owner per status (AFX-117). The descriptions are what agents and
 # Wilson see in Linear, so they name the owner. Bootstrap only creates and
-# updates states; it never archives one. In Staging and Needs Input are
-# transitional: Wilson moves the tickets off them and archives them by
-# hand (planning/runbooks/delivery-cutover-checklist.md).
+# updates states; it never archives one, so a state left out of this file
+# is left alone. In Staging and Needs Input were retired at the AFX-125
+# cutover and are archived by Wilson, so they are not listed here.
 states:
   - name: Triage
     type: triage
@@ -53,12 +53,6 @@ states:
   - name: Duplicate
     type: duplicate
     description: Same as another issue.
-  - name: In Staging
-    type: started
-    description: "Transitional, retired at the AFX-125 cutover; never move a ticket here. Wilson clears and archives it."
-  - name: Needs Input
-    type: started
-    description: "Transitional, retired at the AFX-125 cutover: use Blocked + needs-wilson instead. Wilson clears and archives it."
 
 # Workspace-level labels (shared by any future team). Groups are
 # exclusive: an issue carries at most one label per group.

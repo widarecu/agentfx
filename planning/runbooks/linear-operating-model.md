@@ -42,7 +42,7 @@ Triage ──Wilson accepts──▶ Backlog ──Wilson prioritises──▶ R
 | **Done** | Completed | Deploy sync only, after the merge to `main` is verified running on staging | Shipped to staging. |
 | **Canceled** / **Duplicate** | Canceled | Wilson; agents only for their own duplicates | |
 
-**In Staging** and **Needs Input** are retired transitional states. Never move a ticket into them; Wilson migrates their last tickets and archives them (see `delivery-cutover-checklist.md`).
+**In Staging** and **Needs Input** were retired at the AFX-125 cutover and are archived by Wilson (see `delivery-cutover-checklist.md`). Never move a ticket into them.
 
 Linear can't stop an agent from moving a ticket out of Triage. The rule is enforced in two ways: agent instructions forbid it, and the daily delivery reconcile flags any move into Backlog or Ready that Wilson didn't make.
 
