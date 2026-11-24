@@ -158,6 +158,26 @@ class TestCutover:
         sync = _deploy_jobs()["deploy-sync"]
         assert "afx.py deploy-sync run" in _runs(sync)
 
+    def test_oanda_key_only_reaches_reviewed_code(self, ci):
+        """AFX-125: PR runs of unreviewed agent code get no practice key."""
+        for name, job in ci["jobs"].items():
+            for step in job.get("steps", []):
+                for key, value in (step.get("env") or {}).items():
+                    if "secrets.OANDA" in str(value):
+                        assert "github.event_name == 'push' &&" in value, (name, key)
+        assert _triggers(ci)["push"]["branches"] == ["main"]
+
+    def test_money_path_code_needs_wilson(self):
+        owners = (_WORKFLOWS.parent / "CODEOWNERS").read_text()
+        for path in (
+            "/src/agentfx/adapters/oanda.py",
+            "/src/agentfx/services/paper_sizing.py",
+            "/src/agentfx/api/core/secrets.py",
+            "/scripts/deploy_staging.py",
+        ):
+            assert f"{path} " in owners or f"{path}\t" in owners, path
+            assert (_WORKFLOWS.parents[1] / path.lstrip("/")).exists(), path
+
     def test_ci_runs_every_pr_into_main(self, ci):
         assert _triggers(ci)["pull_request"]["branches"][0] == "main"
         assert "feat/agent-fleet" not in _triggers(ci)["pull_request"]["branches"]
