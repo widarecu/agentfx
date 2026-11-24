@@ -136,7 +136,7 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 
 **Reference:** Full plan at `~/.claude/plans/i-think-we-need-functional-pony.md`.
 
-**Status:** 4 of 5 exit criteria met. The loop runs end-to-end nightly on Railway. Acceptance #3 is **open** — no genome has cleared Gate B because of regime fragility in the validator (single-OOS-fold walk-forward systematically inverts when the OOS slice is a different regime to the training folds). Mitigation belongs in v0.4.0 (rolling walk-forward + regime tagging).
+**Status:** 3 of 5 exit criteria met. The loop runs end-to-end on Railway, started by the PM fleet's morning brief and evolution filler; the nightly Railway cron never ran and was removed (AFX-138). Acceptance #3 is **open** — no genome has cleared Gate B because of regime fragility in the validator (single-OOS-fold walk-forward systematically inverts when the OOS slice is a different regime to the training folds). Mitigation belongs in v0.4.0 (rolling walk-forward + regime tagging).
 
 **Key Capabilities (delivered):**
 - Strategy DSL v1 (constrained JSON grammar over a 9-indicator catalogue) with a compiler that emits the existing `Strategy` interface
@@ -150,7 +150,7 @@ Discovery Agent -> Optimizer Agent -> Validator Agent -> [Human Approval] -> Pap
 **User Stories:** [US-003](requirements/US-003-evolution-run-lifecycle.md), [US-004](requirements/US-004-walk-forward-validation.md), [US-005](requirements/US-005-llm-hypothesis-injection.md), [US-006](requirements/US-006-strategy-dsl.md), [US-016](requirements/US-016-evolution-observability.md)
 
 **Exit Criteria:**
-- [x] Scheduled Railway cron triggers a fresh evolution run nightly
+- [ ] ~~Scheduled Railway cron triggers a fresh evolution run nightly~~ Never ran on Railway (its `railway.toml` block wasn't a Railway setting); removed in AFX-138. The PM fleet starts runs instead.
 - [x] Run completes unattended, hits a stop condition, persists VALIDATED genomes for human review
 - [ ] **OPEN** — At least one VALIDATED genome differs structurally from the gen-0 seeds (system actually discovered something). Carries into v0.4.0.
 - [x] Decision log lets a reviewer reconstruct *why* each surviving genome was kept
