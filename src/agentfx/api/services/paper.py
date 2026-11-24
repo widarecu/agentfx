@@ -1180,10 +1180,7 @@ def get_backtest_overlay(
 
 
 def find_orphaned_running_paper_runs(db: Session) -> Iterable[models.Run]:
-    """Lifespan startup: paper runs left as RUNNING when the app
-    crashed. The caller resets them to APPROVED so the scheduler picks
-    them back up.
-    """
+    """Return RUNNING paper recovery candidates; the caller checks ownership."""
     return (
         db.query(models.Run)
         .filter(

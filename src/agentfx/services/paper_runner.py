@@ -395,6 +395,8 @@ def _claim_runner(db, run) -> bool:
 
 def run_paper_run(
     run_id: str,
+    *,
+    owner_connection=None,
 ) -> None:  # pragma: no cover — exercised via subprocess in PR-G integration tests only
     """Subprocess entry point. Bootstraps the loop.
 
@@ -417,11 +419,17 @@ def run_paper_run(
     from agentfx.api.models import Run, RunStatus, UserOandaCredentials
     from agentfx.core.dsl import StrategySpec, compile_spec
 
-    db = SessionLocal()
+    db = (
+        SessionLocal(bind=owner_connection)
+        if owner_connection is not None
+        else SessionLocal()
+    )
     try:
         run = db.query(Run).filter(Run.id == run_id).one_or_none()
         if run is None:
             logger.error("paper runner: run %s not found; exiting", run_id)
+            return
+        if run.status != RunStatus.APPROVED:
             return
 
         # AFX-7 (2026-11-01 collapse): pool allocation is a run-CREATION
@@ -500,6 +508,7 @@ def run_paper_run(
             candle_fetch_fn=_default_candle_fetch(db),
             instrument=instrument,
             granularity_seconds=granularity_to_seconds(granularity),
+            expected_pid=os.getpid(),
         )
     finally:
         db.close()
@@ -683,6 +692,7 @@ def _execute_loop(
     candle_fetch_fn: Callable[[str, str, int], pd.DataFrame] | None = None,
     instrument: str | None = None,
     granularity_seconds: int = 60,
+    expected_pid: int | None = None,
 ) -> None:
     """Body of the paper-runner main loop.
 
@@ -795,6 +805,10 @@ def _execute_loop(
         # Reload the row so we see kill flags set by the router in
         # another process.
         db.refresh(run)
+        if expected_pid is not None and (
+            run.process_pid != expected_pid or run.status != RunStatus.RUNNING
+        ):
+            return
         if run.kill_requested_at is not None:
             logger.info("paper runner: kill flag observed on %s; closing", run.id)
             _flatten_and_halt(db, run, client, reason="USER_KILL")

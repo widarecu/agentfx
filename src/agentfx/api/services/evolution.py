@@ -745,10 +745,7 @@ def stop_run(db: Session, run_id: str) -> models.EvolutionRun | None:
 
 
 def find_orphaned_running_runs(db: Session) -> list[models.EvolutionRun]:
-    """Runs in RUNNING state on app startup are orphaned by definition —
-    their child process died with the previous app instance. The worker's
-    recovery hook flips them back to QUEUED so they can be re-scheduled.
-    """
+    """Return RUNNING evolution recovery candidates; the caller checks ownership."""
     return (
         db.query(models.EvolutionRun)
         .filter(models.EvolutionRun.status == models.EvolutionRunStatus.RUNNING)

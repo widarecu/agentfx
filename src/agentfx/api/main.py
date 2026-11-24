@@ -24,6 +24,8 @@ from .routers import (
     user_credentials,
 )
 from .routers.integrations import linear as linear_integration
+from .workers.evolution_runner import recover_queued_evolution_runs
+from .workers.paper_runner import recover_orphaned_paper_runs
 
 # Configure root logger to use stdout (so Railway tags normal logs as [inf], not [err])
 logging.basicConfig(
@@ -76,6 +78,34 @@ logger = logging.getLogger(__name__)
 logger.info("Logging configured")
 
 
+async def _recover_run_workers() -> None:
+    evolution_deferred: set[str] = set()
+    paper_deferred: set[str] = set()
+    recoveries = (
+        (recover_queued_evolution_runs, evolution_deferred),
+        (recover_orphaned_paper_runs, paper_deferred),
+    )
+    retry_only = False
+    while True:
+        failed = False
+        for recover, deferred in recoveries:
+            if retry_only and not deferred:
+                continue
+            try:
+                recovered = await asyncio.to_thread(
+                    recover, deferred=deferred, retry_only=retry_only
+                )
+                if recovered:
+                    logger.info("%s: scheduled %d runs", recover.__name__, recovered)
+            except Exception:  # noqa: BLE001
+                failed = True
+                logger.exception("%s failed; will retry", recover.__name__)
+        if not failed and not any(deferred for _, deferred in recoveries):
+            return
+        retry_only = not failed
+        await asyncio.sleep(5)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -83,13 +113,10 @@ async def lifespan(app: FastAPI):
 
     # Start candle ingestion worker
     from .workers.candle_ingestion import start_ingestion_worker, stop_ingestion_worker
-    from .workers.evolution_runner import recover_queued_evolution_runs
     from .workers.optimization_runner import recover_queued_jobs
 
     started = await start_ingestion_worker()
-    if started:
-        logger.info("Candle ingestion worker started")
-    else:
+    if not started:
         logger.info("Candle ingestion worker skipped (disabled or unconfigured)")
 
     # Recover any queued optimization jobs from previous runs
@@ -97,35 +124,11 @@ async def lifespan(app: FastAPI):
     if recovered > 0:
         logger.info(f"Scheduled {recovered} optimization jobs for recovery")
 
-    # Recover any queued evolution runs from previous app instances.
-    # `recover_queued_evolution_runs` is sync — it forks subprocesses but
-    # doesn't await anything. Run it directly.
-    try:
-        recovered_evo = recover_queued_evolution_runs()
-        if recovered_evo > 0:
-            logger.info(f"Scheduled {recovered_evo} evolution runs for recovery")
-    except Exception:  # noqa: BLE001
-        # Recovery failure must not block app startup — runs can be
-        # manually re-queued via the API.
-        logger.exception("evolution-run recovery failed; continuing startup")
+    from .workers.paper_runner import auto_restart_supervisor_loop
 
-    # Recover orphaned paper runs. Same shape as evolution recovery:
-    # flip RUNNING → APPROVED when the child subprocess is gone, then
-    # re-schedule anything APPROVED. Without this, backend restarts
-    # leave paper runs in a zombie RUNNING state with no subprocess or
-    # watchdog — kill requests never get serviced and the UI hides
-    # Delete because status isn't terminal. Wilson UAT 2026-07-14.
-    from .workers.paper_runner import (
-        auto_restart_supervisor_loop,
-        recover_orphaned_paper_runs,
+    recovery_task = asyncio.create_task(
+        _recover_run_workers(), name="run-worker-recovery"
     )
-
-    try:
-        recovered_paper = recover_orphaned_paper_runs()
-        if recovered_paper > 0:
-            logger.info(f"Scheduled {recovered_paper} paper runs for recovery")
-    except Exception:  # noqa: BLE001
-        logger.exception("paper-run recovery failed; continuing startup")
 
     # Start the auto-restart supervisor (Wilson 2026-08-23). Watches
     # for paper runs that halted with a transient stop reason
@@ -148,18 +151,15 @@ async def lifespan(app: FastAPI):
     if fleet_tasks:
         logger.info(f"Agent fleet started with {len(fleet_tasks)} task(s)")
 
-    yield  # App runs here
-
-    # Shutdown
-    logger.info("Shutting down...")
-    supervisor_task.cancel()
     try:
-        await supervisor_task
-    except asyncio.CancelledError:
-        pass
-    await shutdown_agent_fleet()
-    await stop_ingestion_worker()
-    logger.info("Candle ingestion worker stopped")
+        yield  # App runs here
+    finally:
+        logger.info("Shutting down...")
+        recovery_task.cancel()
+        supervisor_task.cancel()
+        await asyncio.gather(recovery_task, supervisor_task, return_exceptions=True)
+        await shutdown_agent_fleet()
+        await stop_ingestion_worker()
 
 
 app = FastAPI(
