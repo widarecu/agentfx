@@ -474,7 +474,7 @@ class TestDevinAdapterDispatch:
         assert captured["json"]["limits"]["max_acu_limit"] == 5
         # Prompt carries target branch + repo reference + no secrets.
         prompt = captured["json"]["prompt"]
-        assert "feat/agent-fleet" in prompt
+        assert "Base your PR against the `main` branch" in prompt
         assert "@widarecu/agentfx" in prompt
         assert "cog_test" not in prompt  # never bake the secret
 
@@ -820,7 +820,7 @@ class TestManagedAgentsAdapterSDK:
                 "url": "https://github.com/widarecu/agentfx",
                 "authorization_token": _FAKE_PAT,
                 "mount_path": "/workspace/agentfx",
-                "checkout": {"type": "branch", "name": "feat/agent-fleet"},
+                "checkout": {"type": "branch", "name": "main"},
             }
         ]
 

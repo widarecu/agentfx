@@ -55,6 +55,7 @@ class FakeGitHub:
             "title": "Fix the thing",
             "base": {"ref": "main"},
             "auto_merge": None,
+            "labels": [{"name": "agent-authored"}],
             "head": {
                 "ref": "agent/AFX-1-fix",
                 "sha": HEAD,
@@ -352,6 +353,16 @@ class TestEligibilityAndScope:
         assert _run(gh, lin, "--pr", "7", output=out) == pp.EXIT_OK
         assert _outputs(out)["eligible"] == "false"
 
+    @pytest.mark.parametrize("labels", [[], [{"name": "needs-wilson"}]])
+    def test_handoff_or_human_pr_is_not_auto_merged(self, gh, lin, labels, tmp_path):
+        """AFX-125: a `[NEEDS DESIGN]` PR names an active ticket and passes
+        the check, but must not merge and let deploy sync close the ticket."""
+        lin.add("AFX-1", "In Progress")
+        gh.add_pr(title="[NEEDS DESIGN] AFX-1: which way?", labels=labels)
+        out = tmp_path / "out"
+        assert _run(gh, lin, "--pr", "7", output=out) == pp.EXIT_OK
+        assert _outputs(out)["eligible"] == "false"
+
     def test_fork_is_not_auto_merged(self, gh, lin, tmp_path):
         lin.add("AFX-1", "In Progress")
         gh.add_pr(head={"repo": {"full_name": "someone/agentfx"}})
@@ -364,10 +375,8 @@ class TestEligibilityAndScope:
         [
             {"base": {"ref": "feat/agent-fleet"}},
             {"state": "closed"},
-            {"head": {"ref": "feat/agent-fleet"}},
-            {"head": {"ref": "promote/2026-11-23"}},
         ],
-        ids=["fleet-pr", "closed", "promote-pr", "frozen-promote"],
+        ids=["fleet-pr", "closed"],
     )
     def test_out_of_scope_prs_are_left_alone(self, gh, lin, pr, tmp_path):
         gh.add_pr(**pr)
@@ -376,6 +385,13 @@ class TestEligibilityAndScope:
         assert gh.statuses == []
         assert lin.calls == []
         assert _outputs(out)["eligible"] == "false"
+
+    @pytest.mark.parametrize("head", ["feat/agent-fleet", "promote/2026-11-23"])
+    def test_former_promote_heads_are_checked(self, gh, lin, head):
+        """AFX-125: the promote exemption is gone with the fleet branch."""
+        gh.add_pr(head={"ref": head})
+        _run(gh, lin, "--pr", "7")
+        assert gh.statuses
 
     def test_unknown_sha_is_a_no_op(self, gh, lin):
         assert _run(gh, lin, "--head-sha", "nope") == pp.EXIT_OK

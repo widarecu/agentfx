@@ -338,7 +338,7 @@ def _render_dispatch_narrative(*, issue: ReadyIssue) -> str:
     - The Linear issue identifier, title, body
     - Branch gate (never push to main)
     - Risk-aware instructions (Money-path → still `agent-authored`;
-      Wilson reviews it on the promote PR to `main`)
+      `pr-policy` holds it for Wilson's approval)
     - `[NEEDS DESIGN]` escape hatch for ambiguous requirements
     """
     lines: list[str] = []
@@ -369,11 +369,11 @@ def _render_dispatch_narrative(*, issue: ReadyIssue) -> str:
     lines.append("## Branch gate (NEVER violate)")
     lines.append("")
     lines.append(
-        "- You work on a sub-branch named `agent/<task-slug>` off "
-        "`feat/agent-fleet`.\n"
-        "- **Never push to `main`.** Wilson gates `feat/agent-fleet` → "
-        "`main` manually.\n"
-        "- Your PR targets `feat/agent-fleet`, never `main`."
+        "- You work on a sub-branch named `agent/<task-slug>` off `main`.\n"
+        "- **Never push to `main`.** Every change reaches `main` through "
+        "a PR that passes `CI required` and `pr-policy`.\n"
+        "- Your PR targets `main` and names exactly one AFX ticket, the "
+        "one it closes, in its title and branch."
     )
     lines.append("")
 
@@ -384,12 +384,11 @@ def _render_dispatch_narrative(*, issue: ReadyIssue) -> str:
             "- This ticket has the **Risk: Money-path** label (order "
             "execution, sizing, kill switch, credentials, deploy gates).\n"
             "- Still add the `agent-authored` label (Workflow step 8). "
-            "Do NOT add `needs-wilson` to your PR: Money-path PRs "
-            "auto-merge into `feat/agent-fleet` on green CI like any "
-            "other. Wilson reviews them on the promote PR to `main`, "
-            "which never auto-merges.\n"
-            "- Call out the money-path impact in the PR body so it is "
-            "easy to spot on the promote PR."
+            "Do NOT add `needs-wilson` for risk alone: `pr-policy` holds "
+            "the PR until Wilson approves its latest commit, then it "
+            "auto-merges.\n"
+            "- Call out the money-path impact in the PR body so Wilson "
+            "can review it quickly."
         )
         lines.append("")
 
@@ -397,15 +396,15 @@ def _render_dispatch_narrative(*, issue: ReadyIssue) -> str:
     lines.append("")
     lines.append(
         f"1. Create branch `agent/{_slugify(issue.identifier)}-"
-        f"{_slugify(issue.title)}` off `feat/agent-fleet`.\n"
+        f"{_slugify(issue.title)}` off `main`.\n"
         "2. Read the relevant code; form a hypothesis.\n"
         "3. Write a reproducing test FIRST (it should fail against current code).\n"
         "4. Apply the fix.\n"
         "5. Run `make test-unit` — iterate until green.\n"
         f"6. Commit with `{issue.identifier}` in the message so Linear links the PR.\n"
         f"7. Push the branch and open a PR titled `{issue.identifier}: <short summary>` "
-        f"against `feat/agent-fleet`.\n"
-        "8. Add label `agent-authored` so the CI auto-merge workflow runs "
+        f"against `main`.\n"
+        "8. Add label `agent-authored` so it auto-merges once `pr-policy` passes "
         "(`gh pr edit --add-label agent-authored`). "
         "Do this regardless of risk, Money-path included.\n"
         "9. If after 3 attempts tests still fail, STOP and report the "
@@ -441,7 +440,7 @@ def _render_dispatch_narrative(*, issue: ReadyIssue) -> str:
 _GH_API_PUBLISH_EXAMPLE = """```bash
 REPO=repos/widarecu/agentfx
 BRANCH="agent/<task-slug>"          # same branch name you tried to push
-BASE_SHA=$(git merge-base HEAD origin/feat/agent-fleet)
+BASE_SHA=$(git merge-base HEAD origin/main)
 BASE_TREE=$(gh api "$REPO/git/commits/$BASE_SHA" --jq .tree.sha)
 
 # One blob per added/modified file, one null-sha entry per deleted file.
@@ -469,7 +468,7 @@ COMMIT_SHA=$(jq -n --arg m "$(git log -1 --format=%B)" --arg t "$TREE_SHA" \\
 #   gh api -X PATCH "$REPO/git/refs/heads/$BRANCH" -f sha="$COMMIT_SHA" -F force=true)
 gh api "$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$COMMIT_SHA"
 
-gh pr create --repo widarecu/agentfx --base feat/agent-fleet --head "$BRANCH" ...
+gh pr create --repo widarecu/agentfx --base main --head "$BRANCH" ...
 ```"""
 
 
@@ -494,15 +493,15 @@ def _render_publishing_section(identifier: str) -> list[str]:
         _GH_API_PUBLISH_EXAMPLE,
         "",
         "3. **If both fail: do NOT die silently.** Open a `[NEEDS WILSON]` "
-        "PR against the current HEAD of `feat/agent-fleet` (an empty-commit "
+        "PR against the current HEAD of `main` (an empty-commit "
         "branch off it is fine) titled "
         f"`[NEEDS WILSON] {identifier}: publish failed — <short summary>` "
         f"(keep `{identifier}` in the title so the Linear link survives). "
         "Label it `needs-wilson`, NOT `agent-authored`. The PR body must "
         "contain the full diff (`git format-patch --stdout "
-        "origin/feat/agent-fleet..HEAD`) and the commands Wilson needs to "
+        "origin/main..HEAD`) and the commands Wilson needs to "
         "apply it from a normal clone, e.g. `git fetch origin && git "
-        "checkout -b <branch> origin/feat/agent-fleet && git am < "
+        "checkout -b <branch> origin/main && git am < "
         "change.patch && git push -u origin <branch>`.",
         "4. If even that PR cannot be opened, end your final message with "
         "a line that reads exactly `PUBLISH FAILED AFTER FALLBACKS`, "

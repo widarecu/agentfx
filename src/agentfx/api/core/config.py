@@ -511,14 +511,13 @@ class Settings(BaseSettings):
     # PE Managed Agents workspace (v0.8.1 C.2 Phase 2) — False by default
     # until the Anthropic SDK integration is wired and verified. With the
     # flag off, PE keeps emailing proposals; with it on, HIGH-confidence
-    # proposals dispatch to a workspace that opens a PR on
-    # `feat/agent-fleet`.
+    # proposals dispatch to a workspace that opens a PR into `main`.
     AGENT_PE_WORKSPACE_ENABLED: bool = Field(
         default=False,
         env="AGENT_PE_WORKSPACE_ENABLED",
         description=(
             "If true, PE routes HIGH-confidence proposals to the "
-            "Managed Agents workspace adapter (PR on `feat/agent-fleet`). "
+            "Managed Agents workspace adapter (PR into `main`). "
             "If false (default), every proposal stays on the email path."
         ),
     )

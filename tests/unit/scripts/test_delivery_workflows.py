@@ -3,8 +3,9 @@
 Pins what `.github/workflows/ci.yml` must keep doing: run the whole
 required suite on every PR into `main` (docs-only included), fail the
 single required check when any job fails, and run E2E only against the
-disposable Docker `test` profile. Also pins that the legacy fleet fast
-gate stays until the cutover (AFX-125).
+disposable Docker `test` profile. Also pins that the fleet pipeline
+(promote, back-merge, legacy Done writer, fleet fast gate) stays removed
+after the cutover (AFX-125).
 """
 
 from __future__ import annotations
@@ -110,11 +111,76 @@ class TestE2ESafety:
         assert 'if [ "$TARGET_PROFILE" != "test" ]' in script
 
 
-class TestLegacyFleetGate:
-    def test_fast_gate_still_guards_fleet_prs(self):
-        fleet = _load("agent-fleet-ci.yml")
-        assert "feat/agent-fleet" in _triggers(fleet)["pull_request"]["branches"]
-        assert "fast-gate" in fleet["jobs"]
+_REMOVED_WORKFLOWS = (
+    "agent-fleet-ci.yml",
+    "agent-fleet-promote.yml",
+    "agent-fleet-state-on-promote.yml",
+    "main-to-fleet-backmerge.yml",
+)
+_REMOVED_SCRIPTS = (
+    "fleet_promote_pr.py",
+    "fleet_state_on_promote.py",
+    "backfill_in_staging.py",
+)
+
+
+class TestCutover:
+    """AFX-125: one branch, one Done writer, no promote machinery."""
+
+    @pytest.mark.parametrize("name", _REMOVED_WORKFLOWS)
+    def test_fleet_workflow_is_gone(self, name):
+        assert not (_WORKFLOWS / name).exists()
+
+    @pytest.mark.parametrize("name", _REMOVED_SCRIPTS)
+    def test_fleet_script_is_gone(self, name):
+        assert not (_WORKFLOWS.parents[1] / "scripts" / name).exists()
+
+    def test_no_workflow_mentions_the_fleet_pipeline(self):
+        for path in _WORKFLOWS.glob("*.yml"):
+            text = path.read_text()
+            assert "feat/agent-fleet" not in text, path.name
+            for gone in (*_REMOVED_WORKFLOWS, *_REMOVED_SCRIPTS):
+                assert gone not in text, (path.name, gone)
+
+    def test_no_workflow_polls_for_promotes(self):
+        for path in _WORKFLOWS.glob("*.yml"):
+            if path.name == "delivery-reconcile.yml":
+                continue  # the daily reconcile only reports
+            assert "schedule" not in _triggers(_load(path.name)), path.name
+
+    def test_deploy_sync_is_the_only_done_writer(self):
+        for path in _WORKFLOWS.glob("*.yml"):
+            wf = _load(path.name)
+            if "workflow_run" in _triggers(wf):
+                assert "Deploy" not in _triggers(wf)["workflow_run"]["workflows"], (
+                    path.name
+                )
+        sync = _deploy_jobs()["deploy-sync"]
+        assert "afx.py deploy-sync run" in _runs(sync)
+
+    def test_oanda_key_only_reaches_reviewed_code(self, ci):
+        """AFX-125: PR runs of unreviewed agent code get no practice key."""
+        for name, job in ci["jobs"].items():
+            for step in job.get("steps", []):
+                for key, value in (step.get("env") or {}).items():
+                    if "secrets.OANDA" in str(value):
+                        assert "github.event_name == 'push' &&" in value, (name, key)
+        assert _triggers(ci)["push"]["branches"] == ["main"]
+
+    def test_money_path_code_needs_wilson(self):
+        owners = (_WORKFLOWS.parent / "CODEOWNERS").read_text()
+        for path in (
+            "/src/agentfx/adapters/oanda.py",
+            "/src/agentfx/services/paper_sizing.py",
+            "/src/agentfx/api/core/secrets.py",
+            "/scripts/deploy_staging.py",
+        ):
+            assert f"{path} " in owners or f"{path}\t" in owners, path
+            assert (_WORKFLOWS.parents[1] / path.lstrip("/")).exists(), path
+
+    def test_ci_runs_every_pr_into_main(self, ci):
+        assert _triggers(ci)["pull_request"]["branches"][0] == "main"
+        assert "feat/agent-fleet" not in _triggers(ci)["pull_request"]["branches"]
 
 
 class TestPrPolicyWorkflow:
@@ -211,11 +277,6 @@ class TestPrPolicyWorkflow:
             assert any(
                 line.split()[:2] == [path, "@widarecu"] for line in owners.splitlines()
             ), path
-
-    def test_fleet_gate_untouched(self):
-        fleet = _load("agent-fleet-ci.yml")
-        assert _triggers(fleet)["pull_request"]["branches"] == ["feat/agent-fleet"]
-        assert "auto-merge" in fleet["jobs"]
 
 
 # ─────────────────────────────────────────────────────────────────────

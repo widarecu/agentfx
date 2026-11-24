@@ -53,12 +53,11 @@ CI_CHECK = "CI required"
 TARGET_BRANCH = "main"
 ALLOWED_STATES = (ld.IN_PROGRESS, ld.IN_REVIEW)
 MONEY_PATH_LABEL = "Money-path"
+# Only agent PRs that finished their work auto-merge; `[NEEDS DESIGN]` /
+# `[NEEDS WILSON]` handoff PRs and human PRs merge by hand.
+AUTO_MERGE_LABEL = "agent-authored"
 DEFAULT_APPROVER = "widarecu"
 GITHUB_API = "https://api.github.com"
-# Promote PRs from the fleet branch stay Wilson-approved merge commits
-# until the cutover (AFX-125) retires them.
-LEGACY_PROMOTE_HEADS = ("feat/agent-fleet",)
-LEGACY_PROMOTE_PREFIX = "promote/"
 
 _TICKET = re.compile(r"(?<![A-Za-z0-9])AFX-(\d+)(?![0-9])", re.IGNORECASE)
 _REVIEW_VERDICTS = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
@@ -157,9 +156,11 @@ def merge_action(
 
 
 def auto_merge_eligible(pr: dict, decision: Decision, repo: str) -> bool:
-    """Normal auto-merge: passed, not a draft, and not from a fork."""
+    """Normal auto-merge: passed, labelled `agent-authored`, not a draft,
+    and not from a fork."""
     head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
-    return decision.ok and not pr.get("draft") and head_repo == repo
+    labelled = AUTO_MERGE_LABEL in {lb.get("name") for lb in pr.get("labels") or []}
+    return decision.ok and labelled and not pr.get("draft") and head_repo == repo
 
 
 class GitHub:
@@ -254,10 +255,6 @@ def check(
     pr = github.pull(number)
     if pr.get("state") != "open" or (pr.get("base") or {}).get("ref") != TARGET_BRANCH:
         print(f"#{number}: not an open PR into {TARGET_BRANCH}, nothing to check")
-        return EXIT_OK, MergeAction()
-    head_ref = pr["head"].get("ref") or ""
-    if head_ref in LEGACY_PROMOTE_HEADS or head_ref.startswith(LEGACY_PROMOTE_PREFIX):
-        print(f"#{number}: legacy promote PR from {head_ref}, not checked")
         return EXIT_OK, MergeAction()
     sha = pr["head"]["sha"]
     try:

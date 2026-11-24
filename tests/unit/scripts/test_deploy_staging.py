@@ -161,7 +161,7 @@ def _outputs(path: Path) -> dict[str, str]:
         ("railway.toml", {"backend"}),
         ("config/financing_fallback.yaml", {"backend"}),
         ("scripts/seed_instruments.py", {"backend"}),
-        ("scripts/fleet_promote_pr.py", set()),
+        ("scripts/pr_policy.py", set()),
         ("portal/web/src/App.tsx", {"frontend"}),
         ("portal/web/vercel.json", {"frontend"}),
         (".github/workflows/deploy.yml", {"backend", "frontend"}),

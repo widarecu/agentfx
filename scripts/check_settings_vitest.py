@@ -13,7 +13,7 @@ for a month.
 
 Stdlib only, so it runs without the project venv:
 
-    python3 scripts/check_settings_vitest.py                    # vs origin/feat/agent-fleet
+    python3 scripts/check_settings_vitest.py                    # vs origin/main
     python3 scripts/check_settings_vitest.py --range HEAD^1..HEAD --strict
 """
 
@@ -41,7 +41,7 @@ SETTINGS_SURFACE = (
 VITEST_GLOB = "portal/web/tests/unit/*.test.ts"
 VITEST_NESTED_GLOB = "portal/web/tests/unit/**/*.test.ts"
 
-DEFAULT_RANGE = "origin/feat/agent-fleet...HEAD"
+DEFAULT_RANGE = "origin/main...HEAD"
 
 
 def is_vitest(path: str) -> bool:

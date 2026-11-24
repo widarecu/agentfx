@@ -14,7 +14,7 @@ deployment reaches a terminal status:
 * No terminal status within `--timeout` seconds → exit 1.
 
 The job conclusion then is the real deploy outcome, which is what
-`scripts/fleet_state_on_promote.py` classifies.
+`afx deploy-sync` reads to move tickets to Done or Blocked.
 
 Stdlib only + the Railway CLI (authenticated through `RAILWAY_TOKEN`):
 
