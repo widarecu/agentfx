@@ -55,6 +55,7 @@ class FakeGitHub:
             "title": "Fix the thing",
             "base": {"ref": "main"},
             "auto_merge": None,
+            "labels": [{"name": "agent-authored"}],
             "head": {
                 "ref": "agent/AFX-1-fix",
                 "sha": HEAD,
@@ -348,6 +349,16 @@ class TestEligibilityAndScope:
     def test_draft_passes_but_is_not_auto_merged(self, gh, lin, tmp_path):
         lin.add("AFX-1", "In Progress")
         gh.add_pr(draft=True)
+        out = tmp_path / "out"
+        assert _run(gh, lin, "--pr", "7", output=out) == pp.EXIT_OK
+        assert _outputs(out)["eligible"] == "false"
+
+    @pytest.mark.parametrize("labels", [[], [{"name": "needs-wilson"}]])
+    def test_handoff_or_human_pr_is_not_auto_merged(self, gh, lin, labels, tmp_path):
+        """AFX-125: a `[NEEDS DESIGN]` PR names an active ticket and passes
+        the check, but must not merge and let deploy sync close the ticket."""
+        lin.add("AFX-1", "In Progress")
+        gh.add_pr(title="[NEEDS DESIGN] AFX-1: which way?", labels=labels)
         out = tmp_path / "out"
         assert _run(gh, lin, "--pr", "7", output=out) == pp.EXIT_OK
         assert _outputs(out)["eligible"] == "false"

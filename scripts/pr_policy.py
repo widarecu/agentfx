@@ -53,6 +53,9 @@ CI_CHECK = "CI required"
 TARGET_BRANCH = "main"
 ALLOWED_STATES = (ld.IN_PROGRESS, ld.IN_REVIEW)
 MONEY_PATH_LABEL = "Money-path"
+# Only agent PRs that finished their work auto-merge; `[NEEDS DESIGN]` /
+# `[NEEDS WILSON]` handoff PRs and human PRs merge by hand.
+AUTO_MERGE_LABEL = "agent-authored"
 DEFAULT_APPROVER = "widarecu"
 GITHUB_API = "https://api.github.com"
 
@@ -153,9 +156,11 @@ def merge_action(
 
 
 def auto_merge_eligible(pr: dict, decision: Decision, repo: str) -> bool:
-    """Normal auto-merge: passed, not a draft, and not from a fork."""
+    """Normal auto-merge: passed, labelled `agent-authored`, not a draft,
+    and not from a fork."""
     head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
-    return decision.ok and not pr.get("draft") and head_repo == repo
+    labelled = AUTO_MERGE_LABEL in {lb.get("name") for lb in pr.get("labels") or []}
+    return decision.ok and labelled and not pr.get("draft") and head_repo == repo
 
 
 class GitHub:
