@@ -13,10 +13,9 @@ port = 8000
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 
-[deploy.healthcheck]
 # Railway polls this endpoint to determine readiness before routing traffic.
 # The /health route is registered in src/agentfx/api/main.py.
-path = "/health-drill"
+healthcheckPath = "/health-drill"
 
 # ─────────────────────────────────────────────────────────────────────────
 # v0.3.0 Autonomous Strategy Loop — nightly evolution-run trigger
