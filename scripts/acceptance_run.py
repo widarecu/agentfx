@@ -39,6 +39,7 @@ import sys
 import textwrap
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -209,30 +210,29 @@ def poll_until_terminal(run_id: str, token: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+NIGHTLY_SCRIPT = "trigger_nightly_evolution.py"
+
+
+def nightly_cron_declared(repo_root: Path) -> tuple[bool, str]:
+    """Return whether a scheduled GitHub workflow runs the nightly trigger."""
+    workflows = repo_root / ".github" / "workflows"
+    for wf in sorted(workflows.glob("*.y*ml")) if workflows.is_dir() else []:
+        text = wf.read_text()
+        if "schedule:" in text and NIGHTLY_SCRIPT in text:
+            return True, f"scheduled by .github/workflows/{wf.name}"
+    return False, f"nothing schedules scripts/{NIGHTLY_SCRIPT}"
+
+
 def evaluate_criteria(
     run: dict, generations: list, decisions: list, best: dict | None
 ) -> list[tuple[str, bool, str]]:
     """Return a list of (criterion_label, passed, note) tuples."""
     results = []
 
-    # Criterion 1: cron declaration exists (verified by file presence)
-    cron_in_toml = False
-    try:
-        with open("railway.toml") as f:
-            cron_in_toml = "trigger_nightly_evolution.py" in f.read()
-    except FileNotFoundError:
-        pass
-    results.append(
-        (
-            "1. Scheduled Railway cron declared",
-            cron_in_toml,
-            (
-                "railway.toml [[deploy.cronJobs]] present"
-                if cron_in_toml
-                else "missing — add [[deploy.cronJobs]] to railway.toml"
-            ),
-        )
-    )
+    # Criterion 1: a scheduler that actually runs the nightly trigger exists
+    cron_declared, cron_note = nightly_cron_declared(REPO_ROOT)
+    results.append(("1. Nightly trigger scheduled", cron_declared, cron_note))
 
     # Criterion 2: run completes unattended and persists state
     status = run.get("status")

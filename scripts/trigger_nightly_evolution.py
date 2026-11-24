@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Trigger nightly evolution runs.
 
-Invoked by the Railway cron job declared in `railway.toml`. POSTs one
+Meant to run once a night, but nothing schedules it yet (AFX-138). POSTs one
 `/api/v1/evolution-runs` per configured instrument to the live API. The
 orchestrator's subprocess fork then runs the loop inside the long-running
 backend service — this script just kicks them off and exits.
