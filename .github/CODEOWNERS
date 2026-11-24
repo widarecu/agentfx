@@ -10,3 +10,25 @@
 /src/agentfx/integrations/linear_delivery.py     @widarecu
 /src/agentfx/integrations/deploy_sync.py         @widarecu
 /src/agentfx/integrations/delivery_reconcile.py  @widarecu
+
+# Money-path code (CLAUDE.md rule 3: order execution, sizing, kill switch,
+# credentials, deploy gates). Before the cutover Wilson saw these on the
+# promote PR; now his review is required on any PR that touches them,
+# whatever the ticket's Risk label (AFX-125).
+/src/agentfx/adapters/oanda.py                   @widarecu
+/src/agentfx/services/paper_runner.py            @widarecu
+/src/agentfx/services/paper_reconciler.py        @widarecu
+/src/agentfx/services/paper_sizing.py            @widarecu
+/src/agentfx/api/workers/paper_runner.py         @widarecu
+/src/agentfx/api/services/paper.py               @widarecu
+/src/agentfx/core/policy.py                      @widarecu
+/src/agentfx/core/gates.py                       @widarecu
+/src/agentfx/core/validation.py                  @widarecu
+/src/agentfx/api/core/secrets.py                 @widarecu
+/src/agentfx/api/core/security.py                @widarecu
+/src/agentfx/api/models/user_credentials.py      @widarecu
+/src/agentfx/api/routers/user_credentials.py     @widarecu
+/scripts/deploy_staging.py                       @widarecu
+/scripts/railway_deploy.py                       @widarecu
+/Dockerfile                                      @widarecu
+/railway.toml                                    @widarecu
