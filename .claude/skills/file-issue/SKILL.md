@@ -23,4 +23,4 @@ Canonical rules: `planning/runbooks/linear-operating-model.md` §6–7; delivery
    +++
    ```
 5. **Never** set priority, move the issue out of Triage, or edit the scope of an approved issue.
-6. **Don't fix it in the current PR.** A filed issue is worked only once Wilson moves it to Ready, through its own `afx start` and its own PR into `main`.
+6. **Don't fix it in the current PR.** A filed issue is worked only once Wilson moves it to Ready, through its own claim (`afx start`, or the Linear MCP claim in a session without `LINEAR_API_KEY`: see `work-issue` step 3) and its own PR into `main`.

@@ -3,9 +3,9 @@
 The canonical guide to how a change gets from a Linear ticket to staging (AFX-117, approved Option A: every merge to `main` deploys to staging). CLAUDE.md, the `.claude/skills/` files, the PE prompts and the setup runbooks summarise this file; if they disagree, this file wins and the others are a bug.
 
 ```
-Ready ──afx start──▶ In Progress ──PR opens──▶ In Review ──squash merge to main──▶ Deploy (staging) ──verified──▶ Done
-                          │                        │                                    └──failed──▶ Blocked + needs-wilson
-                          └──afx block─────────────┴──▶ Blocked + needs-wilson
+Ready ──afx start / MCP claim──▶ In Progress ──PR opens──▶ In Review ──squash merge to main──▶ Deploy (staging) ──verified──▶ Done
+                                      │                        │                                    └──failed──▶ Blocked + needs-wilson
+                                      └──afx block / MCP block─┴──▶ Blocked + needs-wilson
 ```
 
 Only `main` exists. Every merge to `main` deploys to staging (Railway backend, Vercel frontend), which runs paper trading. Nobody pushes to `main` directly; every change reaches it through a PR.
@@ -13,7 +13,9 @@ Only `main` exists. Every merge to `main` deploys to staging (Railway backend, V
 ## 1. The agent's steps (cold start)
 
 1. **Pick** a ticket in **Ready** (only Ready; highest priority first). Grep the code first: shipped work with a stale ticket is common.
-2. **Claim** it: `python3 scripts/afx.py start AFX-<n>` (needs `LINEAR_API_KEY`). It moves Ready → In Progress and refuses any other state, so a second agent can't claim the same ticket. If it refuses, stop.
+2. **Claim** it, so a second agent can't start the same ticket:
+   - **With `LINEAR_API_KEY`** (the PE, local runs): `python3 scripts/afx.py start AFX-<n>`. It moves Ready → In Progress and refuses any other state. If it refuses, stop.
+   - **Without it** (Devin sessions, through the Linear MCP): Linear MCP `get_issue`; if it isn't **Ready**, stop and report, otherwise `save_issue` with `state: "In Progress"` and `assignee: "me"`. The read is the equivalent of `afx start`'s refusal. The assignee takes the ticket out of the PE queue (it only picks unassigned Ready tickets), and the PE's claim release never undoes a claim it didn't make.
 3. **Branch** from `main`:
    ```bash
    git fetch origin main
@@ -23,7 +25,7 @@ Only `main` exists. Every merge to `main` deploys to staging (Railway backend, V
 5. **Open one PR into `main`** whose title and branch name exactly one AFX ticket: the one it closes. Add the `agent-authored` label: `gh pr edit <number> --add-label agent-authored`.
 6. **Comment on the ticket** what was tested and the CI link. Then **stop**. Merge, deploy and Done are automatic; never set In Review, Done or any later state by hand.
 
-**Blocked on a decision?** `python3 scripts/afx.py block AFX-<n> "<the question>"`. It moves the ticket to Blocked, adds `needs-wilson` and posts the question once. Then stop; don't guess.
+**Blocked on a decision?** `python3 scripts/afx.py block AFX-<n> "<the question>"`. It moves the ticket to Blocked, adds `needs-wilson` and posts the question once. Without `LINEAR_API_KEY`, do the same through the Linear MCP: `save_issue` with `state: "Blocked"` and `addLabels: ["needs-wilson"]`, then one `save_comment` with the question. `addLabels` keeps the ticket's other labels (`labels` would replace them all). Then stop; don't guess.
 
 ## 2. Who owns each status
 
@@ -31,9 +33,9 @@ Only `main` exists. Every merge to `main` deploys to staging (Railway backend, V
 |---|---|---|
 | Triage | Anyone | New issues are filed here (skill `file-issue`) |
 | Backlog, Ready, Canceled | Wilson | By hand |
-| In Progress | `afx start AFX-n` | An agent or the PE claims a Ready ticket |
+| In Progress | `afx start AFX-n`, or the Linear MCP claim (Devin sessions) | An agent or the PE claims a Ready ticket |
 | In Review | Linear GitHub integration | A PR naming the ticket opens |
-| Blocked + `needs-wilson` | `afx block`, or deploy sync after a failed staging deploy | Waiting on Wilson |
+| Blocked + `needs-wilson` | `afx block` or the Linear MCP block, or deploy sync after a failed staging deploy | Waiting on Wilson |
 | Done | Deploy sync only | The change is verified running on staging, not just merged |
 
 **In Staging** and **Needs Input** were retired at the AFX-125 cutover and are archived by Wilson ([cutover checklist](delivery-cutover-checklist.md) step 3). They are no longer in `config/linear/workspace.yaml`. Never move a ticket into either.
@@ -77,7 +79,7 @@ Railway's service settings for the backend (Dockerfile builder, `/health` check,
 - **Failed deploy:** each ticket → **Blocked** + `needs-wilson`, with the run link. The range isn't consumed: the next successful deploy covers it again and moves those tickets to Done.
 - Deploy sync writes only when the repo variable `AFX_DEPLOY_SYNC_MODE` is `apply`; otherwise it only logs what it would do.
 
-**Failed because of the change itself:** a re-run fails the same way, so the ticket needs a fix PR. Wilson removes `needs-wilson` and moves it from Blocked to Ready, which makes it an ordinary Ready ticket: agents and the PE leave `needs-wilson` tickets alone, so the label has to go for anyone to pick it up. An agent claims it with `afx start` (Ready → In Progress) and opens a fix PR that names the same ticket. When that fix's deploy is verified, deploy sync covers the failed commit and the fix together and moves the ticket to Done.
+**Failed because of the change itself:** a re-run fails the same way, so the ticket needs a fix PR. Wilson removes `needs-wilson` and moves it from Blocked to Ready, which makes it an ordinary Ready ticket: agents and the PE leave `needs-wilson` tickets alone, so the label has to go for anyone to pick it up. An agent claims it with `afx start` or the Linear MCP claim (Ready → In Progress) and opens a fix PR that names the same ticket. When that fix's deploy is verified, deploy sync covers the failed commit and the fix together and moves the ticket to Done.
 
 **Retries:** re-run the failed Deploy jobs, or run "Deploy" by hand (`workflow_dispatch`) with the commit's `sha`. Never fix ticket states by hand. A sync that was missed after a deploy is replayed with `python3 scripts/afx.py deploy-sync recover --mode apply` (it needs the `deploy-sync/baseline/<sha>` record the deploy wrote).
 

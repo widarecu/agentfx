@@ -119,6 +119,53 @@ def test_workflow_docs_teach_the_canonical_commands(rel: str) -> None:
     assert "into `main`" in text, rel
 
 
+# Docs that teach how a Devin session (no LINEAR_API_KEY) claims or blocks a
+# ticket through the Linear MCP (AFX-142).
+_MCP_PATH_DOCS = _WORKFLOW_DOCS + ["planning/runbooks/cloud-agent-setup.md"]
+
+
+@pytest.mark.parametrize("rel", _MCP_PATH_DOCS)
+def test_docs_teach_the_mcp_claim_for_devin_sessions(rel: str) -> None:
+    text = _read(rel)
+    assert "LINEAR_API_KEY" in text, rel
+    assert "get_issue" in text, rel
+    assert 'save_issue` with `state: "In Progress"` and `assignee: "me"`' in text, rel
+
+
+@pytest.mark.parametrize("rel", _MCP_PATH_DOCS)
+def test_docs_teach_the_mcp_block_for_devin_sessions(rel: str) -> None:
+    text = _read(rel)
+    assert 'save_issue` with `state: "Blocked"` and `addLabels: ["needs-wilson"]`' in (
+        text
+    ), rel
+    assert "one `save_comment`" in text, rel
+
+
+def test_file_issue_names_both_claim_paths() -> None:
+    text = _read(".claude/skills/file-issue/SKILL.md")
+    assert "afx start" in text
+    assert "Linear MCP claim" in text
+
+
+def test_canonical_owner_table_names_both_claim_paths() -> None:
+    text = _read(_CANONICAL)
+    table = text[text.index("## 2. Who owns") : text.index("## 3.")]
+    in_progress = next(line for line in table.splitlines() if "| In Progress" in line)
+    blocked = next(line for line in table.splitlines() if "| Blocked" in line)
+    assert "afx start" in in_progress and "Linear MCP" in in_progress
+    assert "afx block" in blocked and "Linear MCP" in blocked
+
+
+@pytest.mark.parametrize(
+    ("state", "command"), [("In Progress", "afx start"), ("Blocked", "afx block")]
+)
+def test_workspace_state_owner_names_the_mcp_path(state: str, command: str) -> None:
+    workspace = yaml.safe_load(_read("config/linear/workspace.yaml"))
+    spec = next(s for s in workspace["states"] if s["name"] == state)
+    assert command in spec["description"]
+    assert "Linear MCP" in spec["description"]
+
+
 @pytest.mark.parametrize("rel", [".claude/skills/work-issue/SKILL.md", _CANONICAL])
 def test_branch_off_main(rel: str) -> None:
     text = _read(rel)

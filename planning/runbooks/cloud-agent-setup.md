@@ -60,7 +60,7 @@ make docker-down PROFILE=test
 
 Pick a small Ready issue and follow [delivery-pipeline.md](delivery-pipeline.md) §1 end to end:
 
-1. `python3 scripts/afx.py start AFX-N` moves it Ready → In Progress.
+1. `python3 scripts/afx.py start AFX-N` moves it Ready → In Progress. A session without `LINEAR_API_KEY` (Devin) claims through the Linear MCP instead: `get_issue`; if it isn't **Ready**, stop and report, otherwise `save_issue` with `state: "In Progress"` and `assignee: "me"`. To block without the key: `save_issue` with `state: "Blocked"` and `addLabels: ["needs-wilson"]`, then one `save_comment` with the question.
 2. Branch `agent/AFX-N-slug` off `main`, implement, run `make lint` and `make test-unit`.
 3. Open a PR into `main` with `AFX-N` in the title and label it `agent-authored` → Linear moves it to **In Review**.
 4. `pr-policy` passes once `CI required` is green (Money-path: once Wilson approves the latest commit) and squash-merges it.

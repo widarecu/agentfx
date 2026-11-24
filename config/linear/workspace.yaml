@@ -37,13 +37,13 @@ states:
     description: "Owner: Wilson. Approved and prioritised. The ONLY state agents may pick work from."
   - name: In Progress
     type: started
-    description: "Owner: `afx start AFX-n`. An agent is working on it on branch agent/AFX-<n>-<slug>."
+    description: "Owner: `afx start AFX-n`, or the Linear MCP claim (Ready check, then In Progress + assignee) from a Devin session. An agent is working on it on branch agent/AFX-<n>-<slug>."
   - name: In Review
     type: started
     description: "Owner: Linear GitHub integration, when the PR opens. CI and review in progress."
   - name: Blocked
     type: started
-    description: "Owner: `afx block AFX-n` or a failed staging deploy (with needs-wilson). Waiting on Wilson."
+    description: "Owner: `afx block AFX-n`, the Linear MCP block (Blocked + needs-wilson + the question once), or a failed staging deploy (with needs-wilson). Waiting on Wilson."
   - name: Done
     type: completed
     description: "Owner: deploy sync. Verified running on staging (paper), not just merged."
