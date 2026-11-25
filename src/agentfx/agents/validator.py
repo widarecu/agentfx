@@ -15,13 +15,20 @@ generation loop completes. The validator:
    hit rate, CAGR — and sums ``n_trades`` across them. Robust to one
    inverted regime slice that would have failed a single-OOS-fold design.
 4. Applies Gate B (see `core/gates.evaluate_gate_b`) to the aggregated
-   metrics. The genome passes iff Gate B passes on the median.
+   metrics, and requires **every** OOS fold to be net profitable after
+   costs (CAGR > 0) and within the Gate B drawdown cap. The genome passes
+   iff both hold. Per-fold Sharpe, hit rate and trade count are not
+   checked: one short fold is too noisy to judge on them.
 
 Why median and not mean: the analysis on 2026-06-07 showed the single-OOS
 design routinely surfaced training-fold Sharpes of +1.5 to +3 and OOS
 Sharpes of −1 to −2 on the same Apr-Jul 2024 EUR_USD slice — a regime
 shift, not GA overfit. Median across 5 sliding OOS slices is robust to one
 inverted regime; one terrible fold can't poison the verdict.
+
+Why the per-fold floor (AFX-49): the median alone passed genomes that lost
+money or breached the drawdown cap on most OOS folds, as long as the
+middle values looked fine.
 
 Backwards compatibility: callers that pass ``k=K`` (legacy K=4 design)
 get a single OOS fold (``n_train_folds=K-1, n_oos_folds=1``) — median of
@@ -41,7 +48,7 @@ from typing import Any, Protocol
 
 from agentfx.agents.base import AgentResult, BaseAgent
 from agentfx.core.dsl import StrategySpec
-from agentfx.core.gates import evaluate_gate_b
+from agentfx.core.gates import GATE_B_THRESHOLDS, evaluate_gate_b
 from agentfx.core.regime import RegimeTag
 from agentfx.core.validation import (
     WalkForwardFold,
@@ -102,7 +109,8 @@ class ValidationResult:
 
     ``validator_passed`` is the Gate B verdict on the *aggregated* OOS
     metrics (median across OOS folds for Sharpe/MDD/hit-rate/CAGR; sum for
-    trade count). ``oos_aggregate_metrics`` exposes those aggregates so
+    trade count), AND'd with the per-fold floor: every OOS fold net
+    profitable and within the drawdown cap. ``oos_aggregate_metrics`` exposes those aggregates so
     the UI can show "Median OOS Sharpe" without recomputing.
 
     For backward compatibility with the v0.3.0-era K=4 design,
@@ -195,6 +203,37 @@ def _aggregate_oos_metrics(
     aggregate["n_trades"] = n_trades_total
 
     return aggregate
+
+
+def _oos_fold_floor_failures(
+    oos_folds: list[FoldEvaluation],
+    overrides: dict[str, float] | None = None,
+) -> list[str]:
+    """Failures for OOS folds that lose money or breach the drawdown cap.
+
+    CAGR is net of spread, slippage and swap, so ``cagr > 0`` means the
+    fold made money after costs. A missing metric fails, as in Gate B.
+    """
+    cap = {**GATE_B_THRESHOLDS, **(overrides or {})}["max_drawdown"]
+    failures: list[str] = []
+    for n, fe in enumerate(oos_folds, start=1):
+        label = f"OOS fold {n}/{len(oos_folds)}"
+        cagr = _as_float(fe.metrics.get("cagr"), default=-1.0)
+        if cagr <= 0:
+            failures.append(f"{label}: CAGR {cagr * 100:+.1f}% is not profitable")
+        max_dd = abs(_as_float(fe.metrics.get("max_drawdown"), default=1.0))
+        if max_dd > cap:
+            failures.append(
+                f"{label}: Max DD {max_dd * 100:.1f}% > cap {cap * 100:.0f}%"
+            )
+    return failures
+
+
+def _as_float(value: Any, *, default: float) -> float:
+    try:
+        return default if value is None else float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 class ValidatorAgent(BaseAgent):
@@ -374,12 +413,13 @@ class ValidatorAgent(BaseAgent):
         agg_passed, agg_failures = evaluate_gate_b(
             aggregate, overrides=gate_b_overrides
         )
+        fold_failures = _oos_fold_floor_failures(oos_folds, gate_b_overrides)
 
         return ValidationResult(
             spec=spec,
             folds=fold_evaluations,
-            validator_passed=agg_passed,
-            validation_failures=agg_failures,
+            validator_passed=agg_passed and not fold_failures,
+            validation_failures=agg_failures + fold_failures,
             oos_aggregate_metrics=aggregate,
         )
 
