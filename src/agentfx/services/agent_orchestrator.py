@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -118,6 +120,27 @@ def should_alert_monthly_overspend(db: Session, *, today: date | None = None) ->
 # ─────────────────────────────────────────────────────────────────────
 
 
+_fleet_executor: ThreadPoolExecutor | None = None
+
+
+async def _run_fleet_tick(tick: Callable[[], None]) -> None:
+    assert _fleet_executor is not None
+    await asyncio.get_running_loop().run_in_executor(_fleet_executor, tick)
+
+
+def _pm_daily_tick() -> None:
+    from agentfx.agents.fleet.portfolio_manager import run_morning_brief_if_due
+
+    with SessionLocal() as db:
+        if not is_within_daily_budget(db):
+            logger.warning(
+                "agent_orchestrator: PM run skipped — daily budget exceeded for %s",
+                datetime.now(UTC).date(),
+            )
+        else:
+            run_morning_brief_if_due(db=db)
+
+
 async def _pm_daily_loop() -> None:
     """Fire the Portfolio Manager daily brief once per 24 hours.
 
@@ -130,20 +153,10 @@ async def _pm_daily_loop() -> None:
     full fleet surface loaded (useful for the no-op `register`
     path when `AGENT_FLEET_ENABLED=False`).
     """
-    from agentfx.agents.fleet.portfolio_manager import run_morning_brief_if_due
-
     logger.info("agent_orchestrator: PM daily loop armed")
     while True:
         try:
-            with SessionLocal() as db:
-                if not is_within_daily_budget(db):
-                    logger.warning(
-                        "agent_orchestrator: PM run skipped — daily budget "
-                        "exceeded for %s",
-                        datetime.now(UTC).date(),
-                    )
-                else:
-                    run_morning_brief_if_due(db=db)
+            await _run_fleet_tick(_pm_daily_tick)
         except Exception:  # noqa: BLE001 — the orchestrator must never crash
             logger.exception("agent_orchestrator: PM loop iteration failed")
 
@@ -162,32 +175,32 @@ async def _pm_daily_loop() -> None:
 _EVOLUTION_FILLER_SECONDS = 60 * 60 * 2
 
 
+def _evolution_filler_tick() -> None:
+    from agentfx.agents.fleet.portfolio_manager import run_evolution_filler
+
+    with SessionLocal() as db:
+        if not is_within_daily_budget(db):
+            logger.warning(
+                "agent_orchestrator: filler skipped — daily budget exceeded for %s",
+                datetime.now(UTC).date(),
+            )
+        else:
+            fired = run_evolution_filler(db=db)
+            if fired:
+                logger.info("agent_orchestrator: filler fired %d evolution(s)", fired)
+
+
 async def _evolution_filler_loop() -> None:
     """Top-up filler for the daily evolution budget. Runs every
     _EVOLUTION_FILLER_SECONDS between morning briefs. Never raises.
     """
-    from agentfx.agents.fleet.portfolio_manager import run_evolution_filler
-
     logger.info(
         "agent_orchestrator: evolution filler loop armed (cadence=%ds)",
         _EVOLUTION_FILLER_SECONDS,
     )
     while True:
         try:
-            with SessionLocal() as db:
-                if not is_within_daily_budget(db):
-                    logger.warning(
-                        "agent_orchestrator: filler skipped — daily budget "
-                        "exceeded for %s",
-                        datetime.now(UTC).date(),
-                    )
-                else:
-                    fired = run_evolution_filler(db=db)
-                    if fired:
-                        logger.info(
-                            "agent_orchestrator: filler fired %d evolution(s)",
-                            fired,
-                        )
+            await _run_fleet_tick(_evolution_filler_tick)
         except Exception:
             logger.exception("agent_orchestrator: filler loop iteration failed")
         await asyncio.sleep(_EVOLUTION_FILLER_SECONDS)
@@ -210,12 +223,26 @@ _PE_SCAN_SECONDS = 60 * 15
 _PE_WORKSPACE_POLL_SECONDS = 60 * 10
 
 
+def _pe_workspace_poll_tick() -> None:
+    from agentfx.agents.fleet.pe_workspace import poll_running_dispatches
+
+    with SessionLocal() as db:
+        counts = poll_running_dispatches(db)
+        if counts.get("checked"):
+            logger.info(
+                "agent_orchestrator: PE workspace poll "
+                "checked=%d pr_open=%d tests_failed=%d failed=%d",
+                counts.get("checked", 0),
+                counts.get("pr_open", 0),
+                counts.get("tests_failed", 0),
+                counts.get("failed", 0),
+            )
+
+
 async def _pe_workspace_poll_loop() -> None:
     """Poll running Managed Agents workspace sessions; transition
     terminated ones to PR_OPEN / TESTS_FAILED / WORKSPACE_FAILED.
     Only runs when the workspace flag is on. Never raises."""
-    from agentfx.agents.fleet.pe_workspace import poll_running_dispatches
-
     enabled = bool(getattr(settings, "AGENT_PE_WORKSPACE_ENABLED", False))
     logger.info(
         "agent_orchestrator: PE workspace poll loop armed (cadence=%ds, enabled=%s)",
@@ -225,20 +252,28 @@ async def _pe_workspace_poll_loop() -> None:
     while True:
         try:
             if getattr(settings, "AGENT_PE_WORKSPACE_ENABLED", False):
-                with SessionLocal() as db:
-                    counts = poll_running_dispatches(db)
-                    if counts.get("checked"):
-                        logger.info(
-                            "agent_orchestrator: PE workspace poll "
-                            "checked=%d pr_open=%d tests_failed=%d failed=%d",
-                            counts.get("checked", 0),
-                            counts.get("pr_open", 0),
-                            counts.get("tests_failed", 0),
-                            counts.get("failed", 0),
-                        )
+                await _run_fleet_tick(_pe_workspace_poll_tick)
         except Exception:
             logger.exception("agent_orchestrator: PE workspace poll iteration failed")
         await asyncio.sleep(_PE_WORKSPACE_POLL_SECONDS)
+
+
+def _pe_scan_tick() -> None:
+    from agentfx.agents.fleet.platform_engineer import scan_and_dispatch
+
+    with SessionLocal() as db:
+        if not is_within_daily_budget(db):
+            logger.warning(
+                "agent_orchestrator: PE scan skipped — daily budget exceeded for %s",
+                datetime.now(UTC).date(),
+            )
+        else:
+            _, attempted = scan_and_dispatch(db=db)
+            if attempted:
+                logger.info(
+                    "agent_orchestrator: PE attempted %d workspace dispatch(es)",
+                    attempted,
+                )
 
 
 async def _pe_scan_loop() -> None:
@@ -256,8 +291,6 @@ async def _pe_scan_loop() -> None:
     but never dispatches), so this loop is safe to run with the
     flag off.
     """
-    from agentfx.agents.fleet.platform_engineer import scan_and_dispatch
-
     logger.info(
         "agent_orchestrator: PE scan loop armed (cadence=%ds, workspace=%s)",
         _PE_SCAN_SECONDS,
@@ -265,21 +298,7 @@ async def _pe_scan_loop() -> None:
     )
     while True:
         try:
-            with SessionLocal() as db:
-                if not is_within_daily_budget(db):
-                    logger.warning(
-                        "agent_orchestrator: PE scan skipped — daily "
-                        "budget exceeded for %s",
-                        datetime.now(UTC).date(),
-                    )
-                else:
-                    _, attempted = scan_and_dispatch(db=db)
-                    if attempted:
-                        logger.info(
-                            "agent_orchestrator: PE attempted %d workspace "
-                            "dispatch(es)",
-                            attempted,
-                        )
+            await _run_fleet_tick(_pe_scan_tick)
         except Exception:
             logger.exception("agent_orchestrator: PE scan iteration failed")
 
@@ -294,6 +313,30 @@ async def _pe_scan_loop() -> None:
 _QA_SCAN_SECONDS = 60 * 30
 
 
+def _qa_scan_tick() -> None:
+    from agentfx.agents.fleet.quant_analyst import (
+        scan_and_run_reports,
+        scan_for_technical_anomalies,
+    )
+
+    with SessionLocal() as db:
+        if not is_within_daily_budget(db):
+            logger.warning(
+                "agent_orchestrator: QA scan skipped — daily budget exceeded for %s",
+                datetime.now(UTC).date(),
+            )
+        else:
+            produced = scan_and_run_reports(db=db)
+            if produced:
+                logger.info(
+                    "agent_orchestrator: QA produced %d divergence report(s)", produced
+                )
+            # Tech-health scan is idempotent per day; this
+            # call is a no-op once the day's report exists.
+            if scan_for_technical_anomalies(db=db):
+                logger.info("agent_orchestrator: QA produced tech-health report")
+
+
 async def _qa_scan_loop() -> None:
     """Scan paper runs for QA divergence reports every 30 minutes,
     AND fire the daily technical-health scan once per day.
@@ -306,36 +349,12 @@ async def _qa_scan_loop() -> None:
     at most once per calendar day; it analyses the backend's
     WARNING+ log buffer for anomalies the UI doesn't surface.
     """
-    from agentfx.agents.fleet.quant_analyst import (
-        scan_and_run_reports,
-        scan_for_technical_anomalies,
-    )
-
     logger.info(
         "agent_orchestrator: QA scan loop armed (cadence=%ds)", _QA_SCAN_SECONDS
     )
     while True:
         try:
-            with SessionLocal() as db:
-                if not is_within_daily_budget(db):
-                    logger.warning(
-                        "agent_orchestrator: QA scan skipped — daily budget "
-                        "exceeded for %s",
-                        datetime.now(UTC).date(),
-                    )
-                else:
-                    produced = scan_and_run_reports(db=db)
-                    if produced:
-                        logger.info(
-                            "agent_orchestrator: QA produced %d divergence report(s)",
-                            produced,
-                        )
-                    # Tech-health scan is idempotent per day; this
-                    # call is a no-op once the day's report exists.
-                    if scan_for_technical_anomalies(db=db):
-                        logger.info(
-                            "agent_orchestrator: QA produced tech-health report"
-                        )
+            await _run_fleet_tick(_qa_scan_tick)
         except Exception:
             logger.exception("agent_orchestrator: QA scan iteration failed")
 
@@ -356,7 +375,7 @@ def register_lifespan_tasks() -> list[asyncio.Task[Any]]:
     no-op and returns an empty list (NOT raise — the import must
     stay cheap for every environment, especially tests).
     """
-    global _active_tasks
+    global _active_tasks, _fleet_executor
     if not settings.AGENT_FLEET_ENABLED:
         logger.info("agent_orchestrator: AGENT_FLEET_ENABLED=False — fleet is off")
         return []
@@ -375,6 +394,8 @@ def register_lifespan_tasks() -> list[asyncio.Task[Any]]:
     get_global_buffer().attach_global_handler()
     logger.info("agent_orchestrator: log capture buffer attached")
 
+    # Keep ticks serialized so budget checks and dispatches cannot overlap.
+    _fleet_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fleet")
     _active_tasks = [
         asyncio.create_task(_pm_daily_loop(), name="fleet_pm_daily"),
         asyncio.create_task(_evolution_filler_loop(), name="fleet_evolution_filler"),
@@ -386,9 +407,13 @@ def register_lifespan_tasks() -> list[asyncio.Task[Any]]:
 
 
 async def shutdown_lifespan_tasks() -> None:
-    """Cancel + await every task spawned by `register_lifespan_tasks`."""
+    """Stop fleet scheduling and wait for any in-flight tick to finish."""
+    global _fleet_executor
     for task in _active_tasks:
         task.cancel()
+    executor = _fleet_executor
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
     for task in _active_tasks:
         try:
             await task
@@ -399,6 +424,9 @@ async def shutdown_lifespan_tasks() -> None:
                 "agent_orchestrator: task %s raised on shutdown", task.get_name()
             )
     _active_tasks.clear()
+    if executor is not None:
+        await asyncio.to_thread(executor.shutdown)
+        _fleet_executor = None
 
 
 __all__ = [
