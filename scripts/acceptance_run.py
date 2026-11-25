@@ -215,24 +215,8 @@ def evaluate_criteria(
     """Return a list of (criterion_label, passed, note) tuples."""
     results = []
 
-    # Criterion 1: cron declaration exists (verified by file presence)
-    cron_in_toml = False
-    try:
-        with open("railway.toml") as f:
-            cron_in_toml = "trigger_nightly_evolution.py" in f.read()
-    except FileNotFoundError:
-        pass
-    results.append(
-        (
-            "1. Scheduled Railway cron declared",
-            cron_in_toml,
-            (
-                "railway.toml [[deploy.cronJobs]] present"
-                if cron_in_toml
-                else "missing — add [[deploy.cronJobs]] to railway.toml"
-            ),
-        )
-    )
+    # Criterion 1 (a nightly Railway cron) was dropped with AFX-138: the PM
+    # fleet's morning brief and evolution filler start runs instead.
 
     # Criterion 2: run completes unattended and persists state
     status = run.get("status")

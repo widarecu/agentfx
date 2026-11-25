@@ -84,7 +84,6 @@ BACKEND_PATHS = (
     "migrations/",
     "config/",
     "scripts/seed_instruments.py",
-    "scripts/trigger_nightly_evolution.py",
 )
 FRONTEND_PATHS = ("portal/web/",)
 
