@@ -2726,6 +2726,19 @@ def _close_position_and_persist(
             "closed_trade_count": len(open_trades),
         },
     )
+    # Realize the closed position's net P&L into run.current_balance before
+    # snapshotting flat equity (unrealized_pnl=0). Otherwise a profitable
+    # close records a spurious dip back to the pre-close balance until the
+    # next OANDA balance poll, which creates a false drawdown.
+    net_realized = total_pnl + total_fin - total_com
+    base_balance = float(
+        getattr(run, "current_balance", None)
+        or getattr(run, "snapshot_balance", None)
+        or 0.0
+    )
+    if base_balance > 0.0 and net_realized != 0.0:
+        run.current_balance = base_balance + net_realized
+        db.commit()
     # Position is now flat — snapshot equity without unrealized_pnl.
     _persist_equity_snapshot(db=db, run=run, position=None, now_utc=now_utc)
     return result

@@ -253,6 +253,69 @@ class TestServiceEvaluationAndLiveEligibility:
         # drawdown breaches never roll off the evaluation window.
         db.query(models.PaperEquitySnapshot).limit.assert_not_called()
 
+    def test_profitable_close_updates_balance_before_flat_equity_snapshot(self) -> None:
+        from agentfx.services.paper_runner import _close_position_and_persist
+
+        run = SimpleNamespace(
+            id="run_close_profit",
+            current_balance=10_000.0,
+            snapshot_balance=10_000.0,
+        )
+        open_trade = SimpleNamespace(
+            side="buy",
+            entry_price=1.1000,
+            quantity=10_000,
+            exit_price=None,
+            exit_timestamp=None,
+            exit_reason=None,
+            pnl=None,
+            pnl_pct=None,
+            financing=0.0,
+            commission=0.0,
+            broker_close_transaction_id=None,
+        )
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = [open_trade]
+        client = MagicMock()
+        client.close_all_positions.return_value = {
+            "long_realized_pnl": 1_500.0,
+            "short_realized_pnl": 0.0,
+            "long_financing": 10.0,
+            "short_financing": 0.0,
+            "long_commission": 5.0,
+            "short_commission": 0.0,
+            "long_fill_price": 1.1150,
+            "long_fill_transaction_id": "999",
+        }
+        captured: list[models.PaperEquitySnapshot] = []
+
+        def _capture_add(obj):
+            if isinstance(obj, models.PaperEquitySnapshot):
+                captured.append(obj)
+
+        db.add.side_effect = _capture_add
+
+        with patch("agentfx.services.paper_runner._write_decision"):
+            _close_position_and_persist(
+                db=db,
+                run=run,
+                client=client,
+                instrument="EUR_USD",
+                now_utc=datetime(2026, 10, 2, 12, 0, tzinfo=UTC),
+                reason="signal_exit",
+            )
+
+        assert len(captured) == 1
+        post_close = captured[0]
+        assert post_close.balance == pytest.approx(11_505.0)
+        assert post_close.unrealized_pnl == 0.0
+
+        # Pre-close peak (10,000 + 1,505 unrealized) followed by post-close
+        # flat snapshot (11,505 + 0) must produce 0% drawdown, not a false dip.
+        pre_close = SimpleNamespace(balance=10_000.0, unrealized_pnl=1_505.0)
+        mdd = paper_service._compute_equity_snapshot_drawdown([pre_close, post_close])
+        assert mdd == pytest.approx(0.0)
+
 
 class TestRouterForwardTestEndpoints:
     def test_get_forward_test_returns_progress(self) -> None:
