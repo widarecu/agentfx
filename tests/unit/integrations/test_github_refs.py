@@ -110,6 +110,24 @@ def test_failed_read_cannot_cause_an_unchecked_write(gh):
     assert gh.delays == [1, 2, 4]
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "stream error: stream ID 1; INTERNAL_ERROR; received from peer",
+        "http2: client connection lost",
+        "http2: server sent GOAWAY and closed the connection",
+    ],
+)
+def test_http2_disconnect_checks_if_the_patch_already_landed(gh, failure):
+    gh.responses.extend(
+        [(1, "", f'Patch "https://api.github.com/": {failure}'), ref_at(TARGET)]
+    )
+
+    gr.RefWriter("o/r", gh.run).put(REF, TARGET, expected=OLD)
+
+    assert gh.methods == ["PATCH", "GET"]
+
+
 @pytest.mark.parametrize("last_sha", [OLD, TARGET])
 def test_persistent_write_errors_are_bounded_and_the_last_write_is_checked(
     gh, last_sha

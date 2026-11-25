@@ -14,7 +14,8 @@ _RETRY_DELAYS = (1, 2, 4)
 _HTTP_STATUS = re.compile(r"\bHTTP (\d{3})\b")
 _TRANSPORT_ERROR = re.compile(
     r"unexpected end of json input|\beof\b|connection (?:reset|refused)|"
-    r"broken pipe|timeout|timed out|temporary failure in name resolution",
+    r"broken pipe|timeout|timed out|temporary failure in name resolution|"
+    r"stream error: stream id \d+;|http2: (?:client connection lost|server sent goaway)",
     re.IGNORECASE,
 )
 
