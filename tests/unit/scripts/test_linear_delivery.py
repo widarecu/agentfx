@@ -149,6 +149,20 @@ class TestStart:
         assert again.ok is False
         assert len(fake.issues["AFX-1"].comments) == 1
 
+    def test_failed_claim_comment_still_lets_the_winner_start(
+        self, fake, client, monkeypatch
+    ):
+        fake.add("AFX-1", "Ready")
+
+        def _down(*a, **k):
+            raise ld.LinearError("linear 500")
+
+        monkeypatch.setattr(client, "comment_once", _down)
+        result = _start(client, "AFX-1")
+        assert result.ok is True
+        assert "claim comment not posted" in result.reason
+        assert fake.issues["AFX-1"].state == "In Progress"
+
     def test_late_loser_leaves_a_blocked_ticket_alone(self, fake, client):
         """The winner claimed and blocked before the loser's create came back."""
         issue = fake.add("AFX-1", "Ready")

@@ -402,13 +402,20 @@ def start(
         return refuse(f"{issue.identifier} is already claimed by {who}")
     _move(client, issue, IN_PROGRESS)
     body = f"**Claimed by {taker.name}**" + (f": {taker.link}" if taker.link else "")
-    client.comment_once(issue.id, f"{claim_marker(tag)}\n{body}", claim_marker(tag))
+    note = ""
+    try:
+        client.comment_once(issue.id, f"{claim_marker(tag)}\n{body}", claim_marker(tag))
+    except LinearError as exc:
+        # The claim is won and the ticket is In Progress: the taker must
+        # still start, or the ticket sits In Progress with nobody on it.
+        note = f"claim comment not posted: {exc}"
     return TransitionResult(
         ok=True,
         changed=True,
         identifier=issue.identifier,
         from_state=READY,
         to_state=IN_PROGRESS,
+        reason=note,
     )
 
 

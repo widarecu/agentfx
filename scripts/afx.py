@@ -281,6 +281,8 @@ def _report(command: str, result: linear_delivery.TransitionResult) -> int:
         print(f"{result.identifier}: {result.from_state} -> {result.to_state}")
     else:
         print(f"{result.identifier}: already {result.to_state}; nothing to do")
+    if result.reason:
+        print(f"afx {command}: warning: {result.reason}", file=sys.stderr)
     return EXIT_OK
 
 
