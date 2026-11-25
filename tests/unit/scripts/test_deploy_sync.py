@@ -63,8 +63,9 @@ class FakeGitHub:
         self.tags[name] = sha
         self.created.append((name, sha))
 
-    def delete_tag_ref(self, name):
+    def delete_tag_ref(self, name, sha):
         self._check()
+        assert self.tags[name] == sha
         self.tags.pop(name, None)
         self.deleted.append(name)
 

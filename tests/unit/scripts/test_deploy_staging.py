@@ -167,6 +167,7 @@ def _outputs(path: Path) -> dict[str, str]:
         (".github/workflows/deploy.yml", {"backend", "frontend"}),
         ("scripts/deploy_staging.py", {"backend", "frontend"}),
         ("scripts/railway_deploy.py", {"backend", "frontend"}),
+        ("src/agentfx/integrations/github_refs.py", {"backend", "frontend"}),
     ],
 )
 def test_components_for(path, expected):
@@ -611,6 +612,46 @@ def test_record_updates_an_existing_previous_tag(repo):
         f"repos/o/r/git/refs/tags/{ds.PREVIOUS_TAG}",
         ["-f", f"sha={mid}", "-F", "force=true"],
     )
+
+
+@pytest.mark.parametrize("already_applied", [False, True])
+def test_record_recovers_transient_staging_tag_write(
+    repo, monkeypatch, already_applied
+):
+    target = repo.commit({"src/agentfx/api/main.py": "app = 2\n"})
+    repo.tag(repo.initial)
+    gh = FakeGh()
+    staging_writes = 0
+    delays = []
+    monkeypatch.setattr(ds.time, "sleep", delays.append)
+
+    def run(cmd):
+        nonlocal staging_writes
+        result = gh(cmd)
+        if cmd[3] == "PATCH" and cmd[4] == f"repos/o/r/git/refs/tags/{ds.TAG}":
+            staging_writes += 1
+            if staging_writes == 1:
+                if already_applied:
+                    repo.tag(target)
+                return subprocess.CompletedProcess(
+                    cmd, 1, "", "unexpected end of JSON input"
+                )
+            repo.tag(target)
+        if cmd[3] == "GET":
+            return subprocess.CompletedProcess(
+                cmd, 0, json.dumps({"object": {"sha": repo.g.resolve(ds.TAG)}}), ""
+            )
+        return result
+
+    result = ds.record(repo.g, target, repo.initial, None, repo="o/r", runner=run)
+
+    assert result.recorded and result.previous_sha == repo.initial
+    assert repo.g.resolve(ds.TAG) == target
+    methods = ["POST", "PATCH", "GET"]
+    assert [call[3] for call in gh.calls] == methods + (
+        [] if already_applied else ["PATCH"]
+    )
+    assert delays == [1]
 
 
 def test_record_is_a_noop_when_already_recorded(repo):
