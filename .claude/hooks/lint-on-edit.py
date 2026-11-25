@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: run ruff on a Python file Claude just edited.
+"""PostToolUse hook: format and lint a Python file Claude just edited.
 
 Exit code 2 feeds the findings back to Claude so it fixes them before
 moving on. Does nothing for non-Python files, files outside the repo,
@@ -27,17 +27,18 @@ def main() -> int:
     if not os.path.realpath(path).startswith(os.path.realpath(root) + os.sep):
         return 0
 
-    result = subprocess.run(
-        [ruff, "check", "--quiet", path],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        cwd=root,
-    )
-    if result.returncode != 0:
-        print(f"ruff found problems in {path}:", file=sys.stderr)
-        print(result.stdout or result.stderr, file=sys.stderr)
-        return 2
+    for subcommand in ("format", "check"):
+        result = subprocess.run(
+            [ruff, subcommand, "--quiet", "--", path],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=root,
+        )
+        if result.returncode != 0:
+            print(f"ruff {subcommand} found problems in {path}:", file=sys.stderr)
+            print(result.stdout or result.stderr, file=sys.stderr)
+            return 2
     return 0
 
 
