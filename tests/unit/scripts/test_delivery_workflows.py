@@ -271,6 +271,7 @@ class TestPrPolicyWorkflow:
             "/scripts/pr_policy.py",
             "/scripts/afx.py",
             "/src/agentfx/integrations/linear_delivery.py",
+            "/src/agentfx/integrations/claim_store.py",
             "/src/agentfx/integrations/deploy_sync.py",
             "/src/agentfx/integrations/delivery_reconcile.py",
         ):

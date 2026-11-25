@@ -48,6 +48,7 @@ import requests
 
 from agentfx.api.core.config import settings
 from agentfx.integrations import linear_delivery
+from agentfx.integrations.claim_store import GitHubClaims, Taker
 from agentfx.integrations.linear_client import _build_client, _gql
 
 logger = logging.getLogger(__name__)
@@ -125,7 +126,10 @@ def list_ready_dispatch_candidates(limit: int) -> list[ReadyIssue]:
         left alone unless Wilson adds the label himself)
       - label `needs-wilson` absent (any issue blocked on Wilson
         stays off the PE queue until he removes the label)
-      - assignee is null (if Wilson assigns himself, PE skips)
+
+    Assignee is not a filter (AFX-142): Wilson stays the accountable
+    assignee on Ready work, and the shared claim in
+    `transition_to_in_progress` is what keeps a second taker off it.
 
     Never raises; on Linear failure returns [].
     """
@@ -159,8 +163,7 @@ def list_ready_dispatch_candidates(limit: int) -> list[ReadyIssue]:
             filter: {
               team: { key: { eq: $teamKey } },
               state: { id: { eq: $stateId } },
-              labels: { id: { eq: $agentFiledLabelId } },
-              assignee: { null: true }
+              labels: { id: { eq: $agentFiledLabelId } }
             }
           ) {
             nodes {
@@ -297,11 +300,15 @@ def _delivery_client() -> linear_delivery.LinearClient:
     return linear_delivery.LinearClient(settings.LINEAR_API_KEY)
 
 
-def transition_to_in_progress(issue_id: str) -> bool:
-    """Claim a Ready issue (Ready -> In Progress) through the shared
-    `linear_delivery.start`. Returns True only when this call made the
-    claim; an issue that is no longer Ready (another scan or agent got
-    there first) returns False so no duplicate workspace starts.
+FLEET_TAKER = "AgentFX fleet PE"
+
+
+def transition_to_in_progress(issue_id: str, *, link: str = "") -> bool:
+    """Claim a Ready issue through the shared `linear_delivery.start`
+    (AFX-142), serialized with every other taker by the GitHub claim
+    tags. Returns True only when the fleet won the claim; the worker it
+    then launches is told not to claim again. Any refusal (another taker
+    won, not Ready) returns False so no duplicate workspace starts.
 
     Never raises; on failure returns False and the caller skips
     this issue (next scan tick retries).
@@ -311,7 +318,12 @@ def transition_to_in_progress(issue_id: str) -> bool:
         logger.info("linear_pe_queue: transition_to_in_progress skipped — %s", reason)
         return False
     try:
-        result = linear_delivery.start(_delivery_client(), issue_id)
+        result = linear_delivery.start(
+            _delivery_client(),
+            issue_id,
+            claims=_claim_store(),
+            taker=Taker(FLEET_TAKER, link),
+        )
     except Exception:
         logger.exception(
             "linear_pe_queue: transition_to_in_progress failed for %s", issue_id
@@ -320,6 +332,10 @@ def transition_to_in_progress(issue_id: str) -> bool:
     if not result.ok:
         logger.info("linear_pe_queue: not claiming %s — %s", issue_id, result.reason)
     return result.ok
+
+
+def _claim_store() -> GitHubClaims:
+    return GitHubClaims((getattr(settings, "GITHUB_TOKEN", "") or "").strip())
 
 
 def rollback_to_ready(issue_id: str, *, reason_summary: str) -> bool:

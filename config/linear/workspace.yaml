@@ -37,7 +37,7 @@ states:
     description: "Owner: Wilson. Approved and prioritised. The ONLY state agents may pick work from."
   - name: In Progress
     type: started
-    description: "Owner: `afx start AFX-n`. An agent is working on it on branch agent/AFX-<n>-<slug>."
+    description: "Owner: `afx start AFX-n`, the one shared claim. Its comment names who is working on it, on branch agent/AFX-<n>-<slug>."
   - name: In Review
     type: started
     description: "Owner: Linear GitHub integration, when the PR opens. CI and review in progress."

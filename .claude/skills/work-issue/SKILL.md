@@ -9,7 +9,7 @@ Canonical flow: `planning/runbooks/delivery-pipeline.md`. Use the Linear MCP too
 
 1. **Choose.** If no issue was named, list team `AFX` issues in state **Ready** and take the highest priority. Only work issues in Ready. If the named issue is not in Ready, stop and say so.
 2. **Check it is still open in reality.** Grep the code for the feature before planning; shipped work with a stale ticket is common. If it is already done, comment the evidence and stop.
-3. **Claim it:** `python3 scripts/afx.py start AFX-<n>` (needs `LINEAR_API_KEY`). It moves Ready → In Progress and refuses any other state; if it refuses, stop. Wilson stays assignee.
+3. **Claim it:** `python3 scripts/afx.py start AFX-<n> --taker "<who you are>" --link <your session URL or branch>`. This is the one shared claim every taker uses (laptop, Devin, Claude, the fleet): exactly one taker wins a Ready ticket, which moves to In Progress with one comment naming it; everyone else is refused, so if it refuses, stop. Without `LINEAR_API_KEY` it sends the same claim through the `afx-request.yml` workflow and waits for the verdict. Never claim by editing the status, assignee or delegate in Linear yourself; Wilson stays assignee. If you were launched by the fleet, the ticket is already claimed for you: don't claim again.
 4. **Branch** from `main`:
    ```bash
    git fetch origin main

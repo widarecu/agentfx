@@ -13,7 +13,7 @@ Only `main` exists. Every merge to `main` deploys to staging (Railway backend, V
 ## 1. The agent's steps (cold start)
 
 1. **Pick** a ticket in **Ready** (only Ready; highest priority first). Grep the code first: shipped work with a stale ticket is common.
-2. **Claim** it: `python3 scripts/afx.py start AFX-<n>` (needs `LINEAR_API_KEY`). It moves Ready → In Progress and refuses any other state, so a second agent can't claim the same ticket. If it refuses, stop.
+2. **Claim** it: `python3 scripts/afx.py start AFX-<n> --taker "<who you are>" --link <session URL or branch>`. It moves Ready → In Progress for exactly one taker and refuses everyone else (see [How the claim works](#how-the-claim-works)). If it refuses, stop. Never claim by editing the ticket in Linear yourself.
 3. **Branch** from `main`:
    ```bash
    git fetch origin main
@@ -23,7 +23,17 @@ Only `main` exists. Every merge to `main` deploys to staging (Railway backend, V
 5. **Open one PR into `main`** whose title and branch name exactly one AFX ticket: the one it closes. Add the `agent-authored` label: `gh pr edit <number> --add-label agent-authored`.
 6. **Comment on the ticket** what was tested and the CI link. Then **stop**. Merge, deploy and Done are automatic; never set In Review, Done or any later state by hand.
 
-**Blocked on a decision?** `python3 scripts/afx.py block AFX-<n> "<the question>"`. It moves the ticket to Blocked, adds `needs-wilson` and posts the question once. Then stop; don't guess.
+**Blocked on a decision?** `python3 scripts/afx.py block AFX-<n> "<the question>"`. It moves the ticket to Blocked, adds `needs-wilson` and posts the question once, however often it is retried. Then stop; don't guess.
+
+### How the claim works
+
+Every taker uses the same `afx start` / `afx block` (AFX-142): Wilson with Claude Code on his laptop, standalone Claude or Devin sessions, the Devin Product Engineer bot's sessions, and the hosted fleet PE.
+
+- **One winner.** Linear can't do "change the status only if it is still Ready", so the claim is decided on GitHub: the winner is whoever first creates the tag `afx-claim/AFX-<n>/<when the ticket entered Ready>`. GitHub refuses a second create of the same tag, so of two takers racing for one ticket exactly one starts; the other is told who has it and stops. A ticket put back into Ready gets a fresh tag.
+- **What Linear shows.** Status is the only claim: Ready → In Progress, plus one comment "Claimed by <taker>: <session or branch>". Assignee stays Wilson and delegate is never set (delegating can itself launch a Linear agent session).
+- **With or without a Linear key.** With `LINEAR_API_KEY` the command does it all in place (it also needs `gh` or `GH_TOKEN` for the tag). Without it (Devin and other keyless sessions) it pushes an `afx-request/<id>` branch; the `afx-request.yml` workflow runs the same code from `main` with the repo's key, reports the verdict on that commit, deletes the branch, and the command prints the verdict.
+- **The fleet** claims with the same function before it launches a worker and tells the worker not to claim again. It doesn't use an empty assignee as its pickup gate.
+- **Retries.** Re-running `afx start` as the same taker is a no-op success; re-running `afx block` with the same question posts nothing new. If a claim's outcome is unknown, check the ticket in Linear before retrying.
 
 ## 2. Who owns each status
 
@@ -31,7 +41,7 @@ Only `main` exists. Every merge to `main` deploys to staging (Railway backend, V
 |---|---|---|
 | Triage | Anyone | New issues are filed here (skill `file-issue`) |
 | Backlog, Ready, Canceled | Wilson | By hand |
-| In Progress | `afx start AFX-n` | An agent or the PE claims a Ready ticket |
+| In Progress | `afx start AFX-n` (the shared claim) | Any taker (laptop, agent session, the PE) claims a Ready ticket |
 | In Review | Linear GitHub integration | A PR naming the ticket opens |
 | Blocked + `needs-wilson` | `afx block`, or deploy sync after a failed staging deploy | Waiting on Wilson |
 | Done | Deploy sync only | The change is verified running on staging, not just merged |

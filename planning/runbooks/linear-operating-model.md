@@ -36,7 +36,7 @@ Triage ──Wilson accepts──▶ Backlog ──Wilson prioritises──▶ R
 | **Triage** | Triage | Anyone | Proposed, not approved. Agents file every new issue here. |
 | **Backlog** | Backlog | Wilson only | Approved as worth doing, not yet scheduled. |
 | **Ready** | Unstarted | Wilson only | Approved and prioritised. **This is the only state agents may pick work from.** |
-| **In Progress** | Started | `afx start AFX-n` | Work started on branch `agent/AFX-123-short-slug` off `main`. |
+| **In Progress** | Started | `afx start AFX-n` (the one shared claim) | Work started on branch `agent/AFX-123-short-slug` off `main`; one comment names the taker. |
 | **In Review** | Started | Linear GitHub integration, when the PR opens | CI and `pr-policy` running; Money-path waits for Wilson's approval. |
 | **Blocked** | Started | `afx block AFX-n`, or deploy sync after a failed staging deploy (both add `needs-wilson`) | Waiting on Wilson. |
 | **Done** | Completed | Deploy sync only, after the merge to `main` is verified running on staging | Shipped to staging. |
@@ -81,7 +81,7 @@ Creating tickets:
 4. **Never** set priority, move an issue out of Triage, or edit the scope of an approved ticket. Propose scope changes as a comment or a new Triage issue.
 
 Working tickets (step by step in `delivery-pipeline.md` §1):
-5. **Pick only from Ready**, highest priority first, and claim with `python3 scripts/afx.py start AFX-<n>` (Ready → In Progress; it refuses any other state). Wilson stays the assignee.
+5. **Pick only from Ready**, highest priority first, and claim with `python3 scripts/afx.py start AFX-<n> --taker "<who>" --link <session or branch>` (Ready → In Progress for exactly one taker; everyone else and every other state is refused). It works with or without `LINEAR_API_KEY`. Wilson stays the assignee and delegate is never set; never claim by editing the ticket yourself.
 6. **Branch** `agent/AFX-123-slug` off `main`. Open one PR into `main` whose title and branch name exactly one AFX ticket, the one it closes. Linear also reads the PR body: closing words ("Fixes/Closes/Resolves AFX-n") close that ticket and linking words ("Part of/Related to/Refs AFX-n") link it, so mention other tickets only when needed, without those words.
 7. **Before opening the PR:** `make lint` and `make test-unit` green. Label the PR `agent-authored`, post a comment listing what was tested and the CI link, then stop. Merge, deploy and Done are automatic.
 8. **Money-path issues:** label the PR `agent-authored` like any other. `pr-policy` holds it until Wilson approves its latest commit, and any PR touching a path in `.github/CODEOWNERS` needs his code-owner review.

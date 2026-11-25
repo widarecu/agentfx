@@ -17,7 +17,8 @@ import yaml
 
 from agentfx.integrations import deploy_sync as ds
 from agentfx.integrations import linear_delivery as ld
-from tests.unit.scripts.linear_fake import FakeLinear
+from agentfx.integrations import claim_store as cs
+from tests.unit.scripts.linear_fake import FakeClaims, FakeLinear
 
 _REPO = Path(__file__).resolve().parents[3]
 _SCRIPT = _REPO / "scripts" / "afx.py"
@@ -43,8 +44,12 @@ def fake() -> FakeLinear:
     return FakeLinear()
 
 
-def _run(fake: FakeLinear, *argv: str) -> int:
-    return afx.main(list(argv), client=ld.LinearClient("k", opener=fake.opener))
+def _run(fake: FakeLinear, *argv: str, claims: FakeClaims | None = None) -> int:
+    return afx.main(
+        list(argv),
+        client=ld.LinearClient("k", opener=fake.opener),
+        claims=claims if claims is not None else FakeClaims(),
+    )
 
 
 def test_start_ready_exits_zero(fake, capsys):
@@ -54,11 +59,22 @@ def test_start_ready_exits_zero(fake, capsys):
     assert "Ready -> In Progress" in capsys.readouterr().out
 
 
-def test_second_start_refused(fake, capsys):
+def test_second_taker_refused(fake, capsys):
     fake.add("AFX-1", "Ready")
-    _run(fake, "start", "AFX-1")
-    assert _run(fake, "start", "AFX-1") == afx.EXIT_REFUSED
-    assert "refused" in capsys.readouterr().err
+    claims = FakeClaims()
+    _run(fake, "start", "AFX-1", "--taker", "Wilson", claims=claims)
+    assert (
+        _run(fake, "start", "AFX-1", "--taker", "Devin", claims=claims)
+        == afx.EXIT_REFUSED
+    )
+    assert "claimed by Wilson" in capsys.readouterr().err
+
+
+def test_start_comment_names_taker_and_link(fake):
+    fake.add("AFX-1", "Ready")
+    _run(fake, "start", "AFX-1", "--taker", "Devin", "--link", "https://s/1")
+    [comment] = fake.issues["AFX-1"].comments
+    assert "Claimed by Devin**: https://s/1" in comment
 
 
 def test_start_wrong_state_refused(fake):
@@ -96,8 +112,11 @@ def test_api_failure_errors(fake):
     assert _run(fake, "start", "AFX-1") == afx.EXIT_ERROR
 
 
-def test_missing_key_errors(monkeypatch, capsys):
-    monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+def test_missing_key_without_github_errors(monkeypatch, capsys):
+    """Keyless needs GitHub credentials to send the request."""
+    for var in ("LINEAR_API_KEY", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(cs, "_gh_auth_token", lambda: "")
     assert afx.main(["start", "AFX-1"]) == afx.EXIT_ERROR
     assert "LINEAR_API_KEY" in capsys.readouterr().err
 

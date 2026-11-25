@@ -5,7 +5,7 @@ underlying `_gql` function so no HTTP is attempted, and assert:
 
 - `list_ready_dispatch_candidates` builds the right filter payload
   (team key, Ready state id, agent-filed label, no needs-wilson,
-  assignee null), honors the sort, and maps GraphQL nodes to the
+  no assignee filter, AFX-142), honors the sort, and maps GraphQL nodes to the
   `ReadyIssue` dataclass.
 - `transition_to_in_progress` claims through the shared
   `linear_delivery.start` and returns False when not Ready.
@@ -34,6 +34,7 @@ from agentfx.agents.fleet.linear_pe_queue import (
     transition_to_in_progress,
 )
 from agentfx.integrations import linear_delivery
+from agentfx.integrations.claim_store import GitHubClaims, Taker
 
 pytestmark = pytest.mark.unit
 
@@ -160,6 +161,30 @@ class TestListReadyDispatchCandidates:
         assert iss.identifier == "AFX-56"
         assert iss.priority == 2
         assert set(iss.labels) == {"agent-filed", "QA agent", "Paper runner"}
+
+    def test_accountable_assignee_does_not_hide_a_ready_ticket(self, monkeypatch):
+        """AFX-142: Wilson stays assignee on Ready work; the shared claim,
+        not an empty assignee, keeps a second taker off a ticket."""
+        monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
+        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
+        node = {
+            "id": "uuid-afx-9",
+            "identifier": "AFX-9",
+            "title": "assigned to Wilson",
+            "description": "",
+            "url": "u",
+            "priority": 2,
+            "createdAt": "2026-11-01T00:00:00Z",
+            "assignee": {"name": "Wilson Reyes"},
+            "labels": {"nodes": [{"id": "lbl-agent-filed", "name": "agent-filed"}]},
+        }
+        with patch(
+            "agentfx.agents.fleet.linear_pe_queue._gql",
+            return_value={"issues": {"nodes": [node]}},
+        ) as gql:
+            issues = list_ready_dispatch_candidates(limit=5)
+        assert [i.identifier for i in issues] == ["AFX-9"]
+        assert "assignee" not in gql.call_args.args[1]
 
     def test_sort_by_priority_then_created_at(self, monkeypatch):
         """Priority 1 (urgent) must win over priority 2 (high)
@@ -504,23 +529,26 @@ class TestTransitionToInProgress:
     def test_success_uses_shared_start(self, monkeypatch):
         seen = {}
 
-        def _start(client, ident):
-            seen["ident"] = ident
+        def _start(client, ident, *, claims, taker):
+            seen.update(ident=ident, claims=claims, taker=taker)
             return _result(True)
 
+        monkeypatch.setattr(linear_pe_queue.settings, "GITHUB_TOKEN", "gh-token")
         monkeypatch.setattr(linear_delivery, "start", _start)
-        assert transition_to_in_progress("uuid-afx-700") is True
+        assert transition_to_in_progress("uuid-afx-700", link="branch x") is True
         assert seen["ident"] == "uuid-afx-700"
+        assert seen["taker"] == Taker("AgentFX fleet PE", "branch x")
+        assert isinstance(seen["claims"], GitHubClaims)
 
     def test_not_ready_returns_false(self, monkeypatch):
         """Already claimed by another scan or agent: no duplicate work."""
         monkeypatch.setattr(
-            linear_delivery, "start", lambda c, i: _result(False, "In Progress")
+            linear_delivery, "start", lambda c, i, **_: _result(False, "claimed")
         )
         assert transition_to_in_progress("uuid-x") is False
 
     def test_exception_returns_false(self, monkeypatch):
-        def _boom(client, ident):
+        def _boom(client, ident, **_):
             raise linear_delivery.LinearError("linear 500")
 
         monkeypatch.setattr(linear_delivery, "start", _boom)

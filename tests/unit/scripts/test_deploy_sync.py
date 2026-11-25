@@ -17,6 +17,8 @@ import pytest
 
 from agentfx.integrations import deploy_sync as ds
 from agentfx.integrations import linear_delivery as ld
+from agentfx.integrations.claim_store import Taker
+from tests.unit.scripts.linear_fake import FakeClaims
 from tests.unit.scripts.linear_fake import FakeLinear as LinearFake
 
 BASE = "b" * 40
@@ -836,7 +838,7 @@ def test_code_failure_recovers_through_ready_and_a_fix_pr_on_the_same_ticket():
     a10.labels.remove("needs-wilson")  # Wilson answers the block
     a10.state = "Ready"
     client = ld.LinearClient("k", opener=fake.opener)
-    assert ld.start(client, "AFX-10").ok
+    assert ld.start(client, "AFX-10", claims=FakeClaims(), taker=Taker("Devin")).ok
     assert a10.state == "In Progress"
     a10.state = "In Review"  # the fix PR opens
 

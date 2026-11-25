@@ -12,7 +12,8 @@ import urllib.error
 import pytest
 
 from agentfx.integrations import linear_delivery as ld
-from tests.unit.scripts.linear_fake import FakeLinear
+from agentfx.integrations.claim_store import Taker
+from tests.unit.scripts.linear_fake import FakeClaims, FakeLinear
 
 
 @pytest.fixture
@@ -109,45 +110,96 @@ class TestClient:
         assert seen["auth"] == "lin_secret"
 
 
+ME = Taker("Devin", "https://app.devin.ai/sessions/1")
+OTHER = Taker("AgentFX fleet PE", "branch `agent/afx-1-x`")
+
+
+def _start(client, ident, taker=ME, claims=None):
+    return ld.start(client, ident, claims=claims or FakeClaims(), taker=taker)
+
+
 class TestStart:
     def test_ready_moves_to_in_progress(self, fake, client):
         fake.add("AFX-1", "Ready")
-        result = ld.start(client, "AFX-1")
+        result = _start(client, "AFX-1")
         assert result.ok and result.changed
         assert fake.issues["AFX-1"].state == "In Progress"
 
-    def test_repeat_start_is_refused(self, fake, client):
+    def test_claim_comment_names_the_taker(self, fake, client):
         fake.add("AFX-1", "Ready")
-        ld.start(client, "AFX-1")
-        again = ld.start(client, "AFX-1")
+        _start(client, "AFX-1")
+        [comment] = fake.issues["AFX-1"].comments
+        assert "Claimed by Devin" in comment and ME.link in comment
+
+    def test_repeat_start_by_another_taker_is_refused(self, fake, client):
+        fake.add("AFX-1", "Ready")
+        claims = FakeClaims()
+        _start(client, "AFX-1", claims=claims)
+        again = _start(client, "AFX-1", OTHER, claims)
         assert again.ok is False and again.changed is False
-        assert "In Progress" in again.reason
+        assert "claimed by Devin" in again.reason
         assert _states(fake) == ["In Progress"]
+
+    def test_own_retry_is_ok_without_a_second_comment(self, fake, client):
+        fake.add("AFX-1", "Ready")
+        claims = FakeClaims()
+        _start(client, "AFX-1", claims=claims)
+        again = _start(client, "AFX-1", claims=claims)
+        assert again.ok is True and again.changed is False
+        assert len(fake.issues["AFX-1"].comments) == 1
+
+    def test_in_progress_without_a_claim_is_refused(self, fake, client):
+        fake.add("AFX-1", "In Progress")
+        assert _start(client, "AFX-1").ok is False
+        assert fake.mutations == []
+
+    def test_loser_finishes_a_winner_that_never_wrote_linear(self, fake, client):
+        """The winner took the tag and died: the ticket must not sit in
+        Ready with nobody able to take it."""
+        fake.add("AFX-1", "Ready")
+        claims = FakeClaims()
+        claims.tags["afx-claim/AFX-1/20261120000000000"] = OTHER
+        result = _start(client, "AFX-1", claims=claims)
+        assert result.ok is False
+        assert fake.issues["AFX-1"].state == "In Progress"
+        assert fake.issues["AFX-1"].comments == []
+
+    def test_back_in_ready_gets_a_fresh_claim(self, fake, client):
+        """A ticket Wilson puts back into Ready can be claimed again."""
+        issue = fake.add("AFX-1", "Ready")
+        claims = FakeClaims()
+        _start(client, "AFX-1", claims=claims)
+        issue.state = "Ready"
+        issue.history.append(
+            {"createdAt": "2026-11-24T00:00:00Z", "toState": {"name": "Ready"}}
+        )
+        assert _start(client, "AFX-1", OTHER, claims).ok is True
+        assert len(claims.tags) == 2
 
     @pytest.mark.parametrize(
         "state", ["Triage", "Backlog", "In Review", "Blocked", "Done", "Canceled"]
     )
     def test_wrong_state_refused_without_writes(self, fake, client, state):
         fake.add("AFX-1", state)
-        assert ld.start(client, "AFX-1").ok is False
+        assert _start(client, "AFX-1").ok is False
         assert fake.mutations == []
 
     def test_missing_issue_raises(self, client):
         with pytest.raises(ld.NotFoundError):
-            ld.start(client, "AFX-404")
+            _start(client, "AFX-404")
 
     def test_missing_target_state_raises(self):
         fake = FakeLinear(states=["Ready", "Done"])
         fake.add("AFX-1", "Ready")
         c = ld.LinearClient("k", opener=fake.opener)
         with pytest.raises(ld.NotFoundError):
-            ld.start(c, "AFX-1")
+            _start(c, "AFX-1")
         assert fake.mutations == []
 
     def test_api_failure_raises(self, fake, client):
         fake.fail_with = urllib.error.URLError("down")
         with pytest.raises(ld.LinearError):
-            ld.start(client, "AFX-1")
+            _start(client, "AFX-1")
 
 
 class TestBlock:
@@ -206,13 +258,13 @@ class TestBlock:
 class TestReleaseOwnClaim:
     def test_own_claim_without_workspace_goes_back_to_ready(self, fake, client):
         fake.add("AFX-1", "Ready")
-        ld.start(client, "AFX-1")
+        _start(client, "AFX-1")
         result = ld.release_own_claim(client, "AFX-1", workspace_started=False)
         assert result.ok and fake.issues["AFX-1"].state == "Ready"
 
     def test_started_workspace_is_never_rolled_back(self, fake, client):
         fake.add("AFX-1", "Ready")
-        ld.start(client, "AFX-1")
+        _start(client, "AFX-1")
         result = ld.release_own_claim(client, "AFX-1", workspace_started=True)
         assert result.ok is False
         assert fake.issues["AFX-1"].state == "In Progress"

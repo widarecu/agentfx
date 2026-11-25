@@ -171,14 +171,16 @@ def scan_and_dispatch(*, db: Session, now: datetime | None = None) -> tuple[int,
                     merged_pr,
                 )
                 continue
-            if not transition_to_in_progress(issue.id):
+            spec = _build_task_spec(issue=issue, slug_fn=build_task_slug, now=now)
+            if not transition_to_in_progress(
+                issue.id, link=f"branch `agent/{spec.task_slug}`"
+            ):
                 logger.info(
                     "pe_agent: skipping %s — transition_to_in_progress failed "
                     "(race or Linear error). Next scan retries.",
                     issue.identifier,
                 )
                 continue
-            spec = _build_task_spec(issue=issue, slug_fn=build_task_slug, now=now)
             result = adapter.dispatch(db, spec=spec, now=now)
             attempted += 1
             if not result.accepted:
@@ -364,6 +366,18 @@ def _render_dispatch_narrative(*, issue: ReadyIssue) -> str:
 
     lines.append(f"**Linear URL:** {issue.url}")
     lines.append(f"**Labels:** {', '.join(sorted(issue.labels)) or '(none)'}")
+    lines.append("")
+
+    lines.append("## Claim")
+    lines.append("")
+    lines.append(
+        "The fleet has already claimed this ticket for you through the "
+        "shared claim (it is In Progress, with a comment naming the fleet). "
+        "**Do not run `afx.py start` or change the ticket's status, "
+        "assignee or delegate.** If you are blocked on a decision, use "
+        "`python3 scripts/afx.py block "
+        f'{issue.identifier} "<question>"`.'
+    )
     lines.append("")
 
     lines.append("## Branch gate (NEVER violate)")

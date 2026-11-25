@@ -11,7 +11,7 @@ Create an environment for this repo (`widarecu/agentfx`) and set **these secrets
 | Env var | What it's for | Where to get it |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | the cloud agent's own LLM calls | `console.anthropic.com → API keys` |
-| `LINEAR_API_KEY` | `.mcp.json`'s Linear server, and `scripts/afx.py start/block` | `linear.app → Settings → API → Personal API keys` |
+| `LINEAR_API_KEY` | `.mcp.json`'s Linear server. `scripts/afx.py start/block` use it when present; without it they send the same claim through the `afx-request.yml` workflow | `linear.app → Settings → API → Personal API keys` |
 | `GITHUB_TOKEN` | push `agent/AFX-*` branches + open PRs on this repo | GitHub → Settings → Developer settings → Personal access tokens → Fine-grained; scope: `widarecu/agentfx` only; permissions: `Contents: write`, `Pull requests: write`, `Metadata: read` |
 | `OANDA_API_KEY` | local integration tests that hit OANDA (optional: they skip without it, as on PR CI) | OANDA practice account (**never** live) |
 | `OANDA_ACCOUNT_ID` | ditto | same OANDA practice account |
@@ -60,7 +60,7 @@ make docker-down PROFILE=test
 
 Pick a small Ready issue and follow [delivery-pipeline.md](delivery-pipeline.md) §1 end to end:
 
-1. `python3 scripts/afx.py start AFX-N` moves it Ready → In Progress.
+1. `python3 scripts/afx.py start AFX-N --taker "Claude (cloud)" --link <session URL>` moves it Ready → In Progress.
 2. Branch `agent/AFX-N-slug` off `main`, implement, run `make lint` and `make test-unit`.
 3. Open a PR into `main` with `AFX-N` in the title and label it `agent-authored` → Linear moves it to **In Review**.
 4. `pr-policy` passes once `CI required` is green (Money-path: once Wilson approves the latest commit) and squash-merges it.

@@ -1,0 +1,45 @@
+name: AFX request
+
+# Keyless entry to the shared claim and block (AFX-142). A session without
+# LINEAR_API_KEY runs `python3 scripts/afx.py start|block ...` as usual; the
+# script pushes an `afx-request/<id>` branch whose only commit has main's
+# tree and carries the arguments in its message. This job runs the same
+# `start`/`block` code from `main` with the repo's Linear key, reports the
+# verdict as the `afx/request` status on that commit (the script waits for
+# it), then deletes the branch. Claims are serialized by the GitHub claim
+# tags, so parallel requests, the fleet and `afx start` with a key can race
+# safely.
+on:
+  push:
+    branches:
+      - "afx-request/**"
+
+permissions: {}
+
+jobs:
+  run:
+    name: Run start/block request
+    if: github.event.deleted == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # Create claim tags and delete the request branch.
+      contents: write
+      # Report the verdict on the request commit.
+      statuses: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Run request
+        run: python3 scripts/afx.py request run
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          REQUEST_SHA: ${{ github.sha }}
+          REQUEST_REF: ${{ github.ref }}
+          REQUEST_MESSAGE: ${{ github.event.head_commit.message }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

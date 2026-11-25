@@ -4,8 +4,11 @@ One implementation that both `scripts/afx.py` (agents) and the PE queue
 use to claim, block and release tickets, so the board has one owner per
 status (AFX-117):
 
-- `start`: Ready -> In Progress. Anything else is refused, so a second
-  start cannot launch duplicate work.
+- `start`: the one claim (AFX-142). Ready -> In Progress for exactly one
+  taker, serialized by `claim_store` because Linear has no
+  compare-and-set; every other caller is refused before it starts. Status
+  is the only claim in Linear: assignee and delegate are never written,
+  and one comment names the taker.
 - `block`: active ticket -> Blocked, adds `needs-wilson`, posts the
   question once. Never moves an issue to Ready.
 - `release_own_claim`: PE-only undo of its own In Progress claim when
@@ -28,6 +31,8 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+
+from agentfx.integrations.claim_store import ClaimStore, Taker, claim_tag
 
 LINEAR_URL = "https://api.linear.app/graphql"
 DEFAULT_TIMEOUT_SECONDS = 20.0
@@ -61,6 +66,7 @@ class Issue:
     state: str
     team_id: str
     labels: dict[str, str] = field(default_factory=dict)  # name -> id
+    created_at: str = ""
 
 
 @dataclass
@@ -152,7 +158,7 @@ class LinearClient:
 
     def issue(self, ident: str) -> Issue:
         data = self.gql(
-            "query($id: String!) { issue(id: $id) { id identifier "
+            "query($id: String!) { issue(id: $id) { id identifier createdAt "
             "state { name } team { id } labels(first: 100) { nodes { id name } } } }",
             {"id": ident},
         )
@@ -167,6 +173,7 @@ class LinearClient:
             labels={
                 n["name"]: n["id"] for n in (node.get("labels") or {}).get("nodes", [])
             },
+            created_at=node.get("createdAt") or "",
         )
 
     def state_id(self, team_id: str, name: str) -> str:
@@ -337,24 +344,67 @@ def _move(client: LinearClient, issue: Issue, target: str) -> None:
     client.set_state(issue.id, client.state_id(issue.team_id, target))
 
 
-def start(client: LinearClient, ident: str) -> TransitionResult:
-    """Claim a Ready ticket. Refuses every other state, including an
-    existing In Progress claim, so callers never start duplicate work."""
+def ready_since(client: LinearClient, issue: Issue) -> str:
+    """When the issue last entered Ready (its creation if it was filed
+    straight into Ready)."""
+    moves = [
+        m
+        for m in client.state_moves(issue.id)
+        if (m.get("toState") or {}).get("name") == READY
+    ]
+    return moves[-1].get("createdAt") or "" if moves else issue.created_at
+
+
+def claim_marker(tag: str) -> str:
+    return f"<!-- afx:claim:{tag} -->"
+
+
+def start(
+    client: LinearClient, ident: str, *, claims: ClaimStore, taker: Taker
+) -> TransitionResult:
+    """The shared claim (AFX-142), used by `afx start`, keyless requests
+    and the fleet. Only a Ready ticket can be claimed and only one taker
+    wins it: the claim tag for the ticket's current Ready period is
+    created atomically in `claims`, and everyone who loses that create is
+    refused. The winner's ticket moves to In Progress with one comment
+    naming it; assignee and delegate are left alone.
+
+    A taker retrying its own claim (an uncertain launch, a lost reply)
+    gets ok without a second comment. A loser that finds the ticket still
+    Ready finishes the winner's status move so the board shows the claim
+    even if the winner died before writing it."""
     issue = client.issue(ident)
-    if issue.state != READY:
+
+    def refuse(reason: str) -> TransitionResult:
         return TransitionResult(
             ok=False,
             changed=False,
             identifier=issue.identifier,
             from_state=issue.state,
-            reason=f"{issue.identifier} is {issue.state!r}, not {READY!r}",
+            reason=reason,
         )
-    _move(client, issue, IN_PROGRESS)
+
+    if issue.state not in (READY, IN_PROGRESS):
+        return refuse(f"{issue.identifier} is {issue.state!r}, not {READY!r}")
+    tag = claim_tag(issue.identifier, ready_since(client, issue))
+    won = issue.state == READY and claims.create(tag, taker)
+    holder = taker if won else claims.holder(tag)
+    if holder is None:
+        return refuse(f"{issue.identifier} is {issue.state!r}, not {READY!r}")
+    changed = False
+    if issue.state == READY:
+        _move(client, issue, IN_PROGRESS)
+        changed = True
+    if holder != taker:
+        return refuse(f"{issue.identifier} is already claimed by {holder.name}")
+    body = f"**Claimed by {taker.name}**" + (f": {taker.link}" if taker.link else "")
+    if client.comment_once(issue.id, f"{claim_marker(tag)}\n{body}", claim_marker(tag)):
+        changed = True
     return TransitionResult(
         ok=True,
-        changed=True,
+        changed=changed,
         identifier=issue.identifier,
-        from_state=READY,
+        from_state=issue.state,
         to_state=IN_PROGRESS,
     )
 
@@ -521,6 +571,8 @@ __all__ = [
     "TransitionResult",
     "block",
     "block_marker",
+    "claim_marker",
+    "ready_since",
     "release_own_claim",
     "start",
 ]

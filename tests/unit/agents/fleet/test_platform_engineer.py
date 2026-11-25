@@ -143,8 +143,9 @@ def linear_recorder(monkeypatch):
         "attention_filings": [],
     }
 
-    def _transition(issue_id):
+    def _transition(issue_id, *, link=""):
         recorded["transitions_to_in_progress"].append(issue_id)
+        recorded.setdefault("claim_links", []).append(link)
         return True
 
     def _rollback(issue_id, *, reason_summary):
@@ -204,6 +205,8 @@ class TestHappyPath:
         _, attempted = platform_engineer.scan_and_dispatch(db=db)
         assert attempted == 1
         assert linear_recorder["transitions_to_in_progress"] == ["uuid-afx-200"]
+        [link] = linear_recorder["claim_links"]
+        assert link == "branch `agent/2026-11-25-afx-200-fix-cost-model`"
         assert linear_recorder["rollbacks_to_ready"] == []
         assert linear_recorder["attention_filings"] == []
 
@@ -311,7 +314,7 @@ class TestFailureBranches:
         issue = _issue(identifier="AFX-300")
         _patch_list_candidates(monkeypatch, [issue])
         monkeypatch.setattr(
-            platform_engineer, "transition_to_in_progress", lambda _id: False
+            platform_engineer, "transition_to_in_progress", lambda _id, **_: False
         )
         adapter = _RecordingAdapter(_StubAdapterResult())
         _patch_adapter(monkeypatch, adapter)
@@ -576,6 +579,8 @@ class TestDispatchNarrative:
             description="The cost model is wrong.",
         )
         narrative = platform_engineer._render_dispatch_narrative(issue=iss)
+        assert "already claimed this ticket for you" in narrative
+        assert "Do not run `afx.py start`" in narrative
         assert "AFX-500: Fix cost model" in narrative
         assert "The cost model is wrong." in narrative
         assert iss.url in narrative
