@@ -67,6 +67,17 @@ def update_run(
         ]:
             update_data["completed_at"] = datetime.utcnow()
 
+    # AFX-154: forward_test_contract is locked at paper start and must never
+    # be overwritten, removed, or forged via generic run updates.
+    if "parameters" in update_data:
+        existing_contract = (db_run.parameters or {}).get("forward_test_contract")
+        incoming_params = dict(update_data["parameters"] or {})
+        if existing_contract is not None:
+            incoming_params["forward_test_contract"] = existing_contract
+        else:
+            incoming_params.pop("forward_test_contract", None)
+        update_data["parameters"] = incoming_params
+
     for field, value in update_data.items():
         setattr(db_run, field, value)
 

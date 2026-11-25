@@ -345,3 +345,97 @@ class TestRouterForwardTestEndpoints:
         assert resp.status == "passed"
         assert resp.eligible_for_live is True
         assert resp.failures == []
+
+
+class TestContractImmutability:
+    def test_update_run_preserves_locked_contract_and_blocks_forgery(self):
+        from agentfx.api import schemas
+        from agentfx.api.services import run as run_service
+
+        db = MagicMock()
+        locked = ForwardTestContract.create(
+            min_closed_trades=100,
+            min_sharpe=1.0,
+            max_drawdown=0.10,
+            max_divergence=0.30,
+        ).to_dict()
+        run = SimpleNamespace(
+            id="run_locked",
+            user_id="u_owner",
+            parameters={"name": "orig", "forward_test_contract": locked},
+            started_at=None,
+            completed_at=None,
+            updated_at=None,
+        )
+
+        updated = run_service.update_run(
+            db,
+            db_run=run,
+            run_in=schemas.RunUpdate(
+                parameters={
+                    "name": "renamed",
+                    "forward_test_contract": {
+                        "min_closed_trades": 1,
+                        "min_sharpe": -10.0,
+                        "max_drawdown": 1.0,
+                    },
+                }
+            ),
+        )
+        assert updated.parameters["name"] == "renamed"
+        assert updated.parameters["forward_test_contract"] == locked
+
+        # Clearing parameters must still preserve the locked contract.
+        cleared = run_service.update_run(
+            db,
+            db_run=run,
+            run_in=schemas.RunUpdate(parameters={}),
+        )
+        assert cleared.parameters["forward_test_contract"] == locked
+
+        # A legacy run without a contract cannot have one forged via update_run.
+        legacy = SimpleNamespace(
+            id="run_legacy",
+            user_id="u_owner",
+            parameters={"name": "legacy"},
+            started_at=None,
+            completed_at=None,
+            updated_at=None,
+        )
+        forged = run_service.update_run(
+            db,
+            db_run=legacy,
+            run_in=schemas.RunUpdate(
+                parameters={"forward_test_contract": {"min_closed_trades": 1}}
+            ),
+        )
+        assert "forward_test_contract" not in forged.parameters
+
+    def test_put_run_rejects_non_owner(self):
+        from agentfx.api import schemas
+        from agentfx.api.routers.runs import update_run as router_update_run
+        from agentfx.api.services import run as run_service
+
+        db = MagicMock()
+        other = SimpleNamespace(id="u_other", role=models.UserRole.TRADER)
+        run = SimpleNamespace(
+            id="run_owned",
+            user_id="u_owner",
+            parameters={
+                "forward_test_contract": ForwardTestContract.create(
+                    min_closed_trades=100
+                ).to_dict()
+            },
+        )
+
+        with (
+            patch.object(run_service, "get_run", return_value=run),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            router_update_run(
+                run_id=run.id,
+                run_in=schemas.RunUpdate(parameters={"forward_test_contract": {}}),
+                db=db,
+                current_user=other,
+            )
+        assert exc_info.value.status_code == 404
