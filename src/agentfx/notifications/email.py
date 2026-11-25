@@ -448,7 +448,7 @@ def send_agent_message(
     subject: str,
     body: str,
     html_body: str | None = None,
-) -> None:
+) -> bool:
     """Send a tagged email from a fleet agent.
 
     Subject format: `[AgentFX AGENT <ROLE>] <ENV> — <subject>`. The
@@ -461,8 +461,8 @@ def send_agent_message(
     mail clients render HTML while plain-text fallback stays
     available for stripped forwards and copy-paste.
 
-    Never raises. SMTP failures are logged; the orchestrator keeps
-    running.
+    Returns whether SMTP accepted the message. Never raises; skips
+    and send failures return False.
 
     `agent_role` is a short tag (`"PM"`, `"QA"`, `"PE"`, `"RA"`).
     """
@@ -472,7 +472,7 @@ def send_agent_message(
         if not settings.AGENT_FLEET_ENABLED:
             # Belt + braces: even if a caller invokes this with the
             # flag off, we don't want to leak email.
-            return
+            return False
 
         env_tag = _ENV_TAG.get((settings.ENVIRONMENT or "").lower())
         tag = f"[AgentFX AGENT {agent_role}"
@@ -493,7 +493,7 @@ def send_agent_message(
         )
         if not ok_to_send:
             logger.debug("send_agent_message: skipped (%s)", why)
-            return
+            return False
 
         msg = EmailMessage()
         msg["Subject"] = full_subject
@@ -521,12 +521,14 @@ def send_agent_message(
                 subject,
                 detail,
             )
+        return ok
     except Exception:  # noqa: BLE001 — never let email break the fleet
         logger.exception(
             "send_agent_message: unexpected failure role=%s subject=%r",
             agent_role,
             subject,
         )
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────
