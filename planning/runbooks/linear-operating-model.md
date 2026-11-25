@@ -57,20 +57,27 @@ Linear can't stop an agent from moving a ticket out of Triage. The rule is enfor
 
 ## 5. Priority
 
-- **Urgent:** only for Incidents. A running paper (later live) trade is halted, erroring or at risk. Also sends an email.
-- **High / Medium / Low:** set by Wilson when moving to Ready. Agents may suggest a priority in the description but not set one.
+Agents write a **Suggested priority** line in the description with a one-sentence reason. Only Wilson sets the actual priority field.
+
+| Level | When |
+| --- | --- |
+| Urgent | A running paper or live trade is halted or at risk, credentials are exposed, or deploy is broken |
+| High | Blocks a profit-chain stage or the current release; Money-path correctness bug |
+| Medium | Improves pipeline throughput or quality; bug with a workaround; Money-path test gap |
+| Low | Tech debt, chores, cosmetic work, speculative research |
 
 ## 6. Ticket templates
 
-Every template has the same backbone so any agent can pick it up cold:
+The Markdown files in [`config/linear/templates/`](../../config/linear/templates/) are the source for the Linear templates:
 
-**Feature / Improvement:** Why (link to profit) · What · Done when (checkboxes, including test evidence) · Off-limits · Context (files, commits)
+- [Feature / Improvement](../../config/linear/templates/feature.md)
+- [Bug / Defect](../../config/linear/templates/bug.md) keeps expected versus observed behaviour, reproduction steps, Found in, and a regression test that fails before the fix and passes after.
+- [Agent finding](../../config/linear/templates/finding.md) keeps a stable fingerprint, confidence, evidence, and the cost of ignoring the finding.
+- [Test gap](../../config/linear/templates/test-gap.md) explains the missing coverage and how a bug could slip through.
 
-**Bug / Defect:** What happened · Expected · Evidence (logs, run IDs, screenshots) · Steps to reproduce · Found in · Done when (a test that reproduces the bug fails before the fix and passes after)
+All four connect **Why** to a profit-chain stage, describe **What** and **Out of scope** in plain language, attach evidence, and give **Done when** criteria in Given / When / Then form with a test level and command. Mark up to three open questions with `[NEEDS CLARIFICATION]`; any such question requires the `needs-wilson` flag.
 
-**Agent finding** (for QA/PE/PM filings): Fingerprint (a stable id such as `qa:pool-stuck-lease`) · Evidence · Proposed fix · Confidence (High/Med/Low) · Cost of ignoring it
-
-**Test gap:** What isn't covered · How a bug could slip through · Proposed tests
+Use the collapsed **Agent notes** for confirmed files, current behaviour, approach, dependencies, and size. The exclusive **Size** group has S, M, and L; the label matches the notes. Split L work before filing. Before saving, make sure an agent starting cold can complete the issue in one PR, duplicates were searched, and evidence is attached.
 
 ## 7. Rules for agents (canonical; summarised in CLAUDE.md and the `.claude/skills/` files)
 
