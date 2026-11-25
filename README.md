@@ -12,6 +12,10 @@ Broker and market data: OANDA (practice accounts for everything below live). Rol
 
 ## Quick start
 
+Open Claude Code sessions in the **`agentfx` folder itself**, not its parent.
+From the parent, run `cd agentfx && claude` to start a session with this repo's
+guard hooks and project skills.
+
 Requires Docker Desktop (or Colima / OrbStack). Local Postgres is not supported.
 
 ```bash

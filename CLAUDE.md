@@ -4,6 +4,8 @@ AgentFX is an autonomous FX strategy factory: agents define, build, backtest, va
 
 Success means **profitable, live-ready strategies**, not PRs merged or experiments run. Tie every piece of work to that.
 
+**Claude Code:** Open the session in the **`agentfx` folder itself**, not its parent. The project hooks and skills do not load from a session started in the parent folder.
+
 ## Hard rules
 
 1. **Only the `test` Docker profile may be wiped.** Never run `make e2e` or `docker compose down -v` against `dev` or `uat`; uat holds Wilson's real data. ([environments](planning/runbooks/environments.md))
