@@ -403,6 +403,16 @@ export interface GenomeMetrics {
   [k: string]: unknown;
 }
 
+export interface ValidationDsr {
+  trial_count: number;
+  threshold: number;
+  probability: number | null;
+  raw_sharpe: number | null;
+  sharpe_bar: number | null;
+  passed: boolean;
+  reason: string;
+}
+
 export interface StrategyGenome {
   id: string;
   generation_id: string;
@@ -416,6 +426,7 @@ export interface StrategyGenome {
   metrics_json: GenomeMetrics | null;
   validator_passed: boolean | null;
   validation_failures: string[];
+  validation_dsr?: ValidationDsr | null;
   llm_reasoning: string | null;
   llm_call_id: string | null;
   created_at: string;

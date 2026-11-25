@@ -8,6 +8,7 @@ from .evolution import (
     GenomeOrigin,
     StrategyGenome,
     UserAction,
+    ValidationAttempt,
     ValidationFold,
 )
 from .instrument import Instrument
@@ -69,6 +70,7 @@ __all__ = [
     "Generation",
     "StrategyGenome",
     "GenomeOrigin",
+    "ValidationAttempt",
     "ValidationFold",
     "DecisionLog",
     "AgentType",

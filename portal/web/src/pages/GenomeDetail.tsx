@@ -52,6 +52,7 @@ import type {
   GenomeOrigin,
   StrategyGenome,
 } from '../types/evolution';
+import { selectGenomeDsr } from './genomeDsrView';
 
 const ORIGIN_BADGE_COLORS: Record<GenomeOrigin, string> = {
   seed: 'bg-slate-200 text-slate-800 dark:bg-slate-600 dark:text-slate-100',
@@ -195,6 +196,7 @@ export default function GenomeDetail() {
 
   const summary = summarizeDsl(genome.dsl_json);
   const archetype = inferArchetype(genome.dsl_json);
+  const dsr = selectGenomeDsr(genome.validation_dsr);
   const fitnessText =
     genome.fitness != null && Number.isFinite(genome.fitness)
       ? genome.fitness.toFixed(3)
@@ -370,6 +372,23 @@ export default function GenomeDetail() {
           <Stat label="Parents" value={String(genome.parent_ids.length)} />
           <Stat label="Children" value={String(genome.children.length)} />
         </div>
+
+        {dsr && (
+          <section className="mt-4 rounded-md border border-slate-200 p-3 dark:border-slate-700">
+            <h2 className="mb-2 text-sm font-semibold">
+              Deflated Sharpe: {dsr.label}
+            </h2>
+            <div className="grid grid-cols-2 gap-4 text-sm md:grid-cols-4">
+              <Stat label="Genomes tried" value={dsr.trials} />
+              <Stat label="Full OOS Sharpe" value={dsr.sharpe} />
+              <Stat label="Required Sharpe" value={dsr.bar} />
+              <Stat label={`Probability (need ${dsr.threshold})`} value={dsr.probability} />
+            </div>
+            <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+              {dsr.reason}
+            </p>
+          </section>
+        )}
 
         {genome.validation_failures.length > 0 && (
           <div className="mt-4 px-3 py-2 rounded-md bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800">

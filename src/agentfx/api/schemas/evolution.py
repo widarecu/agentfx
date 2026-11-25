@@ -262,6 +262,16 @@ class ValidationFoldPublic(BaseSchema):
     regime_direction: str | None = None
 
 
+class ValidationDsrPublic(BaseSchema):
+    trial_count: int
+    threshold: float
+    probability: float | None
+    raw_sharpe: float | None
+    sharpe_bar: float | None
+    passed: bool
+    reason: str
+
+
 class StrategyGenomePublic(BaseSchema):
     """Detail view for one genome.
 
@@ -287,6 +297,7 @@ class StrategyGenomePublic(BaseSchema):
     metrics_json: dict[str, Any] | None = None
     validator_passed: bool | None = None
     validation_failures: list[str] = Field(default_factory=list)
+    validation_dsr: ValidationDsrPublic | None = None
     llm_reasoning: str | None = None
     llm_call_id: str | None = None
     created_at: datetime

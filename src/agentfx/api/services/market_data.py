@@ -114,7 +114,7 @@ class MarketDataService:
         timeframe: str,
         from_time: datetime | None = None,
         to_time: datetime | None = None,
-        limit: int = 1000,
+        limit: int | None = 1000,
         offset: int = 0,
         run_id: str | None = None,
     ) -> tuple[list[models.Candle], int]:

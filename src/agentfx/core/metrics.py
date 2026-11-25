@@ -215,6 +215,33 @@ def _cagr(eq: pd.Series) -> float:
     return float(eq.iloc[-1] ** (1.0 / years) - 1.0)
 
 
+def daily_equity_from_trade_ledger(
+    trades: list[dict[str, Any]],
+    *,
+    starting_balance: float,
+    window_start: datetime,
+    window_end: datetime,
+) -> pd.Series:
+    daily_pnl: dict[pd.Timestamp, float] = {}
+    for trade in trades:
+        day = pd.to_datetime(trade["exit_timestamp"], utc=True).normalize()
+        daily_pnl[day] = daily_pnl.get(day, 0.0) + float(trade["net_pnl_dollars"])
+
+    days = pd.date_range(
+        pd.to_datetime(window_start, utc=True).normalize(),
+        pd.to_datetime(window_end, utc=True).normalize(),
+        freq="D",
+    )
+    balance = float(starting_balance)
+    equity_vals: list[float] = []
+    for day in days:
+        balance += daily_pnl.get(day, 0.0)
+        equity_vals.append(balance)
+    if not equity_vals:
+        return pd.Series([starting_balance], dtype=float)
+    return pd.Series(equity_vals, index=days, dtype=float)
+
+
 def summarize_from_trade_ledger(
     trades: list[dict[str, Any]],
     *,
@@ -263,44 +290,12 @@ def summarize_from_trade_ledger(
             "peak_balance": float(starting_balance),
         }
 
-    def _parse_ts(v: Any) -> pd.Timestamp:
-        if isinstance(v, pd.Timestamp):
-            return v
-        if isinstance(v, datetime):
-            return pd.Timestamp(v)
-        return pd.Timestamp(v)
-
-    # Aggregate realised P&L by calendar day. Daily granularity matches
-    # standard Sharpe-annualisation convention (sqrt(252)) and is the
-    # right resolution for FX strategies that close many trades per day.
-    daily_pnl: dict[pd.Timestamp, float] = {}
-    for t in trades:
-        ts = _parse_ts(t["exit_timestamp"]).normalize()
-        daily_pnl[ts] = daily_pnl.get(ts, 0.0) + float(t["net_pnl_dollars"])
-
-    start_ts = pd.Timestamp(window_start).normalize()
-    end_ts = pd.Timestamp(window_end).normalize()
-    # Strip tz so the index is comparable to the keys (which we already
-    # normalised). Trade timestamps are UTC in production; for tests
-    # with naive timestamps this is a no-op.
-    if start_ts.tzinfo is not None:
-        start_ts = start_ts.tz_convert("UTC").tz_localize(None)
-    if end_ts.tzinfo is not None:
-        end_ts = end_ts.tz_convert("UTC").tz_localize(None)
-    daily_pnl = {
-        (k.tz_convert("UTC").tz_localize(None) if k.tzinfo is not None else k): v
-        for k, v in daily_pnl.items()
-    }
-    all_days = pd.date_range(start_ts, end_ts, freq="D")
-    balance = float(starting_balance)
-    equity_vals: list[float] = []
-    for d in all_days:
-        balance += daily_pnl.get(d, 0.0)
-        equity_vals.append(balance)
-    if not equity_vals:
-        equity_vals = [float(starting_balance)]
-        all_days = pd.DatetimeIndex([start_ts])
-    eq = pd.Series(equity_vals, index=all_days, dtype=float)
+    eq = daily_equity_from_trade_ledger(
+        trades,
+        starting_balance=starting_balance,
+        window_start=window_start,
+        window_end=window_end,
+    )
 
     # Sharpe from daily equity returns, annualised √252.
     daily_returns = eq.pct_change().dropna()

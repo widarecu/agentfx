@@ -745,11 +745,21 @@ class TestSqlAlchemyPersisterSaveValidation:
             for f in folds
         ]
 
+        evidence = {
+            "trial_count": 3_075,
+            "threshold": 0.95,
+            "probability": 0.97,
+            "raw_sharpe": 3.8,
+            "sharpe_bar": 3.4,
+            "passed": True,
+            "reason": "Deflated Sharpe meets the threshold",
+        }
         persister.save_validation(
             genome.id,
             folds=fold_evals,
             validator_passed=True,
             validation_failures=[],
+            validation_dsr=evidence,
         )
 
         fold_rows = db.scalars(select(models.ValidationFold)).all()
@@ -763,6 +773,58 @@ class TestSqlAlchemyPersisterSaveValidation:
         db.refresh(_orm_genome := db.get(models.StrategyGenome, genome.id))
         assert _orm_genome.validator_passed is True
         assert _orm_genome.validation_failures == []
+        assert _orm_genome.validation_dsr == evidence
+        detail = evolution_service.get_genome_with_lineage(db, run.id, genome.id)
+        assert (
+            schemas.StrategyGenomePublic.model_validate(
+                detail
+            ).validation_dsr.model_dump()
+            == evidence
+        )
+
+
+class TestValidationAttemptLedger:
+    def test_counts_overlap_against_shorter_window_and_survives_deletion(self, db):
+        def run(instrument="EUR_USD", granularity="M1"):
+            return evolution_service.create_run(
+                db,
+                schemas.EvolutionRunCreate(
+                    instrument=instrument, granularity=granularity
+                ),
+            )
+
+        persister = SqlAlchemyPersister(db)
+        start = datetime(2024, 1, 1, tzinfo=UTC)
+
+        def register(source, genomes, lo, hi):
+            return persister.register_validation_attempts(
+                source.id,
+                genomes,
+                (start + timedelta(days=lo), start + timedelta(days=hi)),
+            )
+
+        previous = run()
+        assert register(previous, ["legacy-1", "legacy-2"], 0, 20) == 2
+        assert register(run("GBP_USD"), ["other-pair"], 15, 25) == 1
+        assert register(run(granularity="M5"), ["other-timeframe"], 15, 25) == 1
+        assert register(run(), ["too-little-overlap"], 21, 31) == 1
+        db.delete(previous)
+        db.commit()
+        # Overlap [15, 20) is exactly half of the shorter [15, 25);
+        # the [21, 31) window overlaps by only 40%.
+        assert register(run(), ["warm-start", "current-2"], 15, 25) == 4
+
+    def test_imported_shadows_cannot_register(self, db):
+        run = evolution_service.create_run(
+            db, schemas.EvolutionRunCreate(instrument="EUR_USD")
+        )
+        run.imported_from_run_id = "some-origin"
+        db.commit()
+        start = datetime(2024, 1, 1, tzinfo=UTC)
+        with pytest.raises(ValueError, match="native evolution run"):
+            SqlAlchemyPersister(db).register_validation_attempts(
+                run.id, ["imported"], (start, start + timedelta(days=10))
+            )
 
 
 class TestSqlAlchemyPersisterLogDecision:

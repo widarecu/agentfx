@@ -87,6 +87,8 @@ def load_price_df_from_db(
     start: datetime | None = None,
     end: datetime | None = None,
     exchange: str = "oanda",
+    *,
+    require_full_window: bool = False,
 ) -> pd.DataFrame:
     """Load price data from PostgreSQL candles table.
 
@@ -116,7 +118,7 @@ def load_price_df_from_db(
             timeframe=granularity.upper(),
             from_time=start,
             to_time=end,
-            limit=1_000_000,  # Large limit to fetch all available data
+            limit=None if require_full_window else 1_000_000,
         )
 
         if not candles:
@@ -446,6 +448,7 @@ def run_backtest_from_db(
     account_balance: float = 10000.0,
     position_size: int = 10000,
     leverage: int = 30,
+    require_full_window: bool = False,
 ) -> dict[str, Any]:
     """Run backtest using candle data from PostgreSQL database.
 
@@ -503,6 +506,7 @@ def run_backtest_from_db(
         granularity=granularity,
         start=start,
         end=end,
+        **({"require_full_window": True} if require_full_window else {}),
     )
 
     # Pip size for the instrument — needed for both cost application and
