@@ -71,7 +71,7 @@ The OANDA practice key never reaches unreviewed PR code: on PRs, the tests that 
 
 A merge to `main` starts `deploy.yml`: plan, Railway + Vercel deploys, staging verification, then the `deployed/staging` tag moves to the verified commit. Its "Sync tickets" job (deploy sync, `scripts/afx.py deploy-sync`) then reads every PR merged since the previous successful `deployed/staging` commit:
 
-Railway's service settings for the backend (Dockerfile builder, `/health` check, restart policy) live in `.railway/railway.ts`. The backend deploy job plans that file against staging and applies any difference before `railway up`; a failed plan or apply fails the backend deploy like any other failure. Change those settings in the file through a PR, never in the Railway dashboard. `railway.toml` is deprecated and Railway stops reading it on 2026-12-01.
+Railway's service settings for the backend (Dockerfile builder, `/health` check, restart policy) live in `.railway/railway.ts`. The backend deploy job plans that file against staging and applies any difference before `railway up`; a failed plan or apply fails the backend deploy like any other failure. Change those settings in the file through a PR, never in the Railway dashboard.
 
 - **Verified deploy:** each PR's ticket → **Done**, with a staging link comment.
 - **Failed deploy:** each ticket → **Blocked** + `needs-wilson`, with the run link. The range isn't consumed: the next successful deploy covers it again and moves those tickets to Done.

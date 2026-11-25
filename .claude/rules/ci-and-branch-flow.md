@@ -4,7 +4,6 @@ paths:
   - "scripts/deploy_staging.py"
   - "scripts/railway_deploy.py"
   - "scripts/pr_policy.py"
-  - "railway.toml"
   - ".railway/**"
   - "Dockerfile"
 ---

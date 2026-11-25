@@ -71,11 +71,10 @@ SHARED_PATHS = (
     "scripts/railway_deploy.py",
 )
 # Everything the Railway image is built from (Dockerfile COPY lines,
-# railway.toml and its cron command) and the service settings in .railway/.
+# the nightly trigger script) and the service settings in .railway/.
 BACKEND_PATHS = (
     "Dockerfile",
     ".dockerignore",
-    "railway.toml",
     ".railway/",
     "requirements.txt",
     "requirements-api.txt",
