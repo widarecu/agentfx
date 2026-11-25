@@ -166,11 +166,13 @@ def dispatch_from_linear_webhook(
         from agentfx.agents.fleet.pe_workspace import (
             build_task_slug,
             check_budget_before_dispatch,
+            pe_workspace_operation_lock,
             resolve_adapter,
             sweep_stuck_runs,
         )
 
-        sweep_stuck_runs(db, now=now)
+        with pe_workspace_operation_lock:
+            sweep_stuck_runs(db, now=now)
 
         # Step 3 — Budget pre-flight. Over cap → emit error activity
         # so Wilson sees the reason in Linear, not just Railway logs.

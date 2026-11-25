@@ -20,17 +20,21 @@ Failure branches pinned:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from threading import Event
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agentfx.agents.fleet import linear_webhook_dispatch as lwd
+from agentfx.agents.fleet import pe_workspace
 from agentfx.agents.fleet.pe_workspace import (
     WorkspaceDispatchResult,
     WorkspaceTaskSpec,
 )
 from agentfx.api.models.agent_workspace_run import AgentWorkspaceRun
+from agentfx.services import agent_orchestrator
 
 pytestmark = pytest.mark.unit
 
@@ -135,6 +139,51 @@ def _patch_bg(
         "resolve": mock_resolve,
         "build_slug": mock_build_slug,
     }
+
+
+def test_webhook_sweeps_only_after_inflight_workspace_poll(monkeypatch):
+    mocks = _patch_bg(monkeypatch, budget_result=(False, "cap"))
+    poll_started, finish_poll = Event(), Event()
+    picked_up, swept = Event(), Event()
+    observed_pr_open = []
+
+    def poll(db):
+        poll_started.set()
+        assert finish_poll.wait(5)
+        return {}
+
+    def pick_up(*args):
+        picked_up.set()
+        return True, ""
+
+    def sweep(db, *, now):
+        observed_pr_open.append(finish_poll.is_set())
+        swept.set()
+        return 0
+
+    monkeypatch.setattr(agent_orchestrator, "SessionLocal", MagicMock())
+    monkeypatch.setattr(pe_workspace, "poll_running_dispatches", poll)
+    mocks["thought"].side_effect = pick_up
+    mocks["sweep"].side_effect = sweep
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        poll_job = workers.submit(agent_orchestrator._pe_workspace_poll_tick)
+        try:
+            assert poll_started.wait(5)
+            webhook_job = workers.submit(
+                lwd.dispatch_from_linear_webhook,
+                delivery_id=_DELIVERY_ID,
+                payload=_real_payload(),
+                now=_NOW,
+            )
+            assert picked_up.wait(5)
+            assert not swept.wait(0.1)
+        finally:
+            finish_poll.set()
+        poll_job.result(timeout=5)
+        assert webhook_job.result(timeout=5) == (False, "budget:cap")
+
+    assert observed_pr_open == [True]
 
 
 # ─────────────────────────────────────────────────────────────────────

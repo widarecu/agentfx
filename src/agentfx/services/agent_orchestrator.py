@@ -224,9 +224,12 @@ _PE_WORKSPACE_POLL_SECONDS = 60 * 10
 
 
 def _pe_workspace_poll_tick() -> None:
-    from agentfx.agents.fleet.pe_workspace import poll_running_dispatches
+    from agentfx.agents.fleet.pe_workspace import (
+        pe_workspace_operation_lock,
+        poll_running_dispatches,
+    )
 
-    with SessionLocal() as db:
+    with pe_workspace_operation_lock, SessionLocal() as db:
         counts = poll_running_dispatches(db)
         if counts.get("checked"):
             logger.info(

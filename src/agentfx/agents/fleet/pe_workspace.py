@@ -54,6 +54,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from threading import Lock
 from typing import Protocol
 
 import requests
@@ -64,6 +65,8 @@ from agentfx.api.core.config import settings
 from agentfx.api.models import AgentWorkspaceRun, AgentWorkspaceRunStatus
 
 logger = logging.getLogger(__name__)
+
+pe_workspace_operation_lock = Lock()
 
 _DEVIN_API_BASE = "https://api.devin.ai"
 _DEVIN_HTTP_TIMEOUT_SECONDS = 30.0
