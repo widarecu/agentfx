@@ -60,7 +60,7 @@ def _mock_db_for_eval(
     snap_q.filter.return_value = snap_q
     snap_q.order_by.return_value = snap_q
     snap_q.limit.return_value = snap_q
-    snap_q.all.return_value = list(reversed(snapshots or []))
+    snap_q.all.return_value = list(snapshots or [])
 
     def _query(model):
         if model is models.Trade:
@@ -249,6 +249,9 @@ class TestServiceEvaluationAndLiveEligibility:
         assert ev.status == "failed"
         assert ev.early_failure is True
         assert ev.eligible_for_live is False
+        # Full snapshot history must be scanned without a row limit so older
+        # drawdown breaches never roll off the evaluation window.
+        db.query(models.PaperEquitySnapshot).limit.assert_not_called()
 
 
 class TestRouterForwardTestEndpoints:

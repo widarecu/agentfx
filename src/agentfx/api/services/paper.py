@@ -1346,6 +1346,27 @@ def _build_forward_test_contract(
     )
 
 
+def _list_all_equity_for_run(
+    db: Session,
+    run_id: str,
+) -> list[models.PaperEquitySnapshot]:
+    """Return every persisted equity snapshot for `run_id`, oldest first.
+
+    Unlike `list_equity_for_run` (which caps at 20,000 newest rows for UI
+    chart rendering), live-eligibility evaluation must inspect the full
+    run history so an earlier drawdown breach never rolls off the window.
+    """
+    return (
+        db.query(models.PaperEquitySnapshot)
+        .filter(models.PaperEquitySnapshot.run_id == run_id)
+        .order_by(
+            models.PaperEquitySnapshot.timestamp.asc(),
+            models.PaperEquitySnapshot.id.asc(),
+        )
+        .all()
+    )
+
+
 def _compute_equity_snapshot_drawdown(
     snapshots: list[models.PaperEquitySnapshot],
 ) -> float | None:
@@ -1430,7 +1451,7 @@ def evaluate_paper_run_forward_test(
         window_end=window_end,
     )
 
-    snapshots = list_equity_for_run(db, run.id)
+    snapshots = _list_all_equity_for_run(db, run.id)
     snapshot_mdd = _compute_equity_snapshot_drawdown(snapshots)
 
     drawdown_candidates: list[float] = []
