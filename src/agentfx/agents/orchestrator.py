@@ -56,6 +56,7 @@ from agentfx.agents.validator import FoldEvaluation, ValidationResult, Validator
 from agentfx.api.models import GenomeOrigin
 from agentfx.core.dsl import StrategySpec
 from agentfx.core.dsl.seeds import SEED_SPECS
+from agentfx.core.position_sizing import DEFAULT_LEVERAGE
 from agentfx.core.regime import RegimeTag, compute_regime, regimes_match
 from agentfx.core.validation import (
     make_rolling_walk_forward_folds,
@@ -128,7 +129,7 @@ class OrchestratorConfig:
     account_balance: float = 10000.0
     position_size: int = 10000
     spread_pips: float | None = None  # None = use default
-    leverage: int = 30  # 30:1 OANDA retail default, 50:1 opt-in
+    leverage: int = DEFAULT_LEVERAGE  # 30:1 retail default, 50:1 opt-in
 
     # Gen-0 seeding strategy. The canonical SEED_SPECS are always
     # included; these flags layer additional starting points on top.

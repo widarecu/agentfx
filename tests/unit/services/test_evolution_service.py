@@ -24,6 +24,7 @@ from agentfx.api.services.evolution import SqlAlchemyPersister
 from agentfx.core.dsl import StrategySpec
 from agentfx.core.dsl.seeds import MA_CROSSOVER_SEED, RSI_MEAN_REVERSION_SEED
 from agentfx.core.validation import make_walk_forward_folds
+from agentfx.services.paper_runner import _snapshot_validated_leverage
 
 
 @pytest.fixture
@@ -639,6 +640,33 @@ class TestSqlAlchemyPersisterUpdateRun:
 
 
 class TestSqlAlchemyPersisterSaveGeneration:
+    def test_paper_leverage_snapshot_follows_source_evolution_run(self, db: Session):
+        run = evolution_service.create_run(
+            db,
+            schemas.EvolutionRunCreate(instrument="EUR_USD", config={"leverage": 50}),
+        )
+        genome = _make_genome(MA_CROSSOVER_SEED, 1.5)
+        SqlAlchemyPersister(db).save_generation(
+            run.id,
+            generation_index=0,
+            genomes=[genome],
+            llm_invoked=False,
+            llm_call_id=None,
+            best_fitness=1.5,
+        )
+        paper = models.Run(
+            strategy_genome_id=genome.id, parameters={"instrument": run.instrument}
+        )
+
+        _snapshot_validated_leverage(db, paper)
+        assert paper.parameters == {"instrument": "EUR_USD", "leverage": 50}
+
+        paper.strategy_genome_id = None
+        _snapshot_validated_leverage(db, paper)
+        assert paper.parameters["leverage"] == 50
+        _snapshot_validated_leverage(db, legacy := models.Run(parameters={}))
+        assert legacy.parameters["leverage"] == 30
+
     def test_save_assigns_genome_ids(self, db: Session) -> None:
         run = evolution_service.create_run(
             db, schemas.EvolutionRunCreate(instrument="EUR_USD")

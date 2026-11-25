@@ -19,6 +19,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from agentfx.core.position_sizing import DEFAULT_LEVERAGE
+
 from .base import BaseSchema
 
 
@@ -93,7 +95,7 @@ class OrchestratorConfigSchema(BaseModel):
     # same risk_pct + stop combination, so a tight-stop strategy can
     # use the extra leverage to amplify dollar P&L without changing
     # its risk-per-trade % budget.
-    leverage: int = Field(default=30, ge=1, le=100)
+    leverage: int = Field(default=DEFAULT_LEVERAGE, ge=1, le=100)
     # Gen-0 seeding layers — see OrchestratorConfig docstring.
     use_prior_winners: bool = True
     n_prior_winners: int = Field(default=3, ge=0, le=20)

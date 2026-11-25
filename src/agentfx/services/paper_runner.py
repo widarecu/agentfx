@@ -43,6 +43,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal, Protocol
 
+from agentfx.core.position_sizing import configured_leverage
+
 if TYPE_CHECKING:  # pragma: no cover
     import pandas as pd
 
@@ -393,6 +395,23 @@ def _claim_runner(db, run) -> bool:
     return claimed == 1
 
 
+def _snapshot_validated_leverage(db, run) -> None:
+    """Freeze the source evolution run's leverage on paper-run startup."""
+    from agentfx.api.models import StrategyGenome
+
+    params = run.parameters or {}
+    if "leverage" in params:
+        return
+    genome = (
+        db.get(StrategyGenome, run.strategy_genome_id)
+        if run.strategy_genome_id is not None
+        else None
+    )
+    source_run = genome.generation.run if genome is not None else None
+    config = source_run.config_json if source_run is not None else {}
+    run.parameters = {**params, "leverage": configured_leverage(config)}
+
+
 def run_paper_run(
     run_id: str,
     *,
@@ -498,6 +517,7 @@ def run_paper_run(
             )
             return
         _ensure_started_at(run)
+        _snapshot_validated_leverage(db, run)
         db.commit()
 
         _execute_loop(
@@ -1914,6 +1934,7 @@ def _open_position_and_persist(
     # legacy runs get the correct dynamic size on their next order.
     raw_cap = risk_cfg.get("max_position_size_units")
     safety_cap = int(raw_cap) if raw_cap and int(raw_cap) > 10_000 else None
+    leverage = configured_leverage(run.parameters or {})
     sizing = compute_position_units(
         instrument=instrument,
         balance=balance_account,
@@ -1923,6 +1944,7 @@ def _open_position_and_persist(
         entry_close=float(df["close"].iloc[-1]),
         safety_cap_units=safety_cap,
         client=client,
+        leverage=leverage,
     )
     if sizing.capped_units <= 0:
         _write_decision(
@@ -2088,6 +2110,7 @@ def _open_position_and_persist(
                 "desired_units": sizing.desired_units,
                 "capped_units": sizing.capped_units,
                 "safety_cap": sizing.safety_cap,
+                "leverage": leverage,
                 "notes": sizing.notes,
             },
         },

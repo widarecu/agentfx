@@ -140,6 +140,7 @@ def compute_position_units(
     entry_close: float,
     safety_cap_units: int | None,
     client,
+    leverage: int = DEFAULT_LEVERAGE,
 ) -> SizingBreakdown:
     """Compute the entry unit count for a fresh trade.
 
@@ -191,7 +192,7 @@ def compute_position_units(
     risk_account = balance * risk_pct
     desired_units = int(risk_account / (stop_pips * pip_value_account))
     notional_per_unit = 1.0 if base_currency == account_currency else entry_close * rate
-    leverage_cap = int(max_leveraged_units(balance, notional_per_unit))
+    leverage_cap = int(max_leveraged_units(balance, notional_per_unit, leverage))
     if safety_cap_units is not None and safety_cap_units < min(
         desired_units, leverage_cap
     ):
@@ -199,13 +200,13 @@ def compute_position_units(
         notes = f"capped_at_safety_limit_{safety_cap_units}"
     elif desired_units > leverage_cap:
         capped_units = leverage_cap
-        notes = f"capped_at_leverage_limit_{DEFAULT_LEVERAGE}_to_1"
+        notes = f"capped_at_leverage_limit_{leverage}_to_1"
         logger.warning(
             "Paper leverage cap hit on %s: %d units clamped to %d (%d:1)",
             instrument,
             desired_units,
             capped_units,
-            DEFAULT_LEVERAGE,
+            leverage,
         )
     else:
         capped_units = desired_units

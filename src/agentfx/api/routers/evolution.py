@@ -22,6 +22,8 @@ from typing import Literal
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from agentfx.core.position_sizing import configured_leverage
+
 from .. import models, schemas
 from ..core import rbac
 from ..core.database import get_db
@@ -563,7 +565,7 @@ def get_genome_backtest(
     backtest_kwargs: dict = {
         "account_balance": float(config_dict.get("account_balance", 10000.0)),
         "position_size": int(config_dict.get("position_size", 10000)),
-        "leverage": int(config_dict.get("leverage", 30)),
+        "leverage": configured_leverage(config_dict),
     }
     # Use the spread the worker pinned at run-start so the endpoint's
     # replay matches the persisted walk-forward fold metrics. Live-spread
