@@ -36,7 +36,9 @@ References:
   - Sharpe ≥ 1.0
   - Deflated Sharpe probability ≥ 95% by default (`AFX_DSR_THRESHOLD`).
     Calculated once over the contiguous walk-forward OOS period from daily
-    net equity returns (annualized with √252 for display). The zero-edge
+    net equity returns (annualized with √252 for display). UTC days wholly
+    closed under the FX market calendar are excluded; open days count even
+    if the strategy does not trade. The zero-edge
     variance of the daily Sharpe estimates is approximated as `1/(T-1)`
     for `T` daily observations; the candidate's sampling error also
     accounts for skewness and kurtosis.

@@ -103,6 +103,30 @@ def test_full_oos_dsr_adds_to_gate_b(fold_sharpe):
     assert "3075 trials" in many.dsr.reason
 
 
+def test_full_oos_dsr_excludes_fully_closed_fx_days():
+    fn = MagicMock(
+        return_value={
+            "metrics": _passing_metrics(),
+            "sizing": {"starting_balance": 10_000},
+            "trades": [
+                {"exit_timestamp": _utc(2024, 9, 16), "net_pnl_dollars": 100},
+                {"exit_timestamp": _utc(2024, 9, 17), "net_pnl_dollars": -50},
+            ],
+        }
+    )
+    result = ValidatorAgent().validate(
+        spec=MA_CROSSOVER_SEED,
+        instrument="EUR_USD",
+        start=_utc(2024, 1, 1),
+        end=_utc(2025, 1, 1),
+        backtest_fn=fn,
+        collect_dsr_sample=True,
+    )
+    # Sept 13–Dec 31 includes 16 closed Saturdays and Christmas Day.
+    # Sundays reopen in the evening and open days without trades still count.
+    assert result.dsr_sample.size == 93
+
+
 def test_full_oos_without_returns_fails_explicitly():
     fn = MagicMock(
         return_value={

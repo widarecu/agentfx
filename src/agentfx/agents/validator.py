@@ -47,6 +47,7 @@ from statistics import median
 from typing import Any, Protocol
 
 from agentfx.agents.base import AgentResult, BaseAgent
+from agentfx.api.workers.market_calendar import market_closure_at
 from agentfx.core.deflated_sharpe import SharpeSample, deflated_sharpe
 from agentfx.core.dsl import StrategySpec
 from agentfx.core.gates import GATE_B_THRESHOLDS, evaluate_gate_b
@@ -486,11 +487,25 @@ class ValidatorAgent(BaseAgent):
                     starting_balance=starting_balance,
                     window_start=oos_start,
                     window_end=end_inclusive,
-                ).to_numpy()
-                balances = [starting_balance, *equity]
-                if min(balances) <= 0:
+                )
+                if min(starting_balance, equity.min()) <= 0:
                     raise ValueError("the backtest account ran out of equity")
-                daily_returns = equity / balances[:-1] - 1
+                trading_equity = equity[
+                    [
+                        not (
+                            market_closure_at(max(day, oos_start))[0]
+                            and market_closure_at(
+                                min(
+                                    day + timedelta(days=1, microseconds=-1),
+                                    end_inclusive,
+                                )
+                            )[0]
+                        )
+                        for day in equity.index
+                    ]
+                ].to_numpy()
+                prior_balances = [starting_balance, *trading_equity[:-1]]
+                daily_returns = trading_equity / prior_balances - 1
                 dsr_sample = SharpeSample.from_returns(daily_returns)
             except ValueError as exc:
                 dsr_sample = str(exc)
