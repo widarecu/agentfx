@@ -9,7 +9,9 @@ Tests focus on:
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -587,8 +589,95 @@ class TestLinearFiling:
             assert s.source_label == "QA agent"
             assert s.type_label == "Bug"
             assert s.fingerprint.startswith("qa:")
-            assert "src/execution" in s.body or "src/agentfx/services" in s.body
             assert "run_abc" in s.body
+        assert "src/execution/order_manager.py" not in call_specs[0].body
+        assert "Area: Paper runner. File was not identified." in call_specs[0].body
+        assert (
+            "Target file: `src/agentfx/services/paper_runner.py`" in call_specs[1].body
+        )
+
+    @staticmethod
+    def _file_one(**fields):
+        from agentfx.integrations.linear_client import FilingResult
+
+        report = qa.QADivergenceReport(work_orders=[qa.QAWorkOrder(**fields)])
+        with patch(
+            "agentfx.integrations.linear_client.file_finding",
+            return_value=FilingResult(filed=True, action="created"),
+        ) as file_finding:
+            qa._file_work_orders_to_linear(
+                report=report, run_id="run_example", today=date(2026, 10, 26)
+            )
+        return file_finding.call_args.args[0]
+
+    def test_filing_follows_the_template_in_order(self):
+        spec = self._file_one(
+            observation="The paper account placed two orders for one signal.",
+            evidence="Trades 8 and 9 opened 50 ms apart at 03:40 UTC.",
+            expected_profit_impact="Duplicate orders increase exposure.",
+            spec="Trades 8 and 9 motivate limiting orders per signal.",
+            proposed_fix="Submit at most one order per signal.",
+            confidence="high",
+            done_when=["One signal cannot create a second order."],
+        )
+        template = (
+            Path(__file__).resolve().parents[4] / "config/linear/templates/finding.md"
+        ).read_text(encoding="utf-8")
+        headings = r"^#{1,6} .+$"
+        assert re.findall(headings, spec.body, flags=re.MULTILINE) == re.findall(
+            headings, template, flags=re.MULTILINE
+        )
+        assert "**Confidence:** High" in spec.body
+        assert "## What I observed\n\nThe paper account placed two orders" in spec.body
+        assert "## Why it matters\n\nDuplicate orders increase exposure." in spec.body
+        assert "## Proposed fix\n\nSubmit at most one order per signal." in spec.body
+        assert "Trades 8 and 9 motivate" not in spec.body
+        assert "## Evidence\n\n" + spec.evidence in spec.body
+        assert spec.evidence == (
+            "Paper run: `run_example` (2026-10-26)\n\n"
+            "Trades 8 and 9 opened 50 ms apart at 03:40 UTC."
+        )
+        assert "- [ ] One signal cannot create a second order." in spec.body
+        assert "- [ ] A test reproduces the problem." in spec.body
+        assert "- [ ] `make lint` green." in spec.body
+        assert "- [ ] `make test-unit` green." in spec.body
+
+    @pytest.mark.parametrize("full_path", [True, False])
+    def test_guessed_target_is_not_echoed_in_filing_prose(self, full_path):
+        guess = "src/execution/stop_engine.py"
+        reference = guess if full_path else "stop_engine.py"
+        spec = self._file_one(
+            target_file=guess,
+            title=f"Fix {reference}",
+            proposed_fix=f"Change {reference}.",
+        )
+        assert reference not in spec.title
+        assert reference not in spec.body
+        assert "File was not identified." in spec.body
+
+    @pytest.mark.parametrize(
+        ("category", "risk"),
+        [
+            ("execution_timing", "Money-path"),
+            ("idempotency", "Money-path"),
+            ("cost_model", "Normal"),
+            ("other", "Normal"),
+        ],
+    )
+    def test_analyst_bug_has_risk_and_found_in_labels(self, category, risk):
+        spec = self._file_one(category=category)
+        assert spec.type_label == "Bug"
+        assert spec.risk_label == risk
+        assert spec.extra_labels == ["Paper trading"]
+
+    def test_missing_ticket_fields_are_not_stated(self):
+        spec = self._file_one()
+        assert "**Confidence:** (not stated)" in spec.body
+        assert "## What I observed\n\n(not stated)" in spec.body
+        assert spec.evidence.endswith("\n\n(not stated)")
+        assert "## Why it matters\n\n(not stated)" in spec.body
+        assert "## Proposed fix\n\n(not stated)" in spec.body
+        assert "## Done when\n\n(not stated)" in spec.body
 
     def test_filing_exception_does_not_raise(self):
         from unittest.mock import patch
