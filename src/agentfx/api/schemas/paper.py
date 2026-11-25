@@ -163,6 +163,10 @@ class PaperRunPublic(BaseSchema):
     # `{instrument} {granularity} — YYYY-MM-DD` or the LLM
     # suggestion). Stored inside `run.parameters['name']`.
     name: str | None = None
+    # Pre-agreed forward-test contract locked when the paper run was
+    # approved (AFX-154). Stored inside `run.parameters['forward_test_contract']`.
+    # Null for legacy paper runs created before AFX-154.
+    forward_test_contract: dict | None = None
 
 
 class PaperRunListItem(BaseSchema):
@@ -421,6 +425,55 @@ class BacktestOverlayResponse(BaseSchema):
     reason: BacktestOverlayReason | None = None
 
 
+# ─────────────────────────────────────────────────────────────────────
+# AFX-154 — pre-agreed paper forward-test contract + live eligibility
+# ─────────────────────────────────────────────────────────────────────
+
+
+class ForwardTestContractPublic(BaseSchema):
+    """Immutable forward-test pass criteria locked at paper run start."""
+
+    version: int = 1
+    locked_at: str
+    min_closed_trades: int
+    min_net_pnl: float
+    min_sharpe: float
+    max_drawdown: float
+    max_divergence: float
+    backtest_oos_sharpe: float | None = None
+    backtest_oos_hit_rate: float | None = None
+    backtest_oos_max_drawdown: float | None = None
+
+
+class ForwardTestCriterionPublic(BaseSchema):
+    """Pass/fail/pending verdict for one forward-test criterion."""
+
+    name: str
+    label: str
+    status: Literal["passed", "failed", "pending", "skipped"]
+    actual: float | int | None = None
+    threshold: float | int | None = None
+    message: str
+
+
+class ForwardTestEvaluationPublic(BaseSchema):
+    """`GET /paper-runs/{id}/forward-test` and live-eligibility verdict."""
+
+    run_id: str
+    status: Literal["in_progress", "passed", "failed", "no_contract"]
+    eligible_for_live: bool
+    closed_trades: int
+    min_closed_trades: int
+    trades_remaining: int
+    progress_pct: float
+    progress_label: str
+    early_failure: bool
+    criteria: list[ForwardTestCriterionPublic]
+    failures: list[str]
+    metrics: dict[str, float | int | None]
+    contract: ForwardTestContractPublic | None = None
+
+
 __all__ = [
     "ApprovalQueueItem",
     "ApprovalQueueList",
@@ -431,6 +484,9 @@ __all__ = [
     "DeployPaperRequest",
     "EquityList",
     "EquitySnapshotPublic",
+    "ForwardTestContractPublic",
+    "ForwardTestCriterionPublic",
+    "ForwardTestEvaluationPublic",
     "KillPaperRunResponse",
     "PaperDecisionList",
     "PaperDecisionPublic",

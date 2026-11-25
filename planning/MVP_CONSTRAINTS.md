@@ -40,7 +40,12 @@ References:
   - PnL after slippage and spread positive and stable across regimes
 
 ## 5) Execution & Rollout
-- Paper first: minimum 2 weeks of paper with metrics above thresholds before Live
+- Paper first (pre-agreed forward test): every paper run locks its pass contract at start time before it can be nominated for Live:
+  - Minimum closed paper trades: ≥ 100 closed trades (configurable via `PAPER_FORWARD_TEST_MIN_TRADES`, replacing the 2-week-only minimum)
+  - Net realized PnL (after financing and commission): > 0
+  - Sharpe ratio: ≥ 1.0 (`PAPER_FORWARD_TEST_MIN_SHARPE`)
+  - Max drawdown: ≤ 10% live cap (`PAPER_FORWARD_TEST_MAX_DRAWDOWN`); breaching this fails live eligibility early without auto-halting paper trading
+  - Backtest-vs-paper divergence: Sharpe degradation ≤ 30% vs the genome's locked OOS Sharpe (`PAPER_FORWARD_TEST_MAX_DIVERGENCE`)
 - Latency SLOs: Paper p95 < 1s; Live p95 < 500ms end-to-end decision loop
 - Reliability: auto-retry with backoff; circuit breaker on 5 consecutive broker failures or p95 latency > 2x SLO for 10 minutes
 - Rollback: disable strategy via feature flag; fail-safe to flat positions
