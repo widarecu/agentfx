@@ -21,6 +21,7 @@ Failure branches pinned:
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from threading import Event
 from unittest.mock import MagicMock, patch
@@ -241,6 +242,29 @@ def test_workspace_poll_cannot_interleave_webhook_budget_check_and_dispatch(
         poll_job.result(timeout=5)
 
     assert cost_refreshed.is_set()
+
+
+def test_queued_webhook_uses_dispatch_day_after_utc_midnight(monkeypatch):
+    mocks = _patch_bg(monkeypatch)
+    before_midnight = datetime(2026, 11, 6, 23, 59, 59, tzinfo=UTC)
+    after_midnight = datetime(2026, 11, 7, tzinfo=UTC)
+    clock = MagicMock(wraps=datetime)
+    clock.now.return_value = before_midnight
+
+    @contextmanager
+    def lock():
+        clock.now.return_value = after_midnight
+        yield
+
+    monkeypatch.setattr(lwd, "datetime", clock)
+    monkeypatch.setattr(pe_workspace, "pe_workspace_operation_lock", lock())
+
+    lwd.dispatch_from_linear_webhook(delivery_id=_DELIVERY_ID, payload=_real_payload())
+
+    mocks["budget"].assert_called_once_with(
+        mocks["db"], now=after_midnight, trigger="webhook"
+    )
+    assert mocks["adapter"].dispatch.call_args.kwargs["now"] == after_midnight
 
 
 # ─────────────────────────────────────────────────────────────────────

@@ -106,8 +106,6 @@ def dispatch_from_linear_webhook(
     exists; the actual PR open happens asynchronously via the poll
     loop as usual.
     """
-    now = now or datetime.now(UTC)
-
     extracted = _extract_payload_fields(payload)
     if extracted is None:
         return False, "payload_missing_required_fields"
@@ -143,7 +141,7 @@ def dispatch_from_linear_webhook(
             identifier=identifier,
             title=title,
             narrative=narrative,
-            now=now,
+            now=now or datetime.now(UTC),
         )
 
 
