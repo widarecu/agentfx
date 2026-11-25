@@ -100,8 +100,10 @@ def scan_and_dispatch(*, db: Session, now: datetime | None = None) -> tuple[int,
     # unless a dispatch is actually attempted (keeps the orchestrator
     # import graph light).
     from agentfx.agents.fleet.pe_workspace import (
+        DevinWorkspaceAdapter,
         build_task_slug,
         check_budget_before_dispatch,
+        devin_dispatch_pause_reason,
         resolve_adapter,
         sweep_stuck_runs,
     )
@@ -121,6 +123,17 @@ def scan_and_dispatch(*, db: Session, now: datetime | None = None) -> tuple[int,
         )
         return (0, 0)
 
+    adapter = resolve_adapter()
+    if isinstance(adapter, DevinWorkspaceAdapter):
+        pause_reason = devin_dispatch_pause_reason(now=now)
+        if pause_reason is not None:
+            logger.warning(
+                "pe_agent: Devin dispatches paused (%s) — skipping scan tick, "
+                "no Linear state changed",
+                pause_reason,
+            )
+            return (0, 0)
+
     try:
         max_per_scan = getattr(settings, "PE_LINEAR_MAX_DISPATCH_PER_SCAN", 3)
         # The per-scan cap counts dispatches, not candidates looked at:
@@ -134,7 +147,6 @@ def scan_and_dispatch(*, db: Session, now: datetime | None = None) -> tuple[int,
     if not candidates:
         return (0, 0)
 
-    adapter = resolve_adapter()
     attempted = 0
 
     for issue in candidates:
