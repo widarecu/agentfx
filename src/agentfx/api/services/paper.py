@@ -1436,12 +1436,37 @@ def evaluate_paper_run_forward_test(
         or run.created_at
         or (closed_rows[0].entry_timestamp if closed_rows else now)
     )
-    window_end = (
+    end_anchor = run.completed_at or now
+    last_exit = (
         closed_rows[-1].exit_timestamp
         if closed_rows and closed_rows[-1].exit_timestamp is not None
-        else (run.completed_at or now)
+        else None
     )
-    if window_end < window_start:
+    window_end = end_anchor
+    if last_exit is not None:
+        end_utc = (
+            end_anchor.replace(tzinfo=UTC)
+            if end_anchor.tzinfo is None
+            else end_anchor.astimezone(UTC)
+        )
+        exit_utc = (
+            last_exit.replace(tzinfo=UTC)
+            if last_exit.tzinfo is None
+            else last_exit.astimezone(UTC)
+        )
+        if exit_utc > end_utc:
+            window_end = last_exit
+    start_utc = (
+        window_start.replace(tzinfo=UTC)
+        if window_start.tzinfo is None
+        else window_start.astimezone(UTC)
+    )
+    final_end_utc = (
+        window_end.replace(tzinfo=UTC)
+        if window_end.tzinfo is None
+        else window_end.astimezone(UTC)
+    )
+    if final_end_utc < start_utc:
         window_end = window_start
 
     ledger = summarize_from_trade_ledger(

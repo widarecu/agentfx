@@ -316,6 +316,49 @@ class TestServiceEvaluationAndLiveEligibility:
         mdd = paper_service._compute_equity_snapshot_drawdown([pre_close, post_close])
         assert mdd == pytest.approx(0.0)
 
+    def test_sharpe_window_includes_flat_days_after_last_trade(self) -> None:
+        start = datetime(2026, 10, 1, 0, 0, tzinfo=UTC)
+        contract = ForwardTestContract.create(
+            min_closed_trades=10,
+            min_sharpe=1.0,
+            max_drawdown=0.10,
+            max_divergence=0.30,
+            locked_at=start,
+        ).to_dict()
+        # 10 trades over ~2.5 days, then either completed right away or flat for 60 days.
+        trades = _make_closed_trades(10, start=start, pnl_pattern=[50.0, -20.0])
+        short_run = SimpleNamespace(
+            id="run_short_window",
+            parameters={"forward_test_contract": contract},
+            snapshot_balance=10_000.0,
+            initial_balance=10_000.0,
+            max_drawdown=None,
+            started_at=start,
+            created_at=start,
+            completed_at=trades[-1].exit_timestamp,
+        )
+        long_flat_run = SimpleNamespace(
+            id="run_long_flat_window",
+            parameters={"forward_test_contract": contract},
+            snapshot_balance=10_000.0,
+            initial_balance=10_000.0,
+            max_drawdown=None,
+            started_at=start,
+            created_at=start,
+            completed_at=start + timedelta(days=60),
+        )
+
+        ev_short = paper_service.evaluate_paper_run_forward_test(
+            _mock_db_for_eval(trades), short_run
+        )
+        ev_long = paper_service.evaluate_paper_run_forward_test(
+            _mock_db_for_eval(trades), long_flat_run
+        )
+        assert ev_short.metrics["sharpe"] is not None
+        assert ev_long.metrics["sharpe"] is not None
+        # Sitting flat for ~57 extra days dilutes daily Sharpe vs stopping at last trade.
+        assert ev_long.metrics["sharpe"] < ev_short.metrics["sharpe"]
+
 
 class TestRouterForwardTestEndpoints:
     def test_get_forward_test_returns_progress(self) -> None:
