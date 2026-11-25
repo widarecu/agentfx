@@ -12,7 +12,7 @@ import os
 import sys
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from unittest.mock import patch
@@ -67,6 +67,7 @@ class Replay:
     genome: Genome
     scores: tuple[Score, Score, Score] | None = None
     missing: str | None = None
+    missing_training_folds: list[int] = field(default_factory=list)
 
 
 def load_genomes(connection, before, paper_sources):
@@ -196,8 +197,9 @@ def replay_genome(genome):
         "min_cagr": float(config.get("min_cagr_pct", GATE_B_THRESHOLDS["min_cagr"])),
     }
     evaluations = ([], [], [])
-    try:
-        for fold in genome.folds:
+    missing_training_folds = []
+    for fold in genome.folds:
+        try:
             for out, (gap_aware, shifted_trigger) in zip(
                 evaluations, ((False, False), (True, False), (True, True)), strict=True
             ):
@@ -211,10 +213,14 @@ def replay_genome(genome):
                 if fold.is_oos:
                     passed, failures = evaluate_gate_b(metrics, overrides=overrides)
                     out.append(FoldEvaluation(fold, metrics, passed, failures))
-    except FileNotFoundError as exc:
-        return Replay(genome, missing=str(exc))
+        except FileNotFoundError as exc:
+            if fold.is_oos:
+                return Replay(genome, missing=str(exc))
+            missing_training_folds.append(fold.index)
     return Replay(
-        genome, scores=tuple(score_folds(out, overrides) for out in evaluations)
+        genome,
+        scores=tuple(score_folds(out, overrides) for out in evaluations),
+        missing_training_folds=missing_training_folds,
     )
 
 
@@ -291,6 +297,9 @@ def render_report(replays, before, unresolved_sources):
             continue
         a, b, current = replay.scores
         causes = []
+        if replay.missing_training_folds:
+            indices = ", ".join(str(index) for index in replay.missing_training_folds)
+            causes.append(f"No candles for training fold indices {indices}; OOS scored")
         if g.stored is not None and g.stored != a.old_pass:
             counts["baseline"] += 1
             causes.append("Stored ≠ A")

@@ -154,6 +154,34 @@ def test_score_preserves_old_aggregate_and_adds_new_oos_floor():
     assert len(score.fold_failures) == 2
 
 
+@pytest.mark.parametrize("missing_oos", [False, True])
+def test_only_missing_oos_candles_block_a_verdict(monkeypatch, missing_oos):
+    training = make_fold(0, is_oos=False)
+    held_out = make_fold(1)
+
+    def replay_fold(_genome, fold, _spread, **_variant):
+        if fold.is_oos == missing_oos:
+            raise FileNotFoundError("No candles")
+        return {
+            "sharpe": 1.3,
+            "cagr": 0.14,
+            "max_drawdown": -0.06,
+            "hit_rate": 0.52,
+            "n_trades": 310,
+        }
+
+    monkeypatch.setattr(revalidate, "replay_fold", replay_fold)
+    replay = revalidate.replay_genome(make_genome(training, held_out))
+    report = revalidate.render_report([replay], date(2022, 2, 1), set())
+    if missing_oos:
+        assert replay.scores is None
+        assert "missing replay inputs: 1." in report
+    else:
+        assert all(score.new_pass for score in replay.scores)
+        assert "No candles for training fold indices 0; OOS scored" in report
+        assert "missing replay inputs: 0." in report
+
+
 def test_report_attributes_each_transition_without_counting_missing_as_failing():
     genome = make_genome(make_fold(0))
     results = [
