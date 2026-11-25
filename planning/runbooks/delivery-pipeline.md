@@ -33,7 +33,7 @@ Every taker uses the same `afx start` / `afx block` (AFX-142): Wilson with Claud
 - **What Linear shows.** Status is the only claim: Ready → In Progress, plus one comment "Claimed by <taker>: <session or branch>". Assignee stays Wilson and delegate is never set (delegating can itself launch a Linear agent session).
 - **With or without a Linear key.** With `LINEAR_API_KEY` the command does it all in place (it also needs `gh` or `GH_TOKEN` for the tag). Without it (Devin and other keyless sessions) it pushes an `afx-request/<id>` branch; the `afx-request.yml` workflow runs the same code from `main` with the repo's key, reports the verdict on that commit, deletes the branch, and the command prints the verdict.
 - **The fleet** claims with the same function before it launches a worker and tells the worker not to claim again. It doesn't use an empty assignee as its pickup gate.
-- **Retries.** Re-running `afx start` as the same taker is a no-op success; re-running `afx block` with the same question posts nothing new. If a claim's outcome is unknown, check the ticket in Linear before retrying.
+- **Retries.** Only the taker that created the tag is told to start; any later `afx start` on the ticket is refused, even from a session with the same name. If a claim's outcome is unknown, check the ticket's claim comment in Linear instead of retrying. Re-running `afx block` with the same question posts nothing new.
 
 ## 2. Who owns each status
 

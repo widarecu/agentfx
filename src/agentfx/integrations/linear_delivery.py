@@ -369,10 +369,11 @@ def start(
     refused. The winner's ticket moves to In Progress with one comment
     naming it; assignee and delegate are left alone.
 
-    A taker retrying its own claim (an uncertain launch, a lost reply)
-    gets ok without a second comment. A loser that finds the ticket still
-    Ready finishes the winner's status move so the board shows the claim
-    even if the winner died before writing it."""
+    Only the taker that created the tag gets ok, so two sessions that
+    happen to share a name and branch can't both start. A loser that finds
+    the ticket still Ready (re-read, not its first snapshot) finishes the
+    winner's status move, so the board shows the claim even if the winner
+    died before writing it."""
     issue = client.issue(ident)
 
     def refuse(reason: str) -> TransitionResult:
@@ -387,24 +388,26 @@ def start(
     if issue.state not in (READY, IN_PROGRESS):
         return refuse(f"{issue.identifier} is {issue.state!r}, not {READY!r}")
     tag = claim_tag(issue.identifier, ready_since(client, issue))
-    won = issue.state == READY and claims.create(tag, taker)
-    holder = taker if won else claims.holder(tag)
-    if holder is None:
-        return refuse(f"{issue.identifier} is {issue.state!r}, not {READY!r}")
-    changed = False
-    if issue.state == READY:
-        _move(client, issue, IN_PROGRESS)
-        changed = True
-    if holder != taker:
+    if issue.state == IN_PROGRESS:
+        holder = claims.holder(tag)
+        if holder is None:
+            return refuse(f"{issue.identifier} is {issue.state!r}, not {READY!r}")
         return refuse(f"{issue.identifier} is already claimed by {holder.name}")
+    if not claims.create(tag, taker):
+        holder = claims.holder(tag)
+        current = client.issue(ident)
+        if current.state == READY:
+            _move(client, current, IN_PROGRESS)
+        who = holder.name if holder else "another taker"
+        return refuse(f"{issue.identifier} is already claimed by {who}")
+    _move(client, issue, IN_PROGRESS)
     body = f"**Claimed by {taker.name}**" + (f": {taker.link}" if taker.link else "")
-    if client.comment_once(issue.id, f"{claim_marker(tag)}\n{body}", claim_marker(tag)):
-        changed = True
+    client.comment_once(issue.id, f"{claim_marker(tag)}\n{body}", claim_marker(tag))
     return TransitionResult(
         ok=True,
-        changed=changed,
+        changed=True,
         identifier=issue.identifier,
-        from_state=issue.state,
+        from_state=READY,
         to_state=IN_PROGRESS,
     )
 

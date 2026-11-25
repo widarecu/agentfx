@@ -140,13 +140,28 @@ class TestStart:
         assert "claimed by Devin" in again.reason
         assert _states(fake) == ["In Progress"]
 
-    def test_own_retry_is_ok_without_a_second_comment(self, fake, client):
+    def test_same_name_and_link_is_still_refused(self, fake, client):
+        """Two sessions sharing a taker name and branch must not both start."""
         fake.add("AFX-1", "Ready")
         claims = FakeClaims()
         _start(client, "AFX-1", claims=claims)
         again = _start(client, "AFX-1", claims=claims)
-        assert again.ok is True and again.changed is False
+        assert again.ok is False
         assert len(fake.issues["AFX-1"].comments) == 1
+
+    def test_late_loser_leaves_a_blocked_ticket_alone(self, fake, client):
+        """The winner claimed and blocked before the loser's create came back."""
+        issue = fake.add("AFX-1", "Ready")
+        claims = FakeClaims()
+        claims.tags["afx-claim/AFX-1/20261120000000000"] = OTHER
+
+        def winner_blocks():
+            issue.state = "Blocked"
+
+        claims.before_create = winner_blocks
+        assert _start(client, "AFX-1", claims=claims).ok is False
+        assert issue.state == "Blocked"
+        assert fake.mutations == []
 
     def test_in_progress_without_a_claim_is_refused(self, fake, client):
         fake.add("AFX-1", "In Progress")
