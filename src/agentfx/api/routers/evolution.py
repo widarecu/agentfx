@@ -260,9 +260,7 @@ def stop_evolution_run(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(user_service.get_current_active_user),
 ) -> schemas.EvolutionRunPublic:
-    """Request a manual halt. The worker will SIGTERM the child process if
-    it's running; if the run hasn't started yet, status flips to STOPPED
-    immediately."""
+    """Persist a manual halt for the worker, even on another backend."""
     _ensure_trader(current_user)
     # Ownership check must fire BEFORE the state transition so a
     # non-owner cannot force-halt another user's run.
@@ -278,13 +276,6 @@ def stop_evolution_run(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Evolution run not found"
         )
-    # Best-effort: if the worker is running, kill the child process. The
-    # worker's monitor will see the exit and finalize state.
-    if run.process_pid:
-        from ..workers.evolution_runner import signal_run_stop
-
-        signal_run_stop(run.process_pid)
-
     return schemas.EvolutionRunPublic.model_validate(run)
 
 

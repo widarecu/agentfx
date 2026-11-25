@@ -1404,6 +1404,8 @@ async def ingestion_loop():
                 await asyncio.wait_for(_shutdown_event.wait(), timeout=backoff_seconds)
             except TimeoutError:
                 continue
+            except asyncio.CancelledError:
+                break
 
     if health_task is not None and not health_task.done():
         health_task.cancel()
@@ -1413,6 +1415,37 @@ async def ingestion_loop():
             pass
     executor.shutdown(wait=True, cancel_futures=True)
     logger.info("Candle ingestion worker stopped")
+
+
+async def _ingest_as_owner(shutdown: asyncio.Event, retry_seconds: float = 5.0) -> None:
+    from ..core.database import engine
+    from .ownership import worker_lock
+
+    while not shutdown.is_set():
+        try:
+            with worker_lock(engine, "agentfx:candle-ingestion") as (owned, connection):
+                if owned:
+                    logger.info("Acquired candle ingestion ownership")
+                    ingestion = asyncio.create_task(ingestion_loop())
+                    try:
+                        while not ingestion.done():
+                            await asyncio.wait({ingestion}, timeout=retry_seconds)
+                            if connection is not None and not ingestion.done():
+                                connection.exec_driver_sql("SELECT 1")
+                                connection.commit()
+                        await ingestion
+                        return
+                    finally:
+                        if not ingestion.done():
+                            ingestion.cancel()
+                            await asyncio.gather(ingestion, return_exceptions=True)
+        except Exception:  # noqa: BLE001
+            logger.exception("Candle ingestion owner failed; will retry")
+
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=retry_seconds)
+        except TimeoutError:
+            pass
 
 
 async def start_ingestion_worker() -> bool:
@@ -1444,10 +1477,10 @@ async def start_ingestion_worker() -> bool:
         return False
 
     _shutdown_event = asyncio.Event()
-    _worker_task = asyncio.create_task(ingestion_loop())
+    _worker_task = asyncio.create_task(_ingest_as_owner(_shutdown_event))
 
     logger.info(
-        f"Candle ingestion worker started: "
+        f"Candle ingestion worker configured: "
         f"{len(settings.instruments_list)} instruments, "
         f"{len(settings.granularities_list)} granularities, "
         f"polling every {settings.INGESTION_POLL_INTERVAL}s, "

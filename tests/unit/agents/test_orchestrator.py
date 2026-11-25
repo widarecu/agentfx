@@ -249,6 +249,7 @@ def _build_orchestrator(
     config: OrchestratorConfig | None = None,
     stop_conditions: StopConditions | None = None,
     clock=None,
+    check_stop=None,
 ) -> tuple[OrchestratorAgent, MockPersister]:
     persister = MockPersister()
     orchestrator = OrchestratorAgent(
@@ -282,6 +283,7 @@ def _build_orchestrator(
         validator=validator or _make_validator_returning(validator_passed=True),
         compute_fitness_fn=fitness_fn or FixedFitnessFn([1.0]),
         clock=clock or StepClock(step_seconds=1.0),
+        check_stop=check_stop,
     )
     return orchestrator, persister
 
@@ -605,6 +607,48 @@ def _build_mock_llm_injector(
 
 
 class TestLLMInjection:
+    @pytest.mark.parametrize("seed_gen0", [True, False])
+    def test_does_not_start_an_llm_request_after_manual_stop(
+        self, seed_gen0, monkeypatch
+    ) -> None:
+        class RunStopped(Exception):
+            pass
+
+        stopped = False
+
+        def check_stop():
+            if stopped:
+                raise RunStopped
+
+        injector = _build_mock_llm_injector()
+        orchestrator, _ = _build_orchestrator(
+            llm_injector=injector,
+            check_stop=check_stop,
+            config=OrchestratorConfig(
+                instrument="EUR_USD",
+                population_size=20,
+                use_prior_winners=False,
+                llm_seed_gen0=seed_gen0,
+                llm_injection_every_n=1,
+            ),
+        )
+
+        def analyze_market():
+            nonlocal stopped
+            stopped = seed_gen0
+            return {}, None, None
+
+        def compute_request_cost():
+            nonlocal stopped
+            stopped = True
+            return 1.0
+
+        monkeypatch.setattr(orchestrator, "_compute_fold_regimes", analyze_market)
+        monkeypatch.setattr(orchestrator, "_cost_per_trade_pips", compute_request_cost)
+        with pytest.raises(RunStopped):
+            orchestrator.run_loop()
+        injector.inject.assert_not_called()
+
     def test_no_injection_when_no_injector(self) -> None:
         orchestrator, persister = _build_orchestrator(
             stop_conditions=StopConditions(

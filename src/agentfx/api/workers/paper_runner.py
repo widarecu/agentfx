@@ -24,6 +24,11 @@ import signal
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from time import sleep
+
+from sqlalchemy import select
+
+from .ownership import try_recovery_lock, worker_lock
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +37,7 @@ logger = logging.getLogger(__name__)
 _MP_CONTEXT = multiprocessing.get_context("spawn")
 
 _WATCHDOG_POLL_SECONDS = 5.0
+_OWNER_RETRY_SECONDS = 1.0
 
 # ─────────────────────────────────────────────────────────────────────
 # Auto-restart supervisor (Wilson 2026-08-23)
@@ -97,6 +103,7 @@ class _ChildHandle:
     proc: multiprocessing.Process
     exited: threading.Event
     superseded: bool = False
+    run_id: str | None = None
 
 
 _CHILDREN: dict[int, _ChildHandle] = {}
@@ -123,7 +130,7 @@ def schedule_paper_run(run_id: str) -> None:
     )
     proc.start()
     logger.info("scheduled paper run %s as pid=%s", run_id, proc.pid)
-    handle = _ChildHandle(proc=proc, exited=threading.Event())
+    handle = _ChildHandle(proc=proc, exited=threading.Event(), run_id=run_id)
     with _CHILDREN_LOCK:
         _CHILDREN[proc.pid] = handle
     _record_child_pid(run_id, proc.pid)
@@ -151,57 +158,67 @@ def signal_run_stop(pid: int | None) -> bool:
         return False
 
 
-def recover_orphaned_paper_runs(db=None) -> int:
+def recover_orphaned_paper_runs(
+    db=None, *, deferred: set[str] | None = None, retry_only: bool = False
+) -> int:
     """Lifespan startup hook.
 
     Two responsibilities:
-    1. Paper runs left in RUNNING when the app crashed — their
-       subprocess died. Flip to APPROVED so the scheduler can re-pick
-       them up.
-    2. Paper runs in APPROVED that never got scheduled (crash between
-       DB commit and BackgroundTask fire) — schedule them.
+    1. Reset RUNNING paper runs without a live owner to APPROVED.
+    2. Schedule APPROVED paper runs without an owner.
 
+    `deferred` receives IDs still owned by another worker. A retry
+    pass checks just those IDs so it can pick them up after handoff.
     Returns the number of runs (re-)scheduled.
     """
     from agentfx.api.core.database import SessionLocal
-    from agentfx.api.models import RunStatus
-    from agentfx.api.services import paper as paper_service
+    from agentfx.api.models import Run, RunEnvironment, RunStatus
 
     own_session = db is None
     if own_session:
         db = SessionLocal()
 
-    scheduled = 0
+    candidates = set(deferred or ()) if retry_only else None
+    still_owned: set[str] = set()
     try:
-        orphaned = paper_service.find_orphaned_running_paper_runs(db)
-        for run in orphaned:
-            run.status = RunStatus.APPROVED
-            run.process_pid = None
-        if orphaned:
-            db.commit()
+        recoverable = (RunStatus.RUNNING, RunStatus.APPROVED)
+        pending = db.query(Run).filter(
+            Run.environment == RunEnvironment.PAPER,
+            Run.status.in_(recoverable),
+        )
+        if candidates is not None:
+            pending = pending.filter(Run.id.in_(candidates))
+        run_ids = []
+        reset = 0
+        for run in pending.all():
+            if not try_recovery_lock(db, f"agentfx:paper:{run.id}"):
+                still_owned.add(run.id)
+                continue
+            db.refresh(run)
+            if run.status not in recoverable:
+                continue
+            if run.status == RunStatus.RUNNING:
+                run.status = RunStatus.APPROVED
+                run.process_pid = None
+                reset += 1
+            run_ids.append(run.id)
+        db.commit()
+        if reset:
             logger.warning(
                 "reset %d orphaned RUNNING paper runs to APPROVED",
-                len(orphaned),
+                reset,
             )
 
-        from agentfx.api.models import Run, RunEnvironment
-
-        pending = (
-            db.query(Run)
-            .filter(
-                Run.environment == RunEnvironment.PAPER,
-                Run.status == RunStatus.APPROVED,
-            )
-            .all()
-        )
-        for run in pending:
-            schedule_paper_run(run.id)
-            scheduled += 1
+        for run_id in run_ids:
+            schedule_paper_run(run_id)
+        if deferred is not None:
+            deferred.clear()
+            deferred.update(still_owned)
     finally:
         if own_session:
             db.close()
 
-    return scheduled
+    return len(run_ids)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -244,7 +261,7 @@ def _start_watchdog(
                 proc.pid,
             )
             return
-        _mark_run_failed_after_crash(run_id, exit_code)
+        _mark_run_failed_after_crash(run_id, exit_code, pid=proc.pid)
 
     t = threading.Thread(
         target=_watch,
@@ -254,7 +271,9 @@ def _start_watchdog(
     t.start()
 
 
-def _mark_run_failed_after_crash(run_id: str, exit_code: int | None) -> None:
+def _mark_run_failed_after_crash(
+    run_id: str, exit_code: int | None, *, pid: int | None = None
+) -> None:
     """Flip a crashed paper run to ERROR with a specific stop reason.
 
     Idempotent — never overwrites terminal states. Distinguishes
@@ -269,12 +288,16 @@ def _mark_run_failed_after_crash(run_id: str, exit_code: int | None) -> None:
 
         db = SessionLocal()
         try:
+            if pid is not None and not try_recovery_lock(db, f"agentfx:paper:{run_id}"):
+                return
             run = paper_service.get_paper_run(db, run_id)
             if run is None:
                 logger.warning(
                     "watchdog: paper run %s vanished from DB before update",
                     run_id,
                 )
+                return
+            if pid is not None and run.process_pid != pid:
                 return
             if run.status in {RunStatus.RUNNING, RunStatus.APPROVED}:
                 pre_init = run.status == RunStatus.APPROVED
@@ -339,7 +362,9 @@ def _record_child_pid(run_id: str, pid: int | None) -> None:
         db = SessionLocal()
         try:
             db.query(Run).filter(
-                Run.id == run_id, Run.status == RunStatus.APPROVED
+                Run.id == run_id,
+                Run.status == RunStatus.APPROVED,
+                Run.process_pid.is_(None),
             ).update({Run.process_pid: pid}, synchronize_session=False)
             db.commit()
         finally:
@@ -370,9 +395,20 @@ def _subprocess_entry(run_id: str) -> None:
     logger.info("paper-runner subprocess starting for run %s", run_id)
 
     try:
+        from agentfx.api.core.database import engine
+        from agentfx.api.models import Run, RunStatus
         from agentfx.services.paper_runner import run_paper_run
 
-        run_paper_run(run_id)
+        while True:
+            with worker_lock(engine, f"agentfx:paper:{run_id}") as (owned, connection):
+                if owned:
+                    run_paper_run(run_id, owner_connection=connection)
+                    return
+                assert connection is not None
+                status = connection.scalar(select(Run.status).where(Run.id == run_id))
+                if status != RunStatus.APPROVED:
+                    return
+            sleep(_OWNER_RETRY_SECONDS)
     except Exception as exc:  # noqa: BLE001
         logger.exception("paper-runner subprocess crashed for run %s", run_id)
         # Persist the traceback to `run.parameters.crash_detail` so the
@@ -416,8 +452,10 @@ def _persist_crash_detail(run_id: str, exc: Exception) -> None:
         }
         db = SessionLocal()
         try:
+            if not try_recovery_lock(db, f"agentfx:paper:{run_id}"):
+                return
             run = paper_service.get_paper_run(db, run_id)
-            if run is None:
+            if run is None or run.process_pid != os.getpid():
                 return
             params = dict(run.parameters or {})
             params["crash_detail"] = detail
@@ -531,6 +569,11 @@ def scan_and_restart_transient_errors(db=None, now: datetime | None = None) -> i
             if since_halt < backoff:
                 continue
 
+            if not try_recovery_lock(db, f"agentfx:paper:{run.id}"):
+                continue
+            db.refresh(run)
+            if run.status != RunStatus.ERROR:
+                continue
             # Restart.
             prior_reason = run.stop_reason
             run.status = RunStatus.APPROVED
@@ -660,7 +703,7 @@ def _ensure_prior_runner_dead(run_id: str, pid: int | None) -> bool:
         return True
     with _CHILDREN_LOCK:
         handle = _CHILDREN.get(pid)
-    if handle is None:
+    if handle is None or handle.run_id not in (None, run_id):
         if not _pid_alive(pid):
             return True
         logger.error(
@@ -807,13 +850,14 @@ def scan_and_restart_zombie_running(db=None, now: datetime | None = None) -> int
             # pid must be gone (or terminated and reaped) first.
             if not _ensure_prior_runner_dead(run.id, prior_pid):
                 continue
-            if prior_pid is not None:
-                # The prior runner may have written to the row before
-                # it exited; don't clobber that with a stale snapshot.
-                db.refresh(run)
-                if run.status != RunStatus.RUNNING:
-                    continue
-                params = dict(run.parameters or {})
+            if not try_recovery_lock(db, f"agentfx:paper:{run.id}"):
+                continue
+            # The prior runner may have written to the row before
+            # it exited; don't clobber that with a stale snapshot.
+            db.refresh(run)
+            if run.status != RunStatus.RUNNING:
+                continue
+            params = dict(run.parameters or {})
             logger.warning(
                 "auto-restart (zombie): rescheduling paper run %s "
                 "(attempt %d/%d, signal=%s, heartbeat=%s)",

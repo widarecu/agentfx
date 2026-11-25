@@ -64,10 +64,13 @@ def generate_validation_fold_id(genome_id: str, fold_index: int) -> str:
 # ─────────────────────────────────────────────────────────────────────────
 
 
-def get_run(db: Session, run_id: str) -> models.EvolutionRun | None:
-    return (
-        db.query(models.EvolutionRun).filter(models.EvolutionRun.id == run_id).first()
-    )
+def get_run(
+    db: Session, run_id: str, *, for_update: bool = False
+) -> models.EvolutionRun | None:
+    query = db.query(models.EvolutionRun).filter(models.EvolutionRun.id == run_id)
+    if for_update:
+        query = query.populate_existing().with_for_update()
+    return query.first()
 
 
 def find_prior_winners(
@@ -726,9 +729,8 @@ def create_run(
 
 
 def stop_run(db: Session, run_id: str) -> models.EvolutionRun | None:
-    """Mark a run for manual stop. The worker (next chunk) actually
-    sends SIGTERM to the child process."""
-    run = get_run(db, run_id)
+    """Persist a manual stop for the worker to observe."""
+    run = get_run(db, run_id, for_update=True)
     if run is None:
         return None
     if run.status not in (
@@ -745,10 +747,7 @@ def stop_run(db: Session, run_id: str) -> models.EvolutionRun | None:
 
 
 def find_orphaned_running_runs(db: Session) -> list[models.EvolutionRun]:
-    """Runs in RUNNING state on app startup are orphaned by definition —
-    their child process died with the previous app instance. The worker's
-    recovery hook flips them back to QUEUED so they can be re-scheduled.
-    """
+    """Return RUNNING evolution recovery candidates; the caller checks ownership."""
     return (
         db.query(models.EvolutionRun)
         .filter(models.EvolutionRun.status == models.EvolutionRunStatus.RUNNING)
@@ -996,6 +995,10 @@ def override_validator_verdict(
 # ─────────────────────────────────────────────────────────────────────────
 
 
+class EvolutionRunStopped(Exception):
+    pass
+
+
 class SqlAlchemyPersister:
     """Real implementation of `agents.orchestrator.EvolutionStatePersister`.
 
@@ -1011,6 +1014,13 @@ class SqlAlchemyPersister:
     def __init__(self, db: Session) -> None:
         self.db = db
 
+    def check_stop(self, run_id: str) -> None:
+        status = self.db.scalar(
+            select(models.EvolutionRun.status).where(models.EvolutionRun.id == run_id)
+        )
+        if status in (None, models.EvolutionRunStatus.STOPPED):
+            raise EvolutionRunStopped(run_id)
+
     # ── update_run ──────────────────────────────────────────────────
 
     def update_run(
@@ -1025,17 +1035,15 @@ class SqlAlchemyPersister:
         started_at: datetime | None = None,
         completed_at: datetime | None = None,
     ) -> None:
-        run = (
-            self.db.query(models.EvolutionRun)
-            .filter(models.EvolutionRun.id == run_id)
-            .first()
-        )
+        run = get_run(self.db, run_id, for_update=True)
         if run is None:
             logger.error(
                 "update_run for unknown run_id=%s — skipping (orchestrator bug?)",
                 run_id,
             )
             return
+        if run.status == models.EvolutionRunStatus.STOPPED:
+            raise EvolutionRunStopped(run_id)
 
         if status is not None:
             try:

@@ -11,13 +11,13 @@ that:
 5. Calls `orchestrator.run_loop()`
 6. Exits
 
-The parent records the child's PID on the run row so a later
-`POST /evolution-runs/{id}/stop` can SIGTERM it. On non-zero child exit,
-the parent marks the run FAILED with `stop_reason='process_crashed'`.
+The parent records the child's PID for diagnostics. The child checks the
+persisted run status for manual stops. On non-zero child exit, the parent
+marks the run FAILED with `stop_reason='process_crashed'`.
 
 `recover_queued_evolution_runs()` is wired into the FastAPI lifespan and
 fires at app startup. It re-schedules QUEUED runs and resets orphaned
-RUNNING runs (their previous child died with the previous app instance).
+RUNNING runs once their previous child no longer owns the run.
 """
 
 from __future__ import annotations
@@ -25,11 +25,12 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import os
-import signal
 import threading
 from datetime import UTC, datetime, timedelta
 
 from agentfx.agents.evolution import ResourceLimits, apply_resource_limits
+
+from .ownership import try_recovery_lock, worker_lock
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +77,9 @@ def schedule_run(run_id: str) -> None:
     _start_watchdog(run_id, proc)
 
 
-def _mark_run_failed_after_crash(run_id: str, exit_code: int | None) -> None:
+def _mark_run_failed_after_crash(
+    run_id: str, exit_code: int | None, *, pid: int | None = None
+) -> None:
     """DB-update half of the watchdog, isolated for testability.
 
     Called after the child process exits with a non-zero code. Flips
@@ -100,11 +103,17 @@ def _mark_run_failed_after_crash(run_id: str, exit_code: int | None) -> None:
 
         db = SessionLocal()
         try:
-            run = evolution_service.get_run(db, run_id)
+            if pid is not None and not try_recovery_lock(
+                db, f"agentfx:evolution:{run_id}"
+            ):
+                return
+            run = evolution_service.get_run(db, run_id, for_update=True)
             if run is None:
                 logger.warning(
                     "watchdog: run %s vanished from DB before update", run_id
                 )
+                return
+            if pid is not None and run.process_pid != pid:
                 return
             if run.status in {
                 EvolutionRunStatus.RUNNING,
@@ -148,77 +157,79 @@ def _start_watchdog(run_id: str, proc: multiprocessing.Process) -> None:
         )
 
         if exit_code == 0:
-            # Clean exit: the orchestrator marked the run COMPLETED itself.
+            # The worker finished or observed a manual stop.
             return
 
-        _mark_run_failed_after_crash(run_id, exit_code)
+        _mark_run_failed_after_crash(run_id, exit_code, pid=proc.pid)
 
     t = threading.Thread(target=_watch, name=f"evorun-watchdog-{run_id}", daemon=True)
     t.start()
 
 
-def signal_run_stop(pid: int) -> bool:
-    """Send SIGTERM to a child process. Returns True if the signal was
-    sent, False if the process couldn't be found (already exited).
-
-    The orchestrator catches SIGTERM via Python's signal handler — we
-    don't need a separate teardown protocol.
-    """
-    if pid is None or pid <= 0:
-        return False
-    try:
-        os.kill(pid, signal.SIGTERM)
-        logger.info("sent SIGTERM to pid=%s", pid)
-        return True
-    except ProcessLookupError:
-        logger.info("pid=%s already exited; nothing to signal", pid)
-        return False
-    except PermissionError:
-        logger.error("permission denied sending SIGTERM to pid=%s", pid)
-        return False
-
-
-def recover_queued_evolution_runs(db=None) -> int:
+def recover_queued_evolution_runs(
+    db=None, *, deferred: set[str] | None = None, retry_only: bool = False
+) -> int:
     """Lifespan startup hook.
 
-    1. Finds runs in RUNNING state — these are orphaned (their child died
-       with the previous app instance). Reset to QUEUED.
-    2. Finds all QUEUED runs (including the ones we just reset) and
-       schedules each via `schedule_run`.
+    1. Resets RUNNING runs without a live owner to QUEUED.
+    2. Schedules QUEUED runs that have no owner yet.
 
     Returns the number of runs re-scheduled. The lifespan can log this.
 
     Args:
         db: Optional SQLAlchemy Session. Tests inject their own session;
             production passes None and we open one via SessionLocal.
+        deferred: Receives IDs that still have a live owner.
+        retry_only: Recheck only the IDs deferred by the preceding pass.
     """
     # Lazy imports — the lifespan calls this *during* startup, before the
     # app is ready, but after settings/DB are initialized.
     from agentfx.api.core.database import SessionLocal
-    from agentfx.api.models import EvolutionRunStatus
-    from agentfx.api.services import evolution as evolution_service
+    from agentfx.api.models import EvolutionRun, EvolutionRunStatus
 
     own_session = db is None
     if own_session:
         db = SessionLocal()
 
+    candidates = set(deferred or ()) if retry_only else None
+    still_owned: set[str] = set()
     try:
-        orphaned = evolution_service.find_orphaned_running_runs(db)
-        for run in orphaned:
-            run.status = EvolutionRunStatus.QUEUED
-            run.process_pid = None
-        if orphaned:
-            db.commit()
+        recoverable = (EvolutionRunStatus.RUNNING, EvolutionRunStatus.QUEUED)
+        pending = (
+            db.query(EvolutionRun)
+            .filter(EvolutionRun.status.in_(recoverable))
+            .order_by(EvolutionRun.created_at)
+        )
+        if candidates is not None:
+            pending = pending.filter(EvolutionRun.id.in_(candidates))
+        run_ids = []
+        reset = 0
+        for run in pending.all():
+            if not try_recovery_lock(db, f"agentfx:evolution:{run.id}"):
+                still_owned.add(run.id)
+                continue
+            db.refresh(run, with_for_update=True)
+            if run.status not in recoverable:
+                continue
+            if run.status == EvolutionRunStatus.RUNNING:
+                run.status = EvolutionRunStatus.QUEUED
+                run.process_pid = None
+                reset += 1
+            run_ids.append(run.id)
+        db.commit()
+        if reset:
             logger.warning(
                 "reset %d orphaned RUNNING evolution runs to QUEUED",
-                len(orphaned),
+                reset,
             )
 
-        queued = evolution_service.find_queued_runs(db)
-        for run in queued:
-            schedule_run(run.id)
+        for run_id in run_ids:
+            schedule_run(run_id)
+        if deferred is not None:
+            deferred.clear()
+            deferred.update(still_owned)
 
-        return len(queued)
+        return len(run_ids)
     finally:
         if own_session:
             db.close()
@@ -232,17 +243,18 @@ def recover_queued_evolution_runs(db=None) -> int:
 def _record_child_pid(run_id: str, pid: int | None) -> None:
     """Persist the child PID on the run row so /stop can find it."""
     from agentfx.api.core.database import SessionLocal
-    from agentfx.api.services import evolution as evolution_service
+    from agentfx.api.models import EvolutionRun, EvolutionRunStatus
 
     if pid is None:
         return
 
     db = SessionLocal()
     try:
-        run = evolution_service.get_run(db, run_id)
-        if run is None:
-            return
-        run.process_pid = pid
+        db.query(EvolutionRun).filter(
+            EvolutionRun.id == run_id,
+            EvolutionRun.status == EvolutionRunStatus.QUEUED,
+            EvolutionRun.process_pid.is_(None),
+        ).update({EvolutionRun.process_pid: pid}, synchronize_session=False)
         db.commit()
     finally:
         db.close()
@@ -510,6 +522,14 @@ def _build_stop_conditions(stop_dict: dict):
 
 
 def _subprocess_entry(run_id: str) -> None:
+    from agentfx.api.core.database import engine
+
+    with worker_lock(engine, f"agentfx:evolution:{run_id}") as (owned, connection):
+        if owned:
+            _run_owned_evolution(run_id, connection)
+
+
+def _run_owned_evolution(run_id: str, owner_connection) -> None:
     """The function the child process runs from start to exit.
 
     Steps:
@@ -557,15 +577,24 @@ def _subprocess_entry(run_id: str) -> None:
     )
     from agentfx.agents.validator import ValidatorAgent
     from agentfx.api.core.database import SessionLocal
+    from agentfx.api.models import EvolutionRunStatus
     from agentfx.api.services import evolution as evolution_service
-    from agentfx.api.services.evolution import SqlAlchemyPersister
+    from agentfx.api.services.evolution import EvolutionRunStopped, SqlAlchemyPersister
 
-    db = SessionLocal()
+    db = (
+        SessionLocal(bind=owner_connection)
+        if owner_connection is not None
+        else SessionLocal()
+    )
     try:
         run = evolution_service.get_run(db, run_id)
         if run is None:
             logger.error("run %s not found in DB; child exiting", run_id)
             return
+        if run.status != EvolutionRunStatus.QUEUED:
+            return
+        run.process_pid = os.getpid()
+        db.commit()
 
         config_dict = run.config_json or {}
         stop_dict = run.stop_conditions_json or {}
@@ -806,6 +835,7 @@ def _subprocess_entry(run_id: str) -> None:
             persister=persister,
             llm_injector=llm_injector,
             validator=validator,
+            check_stop=lambda: persister.check_stop(run_id),
         )
 
         summary = orchestrator.run_loop()
@@ -816,8 +846,12 @@ def _subprocess_entry(run_id: str) -> None:
             summary.validated_count,
         )
 
+    except EvolutionRunStopped:
+        logger.info("evolution run %s observed manual stop", run_id)
     except Exception as exc:  # noqa: BLE001
         logger.exception("evolution run %s crashed in child process", run_id)
+        if owner_connection is not None and owner_connection.invalidated:
+            raise
         # Mark the run failed from inside the child so the DB reflects
         # reality even without parent-side monitoring. The original session
         # may be in a failed-transaction state (e.g. IntegrityError leaves
@@ -835,9 +869,11 @@ def _subprocess_entry(run_id: str) -> None:
         failure_message: str | None = str(exc) if specific_reason else None
         try:
             db.rollback()
-            run = evolution_service.get_run(db, run_id)
-            if run is not None:
-                from agentfx.api.models import EvolutionRunStatus
+            run = evolution_service.get_run(db, run_id, for_update=True)
+            if run is not None and run.status in {
+                EvolutionRunStatus.QUEUED,
+                EvolutionRunStatus.RUNNING,
+            }:
                 from sqlalchemy.orm.attributes import flag_modified
 
                 run.status = EvolutionRunStatus.FAILED
@@ -862,5 +898,4 @@ def _subprocess_entry(run_id: str) -> None:
 __all__ = [
     "recover_queued_evolution_runs",
     "schedule_run",
-    "signal_run_stop",
 ]
