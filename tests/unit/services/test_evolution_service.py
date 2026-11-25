@@ -21,6 +21,7 @@ from agentfx.api import models, schemas
 from agentfx.api.core.database import Base
 from agentfx.api.services import evolution as evolution_service
 from agentfx.api.services.evolution import SqlAlchemyPersister
+from agentfx.core.dsl import StrategySpec
 from agentfx.core.dsl.seeds import MA_CROSSOVER_SEED, RSI_MEAN_REVERSION_SEED
 from agentfx.core.validation import make_walk_forward_folds
 
@@ -705,6 +706,32 @@ class TestSqlAlchemyPersisterSaveGeneration:
         gens = db.scalars(select(models.Generation)).all()
         assert gens[0].llm_invoked is True
         assert gens[0].llm_call_id == "llm_call_xyz"
+
+    @pytest.mark.parametrize("risk_pct", [0.001, 0.005, 0.02])
+    def test_run_summary_shows_stored_risk_without_rewriting_genome(
+        self, db: Session, risk_pct: float
+    ) -> None:
+        run = evolution_service.create_run(
+            db, schemas.EvolutionRunCreate(instrument="EUR_USD")
+        )
+        payload = MA_CROSSOVER_SEED.model_dump(mode="json")
+        payload["size"]["risk_pct"] = risk_pct
+        genome = _make_genome(StrategySpec.from_stored_genome(payload), 1.5)
+        SqlAlchemyPersister(db).save_generation(
+            run.id,
+            generation_index=0,
+            genomes=[genome],
+            llm_invoked=False,
+            llm_call_id=None,
+            best_fitness=1.5,
+        )
+
+        (row,) = evolution_service.list_run_genome_summaries(db, run.id)
+        summary = schemas.StrategyGenomeSummary.model_validate(row)
+        assert summary.risk_pct == risk_pct
+        assert summary.fitness == 1.5
+        assert "dsl_json" not in row
+        assert db.get(models.StrategyGenome, genome.id).dsl_json == payload
 
 
 class TestSqlAlchemyPersisterSaveValidation:

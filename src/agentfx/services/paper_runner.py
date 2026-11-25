@@ -480,7 +480,7 @@ def run_paper_run(
         strategy = None
         if dsl_json is not None:
             try:
-                spec = StrategySpec.model_validate(dsl_json)
+                spec = StrategySpec.from_stored_genome(dsl_json)
                 strategy = compile_spec(spec, pip_size=pip_size_for_pair(instrument))
             except Exception:  # noqa: BLE001
                 logger.exception(
@@ -1904,7 +1904,7 @@ def _open_position_and_persist(
     balance_account = float(
         account_summary.get("balance") or run.current_balance or 0.0
     )
-    risk_pct_dsl = 0.005  # DSL grammar default (0.5%); backtest uses it too
+    risk_pct_dsl = 0.005  # Legacy fallback for strategies without DSL sizing
     if exit_rules is not None and getattr(exit_rules, "size", None) is not None:
         risk_pct_dsl = float(exit_rules.size.risk_pct)
     # `max_position_size_units` semantic change (v0.6.1): now a
@@ -1920,6 +1920,7 @@ def _open_position_and_persist(
         account_currency=account_currency,
         risk_pct=risk_pct_dsl,
         stop_pips=float(sl_pips_dsl or 0),
+        entry_close=float(df["close"].iloc[-1]),
         safety_cap_units=safety_cap,
         client=client,
     )
@@ -2087,6 +2088,7 @@ def _open_position_and_persist(
                 "desired_units": sizing.desired_units,
                 "capped_units": sizing.capped_units,
                 "safety_cap": sizing.safety_cap,
+                "notes": sizing.notes,
             },
         },
     )

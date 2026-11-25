@@ -309,6 +309,7 @@ class StrategyGenomeSummary(BaseSchema):
     origin: str
     fitness: float | None = None
     validator_passed: bool | None = None
+    risk_pct: float | None = None
 
 
 class StrategyGenomeSummaryList(BaseModel):

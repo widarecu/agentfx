@@ -148,7 +148,7 @@ def _reference_spec(dsl_json: Any) -> StrategySpec | None:
     if dsl_json is None:
         return None
     try:
-        return StrategySpec.model_validate(dsl_json)
+        return StrategySpec.from_stored_genome(dsl_json)
     except Exception:  # noqa: BLE001
         logger.warning("entry diag: stored dsl_json failed to parse", exc_info=True)
         return None

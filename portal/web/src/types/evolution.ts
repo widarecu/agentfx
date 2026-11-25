@@ -270,6 +270,7 @@ export interface StrategyGenomeSummary {
   origin: GenomeOrigin;
   fitness: number | null;
   validator_passed: boolean | null;
+  risk_pct: number | null;
 }
 
 export interface StrategyGenomeSummaryList {

@@ -582,7 +582,7 @@ class OrchestratorAgent(BaseAgent):
                     try:
                         # Pre-validate the spec so bad rows fail at stash
                         # time rather than at injection time mid-loop.
-                        StrategySpec.model_validate(row["dsl_json"])
+                        StrategySpec.from_stored_genome(row["dsl_json"])
                         self._pending_warm_starts.append(row)
                     except Exception as e:
                         logger.warning(
@@ -604,7 +604,7 @@ class OrchestratorAgent(BaseAgent):
                 # explicitly disables the new scheduling).
                 for row in prior:
                     try:
-                        spec = StrategySpec.model_validate(row["dsl_json"])
+                        spec = StrategySpec.from_stored_genome(row["dsl_json"])
                         composite_seed_genomes.append(
                             Genome(
                                 spec=spec,
@@ -1323,7 +1323,7 @@ class OrchestratorAgent(BaseAgent):
         actually_injected = 0
         for row in picks:
             try:
-                spec = StrategySpec.model_validate(row["dsl_json"])
+                spec = StrategySpec.from_stored_genome(row["dsl_json"])
             except Exception as e:
                 logger.warning(
                     "warm-start deferred injection: spec %s failed "

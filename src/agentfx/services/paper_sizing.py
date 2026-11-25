@@ -19,7 +19,10 @@ Kept in its own module so unit tests can drive it with plain floats
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
+
+from agentfx.core.position_sizing import DEFAULT_LEVERAGE, max_leveraged_units
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +137,7 @@ def compute_position_units(
     account_currency: str,
     risk_pct: float,
     stop_pips: float,
+    entry_close: float,
     safety_cap_units: int | None,
     client,
 ) -> SizingBreakdown:
@@ -143,7 +147,8 @@ def compute_position_units(
         risk_account   = balance × risk_pct
         pip_value_acct = pip_size × quote_to_account_rate
         desired_units  = risk_account / (stop_pips × pip_value_acct)
-        capped_units   = min(desired_units, safety_cap_units) if cap else desired_units
+        notional_unit  = entry_close × quote_to_account_rate (1 if base = account)
+        capped_units   = min(desired_units, leverage cap, optional safety cap)
 
     Runner treats the return as the ABSOLUTE unit count — sign is
     applied by the caller based on signal direction. Zero return
@@ -153,7 +158,7 @@ def compute_position_units(
     parts = instrument.upper().replace("/", "_").split("_")
     if len(parts) != 2:
         raise ValueError(f"unsupported instrument symbol: {instrument}")
-    _, quote_currency = parts
+    base_currency, quote_currency = parts
 
     pip_size = _pip_size_for_pair(instrument)
     rate = _quote_to_account_rate(
@@ -163,7 +168,13 @@ def compute_position_units(
     )
     pip_value_account = pip_size * rate
 
-    if stop_pips <= 0 or pip_value_account <= 0:
+    if (
+        stop_pips <= 0
+        or pip_value_account <= 0
+        or balance <= 0
+        or not math.isfinite(entry_close)
+        or entry_close <= 0
+    ):
         return SizingBreakdown(
             balance=balance,
             risk_pct=risk_pct,
@@ -179,9 +190,23 @@ def compute_position_units(
 
     risk_account = balance * risk_pct
     desired_units = int(risk_account / (stop_pips * pip_value_account))
-    if safety_cap_units is not None and desired_units > safety_cap_units:
+    notional_per_unit = 1.0 if base_currency == account_currency else entry_close * rate
+    leverage_cap = int(max_leveraged_units(balance, notional_per_unit))
+    if safety_cap_units is not None and safety_cap_units < min(
+        desired_units, leverage_cap
+    ):
         capped_units = safety_cap_units
         notes = f"capped_at_safety_limit_{safety_cap_units}"
+    elif desired_units > leverage_cap:
+        capped_units = leverage_cap
+        notes = f"capped_at_leverage_limit_{DEFAULT_LEVERAGE}_to_1"
+        logger.warning(
+            "Paper leverage cap hit on %s: %d units clamped to %d (%d:1)",
+            instrument,
+            desired_units,
+            capped_units,
+            DEFAULT_LEVERAGE,
+        )
     else:
         capped_units = desired_units
         notes = "ok"
