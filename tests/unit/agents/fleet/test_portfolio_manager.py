@@ -9,7 +9,8 @@ The PM agent is read-only in Phase A — tests focus on:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -499,6 +500,125 @@ class TestEvolutionFiller:
         ):
             fired = portfolio_manager.run_evolution_filler(db=db)
         assert fired == 0
+
+    @pytest.fixture
+    def filler_tick(self, monkeypatch):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+
+        from agentfx.agents.fleet import portfolio_manager as pm
+        from agentfx.agents.fleet.llm import LLMCallResult
+        from agentfx.api.models.agent_decision import AgentDecision
+
+        engine = create_engine("sqlite:///:memory:")
+        AgentDecision.__table__.create(engine)
+        now = datetime(2026, 11, 12, 12, tzinfo=UTC)
+        send = MagicMock(return_value=(True, "ok"))
+        execute = MagicMock(return_value=[])
+        monkeypatch.setattr("agentfx.notifications.email._send_with_one_retry", send)
+        monkeypatch.setattr(
+            "agentfx.api.core.config.settings",
+            SimpleNamespace(
+                AGENT_FLEET_ENABLED=True,
+                NOTIFICATIONS_ENABLED=True,
+                ENVIRONMENT="staging",
+                SMTP_HOST="smtp.example.test",
+                SMTP_PORT=587,
+                SMTP_USER="fleet",
+                SMTP_PASSWORD="unused",
+                EMAIL_FROM="fleet@example.test",
+                EMAIL_TO="wilson@example.test",
+            ),
+        )
+        monkeypatch.setattr(
+            pm, "_any_genome_cleared_validator_today", lambda db, today: False
+        )
+        monkeypatch.setattr(pm, "_snapshot_platform_state", lambda db: {})
+        monkeypatch.setattr(pm, "_execute_evolution_actions", execute)
+
+        def tick(reason="api_failure", *, remaining=5):
+            nonlocal now
+            monkeypatch.setattr(pm, "evolutions_remaining_today", lambda db: remaining)
+            brief = (
+                pm.PMBrief(headline="Filler", summary="No new actions")
+                if reason is None
+                else None
+            )
+            monkeypatch.setattr(
+                pm,
+                "structured_call",
+                lambda **kwargs: LLMCallResult(
+                    output=brief,
+                    reasoning="",
+                    model="claude-haiku-4-5",
+                    input_tokens=0,
+                    output_tokens=0,
+                    cache_read_tokens=0,
+                    usd_cost=0.0,
+                    skipped_reason=reason,
+                ),
+            )
+            with Session(engine) as db:
+                fired = pm.run_evolution_filler(db=db, now=now)
+            now += timedelta(hours=2)
+            return fired
+
+        try:
+            yield tick, send, execute
+        finally:
+            engine.dispose()
+
+    def test_persistent_api_failure_sends_one_alert_and_starts_no_runs(
+        self, filler_tick
+    ):
+        tick, send, execute = filler_tick
+        assert tick() == 0
+        send.assert_not_called()
+        assert tick() == 0
+        send.assert_called_once()
+        message = send.call_args.kwargs["msg"]
+        assert message["To"] == "wilson@example.test"
+        assert message["Subject"].startswith("[AgentFX AGENT PM STAGING]")
+        assert "filler" in message["Subject"].lower()
+        assert "no evolution runs" in message.get_content().lower()
+
+        for _ in range(12):
+            assert tick() == 0
+        send.assert_called_once()
+        execute.assert_not_called()
+
+    def test_intentional_skips_do_not_count_as_api_failures(self, filler_tick):
+        tick, send, execute = filler_tick
+        assert tick(remaining=0) == 0
+        assert tick("no_api_key") == 0
+        assert tick() == 0
+        assert tick(remaining=0) == 0
+        assert tick("no_api_key") == 0
+        send.assert_not_called()
+
+        assert tick() == 0
+        send.assert_called_once()
+        execute.assert_not_called()
+
+    def test_success_between_outages_rearms_the_alert(self, filler_tick):
+        tick, send, execute = filler_tick
+        assert tick() == tick() == 0
+        send.assert_called_once()
+
+        assert tick(None) == 0
+        execute.assert_called_once()
+        assert tick() == 0
+        send.assert_called_once()
+
+        assert tick() == 0
+        assert send.call_count == 2
+
+    def test_failed_email_is_retried_on_next_failure(self, filler_tick):
+        tick, send, execute = filler_tick
+        send.side_effect = [(False, "failed"), (True, "ok")]
+        assert tick() == tick() == tick() == tick() == 0
+        assert send.call_count == 2
+        execute.assert_not_called()
 
     def test_internal_exception_does_not_raise(self):
         from agentfx.agents.fleet import portfolio_manager

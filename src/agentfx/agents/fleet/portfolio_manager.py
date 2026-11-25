@@ -39,7 +39,6 @@ from agentfx.agents.fleet.llm import LLMCallResult, structured_call
 from agentfx.agents.fleet.memory import (
     DecisionRecord,
     record_decision,
-    recent_decisions,
     write_memory_file,
 )
 from agentfx.agents.fleet.pm_scheduler import (
@@ -346,7 +345,14 @@ def _recent_pm_summaries(db: Session, limit: int = 3) -> list[dict[str, Any]]:
     Keeps only the headline + summary from each prior brief to stay
     small — Haiku doesn't need the full recommendations list again.
     """
-    rows = recent_decisions(db, agent_role=AgentRole.PM, limit=limit)
+    rows = (
+        db.query(AgentDecision)
+        .filter(AgentDecision.agent_role == AgentRole.PM.value)
+        .filter(AgentDecision.action != _FILLER_LLM_FAILURE_ACTION)
+        .order_by(AgentDecision.created_at.desc())
+        .limit(limit)
+        .all()
+    )
     out: list[dict[str, Any]] = []
     for row in rows:
         output = row.outputs_json or {}
@@ -991,6 +997,55 @@ def _any_genome_cleared_validator_today(db: Session, *, today: date) -> bool:
         return False
 
 
+_FILLER_LLM_FAILURE_ACTION = "evolution_filler_api_failure"
+_FILLER_LLM_ALERT_THRESHOLD = 2
+
+
+def _record_filler_api_failure(*, db: Session, decision_key: str) -> None:
+    from agentfx.notifications.email import send_agent_message
+
+    last_attempt = (
+        db.query(AgentDecision)
+        .filter(AgentDecision.agent_role == AgentRole.PM.value)
+        .filter(
+            AgentDecision.action.in_(("evolution_filler", _FILLER_LLM_FAILURE_ACTION))
+        )
+        .order_by(AgentDecision.created_at.desc(), AgentDecision.decision_key.desc())
+        .first()
+    )
+    prior = (
+        last_attempt.outputs_json or {}
+        if last_attempt is not None
+        and last_attempt.action == _FILLER_LLM_FAILURE_ACTION
+        else {}
+    )
+    failures = prior.get("consecutive_failures", 0) + 1
+    notified = prior.get("notified", False)
+    if failures >= _FILLER_LLM_ALERT_THRESHOLD and not notified:
+        notified = send_agent_message(
+            agent_role="PM",
+            subject="Evolution filler blocked by repeated model API failures",
+            body=(
+                f"The model API failed on {failures} consecutive attempts by the "
+                "Portfolio Manager's evolution filler. No evolution runs were "
+                "started by those attempts. The filler will retry on its usual "
+                "schedule. Check the model API status and the staging or production "
+                "backend logs for the cause."
+            ),
+        )
+
+    record_decision(
+        db,
+        DecisionRecord(
+            agent_role=AgentRole.PM,
+            action=_FILLER_LLM_FAILURE_ACTION,
+            decision_key=decision_key,
+            outputs={"consecutive_failures": failures, "notified": notified},
+        ),
+    )
+    db.commit()
+
+
 def run_evolution_filler(*, db: Session, now: datetime | None = None) -> int:
     """Top-up filler — if the daily cap has headroom AND no genome
     cleared the validator today, ask Haiku to pick 1-N next
@@ -1041,15 +1096,20 @@ def run_evolution_filler(*, db: Session, now: datetime | None = None) -> int:
         logger.exception("pm_agent[filler]: Haiku call failed")
         return 0
 
+    decision_key = _FILLER_DECISION_KEY_PREFIX + now.strftime("%Y%m%d_%H%M")
     brief = llm.output
     if brief is None:
         logger.info(
             "pm_agent[filler]: llm skipped reason=%s",
             llm.skipped_reason,
         )
+        if llm.skipped_reason == "api_failure":
+            try:
+                _record_filler_api_failure(db=db, decision_key=decision_key)
+            except Exception:
+                logger.exception("pm_agent[filler]: failed to track model API outage")
         return 0
 
-    decision_key = _FILLER_DECISION_KEY_PREFIX + now.strftime("%Y%m%d_%H%M")
     try:
         record_decision(
             db,
