@@ -814,6 +814,31 @@ class TestValidationAttemptLedger:
         # the [21, 31) window overlaps by only 40%.
         assert register(run(), ["warm-start", "current-2"], 15, 25) == 4
 
+    def test_replayed_genome_and_window_do_not_add_attempts(self, db):
+        run = evolution_service.create_run(
+            db, schemas.EvolutionRunCreate(instrument="EUR_USD")
+        )
+        persister = SqlAlchemyPersister(db)
+        start = datetime(2024, 1, 1, tzinfo=UTC)
+        end = start + timedelta(days=10)
+
+        assert (
+            persister.register_validation_attempts(run.id, ["existing"], (start, end))
+            == 1
+        )
+        assert (
+            persister.register_validation_attempts(
+                run.id, ["existing", "new", "new"], (start, end)
+            )
+            == 2
+        )
+        assert (
+            persister.register_validation_attempts(
+                run.id, ["existing"], (start, end + timedelta(days=1))
+            )
+            == 3
+        )
+
     def test_imported_shadows_cannot_register(self, db):
         run = evolution_service.create_run(
             db, schemas.EvolutionRunCreate(instrument="EUR_USD")

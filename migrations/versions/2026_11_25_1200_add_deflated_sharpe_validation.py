@@ -23,6 +23,14 @@ def upgrade() -> None:
         sa.Column("granularity", sa.String(5), nullable=False),
         sa.Column("oos_start", sa.DateTime(timezone=True), nullable=False),
         sa.Column("oos_end", sa.DateTime(timezone=True), nullable=False),
+        sa.UniqueConstraint(
+            "genome_id",
+            "instrument",
+            "granularity",
+            "oos_start",
+            "oos_end",
+            name="uq_validation_attempt_genome_window",
+        ),
     )
     op.create_index(
         "ix_validation_attempts_window",

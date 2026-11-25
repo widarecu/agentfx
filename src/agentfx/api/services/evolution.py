@@ -26,6 +26,8 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from sqlalchemy import and_, case, desc, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from agentfx.agents.evolution import Genome
@@ -1179,24 +1181,37 @@ class SqlAlchemyPersister:
         if end <= start:
             raise ValueError("validation attempts require a nonempty OOS window")
         instrument, granularity = run.instrument, run.granularity
-        if self.db.get_bind().dialect.name == "postgresql":
+        is_postgres = self.db.get_bind().dialect.name == "postgresql"
+        if is_postgres:
             # Overlapping windows must share the lock, not just exact matches.
             lock = f"agentfx:dsr:{instrument}:{granularity}"
             self.db.execute(
                 select(func.pg_advisory_xact_lock(func.hashtextextended(lock, 0)))
             )
-        self.db.add_all(
-            models.ValidationAttempt(
-                genome_id=genome_id,
-                instrument=instrument,
-                granularity=granularity,
-                oos_start=start,
-                oos_end=end,
-            )
-            for genome_id in genome_ids
-        )
-        self.db.flush()
         attempt = models.ValidationAttempt
+        if genome_ids:
+            insert = pg_insert if is_postgres else sqlite_insert
+            self.db.execute(
+                insert(attempt).on_conflict_do_nothing(
+                    index_elements=[
+                        attempt.genome_id,
+                        attempt.instrument,
+                        attempt.granularity,
+                        attempt.oos_start,
+                        attempt.oos_end,
+                    ]
+                ),
+                [
+                    {
+                        "genome_id": genome_id,
+                        "instrument": instrument,
+                        "granularity": granularity,
+                        "oos_start": start,
+                        "oos_end": end,
+                    }
+                    for genome_id in genome_ids
+                ],
+            )
         windows = self.db.execute(
             select(attempt.oos_start, attempt.oos_end, func.count())
             .where(

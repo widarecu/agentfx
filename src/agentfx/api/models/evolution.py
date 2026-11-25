@@ -301,6 +301,14 @@ class ValidationAttempt(Base):
     oos_end = Column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
+        UniqueConstraint(
+            "genome_id",
+            "instrument",
+            "granularity",
+            "oos_start",
+            "oos_end",
+            name="uq_validation_attempt_genome_window",
+        ),
         Index(
             "ix_validation_attempts_window",
             "instrument",

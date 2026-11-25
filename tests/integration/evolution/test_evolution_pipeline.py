@@ -290,6 +290,12 @@ class TestEvolutionPipeline:
         )
         assert genome.validation_dsr["trial_count"] >= 1
         assert genome.validation_dsr["reason"]
+        assert (
+            SqlAlchemyPersister(db_session).register_validation_attempts(
+                run.id, [genome.id], (attempt.oos_start, attempt.oos_end)
+            )
+            == genome.validation_dsr["trial_count"]
+        )
 
     def test_run_best_genome_is_recorded(self, db_session, seed_evolution_candles):
         run = _make_run(db_session)
