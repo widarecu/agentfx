@@ -154,6 +154,14 @@ def split_env(tokens: list[str]) -> tuple[dict[str, str], list[str]]:
     return env, tokens[i:]
 
 
+def command_env(tokens: list[str]) -> tuple[dict[str, str], list[str]]:
+    env, words = split_env(tokens)
+    if words and os.path.basename(words[0]) == "env":
+        assignments, words = split_env(words[1:])
+        env.update(assignments)
+    return env, words
+
+
 def current_branch() -> str:
     try:
         out = subprocess.run(
@@ -209,6 +217,9 @@ def check_docker(words: list[str], heredoc_bodies: list[str]) -> str | None:
             return "Refusing to remove the dev or uat database volume."
     if (cmd == "docker" or is_compose) and "exec" in args:
         exec_args = args[args.index("exec") + 1 :]
+        reason = check_docker_downgrade(exec_args, is_compose)
+        if reason:
+            return reason
         targets = LONG_LIVED_POSTGRES | (
             {"postgres", "postgres-uat"} if is_compose else set()
         )
@@ -367,13 +378,45 @@ def check_test_runner(env: dict[str, str], words: list[str]) -> str | None:
     return None
 
 
+def is_alembic_downgrade(words: list[str]) -> bool:
+    return bool(words) and invokes(words, "alembic") and "downgrade" in words[1:]
+
+
 def check_alembic(env: dict[str, str], words: list[str]) -> str | None:
-    if (
-        invokes(words, "alembic")
-        and "downgrade" in words[1:]
-        and env.get("ENVIRONMENT", os.environ.get("ENVIRONMENT", "")).lower() != "test"
-    ):
+    environment = env.get("ENVIRONMENT", os.environ.get("ENVIRONMENT", ""))
+    if is_alembic_downgrade(words) and environment.lower() != "test":
         return "Alembic downgrade may only run with ENVIRONMENT=test."
+    return None
+
+
+def check_docker_downgrade(args: list[str], is_compose: bool) -> str | None:
+    env = {}
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            break
+        option, _, value = arg.partition("=")
+        if option in ("--env", "-e", "--user", "-u", "--workdir", "-w", "--index"):
+            if "=" not in arg and i < len(args):
+                value = args[i]
+                i += 1
+        elif arg.startswith("-e") and not arg.startswith("--"):
+            option, value = "-e", arg[2:]
+        if option in ("--env", "-e"):
+            name, _, assignment = value.partition("=")
+            env[name] = assignment
+    if i == len(args):
+        return None
+    target = args[i]
+    assignments, command = command_env(args[i + 1 :])
+    env.update(assignments)
+    if is_alembic_downgrade(command) and (
+        target != ("backend-test" if is_compose else "agentfx-backend-test")
+        or env.get("ENVIRONMENT", "test").lower() != "test"
+    ):
+        return "Alembic downgrade in Docker may only run on the test backend with ENVIRONMENT=test."
     return None
 
 
@@ -392,10 +435,7 @@ def main() -> int:
         print(f"Blocked: cannot inspect the Bash command ({error}).", file=sys.stderr)
         return 2
     for segment in segments:
-        env, words = split_env(segment.words)
-        if words and os.path.basename(words[0]) == "env":
-            assignments, words = split_env(words[1:])
-            env.update(assignments)
+        env, words = command_env(segment.words)
         if not words:
             continue
         if words[0] == "export" and any(

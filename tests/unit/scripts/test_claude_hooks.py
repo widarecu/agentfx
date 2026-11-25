@@ -96,6 +96,26 @@ def run_hook(hook, root, payload=None, **environment):
         ),
         ("alembic downgrade -1", "ENVIRONMENT=test"),
         ("ENVIRONMENT=test echo harmless && alembic downgrade -1", "ENVIRONMENT=test"),
+        (
+            "docker compose --profile uat exec -T backend-uat alembic downgrade 9a2f4b8c3e17",
+            "test backend with ENVIRONMENT=test",
+        ),
+        (
+            "ENVIRONMENT=test docker compose exec -e ENVIRONMENT=test backend alembic downgrade -1",
+            "test backend with ENVIRONMENT=test",
+        ),
+        (
+            "docker exec --workdir /app agentfx-backend-uat python -m alembic downgrade -1",
+            "test backend with ENVIRONMENT=test",
+        ),
+        (
+            "docker compose exec --env=ENVIRONMENT=uat backend-test alembic downgrade -1",
+            "test backend with ENVIRONMENT=test",
+        ),
+        (
+            "docker exec -it -eENVIRONMENT=dev agentfx-backend-test alembic downgrade -1",
+            "test backend with ENVIRONMENT=test",
+        ),
     ],
 )
 def test_bash_guard_refuses(command, reason):
@@ -135,6 +155,10 @@ def test_bash_guard_refuses(command, reason):
         'docker exec agentfx-postgres-uat psql -c "SELECT 1; SELECT 2;"',
         "ENVIRONMENT=test alembic downgrade -1",
         "alembic upgrade head",
+        "docker compose --profile test exec -T backend-test alembic downgrade -1",
+        "docker exec -e ENVIRONMENT=test agentfx-backend-test alembic downgrade -1",
+        "docker compose --profile uat exec backend-uat alembic upgrade head",
+        "docker compose exec backend echo alembic downgrade -1",
         "cd portal/web && npm run test:watch",
     ],
 )
