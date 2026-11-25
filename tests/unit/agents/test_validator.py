@@ -591,6 +591,7 @@ class TestEveryOosFoldProfitable:
         assert aggregate["cagr"] == pytest.approx(0.30)
         assert result.validator_passed is False
         assert len(result.validation_failures) == 3
+        assert result.fold_failures == result.validation_failures
         assert any("OOS fold 1/5" in f for f in result.validation_failures)
         assert any("OOS fold 2/5" in f for f in result.validation_failures)
         assert any("OOS fold 3/5" in f for f in result.validation_failures)

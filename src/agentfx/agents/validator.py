@@ -125,6 +125,7 @@ class ValidationResult:
     validator_passed: bool
     validation_failures: list[str] = field(default_factory=list)
     oos_aggregate_metrics: dict[str, Any] = field(default_factory=dict)
+    fold_failures: list[str] = field(default_factory=list)
 
     @property
     def oos_evaluations(self) -> list[FoldEvaluation]:
@@ -421,6 +422,7 @@ class ValidatorAgent(BaseAgent):
             validator_passed=agg_passed and not fold_failures,
             validation_failures=agg_failures + fold_failures,
             oos_aggregate_metrics=aggregate,
+            fold_failures=fold_failures,
         )
 
     def run(self, **kwargs) -> AgentResult:
