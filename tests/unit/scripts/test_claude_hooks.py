@@ -10,6 +10,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 HOOKS = ROOT / ".claude" / "hooks"
+CONTINUATION = "\\" + "\n"
 
 
 def run_hook(hook, root, payload=None, **environment):
@@ -42,6 +43,13 @@ def run_hook(hook, root, payload=None, **environment):
         ("docker volume prune", "would delete"),
         ("docker volume rm agentfx_postgres_data", "Refusing to remove"),
         ("docker volume rm agentfx_postgres_uat_data", "Refusing to remove"),
+        (
+            "echo safe # trailing comment\ndocker volume rm agentfx_postgres_uat_data",
+            "Refusing to remove",
+        ),
+        ("cat <<'EOF'\nIt's text\nEOF\ngit push origin main", "Never push to `main`"),
+        ("cat <<'EOF'\nno terminator", "cannot inspect the Bash command"),
+        ("git push origin main; echo 'unterminated", "cannot inspect the Bash command"),
         ("make e2e PROFILE=uat", "may only run"),
         ("E2E_PROFILE=dev make e2e", "may only run"),
         ("export E2E_PROFILE=uat; ./scripts/run-e2e-tests.sh", "may only run"),
@@ -66,6 +74,14 @@ def run_hook(hook, root, payload=None, **environment):
         ('docker exec agentfx-postgres psql -c "DROP TABLE candles;"', "Refusing DROP"),
         (
             'docker exec -i agentfx-postgres-uat psql -c "SELECT 1;\ntruncate candles;"',
+            "Refusing DROP",
+        ),
+        (
+            f"docker exec agentfx-postgres-uat {CONTINUATION} psql -c 'DROP TABLE candles'",
+            "Refusing DROP",
+        ),
+        (
+            "docker exec -i agentfx-postgres-uat psql <<'SQL'\nTRUNCATE candles;\nSQL",
             "Refusing DROP",
         ),
         (
@@ -97,6 +113,11 @@ def test_bash_guard_refuses(command, reason):
         "git push origin agent/AFX-101-hooks",
         "git push --force-with-lease origin agent/AFX-101-hooks",
         "git status && git diff --stat",
+        "echo '# literal' # docker volume prune",
+        "printf '%s' foo#bar; git status",
+        "cat <<'EOF'\nIt's text containing docker volume prune\nEOF\ngit status",
+        "cat <<-'A' <<B\n\tE2E_PROFILE=uat\n\tA\npytest\nB\ngit status",
+        "printf '%s' '<<' '#'; git status",
         "docker compose --profile test down -v",
         "docker compose --profile dev down",
         "docker volume rm agentfx_postgres_test_data",
@@ -106,6 +127,7 @@ def test_bash_guard_refuses(command, reason):
         "ENVIRONMENT=test PYTHONPATH=src .venv/bin/pytest tests/unit",
         "docker compose --profile test exec backend-test pytest",
         "gh pr create --base main --head agent/AFX-101-hooks",
+        f"gh pr create --base main {CONTINUATION} --head agent/AFX-101-hooks",
         "gh pr create -B main -Hagent/AFX-101-hooks",
         "gh pr view 42",
         "gh pr checks 42",

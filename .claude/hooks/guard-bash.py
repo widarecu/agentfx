@@ -15,9 +15,9 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
+from dataclasses import dataclass, field
 
 PROTECTED_PUSH = {"main"}
 PROTECTED_FORCE_PUSH = {"main", "feat/agent-fleet"}
@@ -29,21 +29,116 @@ AGENT_BRANCH = re.compile(r"agent/AFX-[0-9]+-[A-Za-z0-9][A-Za-z0-9._/-]*")
 DESTRUCTIVE_SQL = re.compile(r"\b(?:DROP|TRUNCATE)\b", re.IGNORECASE)
 
 
-def split_segments(command: str) -> list[list[str]]:
-    """Split a shell command line into simple commands, each tokenised."""
-    separators = ";&|\n()"
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=separators)
-    lexer.whitespace = " \t\r"
-    lexer.whitespace_split = True
-    segments, current = [], []
-    for token in lexer:
-        if token and all(c in separators for c in token):
-            if current:
-                segments.append(current)
-                current = []
+@dataclass
+class Segment:
+    words: list[str] = field(default_factory=list)
+    heredoc_bodies: list[str] = field(default_factory=list)
+
+
+def read_heredoc(
+    command: str, start: int, delimiter: str, strip_tabs: bool
+) -> tuple[int, str]:
+    body_start = start
+    while start < len(command):
+        end = command.find("\n", start)
+        if end == -1:
+            end = len(command)
+        line = command[start:end]
+        if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+            return min(end + 1, len(command)), command[body_start:start]
+        start = end + 1
+    raise ValueError("unterminated here-document")
+
+
+def split_segments(command: str) -> list[Segment]:
+    """Tokenise simple shell commands, skipping comments and here-document data."""
+    segments: list[Segment] = []
+    current = Segment()
+    heredocs: list[tuple[str, bool, Segment]] = []
+    word: list[str] | None = None
+    quote = ""
+    heredoc_operator = ""
+
+    def finish_word() -> None:
+        nonlocal word, heredoc_operator
+        if word is None:
+            return
+        value = "".join(word)
+        if heredoc_operator:
+            heredocs.append((value, heredoc_operator == "<<-", current))
+            heredoc_operator = ""
         else:
-            current.append(token)
-    if current:
+            current.words.append(value)
+        word = None
+
+    i = 0
+    while i < len(command):
+        char = command[i]
+        i += 1
+        if char == "\\" and quote != "'":
+            following = command[i : i + 1]
+            if not following:
+                raise ValueError("incomplete escape")
+            if following == "\n":
+                i += 1
+                continue
+            if not quote or following in '"\\`$':
+                char = following
+                i += 1
+            if word is None:
+                word = []
+            word.append(char)
+        elif quote:
+            if char == quote:
+                quote = ""
+            else:
+                assert word is not None
+                word.append(char)
+        elif char in "\"'":
+            quote = char
+            if word is None:
+                word = []
+        elif char == "#" and word is None:
+            newline = command.find("\n", i)
+            i = len(command) if newline == -1 else newline
+        elif char in " \t\r":
+            finish_word()
+        elif char in ";&|()\n":
+            finish_word()
+            if heredoc_operator:
+                raise ValueError("missing here-document delimiter")
+            if current.words:
+                segments.append(current)
+            current = Segment()
+            if char == "\n":
+                for delimiter, strip_tabs, recipient in heredocs:
+                    i, body = read_heredoc(command, i, delimiter, strip_tabs)
+                    recipient.heredoc_bodies.append(body)
+                heredocs.clear()
+        elif char == "<" and command[i : i + 1] == "<":
+            finish_word()
+            if heredoc_operator:
+                raise ValueError("missing here-document delimiter")
+            i += 1
+            suffix = command[i : i + 1]
+            if suffix == "<":  # Here-string: its argument stays in the segment.
+                i += 1
+                continue
+            heredoc_operator = "<<"
+            if suffix == "-":
+                i += 1
+                heredoc_operator += "-"
+        else:
+            if word is None:
+                word = []
+            word.append(char)
+
+    if quote:
+        raise ValueError("unterminated quote")
+    finish_word()
+    if heredocs or heredoc_operator:
+        raise ValueError("unterminated here-document")
+    if current.words:
         segments.append(current)
     return segments
 
@@ -92,7 +187,7 @@ def check_e2e(env: dict[str, str], words: list[str]) -> str | None:
     return None
 
 
-def check_docker(words: list[str]) -> str | None:
+def check_docker(words: list[str], heredoc_bodies: list[str]) -> str | None:
     cmd = os.path.basename(words[0])
     args = words[1:]
     is_compose = cmd == "docker-compose" or (cmd == "docker" and "compose" in args)
@@ -121,7 +216,8 @@ def check_docker(words: list[str]) -> str | None:
             if os.path.basename(arg) != "psql":
                 continue
             if targets.intersection(exec_args[:i]) and any(
-                DESTRUCTIVE_SQL.search(sql) for sql in exec_args[i + 1 :]
+                DESTRUCTIVE_SQL.search(sql)
+                for sql in exec_args[i + 1 :] + heredoc_bodies
             ):
                 return "Refusing DROP or TRUNCATE on the dev or uat database."
             break
@@ -290,27 +386,29 @@ def main() -> int:
     if not command:
         return 0
 
-    # Catches `export E2E_PROFILE=uat` and similar forms the per-command
-    # checks below would not see.
-    exported = re.search(r"\bE2E_PROFILE=[\"']?(?!test\b)\w+", command)
-    if exported:
-        print("Blocked: E2E may only run against the `test` profile.", file=sys.stderr)
-        return 2
-
     try:
         segments = split_segments(command)
-    except ValueError:
-        return 0
-    for tokens in segments:
-        env, words = split_env(tokens)
+    except ValueError as error:
+        print(f"Blocked: cannot inspect the Bash command ({error}).", file=sys.stderr)
+        return 2
+    for segment in segments:
+        env, words = split_env(segment.words)
         if words and os.path.basename(words[0]) == "env":
             assignments, words = split_env(words[1:])
             env.update(assignments)
         if not words:
             continue
+        if words[0] == "export" and any(
+            arg.startswith("E2E_PROFILE=") and arg != "E2E_PROFILE=test"
+            for arg in words[1:]
+        ):
+            print(
+                "Blocked: E2E may only run against the `test` profile.", file=sys.stderr
+            )
+            return 2
         reason = (
             check_e2e(env, words)
-            or check_docker(words)
+            or check_docker(words, segment.heredoc_bodies)
             or check_git_push(words)
             or check_gh_pr(words)
             or check_test_runner(env, words)
