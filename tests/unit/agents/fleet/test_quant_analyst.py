@@ -711,3 +711,508 @@ class TestLinearFiling:
         # Default fallback
         assert _area_label_for("") == "Paper runner"
         assert _area_label_for("random/path.py") == "Paper runner"
+
+
+class TestDivergenceReportTicketWiring:
+    """AFX-149: divergence reports file BEFORE rendering/emailing so
+    HTML, plain text, and saved markdown all show every work order's
+    Linear ticket or skip reason, and survive a Linear outage."""
+
+    def _run_divergence(
+        self,
+        tmp_path,
+        monkeypatch,
+        *,
+        work_orders,
+        filing_return=None,
+        filing_side_effect=None,
+    ):
+        from agentfx.agents.fleet.llm import LLMCallResult
+
+        monkeypatch.setenv("AGENT_MEMORY_ROOT", str(tmp_path))
+        report = qa.QADivergenceReport(
+            headline="Spread mismatch",
+            summary="Realised spread wider than backtest.",
+            classifications=[],
+            work_orders=work_orders,
+        )
+        llm_result = MagicMock(spec=LLMCallResult)
+        llm_result.output = report
+        llm_result.model = "claude-sonnet"
+        llm_result.reasoning = "ok"
+        llm_result.usd_cost = 0.01
+        llm_result.input_tokens = llm_result.output_tokens = 100
+        llm_result.cache_read_tokens = 0
+
+        db = MagicMock()
+        file_kwargs = (
+            {"side_effect": filing_side_effect}
+            if filing_side_effect is not None
+            else {"return_value": filing_return}
+        )
+        with (
+            patch.object(qa, "_snapshot_run", return_value={"run_id": "run_1"}),
+            patch.object(qa, "_call_sonnet", return_value=llm_result),
+            patch.object(qa, "record_decision") as rec_dec,
+            patch("agentfx.integrations.linear_client.file_finding", **file_kwargs),
+            patch("agentfx.notifications.email.send_agent_message") as send_msg,
+        ):
+            qa._write_divergence_report(db=db, run_id="run_1", today=date(2026, 11, 25))
+
+        saved_md = (tmp_path / "paper_divergence" / "run_1_2026-11-25.md").read_text()
+        return rec_dec, db, send_msg, saved_md
+
+    def test_new_ticket_appears_in_email_html_plaintext_and_saved_file(
+        self, tmp_path, monkeypatch
+    ):
+        from agentfx.integrations.linear_client import FilingResult
+
+        wo = qa.QAWorkOrder(
+            title="Tighten M1 spread",
+            category="cost_model",
+            target_file="src/agentfx/services/paper_runner.py",
+            spec="Adjust spread model.",
+        )
+        _, _, send_msg, saved_md = self._run_divergence(
+            tmp_path,
+            monkeypatch,
+            work_orders=[wo],
+            filing_return=FilingResult(
+                filed=True,
+                identifier="AFX-150",
+                url="https://linear.app/agentfx/issue/AFX-150",
+                action="created",
+            ),
+        )
+        send_msg.assert_called_once()
+        body = send_msg.call_args.kwargs["body"]
+        html = send_msg.call_args.kwargs["html_body"]
+        assert "New: [AFX-150](https://linear.app/agentfx/issue/AFX-150)" in body
+        assert "New: [AFX-150](https://linear.app/agentfx/issue/AFX-150)" in saved_md
+        assert "New:" in html
+        assert 'href="https://linear.app/agentfx/issue/AFX-150"' in html
+
+    def test_known_issue_and_reopened_appear_with_status_and_link(
+        self, tmp_path, monkeypatch
+    ):
+        from agentfx.integrations.linear_client import FilingResult
+
+        wos = [
+            qa.QAWorkOrder(title="WO 1", category="cost_model", spec="s1"),
+            qa.QAWorkOrder(title="WO 2", category="idempotency", spec="s2"),
+        ]
+        _, _, send_msg, saved_md = self._run_divergence(
+            tmp_path,
+            monkeypatch,
+            work_orders=wos,
+            filing_side_effect=[
+                FilingResult(
+                    filed=True,
+                    identifier="AFX-51",
+                    url="https://linear.app/agentfx/issue/AFX-51",
+                    action="commented",
+                    state_name="In Progress",
+                ),
+                FilingResult(
+                    filed=True,
+                    identifier="AFX-52",
+                    url="https://linear.app/agentfx/issue/AFX-52",
+                    action="reopened",
+                    state_name="Done",
+                ),
+            ],
+        )
+        body = send_msg.call_args.kwargs["body"]
+        html = send_msg.call_args.kwargs["html_body"]
+        assert (
+            "Known issue: [AFX-51](https://linear.app/agentfx/issue/AFX-51) "
+            "(In Progress), evidence added" in body
+        )
+        assert (
+            "Reopened: [AFX-52](https://linear.app/agentfx/issue/AFX-52) "
+            "(was Done), evidence added" in body
+        )
+        assert "Known issue:" in html and "(In Progress), evidence added" in html
+        assert "Reopened:" in html and "(was Done), evidence added" in html
+        assert "AFX-51" in saved_md and "AFX-52" in saved_md
+
+    @pytest.mark.parametrize(
+        "action,expected",
+        [
+            ("skipped:flag_off", "Not filed: Linear filing is switched off"),
+            ("skipped:cap_hit", "Not filed: daily ticket limit reached"),
+            ("skipped:create_failed", "Not filed: Linear error"),
+        ],
+    )
+    def test_not_filed_reasons_shown_and_email_still_sends(
+        self, tmp_path, monkeypatch, action, expected
+    ):
+        from agentfx.integrations.linear_client import FilingResult
+
+        wo = qa.QAWorkOrder(title="WO", category="cost_model", spec="s")
+        _, _, send_msg, saved_md = self._run_divergence(
+            tmp_path,
+            monkeypatch,
+            work_orders=[wo],
+            filing_return=FilingResult(filed=False, action=action),
+        )
+        send_msg.assert_called_once()
+        assert expected in send_msg.call_args.kwargs["body"]
+        assert expected in send_msg.call_args.kwargs["html_body"]
+        assert expected in saved_md
+
+    def test_linear_outage_still_sends_email_and_writes_decision_log(
+        self, tmp_path, monkeypatch
+    ):
+        wo = qa.QAWorkOrder(title="WO", category="cost_model", spec="s")
+        rec_dec, db, send_msg, saved_md = self._run_divergence(
+            tmp_path,
+            monkeypatch,
+            work_orders=[wo],
+            filing_side_effect=RuntimeError("Linear 503"),
+        )
+        rec_dec.assert_called_once()
+        db.commit.assert_called_once()
+        send_msg.assert_called_once()
+        assert "Not filed: Linear error" in send_msg.call_args.kwargs["body"]
+        assert "Not filed: Linear error" in send_msg.call_args.kwargs["html_body"]
+        assert "Not filed: Linear error" in saved_md
+
+
+class TestTechHealthLinearFiling:
+    """AFX-149: technical-health anomalies file to Linear Triage, skip
+    benign items, group cause+symptom, dedupe across days with varying
+    wording, and survive Linear outages."""
+
+    def _snapshot(self):
+        return {
+            "window_hours": 24,
+            "window_end_utc": "2026-11-25T12:00:00+00:00",
+            "record_count": 20,
+            "records": [],
+        }
+
+    def _run_tech(
+        self,
+        tmp_path,
+        monkeypatch,
+        *,
+        anomalies,
+        today=date(2026, 11, 25),
+        filing_return=None,
+        filing_side_effect=None,
+    ):
+        from agentfx.agents.fleet.llm import LLMCallResult
+
+        monkeypatch.setenv("AGENT_MEMORY_ROOT", str(tmp_path))
+        report = qa.TechnicalHealthReport(
+            headline="Staging anomalies",
+            summary="Found issues in staging logs.",
+            anomalies=anomalies,
+        )
+        llm_result = MagicMock(spec=LLMCallResult)
+        llm_result.output = report
+        llm_result.model = "claude-sonnet"
+        llm_result.reasoning = "ok"
+        llm_result.usd_cost = 0.01
+        llm_result.input_tokens = llm_result.output_tokens = 100
+        llm_result.cache_read_tokens = 0
+
+        db = MagicMock()
+        file_kwargs = (
+            {"side_effect": filing_side_effect}
+            if filing_side_effect is not None
+            else {"return_value": filing_return}
+        )
+        with (
+            patch.object(qa, "_call_sonnet_tech", return_value=llm_result),
+            patch.object(qa, "record_decision") as rec_dec,
+            patch(
+                "agentfx.integrations.linear_client.file_finding", **file_kwargs
+            ) as file_mock,
+            patch("agentfx.notifications.email.send_agent_message") as send_msg,
+        ):
+            qa._write_tech_report(db=db, today=today, snapshot=self._snapshot())
+        saved_md = (tmp_path / "tech_health" / f"{today.isoformat()}.md").read_text()
+        return rec_dec, db, file_mock, send_msg, saved_md
+
+    def test_degraded_and_critical_anomalies_file_with_template_and_labels(
+        self, tmp_path, monkeypatch
+    ):
+        from agentfx.integrations.linear_client import FilingResult
+
+        anomalies = [
+            qa.TechnicalAnomaly(
+                category="external_api",
+                severity="degraded",
+                headline="50 Devin polling failures (HTTP 403)",
+                occurrences=50,
+                first_seen="2026-11-25T01:00:00Z",
+                last_seen="2026-11-25T11:30:00Z",
+                component="agentfx.agents.fleet.pe_workspace",
+                why_it_matters="PE work orders stall for hours.",
+                sample_log="pe_workspace: poll failed HTTP 403",
+                recommended_action="file PE work order to fix auth header",
+            ),
+            qa.TechnicalAnomaly(
+                category="resource",
+                severity="critical",
+                headline="Database connection pool exhausted",
+                occurrences=12,
+                first_seen="2026-11-25T08:00:00Z",
+                last_seen="2026-11-25T09:00:00Z",
+                component="agentfx.services.paper_runner",
+                why_it_matters="Paper runs stop recording fills.",
+                sample_log="paper_runner: QueuePool limit reached",
+                recommended_action="increase pool size and audit leaked sessions",
+            ),
+        ]
+        _, _, file_mock, send_msg, saved_md = self._run_tech(
+            tmp_path,
+            monkeypatch,
+            anomalies=anomalies,
+            filing_side_effect=[
+                FilingResult(
+                    filed=True,
+                    identifier="AFX-151",
+                    url="https://linear.app/agentfx/issue/AFX-151",
+                    action="created",
+                ),
+                FilingResult(
+                    filed=True,
+                    identifier="AFX-152",
+                    url="https://linear.app/agentfx/issue/AFX-152",
+                    action="created",
+                ),
+            ],
+        )
+        assert file_mock.call_count == 2
+        spec0, spec1 = [c.args[0] for c in file_mock.call_args_list]
+
+        # Degraded -> Bug, default Agent fleet area, Staging label
+        assert spec0.type_label == "Bug"
+        assert spec0.source_label == "QA agent"
+        assert spec0.area_label == "Agent fleet"
+        assert "Staging" in spec0.extra_labels
+        assert spec0.fingerprint == "qa:tech:external_api:pe_workspace"
+        for required_fragment in (
+            "## What I observed",
+            "50 Devin polling failures (HTTP 403)",
+            "## Evidence",
+            "50",
+            "2026-11-25T01:00:00Z",
+            "2026-11-25T11:30:00Z",
+            "last 24h",
+            "pe_workspace",
+            "pe_workspace: poll failed HTTP 403",
+            "## Why it matters",
+            "PE work orders stall for hours.",
+            "## Proposed fix",
+            "file PE work order to fix auth header",
+            "## Done when",
+            "The pattern no longer appears in the next technical-health report",
+        ):
+            assert required_fragment in spec0.body
+
+        # Critical -> Incident, Paper runner area
+        assert spec1.type_label == "Incident"
+        assert spec1.area_label == "Paper runner"
+        assert "Staging" in spec1.extra_labels
+
+        # Email and saved markdown carry the ticket links
+        body = send_msg.call_args.kwargs["body"]
+        html = send_msg.call_args.kwargs["html_body"]
+        assert "New: [AFX-151](https://linear.app/agentfx/issue/AFX-151)" in body
+        assert "New: [AFX-152](https://linear.app/agentfx/issue/AFX-152)" in saved_md
+        assert 'href="https://linear.app/agentfx/issue/AFX-151"' in html
+        assert 'href="https://linear.app/agentfx/issue/AFX-152"' in html
+
+    def test_benign_noted_and_noise_anomalies_are_not_filed(
+        self, tmp_path, monkeypatch
+    ):
+        anomalies = [
+            qa.TechnicalAnomaly(
+                category="logic_warning",
+                severity="noted",
+                headline="Routine candle-gap healing ran 3 times",
+                occurrences=3,
+                sample_log="candle_ingestion: healed 2-bar gap",
+                recommended_action="ignore (benign)",
+            ),
+            qa.TechnicalAnomaly(
+                category="noise",
+                severity="degraded",
+                headline="Transient OANDA 429 burst recovered",
+                occurrences=4,
+                sample_log="oanda: 429 retry succeeded",
+                recommended_action="ignore (benign)",
+            ),
+        ]
+        _, _, file_mock, send_msg, saved_md = self._run_tech(
+            tmp_path, monkeypatch, anomalies=anomalies
+        )
+        file_mock.assert_not_called()
+        send_msg.assert_called_once()
+        assert "No ticket needed (benign)" in send_msg.call_args.kwargs["body"]
+        assert "No ticket needed (benign)" in send_msg.call_args.kwargs["html_body"]
+        assert "No ticket needed (benign)" in saved_md
+
+    def test_cause_and_symptom_linked_land_on_one_ticket(self, tmp_path, monkeypatch):
+        from agentfx.integrations.linear_client import FilingResult
+
+        anomalies = [
+            qa.TechnicalAnomaly(
+                category="external_api",
+                severity="degraded",
+                headline="50 Devin polling failures (HTTP 403)",
+                occurrences=50,
+                first_seen="2026-11-25T01:00:00Z",
+                component="pe_workspace",
+                sample_log="pe_workspace: HTTP 403",
+                recommended_action="fix Devin token scope",
+            ),
+            qa.TechnicalAnomaly(
+                category="logic_warning",
+                severity="degraded",
+                headline="Two stuck PE work orders",
+                occurrences=2,
+                first_seen="2026-11-25T02:00:00Z",
+                component="platform_engineer",
+                sample_log="platform_engineer: work order stuck >2h",
+                recommended_action="resolve polling 403",
+                caused_by_index=0,
+            ),
+        ]
+        _, _, file_mock, send_msg, _ = self._run_tech(
+            tmp_path,
+            monkeypatch,
+            anomalies=anomalies,
+            filing_return=FilingResult(
+                filed=True,
+                identifier="AFX-155",
+                url="https://linear.app/agentfx/issue/AFX-155",
+                action="created",
+            ),
+        )
+        # Only ONE ticket filed for both cause and symptom.
+        assert file_mock.call_count == 1
+        spec = file_mock.call_args.args[0]
+        assert "Two stuck PE work orders" in spec.body
+        # Both anomalies in the email show AFX-155.
+        html = send_msg.call_args.kwargs["html_body"]
+        assert html.count("AFX-155") >= 2
+
+    def test_same_anomaly_on_two_consecutive_days_comments_on_first_ticket(
+        self, tmp_path, monkeypatch
+    ):
+        """Day 1 and Day 2 have different headlines and logger path formats;
+        they produce the same fingerprint so Day 2 comments on the first
+        ticket instead of creating a duplicate."""
+        from agentfx.integrations import linear_client
+
+        day1 = qa.TechnicalAnomaly(
+            category="external_api",
+            severity="degraded",
+            headline="50 Devin polling failures (HTTP 403)",
+            occurrences=50,
+            first_seen="2026-11-24T01:00:00Z",
+            component="agentfx.agents.fleet.pe_workspace",
+            sample_log="pe_workspace: HTTP 403",
+        )
+        day2 = qa.TechnicalAnomaly(
+            category="external_api",
+            severity="degraded",
+            headline="Devin session status poll returned 403 Forbidden 38 times",
+            occurrences=38,
+            first_seen="2026-11-25T01:00:00Z",
+            component="pe_workspace",
+            sample_log="pe_workspace: 403 Forbidden",
+        )
+        assert qa._tech_anomaly_fingerprint(day1) == qa._tech_anomaly_fingerprint(day2)
+
+        # Simulate stateful Linear store across the two consecutive days.
+        monkeypatch.setattr(linear_client.settings, "AGENT_LINEAR_ENABLED", True)
+        monkeypatch.setattr(linear_client.settings, "LINEAR_API_KEY", "lk_test")
+        monkeypatch.setattr(linear_client.settings, "AGENT_LINEAR_TEAM_KEY", "AFX")
+        stored_open: dict[str, dict] = {}
+        created_count = 0
+        comments: list[tuple[str, str]] = []
+
+        def fake_search_open(_client, _team, fp):
+            return stored_open.get(fp)
+
+        def fake_create(_client, *, team_key, spec, now):
+            nonlocal created_count
+            created_count += 1
+            issue = {
+                "id": f"uuid-{created_count}",
+                "identifier": f"AFX-{200 + created_count}",
+                "url": f"https://linear.app/agentfx/issue/AFX-{200 + created_count}",
+                "state": {"name": "Triage", "type": "triage"},
+            }
+            stored_open[spec.fingerprint] = issue
+            return issue
+
+        def fake_comment(_client, *, issue_id, body):
+            comments.append((issue_id, body))
+            return True
+
+        with (
+            patch.object(linear_client, "_build_client", return_value=MagicMock()),
+            patch.object(
+                linear_client,
+                "_search_open_by_fingerprint",
+                side_effect=fake_search_open,
+            ),
+            patch.object(
+                linear_client, "_search_closed_by_fingerprint", return_value=[]
+            ),
+            patch.object(linear_client, "_count_files_today", return_value=0),
+            patch.object(
+                linear_client, "_create_triage_issue", side_effect=fake_create
+            ),
+            patch.object(linear_client, "_add_comment", side_effect=fake_comment),
+        ):
+            r1 = qa._file_tech_anomalies_to_linear(
+                report=qa.TechnicalHealthReport(anomalies=[day1]),
+                snapshot=self._snapshot(),
+            )
+            r2 = qa._file_tech_anomalies_to_linear(
+                report=qa.TechnicalHealthReport(anomalies=[day2]),
+                snapshot=self._snapshot(),
+            )
+
+        assert created_count == 1
+        assert r1[0].action == "created"
+        assert r1[0].identifier == "AFX-201"
+        assert r2[0].action == "commented"
+        assert r2[0].identifier == "AFX-201"
+        assert r2[0].state_name == "Triage"
+        assert len(comments) == 1
+        assert comments[0][0] == "uuid-1"
+
+    def test_linear_outage_on_tech_report_still_sends_email_and_writes_decision(
+        self, tmp_path, monkeypatch
+    ):
+        anomalies = [
+            qa.TechnicalAnomaly(
+                category="exception",
+                severity="critical",
+                headline="Unhandled crash in worker",
+                occurrences=5,
+                component="paper_runner",
+                sample_log="Traceback...",
+            )
+        ]
+        rec_dec, db, _, send_msg, saved_md = self._run_tech(
+            tmp_path,
+            monkeypatch,
+            anomalies=anomalies,
+            filing_side_effect=RuntimeError("Linear down"),
+        )
+        rec_dec.assert_called_once()
+        db.commit.assert_called_once()
+        send_msg.assert_called_once()
+        assert "Not filed: Linear error" in send_msg.call_args.kwargs["body"]
+        assert "Not filed: Linear error" in send_msg.call_args.kwargs["html_body"]
+        assert "Not filed: Linear error" in saved_md

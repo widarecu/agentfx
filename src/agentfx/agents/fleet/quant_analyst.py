@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -594,7 +596,14 @@ def _deterministic_fallback(
     )
 
 
-def _render_markdown(report: QADivergenceReport, run_id: str, today: date) -> str:
+def _render_markdown(
+    report: QADivergenceReport,
+    run_id: str,
+    today: date,
+    filing_results: Sequence[Any] | None = None,
+) -> str:
+    from agentfx.notifications.email import format_filing_result_text
+
     lines: list[str] = [
         f"# QA divergence report — run {run_id} — {today.isoformat()}",
         "",
@@ -614,8 +623,11 @@ def _render_markdown(report: QADivergenceReport, run_id: str, today: date) -> st
     if report.work_orders:
         lines.append("## Work orders")
         lines.append("")
-        for w in report.work_orders:
+        for idx, w in enumerate(report.work_orders):
             lines.append(f"### {w.title}")
+            if filing_results is not None:
+                res = filing_results[idx] if idx < len(filing_results) else None
+                lines.append(f"- **Ticket:** {format_filing_result_text(res)}")
             lines.append(f"- **Target:** `{w.target_file}`")
             lines.append(f"- **Spec:** {w.spec}")
             lines.append(f"- **Profit impact:** {w.expected_profit_impact}")
@@ -625,7 +637,7 @@ def _render_markdown(report: QADivergenceReport, run_id: str, today: date) -> st
 
 
 def _write_divergence_report(*, db: Session, run_id: str, today: date) -> None:
-    """Build + persist + email a QA report for one paper run."""
+    """Build + file + persist + email a QA report for one paper run."""
     snapshot = _snapshot_run(db, run_id=run_id)
 
     llm = _call_sonnet(snapshot)
@@ -649,13 +661,21 @@ def _write_divergence_report(*, db: Session, run_id: str, today: date) -> None:
         output_tokens = llm.output_tokens
         cache_read = llm.cache_read_tokens
 
-    body_md = _render_markdown(report, run_id, today)
+    # 1. File work orders to Linear first (AFX-11, AFX-149) so the saved
+    #    report file and email both carry the ticket link / status for
+    #    every finding. Never raises — email and decision log still run
+    #    on a Linear outage.
+    filing_results = _file_work_orders_to_linear(
+        report=report, run_id=run_id, today=today
+    )
 
-    # 1. Markdown on disk — one per (run, date). Previous days'
+    body_md = _render_markdown(report, run_id, today, filing_results=filing_results)
+
+    # 2. Markdown on disk — one per (run, date). Previous days'
     #    reports stay available for Reflexion / audit.
     write_memory_file(f"paper_divergence/{run_id}_{today.isoformat()}.md", body_md)
 
-    # 2. Decision log.
+    # 3. Decision log.
     record_decision(
         db,
         DecisionRecord(
@@ -674,13 +694,14 @@ def _write_divergence_report(*, db: Session, run_id: str, today: date) -> None:
     )
     db.commit()
 
-    # 3. Email with HTML template.
-    _email_report(run_id=run_id, today=today, body=body_md, report=report)
-
-    # 4. File any work orders as Linear Triage issues (AFX-11). Dark
-    #    by default; see AGENT_LINEAR_ENABLED. Email still goes
-    #    regardless so this is additive, not a replacement.
-    _file_work_orders_to_linear(report=report, run_id=run_id, today=today)
+    # 4. Email with HTML template (includes Linear ticket links).
+    _email_report(
+        run_id=run_id,
+        today=today,
+        body=body_md,
+        report=report,
+        filing_results=filing_results,
+    )
 
 
 def _email_report(
@@ -689,6 +710,7 @@ def _email_report(
     today: date,
     body: str,
     report: QADivergenceReport,
+    filing_results: Sequence[Any] | None = None,
 ) -> None:
     try:
         from agentfx.notifications.email import (
@@ -700,7 +722,7 @@ def _email_report(
             f"Divergence report — run {run_id[:16]} — {today.isoformat()}: "
             f"{report.headline}"
         )
-        html = render_qa_divergence_html(report, body)
+        html = render_qa_divergence_html(report, body, filing_results=filing_results)
         send_agent_message(
             agent_role="QA",
             subject=subject,
@@ -713,26 +735,26 @@ def _email_report(
 
 def _file_work_orders_to_linear(
     *, report: QADivergenceReport, run_id: str, today: date
-) -> None:
-    """File each QA work order as a Linear Triage issue (AFX-11).
+) -> list[Any]:
+    """File each QA work order as a Linear Triage issue (AFX-11, AFX-149).
 
-    One finding per work order. Fingerprint = `qa:<title-hash>:<file-hash>`
-    so the same work order recurring across runs dedupes to a single
-    Triage issue with evidence comments appended, instead of flooding
-    Triage with one issue per paper run.
-
-    Area label is picked from the target_file path heuristically — a
-    missing / unrecognised file maps to "Paper runner" since that's
-    where most QA findings land. Never raises.
+    Returns one `FilingResult` per work order (same order as
+    `report.work_orders`) so the report markdown and email can display
+    the ticket link or skip reason for every finding. Never raises.
     """
     if not report.work_orders:
-        return
+        return []
     try:
-        from agentfx.integrations.linear_client import FindingSpec, file_finding
+        from agentfx.integrations.linear_client import (
+            FilingResult,
+            FindingSpec,
+            file_finding,
+        )
     except Exception:
         logger.exception("qa_agent: linear_client import failed")
-        return
+        return [None for _ in report.work_orders]
 
+    results: list[FilingResult] = []
     for wo in report.work_orders:
         try:
             area = _area_label_for(wo.target_file)
@@ -761,11 +783,14 @@ def _file_work_orders_to_linear(
                     wo.title,
                     result.action,
                 )
+            results.append(result)
         except Exception:
             logger.exception(
                 "qa_agent: unexpected failure filing work order %r to Linear",
                 wo.title,
             )
+            results.append(FilingResult(filed=False, action="skipped:error"))
+    return results
 
 
 def _work_order_fingerprint(category: str, area: str) -> str:
@@ -855,6 +880,21 @@ class TechnicalAnomaly(BaseModel):
         default=None,
         description="Earliest UTC ISO timestamp of this pattern in the window.",
     )
+    last_seen: str | None = Field(
+        default=None,
+        description="Latest UTC ISO timestamp of this pattern in the window.",
+    )
+    component: str = Field(
+        default="",
+        description=(
+            "Logger or module name that emitted the log (e.g. "
+            "'pe_workspace', 'paper_runner', 'oanda')."
+        ),
+    )
+    why_it_matters: str = Field(
+        default="",
+        description="One plain sentence on what stops working while this continues.",
+    )
     sample_log: str = Field(
         default="",
         description=(
@@ -867,6 +907,15 @@ class TechnicalAnomaly(BaseModel):
         description=(
             "What a human should do next: 'investigate', "
             "'file PE work order', 'ignore (benign)', 'rotate secret', etc."
+        ),
+    )
+    caused_by_index: int | None = Field(
+        default=None,
+        description=(
+            "If this anomaly is a downstream symptom of another anomaly in "
+            "this same report, set to that root-cause anomaly's 0-based "
+            "index in `anomalies` so both land on one Linear ticket; "
+            "otherwise null."
         ),
     )
 
@@ -935,6 +984,13 @@ Style:
 - Terse.
 - One anomaly entry PER PATTERN, not per occurrence. Count
   repeats via `occurrences`.
+- Fill `component` (logger/module name), `first_seen`, `last_seen`, and
+  `why_it_matters` (what stops working while this continues) for each
+  anomaly.
+- If anomaly B is a direct downstream symptom of anomaly A in the same
+  report (for example stuck PE work orders caused by 403 polling
+  failures), set `caused_by_index` on B to A's 0-based index in
+  `anomalies` so they file onto one ticket.
 - Flag `noise` for patterns a human would otherwise worry about
   but that are benign — this is as useful as flagging real issues.
 - If nothing abnormal: headline "No anomalies in window", empty
@@ -978,8 +1034,13 @@ def _call_sonnet_tech(snapshot: dict[str, Any]) -> LLMCallResult:
 
 
 def _render_tech_markdown(
-    report: TechnicalHealthReport, today: date, record_count: int
+    report: TechnicalHealthReport,
+    today: date,
+    record_count: int,
+    filing_results: Sequence[Any] | None = None,
 ) -> str:
+    from agentfx.notifications.email import format_filing_result_text
+
     lines: list[str] = [
         f"# QA technical health — {today.isoformat()}",
         "",
@@ -993,10 +1054,17 @@ def _render_tech_markdown(
     if report.anomalies:
         lines.append("## Anomalies")
         lines.append("")
-        for a in report.anomalies:
+        for idx, a in enumerate(report.anomalies):
             lines.append(f"### [{a.severity}] {a.category}: {a.headline}")
+            if filing_results is not None:
+                res = filing_results[idx] if idx < len(filing_results) else None
+                lines.append(f"- **Ticket:** {format_filing_result_text(res)}")
             lines.append(f"- **Occurrences:** {a.occurrences}")
             lines.append(f"- **First seen:** {a.first_seen}")
+            if a.last_seen:
+                lines.append(f"- **Last seen:** {a.last_seen}")
+            if a.component:
+                lines.append(f"- **Component:** {a.component}")
             lines.append(f"- **Recommended action:** {a.recommended_action}")
             lines.append("")
             lines.append("```")
@@ -1073,6 +1141,13 @@ def _pool_health_anomalies(db: Session, *, now: datetime) -> list[TechnicalAnoma
             headline=f.headline,
             occurrences=len(f.account_ids),
             first_seen=now.isoformat(),
+            last_seen=now.isoformat(),
+            component=f.kind,
+            why_it_matters=(
+                "Stuck OANDA paper accounts cannot be leased to new paper runs."
+                if f.kind == "in_use_past_lease"
+                else "Paper runs cannot start when OANDA accounts stay stuck cooling down."
+            ),
             sample_log=f.detail,
             recommended_action=(
                 "investigate stuck paper run / release the account"
@@ -1082,6 +1157,252 @@ def _pool_health_anomalies(db: Session, *, now: datetime) -> list[TechnicalAnoma
         )
         for f in flags
     ]
+
+
+def _is_benign_anomaly(anomaly: TechnicalAnomaly) -> bool:
+    """Return True when an anomaly should NOT be filed to Linear."""
+    sev = (anomaly.severity or "").strip().lower()
+    cat = (anomaly.category or "").strip().lower()
+    return cat == "noise" or sev not in ("critical", "degraded")
+
+
+def _extract_tech_component(anomaly: TechnicalAnomaly) -> str:
+    """Resolve a stable component/logger name for a technical-health anomaly."""
+    raw = (anomaly.component or "").strip()
+    if not raw and anomaly.sample_log:
+        log = anomaly.sample_log.strip()
+        m_mod = re.search(r"\b(agentfx\.[a-zA-Z0-9_.]+)\b", log)
+        if m_mod:
+            raw = m_mod.group(1)
+        else:
+            m_prefix = re.match(r"^([a-zA-Z][a-zA-Z0-9_.-]{1,50}):\s", log)
+            if m_prefix:
+                raw = m_prefix.group(1)
+    if not raw:
+        return "unknown"
+    # Normalise dotted module paths (e.g. agentfx.agents.fleet.pe_workspace
+    # -> pe_workspace) so full logger paths and short names dedupe together.
+    if "." in raw:
+        raw = raw.rsplit(".", 1)[-1]
+    return raw.strip() or "unknown"
+
+
+def _tech_anomaly_fingerprint(anomaly: TechnicalAnomaly) -> str:
+    """Stable fingerprint for a technical-health anomaly:
+    `qa:tech:<category>:<component>`. Independent of LLM headline wording."""
+    cat = (
+        re.sub(
+            r"[^a-z0-9]+", "_", (anomaly.category or "unknown").strip().lower()
+        ).strip("_")
+        or "unknown"
+    )
+    comp = (
+        re.sub(r"[^a-z0-9]+", "_", _extract_tech_component(anomaly).lower()).strip("_")
+        or "unknown"
+    )
+    return f"qa:tech:{cat}:{comp}"
+
+
+def _area_label_for_tech_component(component: str, category: str) -> str:
+    """Map a tech-health component/category to an Area label, defaulting
+    to 'Agent fleet' (AFX-149)."""
+    cat = (category or "").strip().lower()
+    comp = (component or "").strip().lower()
+    if cat == "oanda_pool" or any(
+        tok in comp for tok in ("oanda", "candle", "ingestion")
+    ):
+        return "OANDA/data"
+    if "paper_runner" in comp or "paper_" in comp or "paper/" in comp:
+        return "Paper runner"
+    if "backtest" in comp:
+        return "Backtest"
+    if "validator" in comp:
+        return "Validator"
+    if "dsl" in comp or "evolution" in comp:
+        return "Evolution/DSL"
+    if "portal" in comp:
+        return "Portal"
+    if any(tok in comp for tok in ("notification", "email", "smtp")):
+        return "Notifications"
+    if any(tok in comp for tok in ("github", "deploy", "workflow")):
+        return "Infra/CI"
+    return "Agent fleet"
+
+
+def _resolve_root_anomaly_index(idx: int, anomalies: Sequence[TechnicalAnomaly]) -> int:
+    """Follow `caused_by_index` links to the root-cause anomaly index.
+    Ignores cycles, out-of-range indices, or links to benign anomalies."""
+    current = idx
+    visited = {current}
+    while True:
+        parent = anomalies[current].caused_by_index
+        if (
+            parent is None
+            or not isinstance(parent, int)
+            or parent < 0
+            or parent >= len(anomalies)
+            or parent in visited
+            or _is_benign_anomaly(anomalies[parent])
+        ):
+            return current
+        visited.add(parent)
+        current = parent
+
+
+def _render_tech_finding_body(
+    anomaly: TechnicalAnomaly,
+    *,
+    component: str,
+    snapshot: dict[str, Any],
+    symptoms: Sequence[TechnicalAnomaly] = (),
+) -> str:
+    """Render a technical-health Linear ticket body following
+    `config/linear/templates/finding.md` (AFX-149)."""
+    window_hours = snapshot.get("window_hours", 24)
+    window_end = snapshot.get("window_end_utc") or "unknown"
+    first_seen = anomaly.first_seen or "unknown"
+    last_seen = anomaly.last_seen or anomaly.first_seen or "unknown"
+    sample = (anomaly.sample_log or "(no sample log captured)")[:500]
+    why = (anomaly.why_it_matters or "").strip() or (
+        f"{anomaly.severity.capitalize()} {anomaly.category} anomaly in "
+        f"`{component}` ({anomaly.occurrences} occurrences in the last "
+        f"{window_hours}h)."
+    )
+    proposed = (anomaly.recommended_action or "investigate").strip()
+
+    lines = [
+        "_Filed by an agent. Lands in Triage for Wilson to accept or decline._",
+        "",
+        "## What I observed",
+        "",
+        anomaly.headline or "(technical-health anomaly)",
+        "",
+        "## Evidence",
+        "",
+        f"- **Occurrences:** {anomaly.occurrences}",
+        f"- **First seen (UTC):** {first_seen}",
+        f"- **Last seen (UTC):** {last_seen}",
+        f"- **Window scanned:** last {window_hours}h (ended {window_end})",
+        f"- **Component:** `{component}`",
+        "",
+        "```",
+        sample,
+        "```",
+    ]
+    if symptoms:
+        lines.extend(["", "### Linked downstream symptoms", ""])
+        for sym in symptoms:
+            sym_comp = _extract_tech_component(sym)
+            lines.append(
+                f"- **[{sym.severity}] {sym.headline}** "
+                f"({sym.occurrences}× in `{sym_comp}`; "
+                f"first seen {sym.first_seen or 'unknown'})"
+            )
+            if sym.sample_log:
+                lines.append(f"  Sample: `{sym.sample_log[:200]}`")
+    lines.extend(
+        [
+            "",
+            "## Why it matters",
+            "",
+            why,
+            "",
+            "## Proposed fix",
+            "",
+            proposed,
+            "",
+            "## Done when",
+            "",
+            "- [ ] Root cause fixed and covered by a regression test.",
+            "- [ ] The pattern no longer appears in the next technical-health report.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _file_tech_anomalies_to_linear(
+    *, report: TechnicalHealthReport, snapshot: dict[str, Any]
+) -> list[Any]:
+    """File critical/degraded technical-health anomalies to Linear Triage
+    (AFX-149). Benign anomalies ('noted' or 'noise') are skipped. Linked
+    cause-and-symptom anomalies share one ticket. Never raises."""
+    if not report.anomalies:
+        return []
+    try:
+        from agentfx.integrations.linear_client import (
+            FilingResult,
+            FindingSpec,
+            file_finding,
+        )
+    except Exception:
+        logger.exception("qa_agent: linear_client import failed")
+        return [None for _ in report.anomalies]
+
+    anomalies = report.anomalies
+    results: list[FilingResult | None] = [None] * len(anomalies)
+
+    # Partition benign anomalies and group non-benign symptoms under their root.
+    root_to_symptoms: dict[int, list[int]] = {}
+    root_order: list[int] = []
+    for idx, anomaly in enumerate(anomalies):
+        if _is_benign_anomaly(anomaly):
+            results[idx] = FilingResult(filed=False, action="benign")
+            continue
+        root_idx = _resolve_root_anomaly_index(idx, anomalies)
+        if root_idx not in root_to_symptoms:
+            root_to_symptoms[root_idx] = []
+            root_order.append(root_idx)
+        if idx != root_idx:
+            root_to_symptoms[root_idx].append(idx)
+
+    for root_idx in root_order:
+        root = anomalies[root_idx]
+        symptom_indices = root_to_symptoms[root_idx]
+        symptoms = [anomalies[i] for i in symptom_indices]
+        try:
+            component = _extract_tech_component(root)
+            fingerprint = _tech_anomaly_fingerprint(root)
+            area = _area_label_for_tech_component(component, root.category)
+            type_label = (
+                "Incident"
+                if (root.severity or "").strip().lower() == "critical"
+                else "Bug"
+            )
+            body = _render_tech_finding_body(
+                root,
+                component=component,
+                snapshot=snapshot,
+                symptoms=symptoms,
+            )
+            spec = FindingSpec(
+                fingerprint=fingerprint,
+                title=root.headline[:255] if root.headline else "(Technical anomaly)",
+                body=body,
+                source_label="QA agent",
+                type_label=type_label,
+                area_label=area,
+                risk_label="Normal",
+                extra_labels=["Staging"],
+            )
+            result = file_finding(spec)
+            if result.action.startswith("skipped:"):
+                logger.info(
+                    "qa_agent: tech-health linear filing skipped for %r — %s",
+                    root.headline,
+                    result.action,
+                )
+        except Exception:
+            logger.exception(
+                "qa_agent: unexpected failure filing tech anomaly %r to Linear",
+                root.headline,
+            )
+            result = FilingResult(filed=False, action="skipped:error")
+
+        results[root_idx] = result
+        for sym_idx in symptom_indices:
+            results[sym_idx] = result
+
+    return results
 
 
 def _write_tech_report(
@@ -1138,14 +1459,26 @@ def _write_tech_report(
         if pool_anomalies:
             report.headline = f"OANDA pool health needs attention · {report.headline}"
 
+    if pool_anomalies:
+        offset = len(pool_anomalies)
+        for a in report.anomalies:
+            if a.caused_by_index is not None and a.caused_by_index >= 0:
+                a.caused_by_index += offset
     report.anomalies = [*pool_anomalies, *report.anomalies]
 
-    body_md = _render_tech_markdown(report, today, snapshot["record_count"])
+    # 1. File critical/degraded anomalies to Linear Triage first (AFX-149)
+    #    so the saved report file and email show every finding's ticket.
+    #    Never raises — decision log and email still run on Linear outage.
+    filing_results = _file_tech_anomalies_to_linear(report=report, snapshot=snapshot)
 
-    # 1. Markdown on disk — append-only history of tech-health scans.
+    body_md = _render_tech_markdown(
+        report, today, snapshot["record_count"], filing_results=filing_results
+    )
+
+    # 2. Markdown on disk — append-only history of tech-health scans.
     write_memory_file(f"tech_health/{today.isoformat()}.md", body_md)
 
-    # 2. Decision log.
+    # 3. Decision log.
     record_decision(
         db,
         DecisionRecord(
@@ -1168,15 +1501,24 @@ def _write_tech_report(
     )
     db.commit()
 
-    # 3. Email — only when there's something to report (anomalies
+    # 4. Email — only when there's something to report (anomalies
     # list non-empty OR explicitly flagged in headline). Routine
     # "all clear" scans stay in the DB + markdown; no inbox noise.
     if report.anomalies:
-        _email_tech_report(today=today, body=body_md, report=report)
+        _email_tech_report(
+            today=today,
+            body=body_md,
+            report=report,
+            filing_results=filing_results,
+        )
 
 
 def _email_tech_report(
-    *, today: date, body: str, report: TechnicalHealthReport
+    *,
+    today: date,
+    body: str,
+    report: TechnicalHealthReport,
+    filing_results: Sequence[Any] | None = None,
 ) -> None:
     try:
         from agentfx.notifications.email import (
@@ -1185,7 +1527,7 @@ def _email_tech_report(
         )
 
         subject = f"Technical health — {today.isoformat()}: {report.headline}"
-        html = render_qa_tech_health_html(report, body)
+        html = render_qa_tech_health_html(report, body, filing_results=filing_results)
         send_agent_message(
             agent_role="QA",
             subject=subject,
