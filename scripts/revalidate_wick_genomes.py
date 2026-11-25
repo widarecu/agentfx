@@ -17,7 +17,7 @@ from datetime import UTC, date, datetime, time
 from pathlib import Path
 from unittest.mock import patch
 
-from sqlalchemy import text
+from sqlalchemy import String, bindparam, text
 
 from agentfx.agents.validator import (
     FoldEvaluation,
@@ -76,7 +76,11 @@ def load_genomes(connection, before, paper_sources):
                 SELECT id FROM strategy_genomes
                 WHERE validator_passed IS TRUE AND created_at < :before
                     AND dsl_json->'exit'->>'eval_mode' = 'wick'
-                    AND (dsl_json->'exit'->>'min_hold_bars')::int > 1
+                    AND CAST(dsl_json->'exit'->>'min_hold_bars' AS INTEGER) > 1
+            ), historical_paper AS (
+                SELECT DISTINCT strategy_genome_id FROM runs
+                WHERE environment = 'PAPER' AND created_at < :before
+                    AND strategy_genome_id IS NOT NULL
             ), approvals AS (
                 SELECT DISTINCT strategy_genome_id FROM runs
                 WHERE environment = 'PAPER' AND approved_at IS NOT NULL
@@ -85,25 +89,27 @@ def load_genomes(connection, before, paper_sources):
             )
             SELECT g.id, g.validator_passed, g.dsl_json, er.instrument,
                 er.granularity, er.config_json, c.id IS NOT NULL AS cohort,
+                h.strategy_genome_id IS NOT NULL AS historical_paper,
                 a.strategy_genome_id IS NOT NULL AS approved
             FROM strategy_genomes g
             JOIN generations ge ON ge.id = g.generation_id
             JOIN evolution_runs er ON er.id = ge.run_id
             LEFT JOIN cohort c ON c.id = g.id
+            LEFT JOIN historical_paper h ON h.strategy_genome_id = g.id
             LEFT JOIN approvals a ON a.strategy_genome_id = g.id
             WHERE c.id IS NOT NULL OR a.strategy_genome_id IS NOT NULL
-                OR g.id = ANY(:paper_sources)
+                OR h.strategy_genome_id IS NOT NULL OR g.id IN :paper_sources
             ORDER BY g.id
-        """),
+        """).bindparams(bindparam("paper_sources", expanding=True, type_=String)),
         {"before": before, "paper_sources": sorted(paper_sources)},
     ).all()
     folds = defaultdict(list)
     for fold in connection.execute(
         text("""
             SELECT genome_id, fold_index, fold_start, fold_end, is_oos
-            FROM validation_folds WHERE genome_id = ANY(:ids)
+            FROM validation_folds WHERE genome_id IN :ids
             ORDER BY genome_id, fold_index
-        """),
+        """).bindparams(bindparam("ids", expanding=True, type_=String)),
         {"ids": [row.id for row in rows]},
     ):
         folds[fold.genome_id].append(
@@ -121,7 +127,7 @@ def load_genomes(connection, before, paper_sources):
             row.config_json,
             folds[row.id],
             row.cohort,
-            row.id in paper_sources,
+            row.historical_paper or row.id in paper_sources,
             row.approved,
         )
         for row in rows
@@ -355,10 +361,15 @@ def main():
         "--before",
         type=date.fromisoformat,
         required=True,
-        help="Exclusive UTC creation cutoff for the historical cohort",
+        help="Exclusive UTC creation cutoff for historical genomes and paper runs",
     )
     parser.add_argument("--expected-cohort", type=int, required=True)
-    parser.add_argument("--paper-source-genome", action="append", default=[])
+    parser.add_argument(
+        "--paper-source-genome",
+        action="append",
+        default=[],
+        help="Additional historical source genome, e.g. for a deleted paper run",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--jobs", type=int, choices=range(1, 9), default=1)
     args = parser.parse_args()

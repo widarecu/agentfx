@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from sqlalchemy import create_engine
 
 from agentfx.agents.validator import FoldEvaluation
 from agentfx.core.dsl import compiler
@@ -42,6 +43,41 @@ def make_genome(*folds):
         historical_paper=True,
         approved=True,
     )
+
+
+def test_retained_historical_paper_source_counts_even_without_explicit_id():
+    with create_engine("sqlite://").begin() as db:
+        for statement in (
+            "CREATE TABLE strategy_genomes (id, validator_passed, dsl_json, created_at, generation_id)",
+            "CREATE TABLE generations (id, run_id)",
+            "CREATE TABLE evolution_runs (id, instrument, granularity, config_json)",
+            "CREATE TABLE runs (strategy_genome_id, environment, approved_at, status, created_at)",
+            "CREATE TABLE validation_folds (genome_id, fold_index, fold_start, fold_end, is_oos)",
+            "INSERT INTO evolution_runs VALUES ('evolution', 'EUR_USD', 'M30', '{}')",
+            "INSERT INTO generations VALUES ('generation', 'evolution')",
+            "INSERT INTO strategy_genomes VALUES "
+            "('retained', TRUE, '{}', '2022-01-01', 'generation'), "
+            "('current', TRUE, '{}', '2022-01-01', 'generation'), "
+            "('deleted', TRUE, '{}', '2022-01-01', 'generation')",
+            "INSERT INTO runs VALUES "
+            "('retained', 'PAPER', '2022-01-15', 'COMPLETED', '2022-01-15'), "
+            "('current', 'PAPER', '2022-03-01', 'RUNNING', '2022-03-01')",
+        ):
+            db.exec_driver_sql(statement)
+        before = datetime(2022, 2, 1, tzinfo=UTC)
+        genomes = revalidate.load_genomes(db, before, set())
+        with_deleted = revalidate.load_genomes(db, before, {"deleted"})
+
+    assert [(g.id, g.historical_paper, g.approved) for g in genomes] == [
+        ("current", False, True),
+        ("retained", True, False),
+    ]
+    assert {g.id for g in with_deleted if g.historical_paper} == {"retained", "deleted"}
+    failed_score = revalidate.Score(0.7, ["Sharpe"], [])
+    report = revalidate.render_report(
+        [revalidate.Replay(g, (failed_score,) * 3) for g in genomes], before, set()
+    )
+    assert "original paper source genomes failing C: 1." in report
 
 
 @pytest.mark.parametrize(
