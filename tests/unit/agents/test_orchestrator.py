@@ -813,6 +813,29 @@ class TestValidation:
             c.kwargs["collect_dsr_sample"] for c in validator.validate.call_args_list
         )
 
+    def test_stop_between_validations_preserves_completed_result(self):
+        class RunStopped(Exception):
+            pass
+
+        validator = _make_validator_returning()
+
+        def check_stop():
+            if validator.validate.call_count:
+                raise RunStopped
+
+        orchestrator, persister = _build_orchestrator(
+            validator=validator, check_stop=check_stop
+        )
+        orchestrator.config.top_n_to_validate = 2
+        with pytest.raises(RunStopped):
+            orchestrator.run_loop()
+
+        validator.validate.assert_called_once()
+        [batch] = persister.validation_batches
+        [record] = persister.validations
+        assert batch == [record["genome_id"]]
+        assert record["validation_dsr"]["trial_count"] == 101
+
     def test_validator_called_on_run_completion(self) -> None:
         validator = _make_validator_returning(validator_passed=True)
         orchestrator, persister = _build_orchestrator(
@@ -1263,6 +1286,7 @@ class TestChampionByOOS:
         assert s_folds[1] == 6
         assert s_agg[1] == 5
         assert s_folds > s_agg
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Decision log

@@ -1559,30 +1559,30 @@ class OrchestratorAgent(BaseAgent):
             # at least validate the run-best so the old contract holds.
             top_k = [best_genome_overall]
 
-        passed = 0
-        # Track best-by-OOS for champion-by-OOS selection (2026-06-27).
-        # We collect (score_tuple, genome) pairs as each validation
-        # completes; the best after the loop becomes the run's champion
-        # if it differs from best_genome_overall (the training-fitness
-        # leader). See _oos_robustness_score for the score definition.
-        best_oos_score: tuple[bool, int, float, int] | None = None
-        oos_champion: Genome | None = None
         evaluated: list[tuple[int, Genome, ValidationResult]] = []
-        trial_count = 0
         try:
             evaluated.extend(self._evaluate_validation_batch(top_k))
         finally:
-            attempts = [
-                (genome.id, result)
-                for _, genome, result in evaluated
-                if genome.id is not None
-            ]
-            if attempts:
-                trial_count = self.persister.register_validation_attempts(
-                    self.run_id,
-                    [genome_id for genome_id, _ in attempts],
-                    oos_window([fe.fold for fe in attempts[0][1].folds]),
-                )
+            outcome = self._persist_validation_batch(evaluated, batch_size=len(top_k))
+        return outcome
+
+    def _persist_validation_batch(
+        self,
+        evaluated: list[tuple[int, Genome, ValidationResult]],
+        *,
+        batch_size: int,
+    ) -> tuple[int, Genome | None]:
+        if not evaluated:
+            return 0, None
+        genome_ids = [genome.id for _, genome, _ in evaluated if genome.id is not None]
+        trial_count = self.persister.register_validation_attempts(
+            self.run_id,
+            genome_ids,
+            oos_window([fe.fold for fe in evaluated[0][2].folds]),
+        )
+        passed = 0
+        best_oos_score: tuple[bool, int, float, int] | None = None
+        oos_champion: Genome | None = None
 
         for rank, genome, result in evaluated:
             assert genome.id is not None
@@ -1613,7 +1613,7 @@ class OrchestratorAgent(BaseAgent):
                 },
                 reasoning_text=(
                     f"Walk-forward validation on genome {genome.id} "
-                    f"(rank {rank}/{len(top_k)} by training fitness): "
+                    f"(rank {rank}/{batch_size} by training fitness): "
                     f"{'passed' if result.validator_passed else 'failed'} "
                     f"on OOS fold (Sharpe={oos_eval.metrics.get('sharpe', '?')})."
                 ),
