@@ -198,3 +198,23 @@ def test_no_doc_claims_body_references_are_safe() -> None:
         text = _read(rel)
         assert 'go in the body under "Related"' not in text, rel
         assert "Mention related issues in the PR body instead" not in text, rel
+
+
+@pytest.mark.parametrize("rel", _WORKFLOW_DOCS)
+def test_workflow_docs_teach_one_shared_claim(rel: str) -> None:
+    """AFX-142: every taker claims the same way and names itself."""
+    text = _read(rel)
+    assert "--taker" in text and "--link" in text, rel
+    assert "needs `LINEAR_API_KEY`" not in text, rel
+
+
+def test_canonical_runbook_explains_the_claim() -> None:
+    text = _read(_CANONICAL)
+    section = text[text.index("### How the claim works") : text.index("## 2.")]
+    for phrase in (
+        "exactly one starts",
+        "Assignee stays Wilson and delegate is never set",
+        "afx-request.yml",
+        "tells the worker not to claim again",
+    ):
+        assert phrase in section, phrase
