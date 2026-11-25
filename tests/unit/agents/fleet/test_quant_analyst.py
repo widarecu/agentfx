@@ -615,7 +615,8 @@ class TestLinearFiling:
             observation="The paper account placed two orders for one signal.",
             evidence="Trades 8 and 9 opened 50 ms apart at 03:40 UTC.",
             expected_profit_impact="Duplicate orders increase exposure.",
-            spec="Submit at most one order per signal.",
+            spec="Trades 8 and 9 motivate limiting orders per signal.",
+            proposed_fix="Submit at most one order per signal.",
             confidence="high",
             done_when=["One signal cannot create a second order."],
         )
@@ -630,6 +631,7 @@ class TestLinearFiling:
         assert "## What I observed\n\nThe paper account placed two orders" in spec.body
         assert "## Why it matters\n\nDuplicate orders increase exposure." in spec.body
         assert "## Proposed fix\n\nSubmit at most one order per signal." in spec.body
+        assert "Trades 8 and 9 motivate" not in spec.body
         assert "## Evidence\n\n" + spec.evidence in spec.body
         assert spec.evidence == (
             "Paper run: `run_example` (2026-10-26)\n\n"
@@ -645,7 +647,7 @@ class TestLinearFiling:
         spec = self._file_one(
             target_file=guess,
             title=f"Fix {guess}",
-            spec=f"Change {guess}.",
+            proposed_fix=f"Change {guess}.",
         )
         assert guess not in spec.title
         assert guess not in spec.body

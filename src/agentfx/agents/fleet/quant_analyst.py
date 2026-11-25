@@ -173,7 +173,10 @@ class QAWorkOrder(BaseModel):
     )
     spec: str = Field(
         default="",
-        description="Proposed fix in plain sentences, separate from the evidence.",
+        description=(
+            "What needs to change and why. Must cite the specific "
+            "trades / data points that motivated the request."
+        ),
     )
     expected_profit_impact: str = Field(
         default="",
@@ -186,6 +189,10 @@ class QAWorkOrder(BaseModel):
     evidence: str = Field(
         default="",
         description="Relevant run IDs, trades, measured values and the UTC time window.",
+    )
+    proposed_fix: str = Field(
+        default="",
+        description="Proposed fix for the ticket, in plain sentences without evidence.",
     )
     confidence: str = Field(
         default="", description="Confidence in the finding: High, Medium or Low."
@@ -546,6 +553,8 @@ For each work order, write plain sentences describing the observation,
 the evidence (run IDs, trades, numbers and the UTC time window), and the
 proposed fix in separate fields. Give High, Medium or Low confidence
 and a done_when checklist of observable results that verify the fix.
+Keep the spec field for the report and cite the specific trades or
+measurements there as usual.
 Put any guessed repo path only in target_file; you cannot verify it.
 
 Style:
@@ -787,7 +796,7 @@ def _render_work_order_finding(
         "What I observed": wo.observation.strip() or _NOT_STATED,
         "Evidence": evidence,
         "Why it matters": wo.expected_profit_impact.strip() or _NOT_STATED,
-        "Proposed fix": f"{wo.spec.strip() or _NOT_STATED}\n\nArea: {area}. {target}",
+        "Proposed fix": f"{wo.proposed_fix.strip() or _NOT_STATED}\n\nArea: {area}. {target}",
         "Done when": "\n".join(done_when),
     }
     template = _FINDING_TEMPLATE.read_text(encoding="utf-8")
@@ -806,7 +815,13 @@ def _render_work_order_finding(
 def _without_unverified_target(wo: QAWorkOrder, target: str) -> QAWorkOrder:
     if len(target) < 3 or not any(char in target for char in "/.\\"):
         return wo
-    fields = ("title", "observation", "evidence", "spec", "expected_profit_impact")
+    fields = (
+        "title",
+        "observation",
+        "evidence",
+        "proposed_fix",
+        "expected_profit_impact",
+    )
     updates = {
         field: getattr(wo, field).replace(target, "the unidentified file")
         for field in fields
