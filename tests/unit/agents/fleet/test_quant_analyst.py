@@ -642,15 +642,17 @@ class TestLinearFiling:
         assert "- [ ] `make lint` green." in spec.body
         assert "- [ ] `make test-unit` green." in spec.body
 
-    def test_guessed_target_is_not_echoed_in_filing_prose(self):
+    @pytest.mark.parametrize("full_path", [True, False])
+    def test_guessed_target_is_not_echoed_in_filing_prose(self, full_path):
         guess = "src/execution/stop_engine.py"
+        reference = guess if full_path else "stop_engine.py"
         spec = self._file_one(
             target_file=guess,
-            title=f"Fix {guess}",
-            proposed_fix=f"Change {guess}.",
+            title=f"Fix {reference}",
+            proposed_fix=f"Change {reference}.",
         )
-        assert guess not in spec.title
-        assert guess not in spec.body
+        assert reference not in spec.title
+        assert reference not in spec.body
         assert "File was not identified." in spec.body
 
     @pytest.mark.parametrize(

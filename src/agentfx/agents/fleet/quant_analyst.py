@@ -815,6 +815,11 @@ def _render_work_order_finding(
 def _without_unverified_target(wo: QAWorkOrder, target: str) -> QAWorkOrder:
     if len(target) < 3 or not any(char in target for char in "/.\\"):
         return wo
+    basename = Path(target.replace("\\", "/")).name
+    filenames = "|".join(
+        re.escape(name) for name in dict.fromkeys((target, basename)) if name
+    )
+    unverified = re.compile(rf"(?<![\w./\\-])(?:{filenames})(?![\w/\\-]|\.\w)")
     fields = (
         "title",
         "observation",
@@ -823,11 +828,11 @@ def _without_unverified_target(wo: QAWorkOrder, target: str) -> QAWorkOrder:
         "expected_profit_impact",
     )
     updates = {
-        field: getattr(wo, field).replace(target, "the unidentified file")
+        field: unverified.sub("the unidentified file", getattr(wo, field))
         for field in fields
     }
     updates["done_when"] = [
-        item.replace(target, "the unidentified file") for item in wo.done_when
+        unverified.sub("the unidentified file", item) for item in wo.done_when
     ]
     return wo.model_copy(update=updates)
 
