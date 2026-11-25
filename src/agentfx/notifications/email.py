@@ -812,7 +812,77 @@ def _render_scheduling_results_html(
     )
 
 
-def render_qa_divergence_html(report: Any, plaintext_body: str) -> str:
+def _not_filed_reason(action: str) -> str:
+    if action == "skipped:cap_hit":
+        return "daily ticket limit reached"
+    if action == "skipped:flag_off":
+        return "Linear filing is switched off"
+    if action == "skipped:no_key":
+        return "Linear filing is switched off (no API key)"
+    return "Linear error"
+
+
+def format_filing_result_text(result: Any | None) -> str:
+    """Plain-text / Markdown one-liner for a Linear filing result (AFX-149)."""
+    if result is None:
+        return "Not filed: Linear error"
+    action = (getattr(result, "action", "") or "").strip()
+    ident = (getattr(result, "identifier", None) or "").strip()
+    url = (getattr(result, "url", None) or "").strip()
+    state_name = (getattr(result, "state_name", None) or "").strip()
+    safe_url = url if url.startswith(("https://", "http://")) else ""
+    ref = f"[{ident}]({safe_url})" if (ident and safe_url) else (ident or "(unknown)")
+
+    if action == "created" and ident:
+        return f"New: {ref}"
+    if action == "commented" and ident:
+        status_part = f" ({state_name})" if state_name else ""
+        return f"Known issue: {ref}{status_part}, evidence added"
+    if action == "reopened" and ident:
+        status_part = f" (was {state_name})" if state_name else ""
+        return f"Reopened: {ref}{status_part}, evidence added"
+    if action in ("benign", "skipped:benign"):
+        return "No ticket needed (benign)"
+    return f"Not filed: {_not_filed_reason(action)}"
+
+
+def format_filing_result_html(result: Any | None) -> str:
+    """Styled HTML one-liner for a Linear filing result (AFX-149)."""
+    if result is None:
+        return '<span style="color:#6b7280;">Not filed: Linear error</span>'
+    action = (getattr(result, "action", "") or "").strip()
+    ident = (getattr(result, "identifier", None) or "").strip()
+    url = (getattr(result, "url", None) or "").strip()
+    state_name = (getattr(result, "state_name", None) or "").strip()
+    safe_url = url if url.startswith(("https://", "http://")) else ""
+    if ident and safe_url:
+        ref_html = (
+            f'<a href="{_escape(safe_url)}" '
+            f'style="color:#2563eb;text-decoration:none;font-weight:600;">'
+            f"{_escape(ident)}</a>"
+        )
+    else:
+        ref_html = f"<strong>{_escape(ident or '(unknown)')}</strong>"
+
+    if action == "created" and ident:
+        return f"New: {ref_html}"
+    if action == "commented" and ident:
+        status_part = f" ({_escape(state_name)})" if state_name else ""
+        return f"Known issue: {ref_html}{status_part}, evidence added"
+    if action == "reopened" and ident:
+        status_part = f" (was {_escape(state_name)})" if state_name else ""
+        return f"Reopened: {ref_html}{status_part}, evidence added"
+    if action in ("benign", "skipped:benign"):
+        return '<span style="color:#6b7280;">No ticket needed (benign)</span>'
+    reason = _escape(_not_filed_reason(action))
+    return f'<span style="color:#6b7280;">Not filed: {reason}</span>'
+
+
+def render_qa_divergence_html(
+    report: Any,
+    plaintext_body: str,
+    filing_results: Any = None,
+) -> str:
     """Render a QA divergence report as styled HTML.
 
     Mirrors `render_pm_brief_html`'s shape so future refactoring
@@ -847,13 +917,21 @@ def render_qa_divergence_html(report: Any, plaintext_body: str) -> str:
         )
 
         wo_html_parts: list[str] = []
-        for w in work_orders:
+        for idx, w in enumerate(work_orders):
             title = _escape(getattr(w, "title", "") or "")
             file_target = _escape(getattr(w, "target_file", "") or "")
             spec = _escape(getattr(w, "spec", "") or "")
+            ticket_html = ""
+            if filing_results is not None:
+                res = filing_results[idx] if idx < len(filing_results) else None
+                ticket_html = (
+                    f'<div style="color:#374151;font-size:12px;margin-top:4px;">'
+                    f"<strong>Ticket:</strong> {format_filing_result_html(res)}</div>"
+                )
             wo_html_parts.append(
                 f'<li style="margin:0 0 10px 0;">'
                 f"<strong>{title}</strong>"
+                f"{ticket_html}"
                 f'<div style="color:#6b7280;font-size:12px;">target: '
                 f'<code style="background:#f3f4f6;padding:1px 4px;">{file_target}</code></div>'
                 f'<div style="color:#374151;font-size:13px;margin-top:2px;">{spec}</div>'
@@ -888,7 +966,11 @@ def render_qa_divergence_html(report: Any, plaintext_body: str) -> str:
         )
 
 
-def render_qa_tech_health_html(report: Any, plaintext_body: str) -> str:
+def render_qa_tech_health_html(
+    report: Any,
+    plaintext_body: str,
+    filing_results: Any = None,
+) -> str:
     """Render a QA technical-health report as styled HTML.
 
     Mirrors the divergence template's shape. Duck-typed on
@@ -906,7 +988,7 @@ def render_qa_tech_health_html(report: Any, plaintext_body: str) -> str:
         anomalies = getattr(report, "anomalies", []) or []
 
         anomaly_html_parts: list[str] = []
-        for a in anomalies:
+        for idx, a in enumerate(anomalies):
             sev = _escape(getattr(a, "severity", "") or "")
             cat = _escape(getattr(a, "category", "") or "")
             head = _escape(getattr(a, "headline", "") or "")
@@ -919,6 +1001,13 @@ def render_qa_tech_health_html(report: Any, plaintext_body: str) -> str:
                 "degraded": "#d97706",
                 "noted": "#6b7280",
             }.get(sev, "#6b7280")
+            ticket_html = ""
+            if filing_results is not None:
+                res = filing_results[idx] if idx < len(filing_results) else None
+                ticket_html = (
+                    f'<div style="color:#374151;font-size:12px;margin-top:4px;">'
+                    f"<strong>Ticket:</strong> {format_filing_result_html(res)}</div>"
+                )
             anomaly_html_parts.append(
                 f'<li style="margin:0 0 14px 0;list-style:none;'
                 f'padding:10px 12px;background:#f9fafb;border-left:3px solid {sev_color};">'
@@ -928,6 +1017,7 @@ def render_qa_tech_health_html(report: Any, plaintext_body: str) -> str:
                 f'<span style="background:#4f46e5;color:#fff;padding:1px 7px;'
                 f'border-radius:10px;font-size:11px;margin-right:6px;">{cat}</span>'
                 f"<strong>{head}</strong></div>"
+                f"{ticket_html}"
                 f'<div style="color:#6b7280;font-size:12px;margin-top:4px;">'
                 f"{occ}× &middot; first seen {first} &middot; action: {action}</div>"
                 f'<pre style="margin:6px 0 0 0;padding:8px 10px;'

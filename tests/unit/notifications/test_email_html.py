@@ -276,6 +276,83 @@ class TestQADivergenceHTML:
         assert "90%" in html  # confidence
         assert "Update typical_spread_pips" in html
 
+    def test_renders_new_ticket_link(self):
+        from agentfx.integrations.linear_client import FilingResult
+
+        results = [
+            FilingResult(
+                filed=True,
+                identifier="AFX-150",
+                url="https://linear.app/agentfx/issue/AFX-150",
+                action="created",
+            )
+        ]
+        html = email_module.render_qa_divergence_html(
+            self._report(), plaintext_body="", filing_results=results
+        )
+        assert "New:" in html
+        assert 'href="https://linear.app/agentfx/issue/AFX-150"' in html
+        assert ">AFX-150</a>" in html
+
+    def test_renders_known_issue_with_status(self):
+        from agentfx.integrations.linear_client import FilingResult
+
+        results = [
+            FilingResult(
+                filed=True,
+                identifier="AFX-51",
+                url="https://linear.app/agentfx/issue/AFX-51",
+                action="commented",
+                state_name="In Progress",
+            )
+        ]
+        html = email_module.render_qa_divergence_html(
+            self._report(), plaintext_body="", filing_results=results
+        )
+        assert "Known issue:" in html
+        assert 'href="https://linear.app/agentfx/issue/AFX-51"' in html
+        assert "(In Progress), evidence added" in html
+
+    def test_renders_reopened_ticket(self):
+        from agentfx.integrations.linear_client import FilingResult
+
+        results = [
+            FilingResult(
+                filed=True,
+                identifier="AFX-88",
+                url="https://linear.app/agentfx/issue/AFX-88",
+                action="reopened",
+                state_name="Done",
+            )
+        ]
+        html = email_module.render_qa_divergence_html(
+            self._report(), plaintext_body="", filing_results=results
+        )
+        assert "Reopened:" in html
+        assert 'href="https://linear.app/agentfx/issue/AFX-88"' in html
+        assert "(was Done), evidence added" in html
+
+    @pytest.mark.parametrize(
+        "action,expected_text",
+        [
+            ("skipped:flag_off", "Not filed: Linear filing is switched off"),
+            ("skipped:cap_hit", "Not filed: daily ticket limit reached"),
+            ("skipped:create_failed", "Not filed: Linear error"),
+            ("skipped:dedupe_comment_failed", "Not filed: Linear error"),
+            ("skipped:reopen_failed", "Not filed: Linear error"),
+            ("benign", "No ticket needed (benign)"),
+        ],
+    )
+    def test_renders_not_filed_and_benign_reasons(self, action, expected_text):
+        from agentfx.integrations.linear_client import FilingResult
+
+        res = FilingResult(filed=False, action=action)
+        assert email_module.format_filing_result_text(res) == expected_text
+        html = email_module.render_qa_divergence_html(
+            self._report(), plaintext_body="", filing_results=[res]
+        )
+        assert expected_text in html
+
 
 class TestSendAgentMessageHTML:
     """`send_agent_message` must send multipart/alternative when
