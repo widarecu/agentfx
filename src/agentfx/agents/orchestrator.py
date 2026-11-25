@@ -1458,17 +1458,15 @@ class OrchestratorAgent(BaseAgent):
         to passing they are; when some genomes pass, those rank above
         non-passers automatically.
 
-        Five Gate B criteria are tracked in ``validation_failures`` as
-        human-readable strings; the count of NON-failures is
-        ``5 - len(failures)``.
+        Six criteria count: the five aggregate Gate B checks (sharpe /
+        max_dd / hit_rate / n_trades / cagr) plus the per-fold floor (every
+        OOS fold profitable and within the drawdown cap) as one. Per-fold
+        failure strings are excluded from the aggregate count so a genome
+        with several bad folds is not scored as failing many criteria.
         """
-        # The validation_failures list contains one string per failed
-        # criterion (sharpe / max_dd / hit_rate / n_trades / cagr).
-        # 5 total criteria; non-failing count = 5 - len(failures).
-        # Use a generous denominator so future Gate B additions don't
-        # break the score; pass-count is the primary discriminator
-        # regardless.
-        n_passed = 5 - len(result.validation_failures)
+        n_fold = len(result.fold_failures)
+        n_aggregate_failed = len(result.validation_failures) - n_fold
+        n_passed = 6 - n_aggregate_failed - (1 if n_fold else 0)
         agg = result.oos_aggregate_metrics or {}
         median_sharpe = float(agg.get("sharpe", float("-inf")))
         total_trades = int(agg.get("n_trades", 0) or 0)

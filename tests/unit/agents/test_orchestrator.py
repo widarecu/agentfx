@@ -1177,6 +1177,38 @@ class TestChampionByOOS:
         s3 = OrchestratorAgent._oos_robustness_score(result_better_sharpe)
         assert s3 > s1
 
+    def test_oos_robustness_score_counts_fold_floor_once(self) -> None:
+        """Several failing OOS folds count as one failed criterion, not one
+        per fold, so they do not outweigh aggregate Gate B failures."""
+        from agentfx.core.dsl.seeds import MA_CROSSOVER_SEED
+
+        folds_fail = [
+            "OOS fold 1/5: CAGR -2.0% is not profitable",
+            "OOS fold 2/5: CAGR -1.0% is not profitable",
+            "OOS fold 3/5: Max DD 25.0% > cap 10%",
+        ]
+        aggregate_ok_bad_folds = ValidationResult(
+            spec=MA_CROSSOVER_SEED,
+            folds=[],
+            validator_passed=False,
+            validation_failures=list(folds_fail),
+            oos_aggregate_metrics={"sharpe": 1.5, "n_trades": 400},
+            fold_failures=list(folds_fail),
+        )
+        two_aggregate_failures = ValidationResult(
+            spec=MA_CROSSOVER_SEED,
+            folds=[],
+            validator_passed=False,
+            validation_failures=["a", "b"],
+            oos_aggregate_metrics={"sharpe": 0.5, "n_trades": 100},
+        )
+
+        s_folds = OrchestratorAgent._oos_robustness_score(aggregate_ok_bad_folds)
+        s_agg = OrchestratorAgent._oos_robustness_score(two_aggregate_failures)
+        assert s_folds[0] == 5
+        assert s_agg[0] == 4
+        assert s_folds > s_agg
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Decision log
