@@ -134,6 +134,28 @@ def dispatch_from_linear_webhook(
             err,
         )
 
+    from agentfx.agents.fleet.pe_workspace import pe_workspace_operation_lock
+
+    with pe_workspace_operation_lock:
+        return _dispatch_workspace(
+            delivery_id=delivery_id,
+            session_id=session_id,
+            identifier=identifier,
+            title=title,
+            narrative=narrative,
+            now=now,
+        )
+
+
+def _dispatch_workspace(
+    *,
+    delivery_id: str,
+    session_id: str,
+    identifier: str,
+    title: str,
+    narrative: str,
+    now: datetime,
+) -> tuple[bool, str]:
     # Everything from here on needs a DB session. Open a fresh one —
     # the FastAPI request-scoped Depends(get_db) session closed when
     # the webhook handler returned.
@@ -166,13 +188,11 @@ def dispatch_from_linear_webhook(
         from agentfx.agents.fleet.pe_workspace import (
             build_task_slug,
             check_budget_before_dispatch,
-            pe_workspace_operation_lock,
             resolve_adapter,
             sweep_stuck_runs,
         )
 
-        with pe_workspace_operation_lock:
-            sweep_stuck_runs(db, now=now)
+        sweep_stuck_runs(db, now=now)
 
         # Step 3 — Budget pre-flight. Over cap → emit error activity
         # so Wilson sees the reason in Linear, not just Railway logs.

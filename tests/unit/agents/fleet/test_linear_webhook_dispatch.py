@@ -142,14 +142,17 @@ def _patch_bg(
 
 
 def test_webhook_sweeps_only_after_inflight_workspace_poll(monkeypatch):
-    mocks = _patch_bg(monkeypatch, budget_result=(False, "cap"))
+    mocks = _patch_bg(monkeypatch)
     poll_started, finish_poll = Event(), Event()
     picked_up, swept = Event(), Event()
+    refreshed_cost = 0
     observed_pr_open = []
 
     def poll(db):
+        nonlocal refreshed_cost
         poll_started.set()
         assert finish_poll.wait(5)
+        refreshed_cost = 3
         return {}
 
     def pick_up(*args):
@@ -165,6 +168,9 @@ def test_webhook_sweeps_only_after_inflight_workspace_poll(monkeypatch):
     monkeypatch.setattr(pe_workspace, "poll_running_dispatches", poll)
     mocks["thought"].side_effect = pick_up
     mocks["sweep"].side_effect = sweep
+    mocks["budget"].side_effect = lambda *args, **kwargs: (
+        (False, "cap") if refreshed_cost >= 3 else (True, "")
+    )
 
     with ThreadPoolExecutor(max_workers=2) as workers:
         poll_job = workers.submit(agent_orchestrator._pe_workspace_poll_tick)
@@ -184,6 +190,57 @@ def test_webhook_sweeps_only_after_inflight_workspace_poll(monkeypatch):
         assert webhook_job.result(timeout=5) == (False, "budget:cap")
 
     assert observed_pr_open == [True]
+    mocks["adapter"].dispatch.assert_not_called()
+
+
+def test_workspace_poll_cannot_interleave_webhook_budget_check_and_dispatch(
+    monkeypatch,
+):
+    mocks = _patch_bg(monkeypatch)
+    building_spec, finish_spec = Event(), Event()
+    poll_started, cost_refreshed = Event(), Event()
+
+    def build_slug(*args, **kwargs):
+        building_spec.set()
+        assert finish_spec.wait(5)
+        return "afx-8-qa-tech-health"
+
+    def poll(db):
+        cost_refreshed.set()
+        return {}
+
+    def poll_tick():
+        poll_started.set()
+        agent_orchestrator._pe_workspace_poll_tick()
+
+    monkeypatch.setattr(agent_orchestrator, "SessionLocal", MagicMock())
+    monkeypatch.setattr(pe_workspace, "poll_running_dispatches", poll)
+    mocks["build_slug"].side_effect = build_slug
+    mocks["adapter"].dispatch.side_effect = lambda *args, **kwargs: (
+        WorkspaceDispatchResult(
+            accepted=False,
+            reason="cost_changed_after_gate" if cost_refreshed.is_set() else "test",
+        )
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        webhook_job = workers.submit(
+            lwd.dispatch_from_linear_webhook,
+            delivery_id=_DELIVERY_ID,
+            payload=_real_payload(),
+            now=_NOW,
+        )
+        try:
+            assert building_spec.wait(5)
+            poll_job = workers.submit(poll_tick)
+            assert poll_started.wait(5)
+            assert not cost_refreshed.wait(0.1)
+        finally:
+            finish_spec.set()
+        assert webhook_job.result(timeout=5) == (False, "adapter_refused:test")
+        poll_job.result(timeout=5)
+
+    assert cost_refreshed.is_set()
 
 
 # ─────────────────────────────────────────────────────────────────────

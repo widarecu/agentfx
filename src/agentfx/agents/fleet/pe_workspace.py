@@ -66,6 +66,7 @@ from agentfx.api.models import AgentWorkspaceRun, AgentWorkspaceRunStatus
 
 logger = logging.getLogger(__name__)
 
+# Keep workspace state and spend checks ordered across the fleet and webhook workers.
 pe_workspace_operation_lock = Lock()
 
 _DEVIN_API_BASE = "https://api.devin.ai"

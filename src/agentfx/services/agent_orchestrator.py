@@ -262,9 +262,10 @@ async def _pe_workspace_poll_loop() -> None:
 
 
 def _pe_scan_tick() -> None:
+    from agentfx.agents.fleet.pe_workspace import pe_workspace_operation_lock
     from agentfx.agents.fleet.platform_engineer import scan_and_dispatch
 
-    with SessionLocal() as db:
+    with pe_workspace_operation_lock, SessionLocal() as db:
         if not is_within_daily_budget(db):
             logger.warning(
                 "agent_orchestrator: PE scan skipped — daily budget exceeded for %s",
