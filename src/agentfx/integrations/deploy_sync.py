@@ -28,11 +28,11 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from agentfx.integrations.github_refs import GitHubError, RefWriter, run_gh
 from agentfx.integrations.linear_delivery import LinearError
 
 STAGING_TAG = "deployed/staging"
@@ -55,12 +55,6 @@ _AFX_RE = re.compile(r"\bAFX-(\d+)\b", re.IGNORECASE)
 _PAGE = 100
 
 
-class GitHubError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None) -> None:
-        super().__init__(message)
-        self.status = status
-
-
 class BaselineUnknownError(RuntimeError):
     """The tag already points at the attempted SHA and no record exists."""
 
@@ -68,7 +62,7 @@ class BaselineUnknownError(RuntimeError):
 class GitHub(Protocol):
     def get_tag_sha(self, name: str) -> str | None: ...
     def create_tag_ref(self, name: str, sha: str) -> None: ...
-    def delete_tag_ref(self, name: str) -> None: ...
+    def delete_tag_ref(self, name: str, sha: str) -> None: ...
     def list_tag_refs(self, prefix: str) -> dict[str, str]: ...
     def compare(self, base: str, head: str) -> tuple[str, list[str]]: ...
     def commit_pulls(self, sha: str) -> list[dict]: ...
@@ -534,10 +528,10 @@ def _prune_records(
     keep the current ones so a duplicate run or reconcile can replay it."""
     try:
         for prefix in (RECORD_PREFIX, SYNCED_PREFIX):
-            for name in gh.list_tag_refs(prefix):
+            for name, ref_sha in gh.list_tag_refs(prefix).items():
                 sha = name[len(prefix) :]
                 if sha != attempted and sha in deployed:
-                    gh.delete_tag_ref(name)
+                    gh.delete_tag_ref(name, ref_sha)
                     report.info(f"pruned {name}")
     except GitHubError as exc:
         report.warn(f"could not prune old baseline records: {exc}")
@@ -572,24 +566,15 @@ def recover(
 # ── gh CLI client ────────────────────────────────────────────────────
 
 
-def _gh_runner(args: list[str]) -> str:
-    proc = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        status = (
-            404 if "HTTP 404" in proc.stderr or "Not Found" in proc.stderr else None
-        )
-        raise GitHubError(proc.stderr.strip() or f"gh exited {proc.returncode}", status)
-    return proc.stdout
-
-
 class GhCli:
     """GitHub REST through `gh api` (auth from `GH_TOKEN`)."""
 
     def __init__(
-        self, repo: str, *, runner: Callable[[list[str]], str] = _gh_runner
+        self, repo: str, *, runner: Callable[[list[str]], str] = run_gh
     ) -> None:
         self.repo = repo
         self._run = runner
+        self._refs = RefWriter(repo, runner)
 
     def _get(self, path: str):
         try:
@@ -616,21 +601,10 @@ class GhCli:
         return obj["sha"]
 
     def create_tag_ref(self, name: str, sha: str) -> None:
-        self._run(
-            [
-                "api",
-                "-X",
-                "POST",
-                "-f",
-                f"ref=refs/tags/{name}",
-                "-f",
-                f"sha={sha}",
-                f"repos/{self.repo}/git/refs",
-            ]
-        )
+        self._refs.put(f"refs/tags/{name}", sha, expected=None)
 
-    def delete_tag_ref(self, name: str) -> None:
-        self._run(["api", "-X", "DELETE", f"repos/{self.repo}/git/refs/tags/{name}"])
+    def delete_tag_ref(self, name: str, sha: str) -> None:
+        self._refs.delete(f"refs/tags/{name}", expected=sha)
 
     def list_tag_refs(self, prefix: str) -> dict[str, str]:
         refs: dict[str, str] = {}

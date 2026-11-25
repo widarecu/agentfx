@@ -9,6 +9,7 @@
 /scripts/afx.py                                  @widarecu
 /src/agentfx/integrations/linear_delivery.py     @widarecu
 /src/agentfx/integrations/deploy_sync.py         @widarecu
+/src/agentfx/integrations/github_refs.py         @widarecu
 /src/agentfx/integrations/delivery_reconcile.py  @widarecu
 
 # Money-path code (CLAUDE.md rule 3: order execution, sizing, kill switch,

@@ -39,6 +39,11 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from agentfx.integrations.github_refs import GitHubError, RefWriter, run_gh  # noqa: E402
 
 TAG = "deployed/staging"
 TAG_REF = f"refs/tags/{TAG}"
@@ -69,6 +74,7 @@ SHARED_PATHS = (
     ".github/workflows/deploy.yml",
     "scripts/deploy_staging.py",
     "scripts/railway_deploy.py",
+    "src/agentfx/integrations/github_refs.py",
 )
 # Everything the Railway image is built from (Dockerfile COPY lines,
 # the nightly trigger script) and the service settings in .railway/.
@@ -486,34 +492,13 @@ class Record:
     detail: str
 
 
-def gh_api(
-    runner: Runner, method: str, path: str, fields: dict[str, str]
-) -> subprocess.CompletedProcess:
-    cmd = ["gh", "api", "-X", method, path]
-    for key, value in fields.items():
-        flag = "-F" if value in ("true", "false") else "-f"
-        cmd += [flag, f"{key}={value}"]
-    return runner(cmd)
-
-
 def _write_ref(
-    runner: Runner, repo: str, ref: str, sha: str, *, exists: bool, force: bool
+    writer: RefWriter, ref: str, sha: str, *, expected: str | None, force: bool
 ) -> None:
-    if exists:
-        result = gh_api(
-            runner,
-            "PATCH",
-            f"repos/{repo}/git/{ref}",
-            {"sha": sha, "force": _bool(force)},
-        )
-    else:
-        result = gh_api(
-            runner, "POST", f"repos/{repo}/git/refs", {"ref": ref, "sha": sha}
-        )
-    if result.returncode != 0:
-        raise DeployError(
-            f"could not point {ref} at {sha}: {(result.stderr or result.stdout).strip()}"
-        )
+    try:
+        writer.put(ref, sha, expected=expected, force=force)
+    except GitHubError as exc:
+        raise DeployError(f"could not point {ref} at {sha}: {exc}") from exc
 
 
 def record(
@@ -537,21 +522,19 @@ def record(
         )
     if rel == "diverged":
         raise DeployError(diverged_problem(target, tag_sha))
+    writer = RefWriter(repo, lambda args: run_gh(args, runner=runner))
     if tag_sha:
         # Kept first so ticket sync can still find the start of the range.
         _write_ref(
-            runner,
-            repo,
+            writer,
             PREVIOUS_TAG_REF,
             tag_sha,
-            exists=bool(previous_tag_sha),
+            expected=previous_tag_sha,
             force=True,
         )
     # force=false: GitHub rejects anything but a fast-forward, so a racing
     # older run cannot move the tag backwards even past the checks above.
-    _write_ref(
-        runner, repo, TAG_REF, target, exists=bool(tag_sha), force=rel == "unrelated"
-    )
+    _write_ref(writer, TAG_REF, target, expected=tag_sha, force=rel == "unrelated")
     return Record(
         True, tag_sha or "", f"{TAG} moved {(tag_sha or 'none')[:12]} -> {target[:12]}"
     )

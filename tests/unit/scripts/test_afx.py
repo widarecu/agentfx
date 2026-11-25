@@ -134,7 +134,8 @@ class FakeGitHub:
         self.created.append((name, sha))
         self.tags[name] = sha
 
-    def delete_tag_ref(self, name):
+    def delete_tag_ref(self, name, sha):
+        assert self.tags[name] == sha
         self.tags.pop(name, None)
 
     def list_tag_refs(self, prefix):
