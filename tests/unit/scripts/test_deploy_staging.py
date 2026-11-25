@@ -614,44 +614,80 @@ def test_record_updates_an_existing_previous_tag(repo):
     )
 
 
-@pytest.mark.parametrize("already_applied", [False, True])
-def test_record_recovers_transient_staging_tag_write(
-    repo, monkeypatch, already_applied
+@pytest.mark.parametrize("outcome", ["retry", "applied", "changed", "persistent"])
+def test_record_cli_reconciles_ambiguous_staging_tag_write(
+    repo, tmp_path, monkeypatch, capsys, outcome
 ):
     target = repo.commit({"src/agentfx/api/main.py": "app = 2\n"})
+    other = repo.commit({"src/agentfx/api/main.py": "app = 3\n"})
     repo.tag(repo.initial)
+    out = tmp_path / "out"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
     gh = FakeGh()
     staging_writes = 0
     delays = []
     monkeypatch.setattr(ds.time, "sleep", delays.append)
+    staging_write = (
+        "PATCH",
+        f"repos/o/r/git/refs/tags/{ds.TAG}",
+        ["-f", f"sha={target}", "-F", "force=false"],
+    )
+    staging_read = ("GET", f"repos/o/r/git/ref/tags/{ds.TAG}", [])
 
     def run(cmd):
         nonlocal staging_writes
         result = gh(cmd)
-        if cmd[3] == "PATCH" and cmd[4] == f"repos/o/r/git/refs/tags/{ds.TAG}":
+        if cmd[1:5] == ["api", "-X", *staging_write[:2]]:
             staging_writes += 1
-            if staging_writes == 1:
-                if already_applied:
+            if staging_writes == 1 or outcome == "persistent":
+                if outcome == "applied":
                     repo.tag(target)
+                elif outcome == "changed":
+                    repo.tag(other)
                 return subprocess.CompletedProcess(
                     cmd, 1, "", "unexpected end of JSON input"
                 )
             repo.tag(target)
-        if cmd[3] == "GET":
+        if cmd[1:] == ["api", "-X", *staging_read[:2]]:
             return subprocess.CompletedProcess(
                 cmd, 0, json.dumps({"object": {"sha": repo.g.resolve(ds.TAG)}}), ""
             )
         return result
 
-    result = ds.record(repo.g, target, repo.initial, None, repo="o/r", runner=run)
-
-    assert result.recorded and result.previous_sha == repo.initial
-    assert repo.g.resolve(ds.TAG) == target
-    methods = ["POST", "PATCH", "GET"]
-    assert [call[3] for call in gh.calls] == methods + (
-        [] if already_applied else ["PATCH"]
+    code = ds.main(
+        ["--repo-dir", str(repo.path), "record", "--sha", target, "--repo", "o/r"],
+        runner=run,
     )
-    assert delays == [1]
+
+    attempts = [staging_write, staging_read]
+    if outcome == "retry":
+        attempts.append(staging_write)
+    elif outcome == "persistent":
+        attempts *= 3
+    assert _gh_paths(gh) == [
+        (
+            "POST",
+            "repos/o/r/git/refs",
+            ["-f", f"ref={ds.PREVIOUS_TAG_REF}", "-f", f"sha={repo.initial}"],
+        ),
+        *attempts,
+    ]
+    assert delays == ([1, 2, 4] if outcome == "persistent" else [1])
+    if outcome in ("retry", "applied"):
+        assert code == 0
+        assert _outputs(out) == {"recorded": "true", "previous_sha": repo.initial}
+        assert repo.g.resolve(ds.TAG) == target
+    else:
+        assert code == 1
+        assert not out.exists()
+        diagnostic = capsys.readouterr().out
+        assert ds.TAG_REF in diagnostic
+        if outcome == "changed":
+            assert "refusing to retry" in diagnostic
+            assert repo.g.resolve(ds.TAG) == other
+        else:
+            assert "unexpected end of JSON input" in diagnostic
+            assert repo.g.resolve(ds.TAG) == repo.initial
 
 
 def test_record_is_a_noop_when_already_recorded(repo):
