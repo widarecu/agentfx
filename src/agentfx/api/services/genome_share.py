@@ -287,7 +287,7 @@ def import_genome_payload(
     # versions. If any of these fire, we reject cleanly instead of
     # deferring the failure to first-tick paper execution.
     try:
-        StrategySpec.model_validate(payload.genome.dsl_json)
+        StrategySpec.from_stored_genome(payload.genome.dsl_json)
     except Exception as e:  # noqa: BLE001 — Pydantic raises many types
         raise GenomeImportError(
             f"DSL failed static validation: {e}. The exporter's build may "

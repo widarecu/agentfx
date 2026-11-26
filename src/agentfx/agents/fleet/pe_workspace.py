@@ -54,6 +54,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from threading import Lock
 from typing import Protocol
 
 import requests
@@ -64,6 +65,9 @@ from agentfx.api.core.config import settings
 from agentfx.api.models import AgentWorkspaceRun, AgentWorkspaceRunStatus
 
 logger = logging.getLogger(__name__)
+
+# Keep workspace state and spend checks ordered across the fleet and webhook workers.
+pe_workspace_operation_lock = Lock()
 
 _DEVIN_API_BASE = "https://api.devin.ai"
 _DEVIN_HTTP_TIMEOUT_SECONDS = 30.0
@@ -300,6 +304,11 @@ def devin_dispatch_pause_reason(*, now: datetime | None = None) -> str | None:
 # that work for `gh` but not for git over HTTPS (AFX-73).
 _TARGET_REPO_URL = "https://github.com/widarecu/agentfx"
 _SANDBOX_REPO_PATH = "/workspace/agentfx"
+
+_REPO_GUIDANCE = (
+    'Read `CLAUDE.md` first, then the files its "Read before changing" table '
+    "lists for the paths you will touch."
+)
 
 _REDACTED = "[REDACTED]"
 _GITHUB_TOKEN_RE = re.compile(
@@ -1096,6 +1105,7 @@ def _build_managed_kickoff(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str
         f"- `widarecu/agentfx` is already cloned at `{_SANDBOX_REPO_PATH}` "
         f"(checked out on `{spec.target_branch}`) with git push credentials "
         "configured. Work in that checkout.",
+        f"- {_REPO_GUIDANCE}",
         "- Do NOT `git clone` the repo again or change the `origin` remote — "
         "a fresh clone has no push credentials.",
         f"- Publish with `git push -u origin {branch}`, then open the PR with "
@@ -1131,6 +1141,7 @@ def _build_devin_prompt(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str:
         "# Repository + branch instructions",
         "",
         "- Work in the `@widarecu/agentfx` repository.",
+        f"- {_REPO_GUIDANCE}",
         f"- Base your PR against the `{spec.target_branch}` branch. "
         "Never push to it directly.",
     ]
@@ -1151,9 +1162,8 @@ def _build_devin_prompt(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str:
         "- All code changes must be covered by unit tests. Add or "
         "update tests alongside the fix. Do not land a PR without "
         "`make test-unit` green locally in the sandbox.",
-        "- Follow the repository's `CLAUDE.md` work-tracking + "
-        "testing conventions (Docker test profile only, never touch "
-        "`dev`/`uat` profiles, never push to `main` directly).",
+        "- Use only the Docker test profile; never touch `dev`/`uat` profiles "
+        "or push directly to `main`.",
     ]
     return "\n".join(lines)
 

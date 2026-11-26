@@ -110,6 +110,22 @@ class TestDedupe:
         assert "dedupe_comment_failed" in result.action
         create.assert_not_called()
 
+    def test_open_match_comments_with_only_the_new_evidence(self, monkeypatch):
+        _enable(monkeypatch)
+        existing = {"id": "u", "identifier": "AFX-5", "url": "u"}
+        evidence = "Paper run: `run_new`\n\nTwo orders opened for a single signal."
+        spec = _spec(evidence=evidence, body="## Proposed fix\n\nGuard order dispatch.")
+        with (
+            patch.object(linear_client, "_build_client"),
+            patch.object(
+                linear_client, "_search_open_by_fingerprint", return_value=existing
+            ),
+            patch.object(linear_client, "_add_comment", return_value=True) as add,
+        ):
+            result = linear_client.file_finding(spec)
+        assert result.action == "commented"
+        assert add.call_args.kwargs == {"issue_id": "u", "body": evidence}
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Cap
@@ -253,6 +269,20 @@ class TestRendering:
         assert "QA agent saw this again" in rendered
         assert "Saw it again." in rendered
         assert "qa:test:xyz" in rendered
+
+    def test_reopen_comment_uses_new_evidence_and_retains_closure_context(self):
+        evidence = "Paper run: `run_new`\n\nTwo orders opened for a single signal."
+        spec = _spec(evidence=evidence, body="## Proposed fix\n\nGuard order dispatch.")
+        rendered = linear_client._render_reopen_comment(
+            spec,
+            closed_state="Done",
+            closed_at="2026-10-25T10:00:00Z",
+            now=datetime(2026, 10, 26, 10, 0, tzinfo=UTC),
+        )
+        assert "This issue has come back" in rendered
+        assert "previously closed as Done on 2026-10-25" in rendered
+        assert evidence in rendered
+        assert spec.body not in rendered
 
     def test_search_marker_is_substring_of_rendered_body(self):
         """AFX-76 pin: the string `_search_open_by_fingerprint` sends to

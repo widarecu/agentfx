@@ -66,6 +66,18 @@ def _spec(**overrides) -> pe_workspace.WorkspaceTaskSpec:
     return pe_workspace.WorkspaceTaskSpec(**defaults)
 
 
+@pytest.mark.parametrize(
+    "build_prompt",
+    [pe_workspace._build_managed_kickoff, pe_workspace._build_devin_prompt],
+)
+def test_workspace_prompt_requires_repo_guidance(build_prompt) -> None:
+    prompt = build_prompt(spec=_spec(), agent_branch="agent/example")
+    assert (
+        'Read `CLAUDE.md` first, then the files its "Read before changing" table '
+        "lists for the paths you will touch."
+    ) in prompt
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Budget / cap
 # ─────────────────────────────────────────────────────────────────────

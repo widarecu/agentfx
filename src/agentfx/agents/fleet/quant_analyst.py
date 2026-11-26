@@ -33,6 +33,7 @@ import logging
 import re
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -52,6 +53,10 @@ from agentfx.api.core.config import settings
 from agentfx.api.models.agent_decision import AgentDecision, AgentRole
 
 logger = logging.getLogger(__name__)
+
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_FINDING_TEMPLATE = _REPO_ROOT / "config/linear/templates/finding.md"
+_NOT_STATED = "(not stated)"
 
 # Minimum number of closed trades before QA finds the data meaningful
 # enough to analyse. Below this threshold the signal-vs-noise ratio is
@@ -179,6 +184,22 @@ class QAWorkOrder(BaseModel):
             "Explicit note on how this change moves the profit chain "
             "forward (per Wilson's 'profit over activity' directive)."
         ),
+    )
+    observation: str = Field(default="", description="What happened, in plain words.")
+    evidence: str = Field(
+        default="",
+        description="Relevant run IDs, trades, measured values and the UTC time window.",
+    )
+    proposed_fix: str = Field(
+        default="",
+        description="Proposed fix for the ticket, in plain sentences without evidence.",
+    )
+    confidence: str = Field(
+        default="", description="Confidence in the finding: High, Medium or Low."
+    )
+    done_when: list[str] = Field(
+        default_factory=list,
+        description="Finding-specific, testable acceptance checks.",
     )
 
 
@@ -528,6 +549,14 @@ map to one of the standard divergence categories, use the
 closest match ('idempotency', 'instrument_coverage', 'other'
 are available in addition to the DivergenceClassification set).
 
+For each work order, write plain sentences describing the observation,
+the evidence (run IDs, trades, numbers and the UTC time window), and the
+proposed fix in separate fields. Give High, Medium or Low confidence
+and a done_when checklist of observable results that verify the fix.
+Keep the spec field for the report and cite the specific trades or
+measurements there as usual.
+Put any guessed repo path only in target_file; you cannot verify it.
+
 Style:
 - Terse. Wilson reads a lot.
 - Ground every claim in a specific trade or metric from the
@@ -733,6 +762,88 @@ def _email_report(
         logger.exception("qa_agent: email send failed (report still in DB)")
 
 
+def _verified_target_file(target_file: str) -> str | None:
+    if not target_file or Path(target_file).is_absolute():
+        return None
+    try:
+        path = (_REPO_ROOT / target_file).resolve()
+        if path.is_relative_to(_REPO_ROOT) and path.is_file():
+            return path.relative_to(_REPO_ROOT).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return None
+
+
+def _render_work_order_finding(
+    wo: QAWorkOrder, *, area: str, target_file: str | None, run_id: str, today: date
+) -> tuple[str, str]:
+    target = (
+        f"Target file: `{target_file}`" if target_file else "File was not identified."
+    )
+    evidence = (
+        f"Paper run: `{run_id}` ({today.isoformat()})\n\n"
+        f"{wo.evidence.strip() or _NOT_STATED}"
+    )
+    checklist = [item.strip() for item in wo.done_when if item.strip()]
+    standard_checks = [
+        "A test reproduces the problem.",
+        "`make lint` green.",
+        "`make test-unit` green.",
+    ]
+    done_when = [] if checklist else [_NOT_STATED]
+    done_when.extend(f"- [ ] {item}" for item in checklist + standard_checks)
+    # Keys are the headings in `config/linear/templates/finding.md`. The
+    # template folds the observation and the proposed change into "What"
+    # and the profit impact into "Why" (AFX-102); a key that matches no
+    # heading is silently dropped, which is how AFX-160 blanked tickets.
+    sections = {
+        "Why": wo.expected_profit_impact.strip() or _NOT_STATED,
+        "What": (
+            f"**Observed:** {wo.observation.strip() or _NOT_STATED}\n\n"
+            f"**Proposed fix:** {wo.proposed_fix.strip() or _NOT_STATED}\n\n"
+            f"Area: {area}. {target}"
+        ),
+        "Evidence": evidence,
+        "Done when": "\n".join(done_when),
+    }
+    template = _FINDING_TEMPLATE.read_text(encoding="utf-8")
+    headings = re.finditer(r"^#{1,6} (.+)$", template, flags=re.MULTILINE)
+    confidence = wo.confidence.strip().capitalize()
+    body = [
+        f"**Confidence:** {confidence if confidence in {'High', 'Medium', 'Low'} else _NOT_STATED}",
+        *(
+            f"{heading[0]}\n\n{sections.get(heading[1], _NOT_STATED)}"
+            for heading in headings
+        ),
+    ]
+    return "\n\n".join(body), evidence
+
+
+def _without_unverified_target(wo: QAWorkOrder, target: str) -> QAWorkOrder:
+    if len(target) < 3 or not any(char in target for char in "/.\\"):
+        return wo
+    basename = Path(target.replace("\\", "/")).name
+    filenames = "|".join(
+        re.escape(name) for name in dict.fromkeys((target, basename)) if name
+    )
+    unverified = re.compile(rf"(?<![\w./\\-])(?:{filenames})(?![\w/\\-]|\.\w)")
+    fields = (
+        "title",
+        "observation",
+        "evidence",
+        "proposed_fix",
+        "expected_profit_impact",
+    )
+    updates = {
+        field: unverified.sub("the unidentified file", getattr(wo, field))
+        for field in fields
+    }
+    updates["done_when"] = [
+        unverified.sub("the unidentified file", item) for item in wo.done_when
+    ]
+    return wo.model_copy(update=updates)
+
+
 def _file_work_orders_to_linear(
     *, report: QADivergenceReport, run_id: str, today: date
 ) -> list[Any]:
@@ -759,13 +870,12 @@ def _file_work_orders_to_linear(
         try:
             area = _area_label_for(wo.target_file)
             fingerprint = _work_order_fingerprint(wo.category, area)
-            body = (
-                f"## Spec\n\n{wo.spec.strip()}\n\n"
-                f"## Expected profit impact\n\n"
-                f"{wo.expected_profit_impact.strip() or '(none stated)'}\n\n"
-                f"## Context\n\n"
-                f"- Source paper run: `{run_id}` ({today.isoformat()})\n"
-                f"- Target file: `{wo.target_file or '(unspecified)'}`\n"
+            target_guess = wo.target_file.strip()
+            target_file = _verified_target_file(target_guess)
+            if not target_file:
+                wo = _without_unverified_target(wo, target_guess)
+            body, evidence = _render_work_order_finding(
+                wo, area=area, target_file=target_file, run_id=run_id, today=today
             )
             spec = FindingSpec(
                 fingerprint=fingerprint,
@@ -774,7 +884,14 @@ def _file_work_orders_to_linear(
                 source_label="QA agent",
                 type_label="Bug",
                 area_label=area,
-                risk_label="Normal",
+                risk_label=(
+                    "Money-path"
+                    if wo.category.strip().lower()
+                    in {"execution_timing", "idempotency"}
+                    else "Normal"
+                ),
+                extra_labels=["Paper trading"],
+                evidence=evidence,
             )
             result = file_finding(spec)
             if result.action.startswith("skipped:"):

@@ -43,6 +43,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal, Protocol
 
+from agentfx.core.position_sizing import configured_leverage
+
 if TYPE_CHECKING:  # pragma: no cover
     import pandas as pd
 
@@ -393,6 +395,23 @@ def _claim_runner(db, run) -> bool:
     return claimed == 1
 
 
+def _snapshot_validated_leverage(db, run) -> None:
+    """Freeze the source evolution run's leverage on paper-run startup."""
+    from agentfx.api.models import StrategyGenome
+
+    params = run.parameters or {}
+    if "leverage" in params:
+        return
+    genome = (
+        db.get(StrategyGenome, run.strategy_genome_id)
+        if run.strategy_genome_id is not None
+        else None
+    )
+    source_run = genome.generation.run if genome is not None else None
+    config = source_run.config_json if source_run is not None else {}
+    run.parameters = {**params, "leverage": configured_leverage(config)}
+
+
 def run_paper_run(
     run_id: str,
     *,
@@ -480,7 +499,7 @@ def run_paper_run(
         strategy = None
         if dsl_json is not None:
             try:
-                spec = StrategySpec.model_validate(dsl_json)
+                spec = StrategySpec.from_stored_genome(dsl_json)
                 strategy = compile_spec(spec, pip_size=pip_size_for_pair(instrument))
             except Exception:  # noqa: BLE001
                 logger.exception(
@@ -498,6 +517,7 @@ def run_paper_run(
             )
             return
         _ensure_started_at(run)
+        _snapshot_validated_leverage(db, run)
         db.commit()
 
         _execute_loop(
@@ -1904,7 +1924,7 @@ def _open_position_and_persist(
     balance_account = float(
         account_summary.get("balance") or run.current_balance or 0.0
     )
-    risk_pct_dsl = 0.005  # DSL grammar default (0.5%); backtest uses it too
+    risk_pct_dsl = 0.005  # Legacy fallback for strategies without DSL sizing
     if exit_rules is not None and getattr(exit_rules, "size", None) is not None:
         risk_pct_dsl = float(exit_rules.size.risk_pct)
     # `max_position_size_units` semantic change (v0.6.1): now a
@@ -1914,14 +1934,17 @@ def _open_position_and_persist(
     # legacy runs get the correct dynamic size on their next order.
     raw_cap = risk_cfg.get("max_position_size_units")
     safety_cap = int(raw_cap) if raw_cap and int(raw_cap) > 10_000 else None
+    leverage = configured_leverage(run.parameters or {})
     sizing = compute_position_units(
         instrument=instrument,
         balance=balance_account,
         account_currency=account_currency,
         risk_pct=risk_pct_dsl,
         stop_pips=float(sl_pips_dsl or 0),
+        entry_close=float(df["close"].iloc[-1]),
         safety_cap_units=safety_cap,
         client=client,
+        leverage=leverage,
     )
     if sizing.capped_units <= 0:
         _write_decision(
@@ -2087,6 +2110,8 @@ def _open_position_and_persist(
                 "desired_units": sizing.desired_units,
                 "capped_units": sizing.capped_units,
                 "safety_cap": sizing.safety_cap,
+                "leverage": leverage,
+                "notes": sizing.notes,
             },
         },
     )

@@ -68,6 +68,7 @@ class FindingSpec:
     area_label: str  # "Backtest" / "Paper runner" / "Agent fleet" / etc.
     risk_label: str = "Normal"  # "Normal" or "Money-path"
     extra_labels: list[str] = field(default_factory=list)  # e.g. "Found in: Staging"
+    evidence: str | None = None
 
 
 @dataclass
@@ -848,6 +849,8 @@ def _render_body_with_fingerprint(spec: FindingSpec, *, now: datetime) -> str:
 def _render_dedupe_comment(spec: FindingSpec, *, now: datetime) -> str:
     """What we post as a new comment when dedupe matches an existing
     open issue — the fresh evidence, not the whole template again."""
+    if spec.evidence is not None:
+        return spec.evidence.strip()
     ts = now.strftime("%Y-%m-%d %H:%M UTC")
     return (
         f"**{spec.source_label} saw this again at {ts}.**\n\n"
@@ -867,10 +870,11 @@ def _render_reopen_comment(
     reopened to Triage (AFX-149)."""
     ts = now.strftime("%Y-%m-%d %H:%M UTC")
     closed_date = closed_at[:10] if len(closed_at) >= 10 else "an earlier date"
+    details = spec.evidence if spec.evidence is not None else spec.body
     return (
         f"**This issue has come back** (previously closed as {closed_state} on "
         f"{closed_date}). Reopened to Triage by {spec.source_label} at {ts}.\n\n"
-        f"{spec.body.strip()}\n\n"
+        f"{details.strip()}\n\n"
         f"_(Dedupe fingerprint: `{spec.fingerprint}`)_"
     )
 

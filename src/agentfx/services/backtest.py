@@ -11,6 +11,7 @@ import pandas as pd
 from agentfx.adapters.storage.sqlite import Registry
 from agentfx.core.metrics import compute_returns, summarize
 from agentfx.core.policy import PolicyConfig, apply_policies
+from agentfx.core.position_sizing import DEFAULT_LEVERAGE, max_leveraged_units
 from agentfx.core.strategy import (
     DonchianBreakout,
     MACrossover,
@@ -313,7 +314,9 @@ def _dsl_position_size(
 
     was_capped = False
     if notional > max_notional:
-        desired_units = max_notional / notional_per_unit
+        desired_units = max_leveraged_units(
+            account_balance, notional_per_unit, leverage
+        )
         was_capped = True
         logger.warning(
             "Leverage cap hit on %s @ close=%.5f: notional $%.0f clamped "
@@ -447,7 +450,7 @@ def run_backtest_from_db(
     capture_signals: bool = False,
     account_balance: float = 10000.0,
     position_size: int = 10000,
-    leverage: int = 30,
+    leverage: int = DEFAULT_LEVERAGE,
     require_full_window: bool = False,
 ) -> dict[str, Any]:
     """Run backtest using candle data from PostgreSQL database.
@@ -975,7 +978,7 @@ def _get_indicator_values(
             spec = (
                 spec_data
                 if isinstance(spec_data, StrategySpec)
-                else StrategySpec.model_validate(spec_data)
+                else StrategySpec.from_stored_genome(spec_data)
             )
         except Exception:
             return None
@@ -1085,7 +1088,7 @@ def make_strategy(name: str, *, wick_half_spread: float = 0.0, **kwargs) -> Stra
         if isinstance(spec_data, StrategySpec):
             spec = spec_data
         elif isinstance(spec_data, dict):
-            spec = StrategySpec.model_validate(spec_data)
+            spec = StrategySpec.from_stored_genome(spec_data)
         else:
             raise ValueError(
                 f"'spec' must be StrategySpec or dict, got {type(spec_data).__name__}"

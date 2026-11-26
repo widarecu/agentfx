@@ -166,7 +166,7 @@ def _example_spec_json() -> str:
                 "min_hold_bars": 10,
                 "opposite_signal": True,
             },
-            "size": {"risk_pct": 0.005},
+            "size": {"risk_pct": 0.01},
         },
         "reasoning": (
             "Trend-follow long via fast/slow EMA cross; mean-revert short on "
@@ -205,7 +205,7 @@ Specifically (machine-readable bounds):
 
 1. `stop_pips` MUST be strictly less than `target_pips` (negative
    expectancy by construction otherwise).
-2. `risk_pct` MUST be in [0.001, 0.005].
+2. `risk_pct` MUST be in [0.0025, 0.02] (0.25%–2% of balance per trade).
 3. `max_hold_bars` MUST be in [1, 2880].
 4. `min_hold_bars` is OPTIONAL but RECOMMENDED on minute-scale
    timeframes (M1/M5). MUST be in [0, max_hold_bars - 1]. Default 0

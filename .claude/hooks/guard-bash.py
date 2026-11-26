@@ -24,18 +24,27 @@ PROTECTED_FORCE_PUSH = {"main", "feat/agent-fleet"}
 # Dev volume is `postgres_data`, UAT is `postgres_uat_data`; the test
 # volume `postgres_test_data` deliberately does not match.
 LONG_LIVED_VOLUME = re.compile(r"postgres_(uat_)?data\b")
+LONG_LIVED_POSTGRES = {"agentfx-postgres", "agentfx-postgres-uat"}
+AGENT_BRANCH = re.compile(r"agent/AFX-[0-9]+-[A-Za-z0-9][A-Za-z0-9._/-]*")
+DESTRUCTIVE_SQL = re.compile(r"\b(?:DROP|TRUNCATE)\b", re.IGNORECASE)
 
 
 def split_segments(command: str) -> list[list[str]]:
     """Split a shell command line into simple commands, each tokenised."""
-    segments = []
-    for raw in re.split(r"&&|\|\||[;|\n]", command):
-        try:
-            tokens = shlex.split(raw)
-        except ValueError:
-            continue
-        if tokens:
-            segments.append(tokens)
+    separators = ";&|\n()"
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=separators)
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    segments, current = [], []
+    for token in lexer:
+        if token and all(c in separators for c in token):
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(token)
+    if current:
+        segments.append(current)
     return segments
 
 
@@ -103,6 +112,19 @@ def check_docker(words: list[str]) -> str | None:
             )
         if "rm" in args and any(LONG_LIVED_VOLUME.search(a) for a in args):
             return "Refusing to remove the dev or uat database volume."
+    if (cmd == "docker" or is_compose) and "exec" in args:
+        exec_args = args[args.index("exec") + 1 :]
+        targets = LONG_LIVED_POSTGRES | (
+            {"postgres", "postgres-uat"} if is_compose else set()
+        )
+        for i, arg in enumerate(exec_args):
+            if os.path.basename(arg) != "psql":
+                continue
+            if targets.intersection(exec_args[:i]) and any(
+                DESTRUCTIVE_SQL.search(sql) for sql in exec_args[i + 1 :]
+            ):
+                return "Refusing DROP or TRUNCATE on the dev or uat database."
+            break
     return None
 
 
@@ -131,27 +153,131 @@ def check_git_push(words: list[str]) -> str | None:
     return None
 
 
-def check_test_runner(
-    env: dict[str, str], words: list[str], command: str
-) -> str | None:
+def pr_create_refs(args: list[str]) -> tuple[list[str], list[str]]:
+    refs: dict[str, list[str]] = {"base": [], "head": []}
+    options_with_values = {
+        "assignee",
+        "base",
+        "body",
+        "body-file",
+        "head",
+        "label",
+        "milestone",
+        "project",
+        "repo",
+        "reviewer",
+        "template",
+        "title",
+    }
+    short_names = {
+        "a": "assignee",
+        "B": "base",
+        "b": "body",
+        "F": "body-file",
+        "H": "head",
+        "l": "label",
+        "m": "milestone",
+        "p": "project",
+        "R": "repo",
+        "r": "reviewer",
+        "T": "template",
+        "t": "title",
+    }
+    remaining = iter(args)
+    for arg in remaining:
+        if arg == "--":
+            break
+        if arg.startswith("--"):
+            name, _, value = arg[2:].partition("=")
+            if "=" not in arg and name in options_with_values:
+                value = next(remaining, "")
+        elif arg.startswith("-") and arg[1:2] in short_names:
+            name = short_names[arg[1]]
+            value = arg[2:].removeprefix("=") if len(arg) > 2 else next(remaining, "")
+        else:
+            continue
+        if name in refs:
+            refs[name].append(value)
+    return refs["base"] or ["main"], refs["head"]
+
+
+def skip_gh_repo_flag(args: list[str]) -> list[str]:
+    if args[:1] in (["-R"], ["--repo"]):
+        return args[2:]
+    if args and args[0].startswith(("-R", "--repo=")):
+        return args[1:]
+    return args
+
+
+def check_gh_pr(words: list[str]) -> str | None:
+    if os.path.basename(words[0]) != "gh":
+        return None
+    args = skip_gh_repo_flag(words[1:])
+    if args[:1] != ["pr"]:
+        return None
+    args = skip_gh_repo_flag(args[1:])
+    if args[:1] == ["merge"]:
+        return (
+            "Do not merge PRs manually; pr-policy merges approved agent PRs into main."
+        )
+    if args[:1] == ["create"]:
+        bases, heads = pr_create_refs(args[1:])
+        if any(base in {"main", "refs/heads/main"} for base in bases) and not (
+            len(heads) == 1 and AGENT_BRANCH.fullmatch(heads[0])
+        ):
+            return (
+                "To open a PR into main, specify the ticket branch explicitly: "
+                "`gh pr create --base main --head agent/AFX-<n>-<slug>`."
+            )
+    return None
+
+
+def invokes(words: list[str], program: str) -> bool:
     cmd = os.path.basename(words[0])
-    is_pytest = cmd == "pytest" or (
-        cmd.startswith("python") and words[1:3] == ["-m", "pytest"]
+    if cmd == "uv" and words[1:2] == ["run"]:
+        return any(
+            os.path.basename(word) == program
+            or (
+                os.path.basename(word).startswith("python")
+                and words[i + 1 : i + 3] == ["-m", program]
+            )
+            for i, word in enumerate(words[2:], start=2)
+        )
+    return cmd == program or (
+        cmd.startswith("python") and words[1:3] == ["-m", program]
     )
-    if is_pytest and env.get("ENVIRONMENT") != "test":
-        # Inside the test container the environment is already set.
-        if "ENVIRONMENT=test" in command or "backend-test" in command:
-            return None
+
+
+def check_test_runner(env: dict[str, str], words: list[str]) -> str | None:
+    cmd = os.path.basename(words[0])
+    is_pytest = invokes(words, "pytest")
+    if is_pytest and (cmd == "uv" or env.get("ENVIRONMENT") != "test"):
         return (
             "Bare pytest loads the wrong config and can hit the wrong database. "
             "Use `make test-unit`, `make test-integration`, "
             "`make test-file FILE=...` or `make test-pattern PATTERN=...`."
         )
-    if cmd == "npx" and words[1:2] == ["vitest"]:
+    if (cmd == "npx" and words[1:2] == ["vitest"]) or (
+        cmd == "npm"
+        and (
+            words[1:2] in (["test"], ["t"], ["tst"])
+            or words[1:3] in (["run", "test"], ["run-script", "test"])
+        )
+    ):
         return (
             "Running vitest directly skips the parity-fixture staleness check. "
             "Use `make test-unit`."
         )
+    return None
+
+
+def check_alembic(env: dict[str, str], words: list[str]) -> str | None:
+    if (
+        invokes(words, "alembic")
+        and "downgrade" in words[1:]
+        and env.get("ENVIRONMENT", os.environ.get("ENVIRONMENT", "")).lower() != "test"
+    ):
+        return "Alembic downgrade may only run with ENVIRONMENT=test."
     return None
 
 
@@ -171,15 +297,24 @@ def main() -> int:
         print("Blocked: E2E may only run against the `test` profile.", file=sys.stderr)
         return 2
 
-    for tokens in split_segments(command):
+    try:
+        segments = split_segments(command)
+    except ValueError:
+        return 0
+    for tokens in segments:
         env, words = split_env(tokens)
+        if words and os.path.basename(words[0]) == "env":
+            assignments, words = split_env(words[1:])
+            env.update(assignments)
         if not words:
             continue
         reason = (
             check_e2e(env, words)
             or check_docker(words)
             or check_git_push(words)
-            or check_test_runner(env, words, command)
+            or check_gh_pr(words)
+            or check_test_runner(env, words)
+            or check_alembic(env, words)
         )
         if reason:
             print(f"Blocked: {reason}", file=sys.stderr)

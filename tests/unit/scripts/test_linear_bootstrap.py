@@ -205,3 +205,69 @@ class TestApplyStates:
         with pytest.raises(RuntimeError, match="never archives or deletes"):
             api.mutate("remove something", mutation, {"id": "x"})
         assert api.mutations == []
+
+
+class TestWorkspaceDryRun:
+    def test_plans_size_group_and_children_without_writing(self, monkeypatch, capsys):
+        api = bootstrap.Linear("test-key", dry_run=True)
+        cfg = yaml.safe_load(_CONFIG.read_text())
+
+        def query(q, variables=None):
+            assert q.lstrip().startswith("query")
+            assert "issueLabels" in q
+            return {"issueLabels": {"nodes": []}}
+
+        monkeypatch.setattr(api, "query", query)
+
+        bootstrap.apply_labels(api, cfg)
+
+        plan = capsys.readouterr().out.splitlines()
+        assert [line.strip() for line in plan if line.endswith(" Size")] == [
+            "[dry-run] create label group Size",
+            "[dry-run] create label S under Size",
+            "[dry-run] create label M under Size",
+            "[dry-run] create label L under Size",
+        ]
+
+    def test_plans_in_place_updates_from_checked_in_templates(
+        self, monkeypatch, capsys
+    ):
+        api = bootstrap.Linear("test-key", dry_run=True)
+        cfg = yaml.safe_load(_CONFIG.read_text())
+        files = {
+            "Feature / Improvement": "feature.md",
+            "Bug / Defect": "bug.md",
+            "Agent finding": "finding.md",
+            "Test gap": "test-gap.md",
+        }
+        updates = {}
+
+        def query(q, variables=None):
+            assert q.lstrip().startswith("query")
+            assert "templates" in q
+            return {
+                "templates": [
+                    {"id": name, "name": name, "type": "issue"} for name in files
+                ]
+            }
+
+        mutate = api.mutate
+
+        def capture_mutation(description, q, variables):
+            assert "templateUpdate" in q
+            updates[variables["id"]] = variables["i"]["templateData"]["description"]
+            return mutate(description, q, variables)
+
+        monkeypatch.setattr(api, "query", query)
+        monkeypatch.setattr(api, "mutate", capture_mutation)
+
+        bootstrap.apply_templates(api, "team-afx", cfg["templates"], {})
+
+        assert updates == {
+            name: (_CONFIG.parent / "templates" / file).read_text()
+            for name, file in files.items()
+        }
+        assert capsys.readouterr().out.splitlines() == [
+            "Issue templates",
+            *(f"  [dry-run] update template {name}" for name in files),
+        ]

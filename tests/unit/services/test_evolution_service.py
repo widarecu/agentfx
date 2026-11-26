@@ -21,8 +21,10 @@ from agentfx.api import models, schemas
 from agentfx.api.core.database import Base
 from agentfx.api.services import evolution as evolution_service
 from agentfx.api.services.evolution import SqlAlchemyPersister
+from agentfx.core.dsl import StrategySpec
 from agentfx.core.dsl.seeds import MA_CROSSOVER_SEED, RSI_MEAN_REVERSION_SEED
 from agentfx.core.validation import make_walk_forward_folds
+from agentfx.services.paper_runner import _snapshot_validated_leverage
 
 
 @pytest.fixture
@@ -638,6 +640,33 @@ class TestSqlAlchemyPersisterUpdateRun:
 
 
 class TestSqlAlchemyPersisterSaveGeneration:
+    def test_paper_leverage_snapshot_follows_source_evolution_run(self, db: Session):
+        run = evolution_service.create_run(
+            db,
+            schemas.EvolutionRunCreate(instrument="EUR_USD", config={"leverage": 50}),
+        )
+        genome = _make_genome(MA_CROSSOVER_SEED, 1.5)
+        SqlAlchemyPersister(db).save_generation(
+            run.id,
+            generation_index=0,
+            genomes=[genome],
+            llm_invoked=False,
+            llm_call_id=None,
+            best_fitness=1.5,
+        )
+        paper = models.Run(
+            strategy_genome_id=genome.id, parameters={"instrument": run.instrument}
+        )
+
+        _snapshot_validated_leverage(db, paper)
+        assert paper.parameters == {"instrument": "EUR_USD", "leverage": 50}
+
+        paper.strategy_genome_id = None
+        _snapshot_validated_leverage(db, paper)
+        assert paper.parameters["leverage"] == 50
+        _snapshot_validated_leverage(db, legacy := models.Run(parameters={}))
+        assert legacy.parameters["leverage"] == 30
+
     def test_save_assigns_genome_ids(self, db: Session) -> None:
         run = evolution_service.create_run(
             db, schemas.EvolutionRunCreate(instrument="EUR_USD")
@@ -705,6 +734,32 @@ class TestSqlAlchemyPersisterSaveGeneration:
         gens = db.scalars(select(models.Generation)).all()
         assert gens[0].llm_invoked is True
         assert gens[0].llm_call_id == "llm_call_xyz"
+
+    @pytest.mark.parametrize("risk_pct", [0.001, 0.005, 0.02])
+    def test_run_summary_shows_stored_risk_without_rewriting_genome(
+        self, db: Session, risk_pct: float
+    ) -> None:
+        run = evolution_service.create_run(
+            db, schemas.EvolutionRunCreate(instrument="EUR_USD")
+        )
+        payload = MA_CROSSOVER_SEED.model_dump(mode="json")
+        payload["size"]["risk_pct"] = risk_pct
+        genome = _make_genome(StrategySpec.from_stored_genome(payload), 1.5)
+        SqlAlchemyPersister(db).save_generation(
+            run.id,
+            generation_index=0,
+            genomes=[genome],
+            llm_invoked=False,
+            llm_call_id=None,
+            best_fitness=1.5,
+        )
+
+        (row,) = evolution_service.list_run_genome_summaries(db, run.id)
+        summary = schemas.StrategyGenomeSummary.model_validate(row)
+        assert summary.risk_pct == risk_pct
+        assert summary.fitness == 1.5
+        assert "dsl_json" not in row
+        assert db.get(models.StrategyGenome, genome.id).dsl_json == payload
 
 
 class TestSqlAlchemyPersisterSaveValidation:

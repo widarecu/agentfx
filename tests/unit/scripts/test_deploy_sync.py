@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import urllib.error
 
 import pytest
 
 from agentfx.integrations import deploy_sync as ds
+from agentfx.integrations import github_refs as gr
 from agentfx.integrations import linear_delivery as ld
 from agentfx.integrations.claim_store import Taker
 from tests.unit.scripts.linear_fake import FakeClaims
@@ -786,6 +788,159 @@ def test_gh_missing_tag_is_none_and_annotated_tag_is_dereferenced():
     gh = ds.GhCli("o/r", runner=runner)
     assert gh.get_tag_sha(ds.STAGING_TAG) == SHA
     assert gh.get_tag_sha(ds.record_tag(SHA)) is None
+
+
+class AmbiguousTagApi:
+    """Fake `gh api` with lost responses on writes to one tag."""
+
+    def __init__(self, tags, fault_tag, outcome, *, reads=None):
+        self.tags = tags
+        self.fault_tag = fault_tag
+        self.outcome = outcome
+        self.reads = reads or {}
+        self.reconciliation = []
+
+    def run(self, args):
+        return gr.run_gh(args, runner=self.process)
+
+    def process(self, cmd):
+        assert cmd[:2] == ["gh", "api"]
+        explicit = cmd[2] == "-X"
+        method, endpoint, *fields = cmd[3:] if explicit else ["GET", cmd[2]]
+        assert endpoint.startswith("repos/o/r/")
+        path = endpoint.removeprefix("repos/o/r/")
+        if method == "GET":
+            if path.startswith("git/ref/tags/"):
+                tag = path.removeprefix("git/ref/tags/")
+                if explicit:
+                    self.reconciliation.append((method, tag))
+                if tag not in self.tags:
+                    return subprocess.CompletedProcess(cmd, 1, "", "HTTP 404")
+                payload = {"object": {"sha": self.tags[tag]}}
+            elif path.startswith("git/matching-refs/tags/"):
+                prefix = path.removeprefix("git/matching-refs/tags/").split("?")[0]
+                payload = [
+                    {"ref": f"refs/tags/{tag}", "object": {"sha": sha}}
+                    for tag, sha in self.tags.items()
+                    if tag.startswith(prefix)
+                ]
+            else:
+                payload = self.reads[path]
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        if method == "POST":
+            assert path == "git/refs"
+            ref_flag, ref, sha_flag, sha = fields
+            assert ref_flag == sha_flag == "-f"
+            assert ref.startswith("ref=refs/tags/") and sha.startswith("sha=")
+            tag, sha = ref.removeprefix("ref=refs/tags/"), sha.removeprefix("sha=")
+        else:
+            assert method == "DELETE" and path.startswith("git/refs/tags/")
+            tag = path.removeprefix("git/refs/tags/")
+            assert not fields
+        write = (method, tag)
+        ambiguous = tag == self.fault_tag and (
+            write not in self.reconciliation or self.outcome == "persistent"
+        )
+        self.reconciliation.append(write)
+        if not ambiguous or self.outcome == "applied":
+            if method == "POST":
+                assert tag not in self.tags
+                self.tags[tag] = sha
+            else:
+                del self.tags[tag]
+        elif self.outcome == "changed":
+            self.tags[tag] = _sha(99)
+        return subprocess.CompletedProcess(
+            cmd, int(ambiguous), "", "HTTP 503" if ambiguous else ""
+        )
+
+
+def _reconciliation_calls(method, tag, outcome):
+    sequence = [(method, tag), ("GET", tag)]
+    if outcome == "retry":
+        return [*sequence, (method, tag)]
+    return sequence * (3 if outcome == "persistent" else 1)
+
+
+@pytest.mark.parametrize("outcome", ["retry", "applied", "changed", "persistent"])
+def test_record_reconciles_ambiguous_baseline_creation(monkeypatch, outcome):
+    tag = ds.record_tag(SHA)
+    api = AmbiguousTagApi({ds.STAGING_TAG: BASE}, tag, outcome)
+    monkeypatch.setattr(gr.time, "sleep", lambda _: None)
+
+    report = ds.record(ds.GhCli("o/r", runner=api.run), SHA, apply=True)
+
+    assert api.reconciliation == _reconciliation_calls("POST", tag, outcome)
+    expected = {ds.STAGING_TAG: BASE}
+    if outcome in ("retry", "applied"):
+        expected[tag] = BASE
+        assert report.exit_code == 0
+        assert report.lines == [f"recorded {tag} -> {BASE[:7]}"]
+    else:
+        assert report.exit_code == 1
+        assert report.lines[0].startswith("::error ::GitHub API failed")
+        if outcome == "changed":
+            expected[tag] = _sha(99)
+            assert "refusing to retry" in report.lines[0]
+        else:
+            assert "HTTP 503" in report.lines[0]
+    assert api.tags == expected
+
+
+@pytest.mark.parametrize("outcome", ["retry", "applied", "changed", "persistent"])
+@pytest.mark.parametrize("operation", ["mark-synced", "prune-baseline"])
+def test_successful_sync_reconciles_ambiguous_tag_writes(
+    monkeypatch, operation, outcome
+):
+    record, receipt = ds.record_tag(SHA), ds.synced_tag(SHA)
+    old_record, old_receipt = ds.record_tag(BASE), ds.synced_tag(BASE)
+    unrelated = ds.record_tag(_sha(2))
+    tag, method = (
+        (receipt, "POST") if operation == "mark-synced" else (old_record, "DELETE")
+    )
+    protected = {ds.STAGING_TAG: SHA, record: BASE, unrelated: _sha(1)}
+    api = AmbiguousTagApi(
+        {**protected, old_record: _sha(1), old_receipt: BASE},
+        tag,
+        outcome,
+        reads={
+            f"compare/{BASE}...{SHA}?per_page=100&page=1": {
+                "status": "ahead",
+                "commits": [{"sha": SHA}],
+                "total_commits": 1,
+            },
+            f"commits/{SHA}/pulls?per_page=100&page=1": [
+                _pr(10, title="AFX-10: fix", head="agent/AFX-10-fix", merge_sha=SHA)
+            ],
+        },
+    )
+    monkeypatch.setattr(gr.time, "sleep", lambda _: None)
+    linear = FakeLinear({"AFX-10": _issue("AFX-10")})
+
+    report = _run(ds.GhCli("o/r", runner=api.run), linear, OK)
+
+    assert report.exit_code == 0
+    assert linear.issues["AFX-10"]["state"]["name"] == "Done"
+    assert [call for call in api.reconciliation if call[1] == tag] == (
+        _reconciliation_calls(method, tag, outcome)
+    )
+    warnings = [line for line in report.lines if line.startswith("::warning")]
+    expected = {**protected, receipt: SHA}
+    if outcome in ("changed", "persistent"):
+        reason = "refusing to retry" if outcome == "changed" else "HTTP 503"
+        assert len(warnings) == 1 and reason in warnings[0]
+        if operation == "mark-synced":
+            assert "could not mark" in warnings[0]
+            del expected[receipt]
+        else:
+            assert "could not prune" in warnings[0]
+            expected.update({old_record: _sha(1), old_receipt: BASE})
+        if outcome == "changed":
+            expected[tag] = _sha(99)
+    else:
+        assert not warnings
+    assert api.tags == expected
 
 
 # ── Linear adapter (real LinearClient over linear_fake) ──────────────

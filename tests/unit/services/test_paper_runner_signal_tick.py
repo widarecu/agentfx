@@ -403,6 +403,40 @@ class TestSignalTick:
         decisions = [r for r in added if type(r).__name__ == "DecisionLog"]
         assert any(d.action == "USER_ORDER_PLACED" for d in decisions)
 
+    @pytest.mark.parametrize(
+        ("parameters", "units"),
+        [({}, 267_857), ({"leverage": 50}, 400_000)],
+    )
+    def test_entry_uses_snapshotted_leverage(self, parameters, units):
+        now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+        candles = _mk_candles_df(3, now)
+        candles.loc[:, "close"] = 1.12
+        client = MagicMock()
+        client.get_position.return_value = {"long_units": 0, "short_units": 0}
+        client.get_account_balance.return_value = {"balance": 10_000, "currency": "USD"}
+        client.place_market_order.return_value = {
+            "trade_id": "broker_leverage",
+            "fill_price": 1.12,
+            "units": units,
+        }
+        run = _make_run()
+        run.parameters = parameters
+
+        _signal_tick(
+            db=_make_db(),
+            run=run,
+            client=client,
+            strategy=_make_strategy(signals=[0, 0, 1], risk_pct=0.02, stop_pips=5),
+            candle_fetch_fn=MagicMock(return_value=candles),
+            instrument="EUR_USD",
+            granularity_seconds=60,
+            now_utc=now,
+        )
+
+        client.place_market_order.assert_called_once_with(
+            "EUR_USD", units, stop_loss_pips=100, take_profit_pips=None
+        )
+
     def test_no_entry_event_from_flat_is_silent_noop(self):
         # Under the v0.6.1 raw-entry-signal model, `raw_entries.iloc[-1] == 0`
         # means "no fresh cross at the latest bar." With OANDA flat and
