@@ -19,6 +19,8 @@ US-016-evolution-observability.md.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -48,6 +50,18 @@ def _shares_dsr_window(
     shared = min(end, other_end) - max(start, other_start)
     shorter = min(end - start, other_end - other_start)
     return shorter.total_seconds() > 0 and shared >= shorter * DSR_WINDOW_OVERLAP
+
+
+def holdout_spec_key(dsl: Any) -> str:
+    """Fingerprint of a strategy, whatever genome ID carries it. Used by
+    the sealed-holdout ledger (AFX-151)."""
+    if isinstance(dsl, str):
+        try:
+            dsl = json.loads(dsl)
+        except (TypeError, ValueError):
+            pass
+    canonical = json.dumps(dsl, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -448,6 +462,20 @@ def find_prior_winners(
             obj = dsl_json
         return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
+    # AFX-151: a strategy that has been judged on a sealed holdout never
+    # seeds another run. A failure is permanent, and seeding from a pass
+    # would let the holdout's verdict steer evolution.
+    holdout_used = db.execute(
+        select(
+            models.HoldoutEvaluation.genome_id, models.HoldoutEvaluation.spec_key
+        ).where(
+            models.HoldoutEvaluation.instrument == instrument,
+            models.HoldoutEvaluation.granularity == granularity,
+        )
+    ).all()
+    holdout_genome_ids = {r.genome_id for r in holdout_used}
+    holdout_spec_keys = {r.spec_key for r in holdout_used}
+
     rows: list = []
     seen_specs: set[str] = set()  # canonical DSL keys we've already added
     seen_source_runs: set[str] = set()  # source_run_ids we've already added
@@ -487,6 +515,11 @@ def find_prior_winners(
             if enforce_source_diversity and r.run_id in seen_source_runs:
                 continue
             if not allow_plateau_specs and key in plateau_spec_keys:
+                continue
+            if (
+                r.id in holdout_genome_ids
+                or holdout_spec_key(r.dsl_json) in holdout_spec_keys
+            ):
                 continue
             seen_specs.add(key)
             seen_source_runs.add(r.run_id)
@@ -861,6 +894,7 @@ def get_genome_with_lineage(
         "validator_passed": genome.validator_passed,
         "validation_failures": list(genome.validation_failures or []),
         "validation_dsr": genome.validation_dsr,
+        "validation_holdout": genome.validation_holdout,
         "llm_reasoning": genome.llm_reasoning,
         "llm_call_id": genome.llm_call_id,
         "created_at": genome.created_at,
@@ -1239,6 +1273,7 @@ class SqlAlchemyPersister:
         validator_passed: bool,
         validation_failures: list[str],
         validation_dsr: dict[str, Any] | None = None,
+        validation_holdout: dict[str, Any] | None = None,
     ) -> None:
         # Persist each fold row
         for fe in folds:
@@ -1287,8 +1322,115 @@ class SqlAlchemyPersister:
             genome.validator_passed = validator_passed
             genome.validation_failures = list(validation_failures)
             genome.validation_dsr = validation_dsr
+            genome.validation_holdout = validation_holdout
+
+        # Close this genome's holdout claim with the verdict. A claim whose
+        # backtest crashed stays open (passed NULL): spent, no verdict.
+        status = (validation_holdout or {}).get("status")
+        if status in ("passed", "failed"):
+            self.db.query(models.HoldoutEvaluation).filter(
+                models.HoldoutEvaluation.genome_id == genome_id,
+                models.HoldoutEvaluation.passed.is_(None),
+            ).update({"passed": status == "passed"}, synchronize_session=False)
 
         self.db.commit()
+
+    # ── sealed final holdout (AFX-151) ──────────────────────────────
+
+    def _ancestor_ids(self, genome_id: str) -> set[str]:
+        """Every ancestor reachable through ``parent_ids``, across runs.
+        An ancestor whose row is gone still counts, by ID."""
+        seen = {genome_id}
+        frontier = [genome_id]
+        while frontier:
+            parents: set[str] = set()
+            for i in range(0, len(frontier), 500):
+                rows = self.db.query(models.StrategyGenome.parent_ids).filter(
+                    models.StrategyGenome.id.in_(frontier[i : i + 500])
+                )
+                for (parent_ids,) in rows:
+                    parents.update(parent_ids or [])
+            frontier = [p for p in parents if p not in seen]
+            seen.update(frontier)
+        return seen - {genome_id}
+
+    def claim_holdout(
+        self, run_id: str, genome_id: str, window: tuple[datetime, datetime]
+    ) -> str | None:
+        """Refuses, in order of the ledger: this genome or an identical
+        strategy on an overlapping holdout; an identical strategy that
+        ever failed one; and a genome bred from an ancestor after that
+        ancestor was judged on an overlapping holdout (retuning against
+        it). A parent and child that were both already finalists when the
+        parent was judged each get their one check."""
+        run = self.db.get(models.EvolutionRun, run_id)
+        if run is None:
+            raise ValueError(f"evolution run {run_id} not found")
+        start, end = map(_as_utc, window)
+        if end <= start:
+            raise ValueError("a holdout claim requires a nonempty window")
+        instrument, granularity = run.instrument, run.granularity
+        if self.db.get_bind().dialect.name == "postgresql":
+            lock = f"agentfx:holdout:{instrument}:{granularity}"
+            self.db.execute(
+                select(func.pg_advisory_xact_lock(func.hashtextextended(lock, 0)))
+            )
+        genome = self.db.get(models.StrategyGenome, genome_id)
+        if genome is None:
+            raise ValueError(f"genome {genome_id} not found")
+        own_key = holdout_spec_key(genome.dsl_json)
+        born = _as_utc(genome.created_at)
+        ancestors = self._ancestor_ids(genome_id)
+
+        use = models.HoldoutEvaluation
+        # Few rows: only Gate B finalists ever get here.
+        prior = self.db.execute(
+            select(use)
+            .where(use.instrument == instrument, use.granularity == granularity)
+            .order_by(use.id)
+        ).scalars()
+        blocker: str | None = None
+        for row in prior:
+            row_start, row_end = _as_utc(row.holdout_start), _as_utc(row.holdout_end)
+            span = f"{row_start:%Y-%m-%d} to {row_end:%Y-%m-%d}"
+            overlaps = row_start < end and row_end > start
+            same = row.genome_id == genome_id or row.spec_key == own_key
+            if same and overlaps:
+                who = (
+                    "this genome"
+                    if row.genome_id == genome_id
+                    else f"the same strategy as genome {row.genome_id}"
+                )
+                blocker = f"{who} was already judged on the holdout {span}"
+            elif same and row.passed is False:
+                blocker = (
+                    f"this strategy failed the holdout {span} as genome "
+                    f"{row.genome_id} and is rejected permanently"
+                )
+            elif (
+                overlaps
+                and row.genome_id in ancestors
+                and _as_utc(row.created_at) <= born
+            ):
+                blocker = (
+                    f"bred from genome {row.genome_id} after it was judged "
+                    f"on the holdout {span}"
+                )
+            if blocker is not None:
+                break
+        if blocker is None:
+            self.db.add(
+                use(
+                    genome_id=genome_id,
+                    spec_key=own_key,
+                    instrument=instrument,
+                    granularity=granularity,
+                    holdout_start=start,
+                    holdout_end=end,
+                )
+            )
+        self.db.commit()
+        return blocker
 
     # ── log_decision ────────────────────────────────────────────────
 

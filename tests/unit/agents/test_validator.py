@@ -15,10 +15,16 @@ import pytest
 
 from agentfx.agents.validator import (
     FoldEvaluation,
+    HoldoutEvidence,
     ValidationResult,
     ValidatorAgent,
 )
 from agentfx.core.dsl.seeds import MA_CROSSOVER_SEED, RSI_MEAN_REVERSION_SEED
+from agentfx.core.validation import (
+    make_rolling_walk_forward_folds,
+    oos_window,
+    split_final_holdout,
+)
 
 
 def _utc(year: int, month: int, day: int) -> datetime:
@@ -728,3 +734,120 @@ class TestEveryOosFoldProfitable:
         oos.append({**_passing_metrics(), "max_drawdown": -0.12})
         result = self._validate(oos, gate_b_overrides={"max_drawdown": 0.15})
         assert result.validator_passed is True
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Sealed final holdout (AFX-151)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestSealedHoldout:
+    """The latest six months are judged once, apart from the folds."""
+
+    SEARCH, HOLDOUT = split_final_holdout(_utc(2021, 11, 26), _utc(2026, 11, 26))
+
+    def _judge(self, metrics: dict | Exception, **kwargs):
+        backtest = MagicMock(
+            side_effect=metrics
+            if isinstance(metrics, Exception)
+            else [{"metrics": metrics}]
+        )
+        oos = oos_window(make_rolling_walk_forward_folds(*self.SEARCH))
+        evidence = ValidatorAgent().evaluate_holdout(
+            MA_CROSSOVER_SEED,
+            instrument="EUR_USD",
+            holdout_window=self.HOLDOUT,
+            oos=oos,
+            backtest_fn=backtest,
+            **kwargs,
+        )
+        return evidence, backtest
+
+    def test_walk_forward_and_holdout_share_no_candle(self) -> None:
+        """Zero leakage: every training, OOS and Deflated Sharpe backtest
+        ends at or before the cutoff, and the holdout backtest starts
+        after it. The candle loader includes both ends of a window."""
+        cutoff = self.HOLDOUT[0]
+        backtest = MagicMock(return_value={"metrics": _passing_metrics()})
+        ValidatorAgent().validate(
+            MA_CROSSOVER_SEED,
+            instrument="EUR_USD",
+            start=self.SEARCH[0],
+            end=self.SEARCH[1],
+            backtest_fn=backtest,
+            collect_dsr_sample=True,
+        )
+        assert backtest.call_count == 9  # 3 training + 5 OOS + full OOS
+        assert all(c.kwargs["end"] <= cutoff for c in backtest.call_args_list)
+
+        _, holdout_backtest = self._judge(_passing_metrics())
+        [call] = holdout_backtest.call_args_list
+        assert call.kwargs["start"] > cutoff
+        assert call.kwargs["start"] - cutoff == timedelta(microseconds=1)
+        assert call.kwargs["end"] == self.HOLDOUT[1]
+
+    def test_passes_gate_b_with_the_trade_minimum_scaled(self) -> None:
+        # 4.5 years of search → 30% OOS ≈ 16 months; six months of that
+        # (300 × 183 / 492.9 days) needs 112 trades, not Gate B's 300.
+        metrics = {**_passing_metrics(), "n_trades": 112}
+        evidence, backtest = self._judge(metrics)
+
+        backtest.assert_called_once()
+        assert evidence.min_trades == 112
+        assert evidence.passed and evidence.status == "passed"
+        assert evidence.failures == []
+        assert evidence.metrics == metrics
+        assert evidence.window_start == self.HOLDOUT[0].isoformat()
+        assert evidence.window_end == self.HOLDOUT[1].isoformat()
+
+    def test_fails_one_trade_short_of_the_scaled_minimum(self) -> None:
+        evidence, _ = self._judge({**_passing_metrics(), "n_trades": 111})
+        assert evidence.status == "failed" and not evidence.passed
+        assert evidence.failures == ["Trade Count 111 < 112"]
+        assert evidence.reason == "Sealed holdout failed: Trade Count 111 < 112"
+
+    @pytest.mark.parametrize(
+        ("change", "failure"),
+        [
+            ({"sharpe": 0.99}, "Sharpe 0.99 < 1.0"),
+            ({"max_drawdown": -0.11}, "Max DD 11.0% > cap 10%"),
+            ({"hit_rate": 0.47}, "Hit Rate 47.0% < 48.0%"),
+            ({"cagr": 0.14}, "CAGR +14.0% < 15%"),
+        ],
+    )
+    def test_other_gate_b_bars_are_not_loosened(self, change, failure) -> None:
+        evidence, _ = self._judge({**_passing_metrics(), **change})
+        assert evidence.status == "failed"
+        assert evidence.failures == [failure]
+
+    def test_honours_the_runs_minimum_return(self) -> None:
+        evidence, _ = self._judge(
+            _passing_metrics(), gate_b_overrides={"min_cagr": 0.25}
+        )
+        assert evidence.failures == ["CAGR +20.0% < 25%"]
+
+    def test_missing_metrics_fail(self) -> None:
+        evidence, _ = self._judge({})
+        assert evidence.status == "failed"
+        assert len(evidence.failures) == 5
+
+    def test_crashed_backtest_is_an_error_not_a_pass(self) -> None:
+        evidence, _ = self._judge(RuntimeError("db down"))
+        assert evidence.status == "error" and not evidence.passed
+        assert "spent" in evidence.reason
+
+    def test_anything_but_a_pass_rejects_the_genome(self) -> None:
+        def result() -> ValidationResult:
+            return ValidationResult(
+                spec=MA_CROSSOVER_SEED, folds=[], validator_passed=True
+            )
+
+        passed = result()
+        passed.apply_holdout(HoldoutEvidence(status="passed", reason="ok"))
+        assert passed.validator_passed and passed.validation_failures == []
+
+        for status in ("failed", "blocked", "unavailable", "error"):
+            rejected = result()
+            rejected.apply_holdout(HoldoutEvidence(status=status, reason="why"))
+            assert not rejected.validator_passed
+            assert rejected.validation_failures == ["why"]

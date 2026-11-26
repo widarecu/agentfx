@@ -49,6 +49,7 @@ def _build_orchestrator(
     instrument: str,
     granularity: str,
     data_window: tuple[datetime, datetime],
+    holdout_window: tuple[datetime, datetime] | None = None,
     # Population must be ≥ SEED_SPECS count, which grew from 3 → 9
     # when v0.4.0 added MACD/Stoch/BB/Ichimoku/ADX/OBV seeds. 15
     # gives 9 seeds + 6 mutated copies — enough for the GA loop
@@ -83,6 +84,7 @@ def _build_orchestrator(
             no_improvement_generations=no_improvement_generations,
         ),
         data_window=data_window,
+        holdout_window=holdout_window,
         persister=SqlAlchemyPersister(db_session),
         llm_injector=None,  # no LLM injection in these tests
         rng=Random(rng_seed),
@@ -296,6 +298,80 @@ class TestEvolutionPipeline:
             )
             == genome.validation_dsr["trial_count"]
         )
+
+    def test_sealed_holdout_is_single_use_on_postgres(
+        self, db_session, seed_evolution_candles
+    ):
+        """AFX-151 against the real DB and backtest engine: a genome that
+        fails Gate B never spends the holdout; a claim is recorded once,
+        under the Postgres advisory lock; the holdout backtest runs on
+        the sealed days only."""
+        from agentfx.core.dsl import StrategySpec
+        from agentfx.core.validation import oos_window
+
+        start, end = seed_evolution_candles["start"], seed_evolution_candles["end"]
+        cutoff = start + timedelta(days=5)
+        holdout = (cutoff, end)
+        run = _make_run(db_session)
+        orchestrator = _build_orchestrator(
+            db_session,
+            run.id,
+            instrument=seed_evolution_candles["instrument"],
+            granularity=seed_evolution_candles["timeframe"],
+            data_window=(start, cutoff),
+            holdout_window=holdout,
+            population_size=15,
+            max_generations=2,
+        )
+        orchestrator.run_loop()
+
+        db_session.refresh(run)
+        genome = db_session.get(models.StrategyGenome, run.best_genome_id)
+        folds = sorted(genome.validation_folds, key=lambda f: f.fold_index)
+        assert max(f.fold_end for f in folds) == cutoff  # folds stop at the seal
+        # Random-walk candles: nothing clears Gate B, so nothing was spent.
+        assert genome.validator_passed is False
+        assert genome.validation_holdout is None
+        ledger = db_session.query(models.HoldoutEvaluation).filter_by(
+            genome_id=genome.id
+        )
+        assert ledger.count() == 0
+
+        persister = SqlAlchemyPersister(db_session)
+        assert persister.claim_holdout(run.id, genome.id, holdout) is None
+        blocker = persister.claim_holdout(run.id, genome.id, holdout)
+        assert blocker is not None and blocker.startswith("this genome")
+        row = ledger.one()
+        assert (row.holdout_start, row.holdout_end) == holdout
+        assert row.passed is None
+
+        evidence = orchestrator.validator.evaluate_holdout(
+            StrategySpec.from_stored_genome(genome.dsl_json),
+            instrument=run.instrument,
+            granularity=run.granularity,
+            holdout_window=holdout,
+            oos=oos_window(orchestrator._rolling_folds()),
+            account_balance=orchestrator.config.account_balance,
+            leverage=orchestrator.config.leverage,
+        )
+        assert evidence.status in ("passed", "failed")  # the backtest ran
+        assert evidence.metrics["n_trades"] is not None
+        assert 1 <= evidence.min_trades <= 300
+
+        persister.save_validation(
+            genome.id,
+            folds=[],
+            validator_passed=False,
+            validation_failures=[evidence.reason],
+            validation_holdout={
+                "status": evidence.status,
+                "reason": evidence.reason,
+                "window_start": evidence.window_start,
+                "window_end": evidence.window_end,
+            },
+        )
+        db_session.refresh(row)
+        assert row.passed is evidence.passed
 
     def test_run_best_genome_is_recorded(self, db_session, seed_evolution_candles):
         run = _make_run(db_session)

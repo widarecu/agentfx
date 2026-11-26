@@ -8,6 +8,7 @@ from .evolution import (
     GenomeOrigin,
     StrategyGenome,
     UserAction,
+    HoldoutEvaluation,
     ValidationAttempt,
     ValidationFold,
 )
@@ -70,6 +71,7 @@ __all__ = [
     "Generation",
     "StrategyGenome",
     "GenomeOrigin",
+    "HoldoutEvaluation",
     "ValidationAttempt",
     "ValidationFold",
     "DecisionLog",

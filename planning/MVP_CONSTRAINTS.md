@@ -31,6 +31,17 @@ References:
 - Data granularity: 1m bars for decisioning; optional 5s tick aggregation later
 - Lookback window: ≥ 180 days for features; ≥ 365 days preferred where available
 - Backtesting protocol: rolling walk-forward with final OOS holdout ≥ 6 months
+  - Sealed final holdout (AFX-151): the latest 183 days of each evolution
+    run's data window. Evolution, warm-start selection and the walk-forward
+    folds use only the data before it. A genome that passes Gate B (below)
+    is judged on the holdout once: the same Gate B bars, with the trade
+    minimum scaled to the holdout's share of the walk-forward OOS span
+    (never above 300). A failure is permanent. Neither the genome, an
+    identical strategy, nor anything bred from it afterwards can be judged
+    on an overlapping holdout again, and holdout-tested genomes never seed
+    later runs.
+  - A run whose window is under 366 days reserves no holdout, and nothing
+    from it can pass validation.
 - Minimum trades in OOS: ≥ 300 trades or ≥ 3 months of activity (whichever later)
 - OOS thresholds to pass Gate B:
   - Sharpe ≥ 1.0

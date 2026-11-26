@@ -257,6 +257,9 @@ class StrategyGenome(Base):
     # Human-readable failure messages from evaluate_gate_b()
     validation_failures = Column(JSON, nullable=False, default=list)
     validation_dsr = Column(JSON, nullable=True)
+    # Sealed final holdout check (AFX-151): window, metrics and verdict.
+    # NULL when the genome never reached the holdout.
+    validation_holdout = Column(JSON, nullable=True)
 
     # Only populated when origin='llm'
     llm_reasoning = Column(Text, nullable=True)
@@ -315,6 +318,50 @@ class ValidationAttempt(Base):
             "granularity",
             "oos_start",
             "oos_end",
+        ),
+    )
+
+
+class HoldoutEvaluation(Base):
+    """One finalist's single use of a sealed final holdout (AFX-151).
+
+    Written before the holdout backtest runs and kept independently of
+    the evolution run, so deleting a run never gives a strategy a second
+    try. ``passed`` stays NULL when the backtest never reported back: the
+    holdout is still spent.
+    """
+
+    __tablename__ = "holdout_evaluations"
+
+    id = Column(Integer, primary_key=True)
+    genome_id = Column(String(120), nullable=False, index=True)
+    # sha256 of the canonical strategy JSON: catches the same strategy
+    # under another genome ID (warm start, re-discovery).
+    spec_key = Column(String(64), nullable=False, index=True)
+    instrument = Column(String(10), nullable=False)
+    granularity = Column(String(5), nullable=False)
+    holdout_start = Column(DateTime(timezone=True), nullable=False)
+    holdout_end = Column(DateTime(timezone=True), nullable=False)
+    passed = Column(Boolean, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "genome_id",
+            "instrument",
+            "granularity",
+            "holdout_start",
+            "holdout_end",
+            name="uq_holdout_evaluation_genome_window",
+        ),
+        Index(
+            "ix_holdout_evaluations_window",
+            "instrument",
+            "granularity",
+            "holdout_start",
+            "holdout_end",
         ),
     )
 

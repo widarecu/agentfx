@@ -30,6 +30,7 @@ from agentfx.agents.orchestrator import (
 )
 from agentfx.agents.validator import (
     FoldEvaluation,
+    HoldoutEvidence,
     ValidationResult,
     ValidatorAgent,
 )
@@ -77,6 +78,10 @@ class MockPersister:
         self.generations: list[_PersistedGen] = []
         self.validations: list[dict] = []
         self.validation_batches: list[list[str]] = []
+        # Sealed holdout (AFX-151): every claim attempt, and the genome
+        # IDs the fake ledger refuses (ID -> reason).
+        self.holdout_claims: list[tuple[str, tuple[datetime, datetime]]] = []
+        self.holdout_blockers: dict[str, str] = {}
         self.decisions: list[_PersistedDecision] = []
         self._next_id = 0
 
@@ -120,6 +125,7 @@ class MockPersister:
         validator_passed: bool,
         validation_failures: list[str],
         validation_dsr: dict[str, Any] | None = None,
+        validation_holdout: dict[str, Any] | None = None,
     ) -> None:
         self.validations.append(
             {
@@ -128,8 +134,13 @@ class MockPersister:
                 "validator_passed": validator_passed,
                 "validation_failures": validation_failures,
                 "validation_dsr": validation_dsr,
+                "validation_holdout": validation_holdout,
             }
         )
+
+    def claim_holdout(self, run_id, genome_id, window) -> str | None:
+        self.holdout_claims.append((genome_id, window))
+        return self.holdout_blockers.get(genome_id)
 
     def log_decision(
         self,
@@ -232,12 +243,38 @@ def _passing_fold_evals(spec: StrategySpec) -> list[FoldEvaluation]:
     ]
 
 
+HOLDOUT_WINDOW = (
+    datetime(2024, 5, 1, tzinfo=UTC),
+    datetime(2024, 10, 31, tzinfo=UTC),
+)
+
+
+def _holdout_evidence(status: str = "passed") -> HoldoutEvidence:
+    return HoldoutEvidence(
+        status=status,
+        reason=(
+            "Sealed holdout passed"
+            if status == "passed"
+            else "Sealed holdout failed: Sharpe 0.20 < 1.0"
+        ),
+        window_start=HOLDOUT_WINDOW[0].isoformat(),
+        window_end=HOLDOUT_WINDOW[1].isoformat(),
+        metrics={"sharpe": 1.4 if status == "passed" else 0.2},
+        min_trades=300,
+    )
+
+
 def _make_validator_returning(
     validator_passed: bool = True,
     failures: list[str] | None = None,
+    holdout_status: str = "passed",
 ) -> ValidatorAgent:
-    """Build a ValidatorAgent whose .validate() returns a fixed result."""
+    """Build a ValidatorAgent whose .validate() returns a fixed result
+    and whose sealed-holdout check returns ``holdout_status``."""
     validator = ValidatorAgent(k=4)
+    validator.evaluate_holdout = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda *a, **k: _holdout_evidence(holdout_status)
+    )
     validator.validate = MagicMock(  # type: ignore[method-assign]
         return_value=ValidationResult(
             spec=MA_CROSSOVER_SEED,
@@ -259,6 +296,7 @@ def _build_orchestrator(
     stop_conditions: StopConditions | None = None,
     clock=None,
     check_stop=None,
+    holdout_window: tuple[datetime, datetime] | None = HOLDOUT_WINDOW,
 ) -> tuple[OrchestratorAgent, MockPersister]:
     persister = MockPersister()
     orchestrator = OrchestratorAgent(
@@ -293,6 +331,7 @@ def _build_orchestrator(
         compute_fitness_fn=fitness_fn or FixedFitnessFn([1.0]),
         clock=clock or StepClock(step_seconds=1.0),
         check_stop=check_stop,
+        holdout_window=holdout_window,
     )
     return orchestrator, persister
 
@@ -1815,3 +1854,171 @@ class TestDeferredWarmStart:
             "init_population outputs_json must report the stash size "
             f"as n_warm_start_deferred; got {out}"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Sealed final holdout (AFX-151)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _datetimes(value: Any) -> list[datetime]:
+    """Every datetime nested anywhere in a call's arguments."""
+    if isinstance(value, datetime):
+        return [value]
+    if isinstance(value, dict):
+        value = list(value.values())
+    if isinstance(value, (list, tuple)):
+        return [d for item in value for d in _datetimes(item)]
+    return []
+
+
+class TestSealedHoldout:
+    def test_finalist_is_judged_once_and_the_verdict_is_recorded(self) -> None:
+        validator = _make_validator_returning(validator_passed=True)
+        orchestrator, persister = _build_orchestrator(validator=validator)
+        summary = orchestrator.run_loop()
+
+        [record] = persister.validations
+        assert persister.holdout_claims == [(record["genome_id"], HOLDOUT_WINDOW)]
+        validator.evaluate_holdout.assert_called_once()
+        kwargs = validator.evaluate_holdout.call_args.kwargs
+        assert kwargs["holdout_window"] == HOLDOUT_WINDOW
+        # Scaled against the walk-forward OOS span of the same genome.
+        oos_fold = _passing_fold_evals(MA_CROSSOVER_SEED)[-1].fold
+        assert kwargs["oos"] == (oos_fold.start, oos_fold.end)
+        assert kwargs["gate_b_overrides"] == {
+            "min_cagr": orchestrator.config.min_cagr_pct
+        }
+
+        assert record["validator_passed"] is True
+        assert record["validation_holdout"]["status"] == "passed"
+        assert record["validation_holdout"]["window_start"] == (
+            HOLDOUT_WINDOW[0].isoformat()
+        )
+        assert record["validation_holdout"]["window_end"] == (
+            HOLDOUT_WINDOW[1].isoformat()
+        )
+        assert summary.validated_count == 1
+        [decision] = [d for d in persister.decisions if d.action == "validate"]
+        assert decision.outputs_json["validation_holdout"]["status"] == "passed"
+
+    def test_holdout_failure_rejects_a_gate_b_passer(self) -> None:
+        validator = _make_validator_returning(
+            validator_passed=True, holdout_status="failed"
+        )
+        orchestrator, persister = _build_orchestrator(validator=validator)
+        summary = orchestrator.run_loop()
+
+        [record] = persister.validations
+        assert record["validator_passed"] is False
+        assert record["validation_failures"] == [
+            "Sealed holdout failed: Sharpe 0.20 < 1.0"
+        ]
+        assert record["validation_holdout"]["status"] == "failed"
+        assert summary.validated_count == 0
+        validator.evaluate_holdout.assert_called_once()  # no second attempt
+
+    def test_gate_b_failure_never_spends_the_holdout(self) -> None:
+        validator = _make_validator_returning(
+            validator_passed=False, failures=["Sharpe 0.30 < 1.0"]
+        )
+        orchestrator, persister = _build_orchestrator(validator=validator)
+        orchestrator.run_loop()
+
+        [record] = persister.validations
+        assert persister.holdout_claims == []
+        validator.evaluate_holdout.assert_not_called()
+        assert record["validation_holdout"] is None
+
+    def test_deflated_sharpe_failure_never_spends_the_holdout(self) -> None:
+        validator = _make_validator_returning(validator_passed=True)
+        validator.validate.return_value.dsr_sample = "no full OOS returns"
+        orchestrator, persister = _build_orchestrator(validator=validator)
+        orchestrator.run_loop()
+
+        [record] = persister.validations
+        assert record["validator_passed"] is False
+        assert persister.holdout_claims == []
+        validator.evaluate_holdout.assert_not_called()
+
+    def test_lineage_that_already_used_the_holdout_is_blocked(self) -> None:
+        validator = _make_validator_returning(validator_passed=True)
+        orchestrator, persister = _build_orchestrator(validator=validator)
+        reason = "ancestor genome_old was already judged on the holdout"
+        persister.claim_holdout = MagicMock(return_value=reason)
+        summary = orchestrator.run_loop()
+
+        [record] = persister.validations
+        persister.claim_holdout.assert_called_once()
+        validator.evaluate_holdout.assert_not_called()  # no backtest at all
+        assert record["validator_passed"] is False
+        assert record["validation_failures"] == [
+            f"Sealed holdout already used: {reason}"
+        ]
+        assert record["validation_holdout"]["status"] == "blocked"
+        assert record["validation_holdout"]["blocked_by"] == reason
+        assert summary.validated_count == 0
+
+    def test_claim_that_cannot_be_recorded_rejects_without_a_backtest(self) -> None:
+        validator = _make_validator_returning(validator_passed=True)
+        orchestrator, persister = _build_orchestrator(validator=validator)
+        persister.claim_holdout = MagicMock(side_effect=RuntimeError("db down"))
+        orchestrator.run_loop()
+
+        [record] = persister.validations
+        validator.evaluate_holdout.assert_not_called()
+        assert record["validator_passed"] is False
+        assert record["validation_holdout"]["status"] == "error"
+
+    def test_run_without_a_holdout_approves_nothing(self) -> None:
+        validator = _make_validator_returning(validator_passed=True)
+        orchestrator, persister = _build_orchestrator(
+            validator=validator, holdout_window=None
+        )
+        summary = orchestrator.run_loop()
+
+        [record] = persister.validations
+        assert record["validator_passed"] is False
+        assert record["validation_holdout"]["status"] == "unavailable"
+        assert persister.holdout_claims == []
+        validator.evaluate_holdout.assert_not_called()
+        assert summary.validated_count == 0
+
+    def test_holdout_overlapping_the_search_window_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="sealed holdout must start"):
+            _build_orchestrator(
+                holdout_window=(
+                    datetime(2024, 4, 30, tzinfo=UTC),
+                    datetime(2024, 10, 30, tzinfo=UTC),
+                )
+            )
+
+    def test_evolution_and_warm_start_never_see_the_holdout(self) -> None:
+        """Zero leakage: fitness, validation and the warm-start lookup are
+        only ever given dates at or before the holdout's start."""
+        cutoff = HOLDOUT_WINDOW[0]
+        seen: list[datetime] = []
+
+        class RecordingFitness(FixedFitnessFn):
+            def __call__(self, spec, **kwargs):  # noqa: ANN001
+                seen.extend(_datetimes(kwargs))
+                return super().__call__(spec, **kwargs)
+
+        class RecordingPersister(MockPersister):
+            def find_prior_winners(self, **kwargs):
+                seen.extend(_datetimes(kwargs))
+                return []
+
+        validator = _make_validator_returning(validator_passed=True)
+        orchestrator, _ = _build_orchestrator(
+            validator=validator, fitness_fn=RecordingFitness([1.0])
+        )
+        orchestrator.persister = RecordingPersister()
+        orchestrator.run_loop()
+        for call in validator.validate.call_args_list:
+            seen.extend(_datetimes(call.kwargs))
+
+        assert len(seen) > 10
+        assert max(seen) == cutoff
+        # Only the holdout check itself is handed the holdout.
+        assert validator.evaluate_holdout.call_args.kwargs["holdout_window"][1] > cutoff

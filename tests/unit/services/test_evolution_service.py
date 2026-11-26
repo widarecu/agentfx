@@ -2145,3 +2145,283 @@ class TestFindPriorWinnersImportIsolation:
             "picker must skip the higher-fitness imported genome and "
             "pick only the native one"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Sealed final holdout: single use per lineage (AFX-151)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestSealedHoldoutLedger:
+    START = datetime(2026, 5, 27, tzinfo=UTC)
+    WINDOW = (START, START + timedelta(days=183))
+    LATER = (START + timedelta(days=183), START + timedelta(days=366))
+
+    def _run(self, db, instrument="EUR_USD", granularity="M1"):
+        return evolution_service.create_run(
+            db,
+            schemas.EvolutionRunCreate(instrument=instrument, granularity=granularity),
+        )
+
+    def _genome(self, db, run, spec=MA_CROSSOVER_SEED, parents=(), index=0):
+        """Save one genome in its own generation; returns its ID."""
+        genome = _make_genome(spec, 1.5)
+        genome.parent_ids = list(parents)
+        SqlAlchemyPersister(db).save_generation(
+            run.id,
+            generation_index=index,
+            genomes=[genome],
+            llm_invoked=False,
+            llm_call_id=None,
+            best_fitness=1.5,
+        )
+        return genome.id
+
+    def _finish(self, db, genome_id, status):
+        SqlAlchemyPersister(db).save_validation(
+            genome_id,
+            folds=[],
+            validator_passed=status == "passed",
+            validation_failures=[],
+            validation_holdout={
+                "status": status,
+                "reason": f"Sealed holdout {status}",
+                "window_start": self.WINDOW[0].isoformat(),
+                "window_end": self.WINDOW[1].isoformat(),
+                "metrics": {"sharpe": 1.4, "n_trades": 120},
+                "min_trades": 112,
+                "failures": [],
+                "blocked_by": None,
+            },
+        )
+
+    def test_first_claim_is_recorded_before_any_verdict(self, db) -> None:
+        run = self._run(db)
+        genome_id = self._genome(db, run)
+
+        assert (
+            SqlAlchemyPersister(db).claim_holdout(run.id, genome_id, self.WINDOW)
+            is None
+        )
+
+        [row] = db.scalars(select(models.HoldoutEvaluation)).all()
+        assert row.genome_id == genome_id
+        assert (row.instrument, row.granularity) == ("EUR_USD", "M1")
+        assert row.spec_key == evolution_service.holdout_spec_key(
+            MA_CROSSOVER_SEED.model_dump(mode="json")
+        )
+        assert row.passed is None  # spent, even if the backtest never returns
+
+    def test_same_genome_cannot_be_judged_twice(self, db) -> None:
+        run = self._run(db)
+        genome_id = self._genome(db, run)
+        persister = SqlAlchemyPersister(db)
+        persister.claim_holdout(run.id, genome_id, self.WINDOW)
+
+        blocker = persister.claim_holdout(run.id, genome_id, self.WINDOW)
+
+        assert blocker == (
+            "this genome was already judged on the holdout 2026-05-27 to 2026-11-26"
+        )
+        assert db.query(models.HoldoutEvaluation).count() == 1
+
+    def test_crashed_attempt_still_blocks_a_retry(self, db) -> None:
+        run = self._run(db)
+        genome_id = self._genome(db, run)
+        persister = SqlAlchemyPersister(db)
+        persister.claim_holdout(run.id, genome_id, self.WINDOW)
+        self._finish(db, genome_id, "error")
+
+        assert db.scalars(select(models.HoldoutEvaluation)).one().passed is None
+        assert persister.claim_holdout(run.id, genome_id, self.WINDOW) is not None
+
+    def test_retuned_descendant_is_blocked_on_an_overlapping_holdout(self, db) -> None:
+        run = self._run(db)
+        persister = SqlAlchemyPersister(db)
+        parent = self._genome(db, run)
+        persister.claim_holdout(run.id, parent, self.WINDOW)
+        self._finish(db, parent, "failed")
+
+        # Two mutations down, in a later run that warm-started from it.
+        later_run = self._run(db)
+        child = self._genome(
+            db, later_run, mutate_spec(MA_CROSSOVER_SEED, Random(1)), [parent]
+        )
+        grandchild = self._genome(
+            db, later_run, mutate_spec(MA_CROSSOVER_SEED, Random(2)), [child], index=1
+        )
+        overlapping = (
+            self.WINDOW[0] + timedelta(days=90),
+            self.WINDOW[1] + timedelta(days=90),
+        )
+
+        blocker = persister.claim_holdout(later_run.id, grandchild, overlapping)
+
+        assert blocker == (
+            f"bred from genome {parent} after it was judged on the holdout "
+            "2026-05-27 to 2026-11-26"
+        )
+        assert db.query(models.HoldoutEvaluation).count() == 1
+
+    def test_parent_and_child_already_finalists_each_get_one_check(self, db) -> None:
+        """Both were bred before either saw the holdout, so judging the
+        parent first tells the child nothing: no retuning happened."""
+        run = self._run(db)
+        persister = SqlAlchemyPersister(db)
+        parent = self._genome(db, run)
+        child = self._genome(
+            db, run, mutate_spec(MA_CROSSOVER_SEED, Random(1)), [parent], index=1
+        )
+        bred = datetime(2026, 11, 26, 9, tzinfo=UTC)
+        for genome_id in (parent, child):
+            db.get(models.StrategyGenome, genome_id).created_at = bred
+        db.commit()
+
+        assert persister.claim_holdout(run.id, parent, self.WINDOW) is None
+        db.scalars(select(models.HoldoutEvaluation)).one().created_at = (
+            bred + timedelta(hours=2)
+        )
+        db.commit()
+
+        assert persister.claim_holdout(run.id, child, self.WINDOW) is None
+        assert db.query(models.HoldoutEvaluation).count() == 2
+
+    def test_fresh_offspring_of_a_common_seed_are_not_blocked(self, db) -> None:
+        """A canonical seed judged in one run must not lock out every
+        later run: its untested copy seeds new genomes as usual."""
+        persister = SqlAlchemyPersister(db)
+        first_run = self._run(db)
+        persister.claim_holdout(first_run.id, self._genome(db, first_run), self.WINDOW)
+
+        later_run = self._run(db)
+        seed_copy = self._genome(db, later_run)  # same strategy, new ID
+        offspring = self._genome(
+            db,
+            later_run,
+            mutate_spec(MA_CROSSOVER_SEED, Random(3)),
+            [seed_copy],
+            index=1,
+        )
+
+        assert persister.claim_holdout(later_run.id, seed_copy, self.WINDOW) is not None
+        assert persister.claim_holdout(later_run.id, offspring, self.WINDOW) is None
+
+    def test_same_strategy_under_a_new_genome_id_is_blocked(self, db) -> None:
+        persister = SqlAlchemyPersister(db)
+        first_run = self._run(db)
+        first = self._genome(db, first_run)
+        persister.claim_holdout(first_run.id, first, self.WINDOW)
+        # The ledger outlives the run it came from.
+        db.delete(first_run)
+        db.commit()
+
+        second_run = self._run(db)
+        rediscovered = self._genome(db, second_run)  # same spec, no parents
+
+        blocker = persister.claim_holdout(second_run.id, rediscovered, self.WINDOW)
+        assert blocker is not None
+        assert f"the same strategy as genome {first}" in blocker
+
+    def test_failed_strategy_is_rejected_on_every_later_holdout(self, db) -> None:
+        run = self._run(db)
+        persister = SqlAlchemyPersister(db)
+        failed = self._genome(db, run)
+        persister.claim_holdout(run.id, failed, self.WINDOW)
+        self._finish(db, failed, "failed")
+
+        again = self._genome(db, self._run(db))  # identical strategy
+        blocker = persister.claim_holdout(run.id, again, self.LATER)
+
+        assert blocker is not None
+        assert "rejected permanently" in blocker
+
+    def test_passed_lineage_may_face_a_later_unseen_holdout(self, db) -> None:
+        run = self._run(db)
+        persister = SqlAlchemyPersister(db)
+        parent = self._genome(db, run)
+        persister.claim_holdout(run.id, parent, self.WINDOW)
+        self._finish(db, parent, "passed")
+
+        child = self._genome(
+            db, run, mutate_spec(MA_CROSSOVER_SEED, Random(1)), [parent], index=1
+        )
+        assert persister.claim_holdout(run.id, child, self.LATER) is None
+        assert db.query(models.HoldoutEvaluation).count() == 2
+
+    def test_unrelated_genome_pair_and_timeframe_are_independent(self, db) -> None:
+        run = self._run(db)
+        persister = SqlAlchemyPersister(db)
+        persister.claim_holdout(run.id, self._genome(db, run), self.WINDOW)
+
+        other = self._genome(db, run, RSI_MEAN_REVERSION_SEED, index=1)
+        assert persister.claim_holdout(run.id, other, self.WINDOW) is None
+
+        gbp = self._run(db, instrument="GBP_USD")
+        assert (
+            persister.claim_holdout(gbp.id, self._genome(db, gbp), self.WINDOW) is None
+        )
+        m5 = self._run(db, granularity="M5")
+        assert persister.claim_holdout(m5.id, self._genome(db, m5), self.WINDOW) is None
+
+    def test_unknown_genome_or_empty_window_raises(self, db) -> None:
+        run = self._run(db)
+        persister = SqlAlchemyPersister(db)
+        with pytest.raises(ValueError, match="not found"):
+            persister.claim_holdout(run.id, "genome_missing", self.WINDOW)
+        with pytest.raises(ValueError, match="nonempty window"):
+            persister.claim_holdout(
+                run.id, self._genome(db, run), (self.START, self.START)
+            )
+
+    @pytest.mark.parametrize("status", ["passed", "failed"])
+    def test_verdict_is_saved_and_shown_in_the_genome_output(self, db, status) -> None:
+        run = self._run(db)
+        genome_id = self._genome(db, run)
+        SqlAlchemyPersister(db).claim_holdout(run.id, genome_id, self.WINDOW)
+        self._finish(db, genome_id, status)
+
+        row = db.scalars(select(models.HoldoutEvaluation)).one()
+        assert row.passed is (status == "passed")
+        detail = evolution_service.get_genome_with_lineage(db, run.id, genome_id)
+        public = schemas.StrategyGenomePublic.model_validate(detail)
+        assert public.validation_holdout.status == status
+        assert public.validation_holdout.window_start == self.WINDOW[0]
+        assert public.validation_holdout.window_end == self.WINDOW[1]
+        assert public.validation_holdout.metrics == {"sharpe": 1.4, "n_trades": 120}
+        assert public.validation_holdout.min_trades == 112
+
+    def test_genome_that_never_reached_the_holdout_shows_none(self, db) -> None:
+        run = self._run(db)
+        genome_id = self._genome(db, run)
+        SqlAlchemyPersister(db).save_validation(
+            genome_id, folds=[], validator_passed=False, validation_failures=["x"]
+        )
+        detail = evolution_service.get_genome_with_lineage(db, run.id, genome_id)
+        assert (
+            schemas.StrategyGenomePublic.model_validate(detail).validation_holdout
+            is None
+        )
+
+    @pytest.mark.parametrize("status", ["passed", "failed"])
+    def test_holdout_tested_genomes_never_seed_another_run(self, db, status) -> None:
+        """No re-seeding after a failure, and a pass must not steer
+        evolution either: warm start skips both, by ID and by strategy."""
+        persister = SqlAlchemyPersister(db)
+        run = self._run(db)
+        tested = self._genome(db, run)
+        untested = self._genome(db, run, RSI_MEAN_REVERSION_SEED, index=1)
+        run.status = models.EvolutionRunStatus.COMPLETED
+        db.commit()
+        persister.claim_holdout(run.id, tested, self.WINDOW)
+        self._finish(db, tested, status)
+
+        # The same strategy saved again under another ID, untested itself.
+        twin_run = self._run(db)
+        self._genome(db, twin_run)
+        twin_run.status = models.EvolutionRunStatus.COMPLETED
+        db.commit()
+
+        picked = evolution_service.find_prior_winners(
+            db, instrument="EUR_USD", granularity="M1", limit=5
+        )
+        assert [row["id"] for row in picked] == [untested]
