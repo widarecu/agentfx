@@ -147,6 +147,13 @@ class Run(Base):
     risk_config = Column(JSON, nullable=True)
     # PID of the runner subprocess. Set by `schedule_paper_run`.
     process_pid = Column(Integer, nullable=True)
+    # AFX-99: runner liveness, read by the zombie supervisor. The
+    # heartbeat is written only by the runner's heartbeat thread (the
+    # process is alive); the progress stamp only by the trading loop
+    # (the loop is not wedged). Separate columns so neither writer can
+    # overwrite the other's value or the `parameters` blob.
+    last_heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    last_loop_progress_at = Column(DateTime(timezone=True), nullable=True)
     # v0.6.1 T1 (Wilson UAT 2026-07-16): high-water mark for
     # OANDA transaction-log polling. The reconciler fetches
     # `/transactions/sinceid` from this value on every health tick

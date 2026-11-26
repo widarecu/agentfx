@@ -81,10 +81,18 @@ _ATTEMPT_RESET_AFTER_SECONDS = 24 * 3600.0
 
 # Wilson 2026-08-24: zombie RUNNING detection window. A RUNNING paper
 # run whose heartbeat is older than this (or whose process_pid is NULL)
-# is considered dead — restart via the same auto-restart flow. The
-# subprocess emits a heartbeat every ~5 min, so 15 min is 3× interval
-# and rules out normal loop backoffs.
+# is considered dead — restart via the same auto-restart flow. Since
+# AFX-99 a dedicated thread in the runner writes the heartbeat every
+# 60s, whatever the trading loop is blocked on.
 _HEARTBEAT_STALE_SECONDS = 15 * 60.0
+
+# AFX-99: a RUNNING run with a fresh heartbeat but no loop progress for
+# this long is stuck (deadlock, socket with no timeout): the process is
+# alive but not managing its positions. One legitimate iteration can
+# chain several ~300s OANDA retry ladders, so stay well above that.
+# Wilson 2026-11-26: stop it, and restart only once its exit is
+# confirmed (`_ensure_prior_runner_dead`); never run two runners.
+_LOOP_PROGRESS_STALE_SECONDS = 60 * 60.0
 
 # AFX-92: before a zombie restart the supervisor terminates the prior
 # runner and waits for the watchdog to reap it. SIGTERM first, SIGKILL
@@ -751,15 +759,21 @@ def scan_and_restart_zombie_running(db=None, now: datetime | None = None) -> int
     Catches paper runs that are RUNNING in the DB but whose subprocess
     is dead (or silent) — the failure mode where the watchdog never
     fired so status never flipped to ERROR. Two signals identify a
-    zombie:
+    zombie (dead process):
 
     1. `process_pid IS NULL` on a RUNNING row — the pid was cleared
        (e.g. by `recover_orphaned_paper_runs` during a container
        restart) but a fresh subprocess was never re-scheduled OR
        its pid never got recorded back.
-    2. `parameters['last_heartbeat_at']` older than
-       `_HEARTBEAT_STALE_SECONDS` — heartbeat writes every ~5 min
-       when the loop is healthy; 15 min of silence = dead.
+    2. `last_heartbeat_at` older than `_HEARTBEAT_STALE_SECONDS` — the
+       runner's heartbeat thread writes every 60s while the process
+       is alive; 15 min of silence = dead.
+
+    AFX-99: a fresh heartbeat with `last_loop_progress_at` older than
+    `_LOOP_PROGRESS_STALE_SECONDS` means stuck (alive, loop wedged).
+    It takes the same path, recorded as `stuck:` instead of `zombie:`;
+    `_ensure_prior_runner_dead` stops the live process and nothing is
+    rescheduled unless its exit is confirmed.
 
     Zombie runs go through the SAME auto-restart flow as ERROR runs:
     increment attempt counter, honour backoff, reschedule. Prevents
@@ -789,20 +803,12 @@ def scan_and_restart_zombie_running(db=None, now: datetime | None = None) -> int
         for run in candidates:
             params = dict(run.parameters or {})
             pid_null = run.process_pid is None
-            heartbeat_iso = params.get("last_heartbeat_at")
+            heartbeat_dt = run.last_heartbeat_at
             heartbeat_stale = False
-            heartbeat_dt = None
-            if heartbeat_iso:
-                try:
-                    heartbeat_dt = datetime.fromisoformat(heartbeat_iso)
-                    if heartbeat_dt.tzinfo is None:
-                        heartbeat_dt = heartbeat_dt.replace(tzinfo=UTC)
-                    heartbeat_stale = (
-                        _seconds_since(heartbeat_dt, now) >= _HEARTBEAT_STALE_SECONDS
-                    )
-                except (ValueError, TypeError):
-                    heartbeat_dt = None
-                    heartbeat_stale = True
+            if heartbeat_dt is not None:
+                heartbeat_stale = (
+                    _seconds_since(heartbeat_dt, now) >= _HEARTBEAT_STALE_SECONDS
+                )
             else:
                 # No heartbeat yet + non-null pid → subprocess just
                 # started; give it one full stale window before
@@ -816,11 +822,22 @@ def scan_and_restart_zombie_running(db=None, now: datetime | None = None) -> int
                         continue
                     heartbeat_stale = True
 
-            if not (pid_null or heartbeat_stale):
+            # AFX-99: alive (fresh heartbeat) but wedged. No heartbeat or
+            # no progress stamp yet means unknown, never stuck.
+            loop_stuck = False
+            alive = heartbeat_dt is not None and not (pid_null or heartbeat_stale)
+            if alive and run.last_loop_progress_at is not None:
+                progress_age = _seconds_since(run.last_loop_progress_at, now)
+                loop_stuck = progress_age >= _LOOP_PROGRESS_STALE_SECONDS
+
+            if not (pid_null or heartbeat_stale or loop_stuck):
                 continue
-            silent_seconds = _seconds_since(
-                heartbeat_dt if heartbeat_dt is not None else run.approved_at, now
-            )
+            if loop_stuck:
+                silent_seconds = progress_age
+            else:
+                silent_seconds = _seconds_since(
+                    heartbeat_dt if heartbeat_dt is not None else run.approved_at, now
+                )
             if silent_seconds == float("inf"):
                 silent_seconds = 0.0
 
@@ -844,8 +861,23 @@ def scan_and_restart_zombie_running(db=None, now: datetime | None = None) -> int
 
             # Zombie runs skip the backoff wait. But we still honour the
             # attempts counter so a persistent bug can't loop forever.
-            reason_desc = "process_pid=None" if pid_null else "heartbeat stale"
+            if pid_null:
+                prior_reason = "zombie:process_pid=None"
+            elif heartbeat_stale:
+                prior_reason = "zombie:heartbeat stale"
+            else:
+                prior_reason = "stuck:loop progress stale"
             prior_pid = run.process_pid
+            if loop_stuck:
+                logger.error(
+                    "auto-restart (stuck): run %s pid=%s is alive (heartbeat "
+                    "%s) but its trading loop has made no progress for %.0fs; "
+                    "stopping it, restart only once its exit is confirmed",
+                    run.id,
+                    prior_pid,
+                    heartbeat_dt.isoformat(),
+                    silent_seconds,
+                )
             # AFX-92: never run two runners on one sub-account. The old
             # pid must be gone (or terminated and reaped) first.
             if not _ensure_prior_runner_dead(run.id, prior_pid):
@@ -864,27 +896,28 @@ def scan_and_restart_zombie_running(db=None, now: datetime | None = None) -> int
                 run.id,
                 attempts_so_far + 1,
                 _MAX_AUTO_RESTART_ATTEMPTS,
-                reason_desc,
-                heartbeat_iso or "never",
+                prior_reason,
+                heartbeat_dt.isoformat() if heartbeat_dt is not None else "never",
             )
 
             run.status = RunStatus.APPROVED
             run.process_pid = None
             params["auto_restart_attempts"] = attempts_so_far + 1
             params["auto_restart_last_at"] = now.isoformat()
-            params["auto_restart_prior_reason"] = f"zombie:{reason_desc}"
-            # Clear stale heartbeat so the next tick doesn't
-            # immediately re-trigger zombie detection.
-            params.pop("last_heartbeat_at", None)
+            params["auto_restart_prior_reason"] = prior_reason
             run.parameters = params
             flag_modified(run, "parameters")
+            # Clear the prior runner's liveness so the next tick doesn't
+            # immediately re-trigger on its stale stamps.
+            run.last_heartbeat_at = None
+            run.last_loop_progress_at = None
             db.commit()
 
             _write_restart_decision(
                 db,
                 run,
                 attempts_so_far + 1,
-                f"zombie:{reason_desc}(pid={prior_pid})",
+                f"{prior_reason}(pid={prior_pid})",
                 silent_seconds,
                 skipped_backoff=True,
             )
@@ -907,7 +940,8 @@ async def auto_restart_supervisor_loop(
       1. `scan_and_restart_transient_errors` — ERROR runs with
          transient stop_reason (BROKER_NETWORK, process_crashed*).
       2. `scan_and_restart_zombie_running` — RUNNING runs whose
-         subprocess is silently dead (pid=None or stale heartbeat).
+         subprocess is silently dead (pid=None or stale heartbeat) or
+         stuck (fresh heartbeat, stale loop progress; AFX-99).
 
     Both run inside an executor so blocking DB work doesn't tie up
     the event loop. Any per-tick exception is logged and swallowed —

@@ -3,7 +3,7 @@ halt the paper run with OANDA_AUTH_LOST.
 
 OANDA's weekend maintenance returns transient 401s on the account
 summary. Off-hours the runner logs a decision and keeps retrying with
-backoff (heartbeat still persisted, no flatten). In market hours the
+backoff (no flatten). In market hours the
 existing refresh-once-then-halt behaviour is unchanged, and a 401 that
 outlives the reopen halts on the first market-open tick.
 """
@@ -101,26 +101,7 @@ class TestAuthErrorWhileMarketClosed:
         db = MagicMock()
         sleep_fn = MagicMock()
 
-        # Record a heartbeat only when it is actually committed:
-        # `flag_modified(run, "parameters")` followed by `db.commit()`.
-        flagged = {"pending": False}
-        committed_heartbeats: list[str] = []
-
-        def _flag(obj, key):
-            assert obj is run and key == "parameters"
-            flagged["pending"] = True
-
-        def _commit():
-            if flagged["pending"]:
-                committed_heartbeats.append(run.parameters["last_heartbeat_at"])
-                flagged["pending"] = False
-
-        db.commit.side_effect = _commit
-
-        with (
-            patch(_RECOVER, return_value=None) as recover,
-            patch("sqlalchemy.orm.attributes.flag_modified", _flag),
-        ):
+        with patch(_RECOVER, return_value=None) as recover:
             _execute_loop(
                 db=db,
                 run=run,
@@ -148,10 +129,8 @@ class TestAuthErrorWhileMarketClosed:
             _balance_retry_sleep_seconds(2),
             _balance_retry_sleep_seconds(3),
         ]
-        # Heartbeat keeps flowing so the supervisor doesn't zombie-restart:
-        # startup, then at least one committed beat before each deferred
-        # sleep.
-        assert len(committed_heartbeats) >= 1 + sleep_fn.call_count
+        # Liveness during these retries comes from the AFX-99 heartbeat
+        # thread: see test_paper_runner_heartbeat.py.
 
     def test_weekend_refresh_success_resumes_with_fresh_client(self):
         run = _run()

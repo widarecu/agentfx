@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 import traceback
 import uuid
@@ -124,37 +125,80 @@ _BALANCE_RETRY_BACKOFF_SECONDS = (15.0, 30.0, 60.0, 120.0, 240.0)
 _AUTH_DEFERRED_ACTION = "USER_AUTH_DEFERRED_MARKET_CLOSED"
 
 
-# AFX-92: wall-clock heartbeat cadence. Must stay well under the
-# supervisor's `_HEARTBEAT_STALE_SECONDS` (900s) even when one adapter
-# call blocks for its full retry ladder (~300s).
-_HEARTBEAT_INTERVAL_SECONDS = 300.0
+# AFX-99: cadence of the heartbeat thread's `runs.last_heartbeat_at`
+# write. 15x inside the supervisor's `_HEARTBEAT_STALE_SECONDS` (900s),
+# so a few failed DB writes in a row still don't look like a dead runner.
+_HEARTBEAT_INTERVAL_SECONDS = 60.0
+_HEARTBEAT_STOP_TIMEOUT_SECONDS = 5.0
+
+# AFX-99: how often the trading loop stamps `runs.last_loop_progress_at`.
+# The supervisor calls a run stuck when this is far older than any
+# legitimate slow iteration (see `_LOOP_PROGRESS_STALE_SECONDS`).
+_LOOP_PROGRESS_INTERVAL_SECONDS = 60.0
 
 
-def _persist_heartbeat(
-    db, run, iteration: int, now_dt: datetime, *, phase: str | None = None
-) -> None:
-    """Log + persist `run.parameters['last_heartbeat_at']`. Never raises."""
-    logger.info(
-        "paper runner heartbeat: run=%s iter=%d balance=%.2f pnl=%.2f%s",
-        run.id,
-        iteration,
-        run.current_balance or 0.0,
-        run.pnl or 0.0,
-        f" phase={phase}" if phase else "",
-    )
-    try:
-        params = dict(run.parameters or {})
-        params["last_heartbeat_at"] = now_dt.isoformat()
-        run.parameters = params
-        from sqlalchemy.orm.attributes import flag_modified
+class _HeartbeatThread:
+    """AFX-99: writes `runs.last_heartbeat_at` from a daemon thread.
 
-        flag_modified(run, "parameters")
-        db.commit()
-    except Exception:  # noqa: BLE001 — never let heartbeat crash the loop
-        logger.exception(
-            "paper runner: heartbeat persist failed on %s (loop continues)",
-            run.id,
+    Liveness no longer depends on what the trading loop is blocked on
+    (a 401 ladder, a hung socket). Each beat opens its own session from
+    `session_factory`, never the loop's, and updates only this column,
+    so it can't race the loop's `parameters` writes. A beat is a no-op
+    once the run is no longer RUNNING under this process's pid.
+    """
+
+    def __init__(self, *, run_id: str, expected_pid: int | None, session_factory):
+        self._run_id = run_id
+        self._expected_pid = expected_pid
+        self._session_factory = session_factory
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._beat_until_stopped,
+            name=f"paperrun-heartbeat-{run_id}",
+            daemon=True,
         )
+
+    def start(self) -> None:
+        # First beat runs here, so a (re)started runner has a fresh
+        # heartbeat before its first broker call can block.
+        self._beat()
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(_HEARTBEAT_STOP_TIMEOUT_SECONDS)
+        if self._thread.is_alive():
+            logger.warning(
+                "paper runner: heartbeat thread for %s did not stop within %.0fs",
+                self._run_id,
+                _HEARTBEAT_STOP_TIMEOUT_SECONDS,
+            )
+
+    def _beat_until_stopped(self) -> None:
+        while not self._stop.wait(_HEARTBEAT_INTERVAL_SECONDS):
+            self._beat()
+
+    def _beat(self) -> None:
+        from agentfx.api.models import Run, RunStatus
+
+        now_dt = datetime.now(UTC)
+        conditions = [Run.id == self._run_id, Run.status == RunStatus.RUNNING]
+        if self._expected_pid is not None:
+            conditions.append(Run.process_pid == self._expected_pid)
+        db = self._session_factory()
+        try:
+            db.query(Run).filter(*conditions).update(
+                {Run.last_heartbeat_at: now_dt}, synchronize_session=False
+            )
+            db.commit()
+            logger.info("paper runner heartbeat: run=%s", self._run_id)
+        except Exception:  # noqa: BLE001 — never let a beat kill the thread
+            logger.exception(
+                "paper runner: heartbeat write failed on %s (will retry)",
+                self._run_id,
+            )
+        finally:
+            db.close()
 
 
 def _balance_retry_sleep_seconds(consecutive_failures: int) -> float:
@@ -529,6 +573,7 @@ def run_paper_run(
             instrument=instrument,
             granularity_seconds=granularity_to_seconds(granularity),
             expected_pid=os.getpid(),
+            heartbeat_session_factory=SessionLocal,
         )
     finally:
         db.close()
@@ -704,6 +749,36 @@ def _execute_loop(
     *,
     db,
     run,
+    expected_pid: int | None = None,
+    heartbeat_session_factory=None,
+    **loop_kwargs,
+) -> None:
+    """Run the trading loop with the AFX-99 heartbeat thread alongside.
+
+    The thread lives exactly as long as the loop: it stops on every
+    exit (halt, kill, superseded, crash). Production passes
+    `SessionLocal`; unit tests that don't exercise liveness omit the
+    factory and get no thread.
+    """
+    heartbeat = None
+    if heartbeat_session_factory is not None:
+        heartbeat = _HeartbeatThread(
+            run_id=run.id,
+            expected_pid=expected_pid,
+            session_factory=heartbeat_session_factory,
+        )
+        heartbeat.start()
+    try:
+        _trading_loop(db=db, run=run, expected_pid=expected_pid, **loop_kwargs)
+    finally:
+        if heartbeat is not None:
+            heartbeat.stop()
+
+
+def _trading_loop(
+    *,
+    db,
+    run,
     client,
     sleep_fn=time.sleep,
     now_fn: Callable[[], float] | None = None,
@@ -770,44 +845,34 @@ def _execute_loop(
     # AFX-93: consecutive auth failures while the market is closed.
     closed_market_auth_failures = 0
 
-    # Wilson 2026-08-24: subprocess heartbeat. Persisted to
-    # `run.parameters['last_heartbeat_at']` every ~5 minutes of
-    # healthy iteration (measured in iterations, not wall time, so
-    # tests that inject a pre-baked now_fn iterator don't run out).
-    # The supervisor uses this + `process_pid` to detect zombie
-    # RUNNING rows (subprocess dead but DB status still RUNNING) and
-    # restart them. Also grep-able signature in Railway logs — the
-    # absence of "paper runner heartbeat" lines after N minutes is
-    # proof of silent death. Loop iterates every ~5s so 60 = ~5 min.
-    #
-    # AFX-92: the heartbeat also fires on elapsed wall time, and is
-    # forced between steps of the balance retry / 401 ladder. One
-    # iteration can block for minutes inside the adapter's own retries,
-    # so an iteration count alone let a live runner look stale to the
-    # supervisor, which then started a second runner.
-    _HEARTBEAT_INTERVAL_ITERATIONS = 60
-    last_heartbeat: datetime | None = None
+    # AFX-99: liveness (`last_heartbeat_at`) comes from `_HeartbeatThread`,
+    # whatever the loop is blocked on. The loop stamps its own progress
+    # at the top of each iteration so the supervisor can tell a live but
+    # wedged runner (deadlock, hung socket) from a dead one.
+    last_progress: datetime | None = None
 
-    def _heartbeat(*, phase: str | None = None, force: bool = False) -> None:
-        nonlocal last_heartbeat
+    def _stamp_progress() -> None:
+        nonlocal last_progress
         now_dt = datetime.now(UTC)
-        due = (
-            force
-            or iteration == 1
-            or iteration % _HEARTBEAT_INTERVAL_ITERATIONS == 0
-            or (now_dt - last_heartbeat).total_seconds() >= _HEARTBEAT_INTERVAL_SECONDS
-        )
-        if not due:
+        if (
+            last_progress is not None
+            and (now_dt - last_progress).total_seconds()
+            < _LOOP_PROGRESS_INTERVAL_SECONDS
+        ):
             return
-        last_heartbeat = now_dt
-        _persist_heartbeat(db, run, iteration, now_dt, phase=phase)
+        last_progress = now_dt
+        run.last_loop_progress_at = now_dt
+        try:
+            db.commit()
+        except Exception:  # noqa: BLE001 — a missed stamp must not crash the loop
+            db.rollback()
+            logger.exception(
+                "paper runner: progress stamp failed on %s (loop continues)",
+                run.id,
+            )
 
-    # Heartbeat before the first broker call: a freshly (re)started
-    # runner whose first balance call ladders must not look like a
-    # zombie to the supervisor before it has had a chance to beat.
     iteration = 0
-    last_heartbeat = datetime.now(UTC)
-    _persist_heartbeat(db, run, iteration, last_heartbeat, phase="startup")
+    _stamp_progress()
 
     _snapshot_balance_if_needed(db=db, run=run, client=client)
 
@@ -829,6 +894,7 @@ def _execute_loop(
             run.process_pid != expected_pid or run.status != RunStatus.RUNNING
         ):
             return
+        _stamp_progress()
         if run.kill_requested_at is not None:
             logger.info("paper runner: kill flag observed on %s; closing", run.id)
             _flatten_and_halt(db, run, client, reason="USER_KILL")
@@ -870,7 +936,6 @@ def _execute_loop(
                 balance_exc,
                 now=datetime.fromtimestamp(now_fn(), tz=UTC),
                 prior_closed_failures=closed_market_auth_failures,
-                heartbeat=_heartbeat,
             )
             if outcome.kind == "halt":
                 logger.error(
@@ -881,7 +946,6 @@ def _execute_loop(
                 return
             if outcome.kind == "deferred":
                 closed_market_auth_failures += 1
-                _heartbeat(phase="auth-deferred", force=True)
                 sleep_fn(_balance_retry_sleep_seconds(closed_market_auth_failures))
                 continue
             if outcome.kind == "recovered":
@@ -919,7 +983,6 @@ def _execute_loop(
                 _BALANCE_RETRY_LIMIT,
                 sleep_seconds,
             )
-            _heartbeat(phase="balance-retry", force=True)
             sleep_fn(sleep_seconds)
             continue
         consecutive_balance_failures = 0
@@ -927,12 +990,6 @@ def _execute_loop(
         run.current_balance = balance["balance"]
         run.pnl = balance["balance"] - (run.snapshot_balance or 0.0)
         db.commit()
-
-        # Heartbeat: log INFO + persist `last_heartbeat_at` every
-        # ~5 min of healthy iteration. Supervisor uses this to detect
-        # zombie RUNNING rows and restart them. Emitted on iteration 1
-        # too so a fresh subprocess registers a heartbeat immediately.
-        _heartbeat()
 
         # AFX-104: paper has no loss-based auto-halts (CLAUDE.md rule
         # 11). Stored `loss_cap_pct` / `kill_switch_dd_pct` on legacy
@@ -3034,7 +3091,6 @@ def _resolve_auth_failure(
     *,
     now: datetime,
     prior_closed_failures: int,
-    heartbeat: Callable[..., None],
 ) -> _AuthOutcome:
     """Classify a 401/403 on the health-tick balance call.
 
@@ -3047,10 +3103,8 @@ def _resolve_auth_failure(
     rebuilds its session on every 401. A 401 that outlives the reopen
     takes the market-open path on the next tick.
 
-    Every broker call here is preceded by a forced heartbeat so the
-    AFX-92 supervisor never sees a live runner as stale. Nothing in
-    here raises an `OandaError`: a non-auth error during the refresh
-    comes back as `broker_error` for the caller's retry budget.
+    Nothing in here raises an `OandaError`: a non-auth error during the
+    refresh comes back as `broker_error` for the caller's retry budget.
     """
     from agentfx.adapters.oanda import OandaError
     from agentfx.api.workers.market_calendar import market_closure_at
@@ -3074,11 +3128,9 @@ def _resolve_auth_failure(
             run.id,
         )
 
-    heartbeat(phase="auth-refresh", force=True)
     try:
         fresh = _recover_from_auth_loss(db, run, exc)
         if fresh is not None:
-            heartbeat(phase="auth-refresh-recheck", force=True)
             balance = fresh.get_account_balance()
             return _AuthOutcome("recovered", client=fresh, balance=balance)
     except OandaError as refresh_exc:
