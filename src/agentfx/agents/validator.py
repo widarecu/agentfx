@@ -19,6 +19,12 @@ generation loop completes. The validator:
    costs (CAGR > 0) and within the Gate B drawdown cap. The genome passes
    iff both hold. Per-fold Sharpe, hit rate and trade count are not
    checked: one short fold is too noisy to judge on them.
+5. For a finalist that also clears the deflated Sharpe bar,
+   ``evaluate_robustness`` nudges each tunable parameter by ±10%, one at
+   a time, and re-runs the OOS folds (AFX-153). Every variant must stay
+   profitable, within the drawdown cap, and keep at least half the
+   genome's median OOS Sharpe and net return. This runs before the
+   sealed holdout, on the regular OOS folds only.
 
 Why median and not mean: the analysis on 2026-06-07 showed the single-OOS
 design routinely surfaced training-fold Sharpes of +1.5 to +3 and OOS
@@ -41,6 +47,7 @@ v0.3.0-era contract; this module is the v0.4.0 extension.
 from __future__ import annotations
 
 import logging
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from statistics import median
@@ -50,6 +57,7 @@ from agentfx.agents.base import AgentResult, BaseAgent
 from agentfx.api.workers.market_calendar import market_closure_at
 from agentfx.core.deflated_sharpe import SharpeSample, deflated_sharpe
 from agentfx.core.dsl import StrategySpec
+from agentfx.core.dsl.perturb import PERTURBATION, ParameterVariant, perturbed_variants
 from agentfx.core.gates import GATE_B_THRESHOLDS, evaluate_gate_b
 from agentfx.core.metrics import daily_equity_from_trade_ledger
 from agentfx.core.regime import RegimeTag
@@ -144,6 +152,93 @@ class HoldoutEvidence:
 
 _HOLDOUT_METRICS = ("sharpe", "max_drawdown", "hit_rate", "n_trades", "cagr")
 
+# AFX-153: each ±10% variant must keep at least this share of the
+# genome's median OOS Sharpe and median OOS net return (Wilson, 2026-11-26).
+ROBUSTNESS_MIN_RETENTION = 0.5
+
+
+@dataclass
+class RobustnessVariantResult:
+    """One ±10% nudge of one parameter, backtested on the OOS folds.
+
+    ``status`` is ``passed`` or ``failed`` when the backtests ran,
+    ``invalid`` when the nudged strategy is not a valid strategy (not
+    tested and not held against the genome), and ``error`` when a
+    backtest crashed (counts as a failure).
+    """
+
+    direction: str
+    value: float
+    status: str
+    metrics: dict[str, Any] = field(default_factory=dict)
+    failures: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RobustnessParameterResult:
+    path: str
+    description: str
+    baseline_value: float
+    passed: bool
+    variants: list[RobustnessVariantResult] = field(default_factory=list)
+
+
+@dataclass
+class RobustnessEvidence:
+    """The ±10% parameter robustness check for one finalist (AFX-153).
+
+    Runs on the regular walk-forward OOS folds only, never on the sealed
+    holdout. ``status`` is ``passed``, ``failed``, or ``error`` when the
+    check itself could not run. Only ``passed`` approves.
+    """
+
+    status: str
+    reason: str
+    perturbation: float = 0.0
+    min_retention: float = 0.0
+    max_drawdown_cap: float = 0.0
+    baseline: dict[str, Any] = field(default_factory=dict)
+    parameters: list[RobustnessParameterResult] = field(default_factory=list)
+    failed_parameters: list[str] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "passed"
+
+
+def _robustness_failures(
+    metrics: dict[str, Any],
+    baseline: dict[str, Any],
+    *,
+    min_retention: float,
+    max_drawdown_cap: float,
+) -> list[str]:
+    """Why one variant's OOS results did not hold up. ``metrics`` are the
+    variant's median OOS figures plus ``worst_fold_drawdown``."""
+    failures: list[str] = []
+    cagr = _as_float(metrics.get("cagr"), default=-1.0)
+    if cagr <= 0:
+        failures.append(f"net return {cagr * 100:+.1f}% is not profitable")
+    worst_dd = abs(_as_float(metrics.get("worst_fold_drawdown"), default=1.0))
+    if worst_dd > max_drawdown_cap:
+        failures.append(
+            f"Max DD {worst_dd * 100:.1f}% > cap {max_drawdown_cap * 100:.0f}%"
+        )
+    base_sharpe = _as_float(baseline.get("sharpe"), default=0.0)
+    sharpe = _as_float(metrics.get("sharpe"), default=0.0)
+    if sharpe < min_retention * base_sharpe:
+        failures.append(
+            f"Sharpe {sharpe:.2f} keeps under {min_retention:.0%} of "
+            f"baseline {base_sharpe:.2f}"
+        )
+    base_cagr = _as_float(baseline.get("cagr"), default=0.0)
+    if cagr < min_retention * base_cagr:
+        failures.append(
+            f"net return {cagr * 100:+.1f}% keeps under {min_retention:.0%} of "
+            f"baseline {base_cagr * 100:+.1f}%"
+        )
+    return failures
+
 
 @dataclass
 class ValidationResult:
@@ -172,6 +267,14 @@ class ValidationResult:
     dsr_sample: SharpeSample | str | None = None
     dsr: DsrEvidence | None = None
     holdout: HoldoutEvidence | None = None
+    robustness: RobustnessEvidence | None = None
+
+    def apply_robustness(self, evidence: RobustnessEvidence) -> None:
+        """Record the ±10% robustness check. Anything but a pass rejects."""
+        self.robustness = evidence
+        if not evidence.passed:
+            self.validator_passed = False
+            self.validation_failures = [*self.validation_failures, evidence.reason]
 
     def apply_holdout(self, evidence: HoldoutEvidence) -> None:
         """Record the sealed holdout check. Anything but a pass rejects."""
@@ -346,6 +449,7 @@ class ValidatorAgent(BaseAgent):
         n_oos_folds: int = 5,
         train_frac: float = 0.7,
         k: int | None = None,
+        robustness_min_retention: float = ROBUSTNESS_MIN_RETENTION,
         **kwargs,
     ) -> None:
         """Construct the validator.
@@ -362,6 +466,9 @@ class ValidatorAgent(BaseAgent):
                 n_oos_folds=1, train_frac=(k-1)/k`` so the validator
                 behaves identically to the v0.3.0 K=4 design. Existing
                 tests use this path.
+            robustness_min_retention: Share of the genome's median OOS
+                Sharpe and net return every ±10% parameter variant must
+                keep (AFX-153). Default 0.5.
 
         Raises:
             ValueError: if the resulting fold counts are invalid.
@@ -383,6 +490,7 @@ class ValidatorAgent(BaseAgent):
                 f"(got n_train_folds={self.n_train_folds}, "
                 f"n_oos_folds={self.n_oos_folds})"
             )
+        self.robustness_min_retention = float(robustness_min_retention)
         self._backtest_fn = backtest_fn
 
     @property
@@ -621,6 +729,147 @@ class ValidatorAgent(BaseAgent):
         )
         return evidence
 
+    def evaluate_robustness(
+        self,
+        result: ValidationResult,
+        *,
+        instrument: str,
+        granularity: str = "M1",
+        backtest_fn: BacktestFn | None = None,
+        gate_b_overrides: dict[str, float] | None = None,
+        **backtest_kwargs: Any,
+    ) -> RobustnessEvidence:
+        """Nudge each tunable parameter of a Gate B finalist by ±10%, one
+        at a time, and re-run its OOS folds (AFX-153).
+
+        Every variant must stay net profitable (median OOS net return
+        above zero), keep every OOS fold within the drawdown cap, and keep
+        at least ``robustness_min_retention`` of the genome's median OOS
+        Sharpe and net return. Every variant is tested, so the record
+        names every parameter that failed. A crashed variant backtest
+        counts as a failure.
+
+        Uses the same OOS fold windows as ``result``: the regular
+        walk-forward OOS, never the sealed holdout.
+        """
+        fn = backtest_fn or self._backtest_fn or _default_backtest_fn
+        backtest_kwargs.setdefault("capture_signals", True)
+        cap = {**GATE_B_THRESHOLDS, **(gate_b_overrides or {})}["max_drawdown"]
+        baseline = {
+            key: result.oos_aggregate_metrics.get(key) for key in ("sharpe", "cagr")
+        }
+        oos_folds = [fe.fold for fe in result.oos_evaluations]
+
+        def judge(variant: ParameterVariant) -> RobustnessVariantResult:
+            if variant.spec is None:
+                return RobustnessVariantResult(
+                    variant.direction,
+                    variant.value,
+                    "invalid",
+                    failures=[variant.invalid_reason or "invalid strategy"],
+                )
+            spec_params = {"spec": variant.spec.model_dump(mode="json")}
+            fold_evals: list[FoldEvaluation] = []
+            try:
+                for fold in oos_folds:
+                    out = fn(
+                        instrument=instrument,
+                        granularity=granularity,
+                        start=fold.start,
+                        end=fold.end,
+                        strategy_name="dsl",
+                        strategy_params=spec_params,
+                        **backtest_kwargs,
+                    )
+                    fold_result = (
+                        out.get("metrics", {}) if isinstance(out, dict) else {}
+                    )
+                    passed, failures = evaluate_gate_b(
+                        fold_result, overrides=gate_b_overrides
+                    )
+                    fold_evals.append(
+                        FoldEvaluation(fold, fold_result, passed, failures)
+                    )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "robustness backtest failed for %s %s",
+                    variant.parameter.path,
+                    variant.direction,
+                )
+                return RobustnessVariantResult(
+                    variant.direction,
+                    variant.value,
+                    "error",
+                    failures=["the backtest failed"],
+                )
+            metrics = _aggregate_oos_metrics(fold_evals)
+            metrics["worst_fold_drawdown"] = max(
+                abs(_as_float(fe.metrics.get("max_drawdown"), default=1.0))
+                for fe in fold_evals
+            )
+            failures = _robustness_failures(
+                metrics,
+                baseline,
+                min_retention=self.robustness_min_retention,
+                max_drawdown_cap=cap,
+            )
+            return RobustnessVariantResult(
+                variant.direction,
+                variant.value,
+                "failed" if failures else "passed",
+                metrics=metrics,
+                failures=failures,
+            )
+
+        parameters: dict[str, RobustnessParameterResult] = {}
+        with _candle_reuse(fn):
+            for variant in perturbed_variants(result.spec, PERTURBATION):
+                param = variant.parameter
+                entry = parameters.setdefault(
+                    param.path,
+                    RobustnessParameterResult(
+                        param.path, param.description, param.value, True
+                    ),
+                )
+                judged = judge(variant)
+                entry.variants.append(judged)
+                if judged.status in ("failed", "error"):
+                    entry.passed = False
+
+        failed = [p for p in parameters.values() if not p.passed]
+        tested = sum(
+            v.status != "invalid" for p in parameters.values() for v in p.variants
+        )
+        if failed:
+            details = "; ".join(
+                f"{p.path} ({p.description}) "
+                + ", ".join(
+                    f"{v.direction} to {v.value:g}: " + ", ".join(v.failures)
+                    for v in p.variants
+                    if v.status in ("failed", "error")
+                )
+                for p in failed
+            )
+            reason = (
+                f"Parameter robustness failed on {len(failed)} of "
+                f"{len(parameters)} parameters: {details}"
+            )
+        else:
+            reason = (
+                f"Parameter robustness passed: {tested} ±{PERTURBATION:.0%} "
+                f"variants of {len(parameters)} parameters held up on OOS"
+            )
+        return RobustnessEvidence(
+            status="failed" if failed else "passed",
+            reason=reason,
+            perturbation=PERTURBATION,
+            min_retention=self.robustness_min_retention,
+            max_drawdown_cap=cap,
+            baseline=baseline,
+            parameters=list(parameters.values()),
+            failed_parameters=[p.path for p in failed],
+        )
+
     def run(self, **kwargs) -> AgentResult:
         """BaseAgent contract entry point — wraps ``validate(...)``."""
         self.started_at = datetime.utcnow()
@@ -689,10 +938,23 @@ def _default_backtest_fn(**kwargs: Any) -> dict[str, Any]:
     return run_backtest_from_db(**kwargs)
 
 
+def _candle_reuse(fn: Any) -> AbstractContextManager[None]:
+    """Load each OOS fold's candles once across all robustness variants
+    when the production backtest reads them from the database."""
+    if fn is not _default_backtest_fn:
+        return nullcontext()
+    from agentfx.services.backtest import reuse_candles
+
+    return reuse_candles()
+
+
 __all__ = [
     "BacktestFn",
     "FoldEvaluation",
     "HoldoutEvidence",
+    "RobustnessEvidence",
+    "RobustnessParameterResult",
+    "RobustnessVariantResult",
     "ValidationResult",
     "ValidatorAgent",
 ]

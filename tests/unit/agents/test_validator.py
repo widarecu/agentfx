@@ -8,6 +8,8 @@ should be marked `validator_passed=True`.
 
 from __future__ import annotations
 
+import json
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -16,8 +18,17 @@ import pytest
 from agentfx.agents.validator import (
     FoldEvaluation,
     HoldoutEvidence,
+    RobustnessEvidence,
     ValidationResult,
     ValidatorAgent,
+)
+from agentfx.core.dsl import (
+    Comparison,
+    EntryConditions,
+    ExitRules,
+    IndicatorCall,
+    SizeRules,
+    StrategySpec,
 )
 from agentfx.core.dsl.seeds import MA_CROSSOVER_SEED, RSI_MEAN_REVERSION_SEED
 from agentfx.core.validation import (
@@ -851,3 +862,315 @@ class TestSealedHoldout:
             rejected.apply_holdout(HoldoutEvidence(status=status, reason="why"))
             assert not rejected.validator_passed
             assert rejected.validation_failures == ["why"]
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ±10% parameter robustness (AFX-153)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _rsi_spec(period: float = 10.7525) -> StrategySpec:
+    """Shaped like the losing paper genome from AFX-49: RSI period
+    10.7525 on both sides."""
+    rsi = IndicatorCall(ind="rsi", args=[period])
+    return StrategySpec(
+        entry=EntryConditions(
+            long=Comparison(lhs=rsi, cmp="<", rhs=30),
+            short=Comparison(lhs=rsi, cmp=">", rhs=70),
+        ),
+        exit=ExitRules(
+            stop_pips=20, target_pips=60, max_hold_bars=240, min_hold_bars=5
+        ),
+        size=SizeRules(risk_pct=0.005),
+    )
+
+
+def _rsi_periods(kwargs: dict) -> list[int]:
+    entry = kwargs["strategy_params"]["spec"]["entry"]
+    return [int(entry[side]["lhs"]["args"][0]) for side in ("long", "short")]
+
+
+def _landscape(*, spike: bool):
+    """A fake backtest whose OOS results depend on the RSI period the
+    strategy runs with (10). On a spike, any other period collapses to a
+    loss; on a plateau, results fade gently with distance from 10."""
+
+    def backtest(**kwargs):
+        off = max(abs(p - 10) for p in _rsi_periods(kwargs))
+        if spike and off:
+            sharpe, cagr = 0.3, -0.02
+        else:
+            sharpe, cagr = 2.0 - 0.1 * off, 0.30 - 0.02 * off
+        return {
+            "metrics": {
+                "sharpe": sharpe,
+                "cagr": cagr,
+                "max_drawdown": -0.04,
+                "hit_rate": 0.55,
+                "n_trades": 120,
+            }
+        }
+
+    return MagicMock(side_effect=backtest)
+
+
+class TestParameterRobustness:
+    SEARCH, HOLDOUT = split_final_holdout(_utc(2021, 11, 26), _utc(2026, 11, 26))
+
+    def _finalist(self, spec: StrategySpec | None = None) -> ValidationResult:
+        result = ValidatorAgent().validate(
+            spec or _rsi_spec(),
+            instrument="EUR_USD",
+            start=self.SEARCH[0],
+            end=self.SEARCH[1],
+            backtest_fn=_landscape(spike=False),
+        )
+        assert result.validator_passed  # a Gate B finalist
+        assert result.oos_aggregate_metrics["sharpe"] == 2.0
+        return result
+
+    def _check(self, backtest, result: ValidationResult | None = None, **kwargs):
+        result = result or self._finalist()
+        evidence = ValidatorAgent().evaluate_robustness(
+            result, instrument="EUR_USD", backtest_fn=backtest, **kwargs
+        )
+        return result, evidence
+
+    def test_fragile_spike_strategy_is_rejected_and_names_the_parameter(self) -> None:
+        result, evidence = self._check(_landscape(spike=True))
+
+        assert evidence.status == "failed" and not evidence.passed
+        assert evidence.failed_parameters == [
+            "entry.long.lhs.args[0]",
+            "entry.short.lhs.args[0]",
+        ]
+        [period] = [
+            p for p in evidence.parameters if p.path == "entry.long.lhs.args[0]"
+        ]
+        assert period.description == "rsi argument 1"
+        assert period.baseline_value == 10.7525
+        assert [(v.direction, v.value, v.status) for v in period.variants] == [
+            ("down", 9, "failed"),
+            ("up", 11, "failed"),
+        ]
+        assert period.variants[0].metrics["sharpe"] == 0.3
+        assert period.variants[0].failures == [
+            "net return -2.0% is not profitable",
+            "Sharpe 0.30 keeps under 50% of baseline 2.00",
+            "net return -2.0% keeps under 50% of baseline +30.0%",
+        ]
+        # Thresholds and exits don't move this strategy: they pass.
+        assert all(
+            p.passed
+            for p in evidence.parameters
+            if p.path not in evidence.failed_parameters
+        )
+        assert evidence.reason.startswith(
+            "Parameter robustness failed on 2 of 8 parameters: "
+            "entry.long.lhs.args[0] (rsi argument 1) down to 9: "
+        )
+
+        result.apply_robustness(evidence)
+        assert result.validator_passed is False
+        assert result.validation_failures == [evidence.reason]
+
+    def test_stable_plateau_strategy_is_accepted(self) -> None:
+        backtest = _landscape(spike=False)
+        result, evidence = self._check(backtest)
+
+        assert evidence.status == "passed" and evidence.failed_parameters == []
+        assert all(p.passed for p in evidence.parameters)
+        # 8 parameters; min_hold_bars 5 → 4/6 and every other one both
+        # ways: 16 variants, each on the 5 OOS folds.
+        n_variants = sum(len(p.variants) for p in evidence.parameters)
+        assert n_variants == 16
+        assert backtest.call_count == 16 * 5
+        assert evidence.reason == (
+            "Parameter robustness passed: 16 ±10% variants of 8 parameters "
+            "held up on OOS"
+        )
+        assert evidence.baseline == {"sharpe": 2.0, "cagr": 0.30}
+        assert (evidence.perturbation, evidence.min_retention) == (0.10, 0.5)
+        assert evidence.max_drawdown_cap == 0.10
+
+        result.apply_robustness(evidence)
+        assert result.validator_passed is True
+        assert result.validation_failures == []
+
+    def test_runs_on_the_regular_oos_folds_never_the_sealed_holdout(self) -> None:
+        backtest = _landscape(spike=False)
+        result, _ = self._check(backtest, spread_pips=0.8, account_balance=5_000)
+
+        folds = {(fe.fold.start, fe.fold.end) for fe in result.oos_evaluations}
+        seen = {(c.kwargs["start"], c.kwargs["end"]) for c in backtest.call_args_list}
+        assert seen == folds
+        assert all(end <= self.HOLDOUT[0] for _, end in seen)
+        for call in backtest.call_args_list:
+            assert call.kwargs["capture_signals"] is True
+            assert call.kwargs["spread_pips"] == 0.8
+            assert call.kwargs["account_balance"] == 5_000
+            assert call.kwargs["strategy_name"] == "dsl"
+
+    @pytest.mark.parametrize(
+        ("variant", "failure"),
+        [
+            ({"sharpe": 1.0, "cagr": 0.15}, None),  # keeps exactly 50%: holds
+            ({"sharpe": 0.99}, "Sharpe 0.99 keeps under 50% of baseline 2.00"),
+            ({"cagr": 0.149}, "net return +14.9% keeps under 50% of baseline +30.0%"),
+            ({"cagr": 0.0}, "net return +0.0% is not profitable"),
+            ({"max_drawdown": -0.101}, "Max DD 10.1% > cap 10%"),
+        ],
+    )
+    def test_pass_rule(self, variant, failure) -> None:
+        """Every variant keeps at least half the baseline Sharpe and net
+        return, stays profitable after costs and within the 10% cap."""
+        base = {
+            "sharpe": 2.0,
+            "cagr": 0.30,
+            "max_drawdown": -0.04,
+            "hit_rate": 0.55,
+            "n_trades": 120,
+        }
+
+        def backtest(**kwargs):
+            nudged = _rsi_periods(kwargs)[0] != 10
+            return {"metrics": {**base, **variant} if nudged else base}
+
+        _, evidence = self._check(MagicMock(side_effect=backtest))
+        [period] = [
+            p for p in evidence.parameters if p.path == "entry.long.lhs.args[0]"
+        ]
+        if failure is None:
+            assert evidence.passed
+        else:
+            assert evidence.failed_parameters == ["entry.long.lhs.args[0]"]
+            assert all(failure in v.failures for v in period.variants)
+
+    def test_one_fold_over_the_drawdown_cap_fails_the_variant(self) -> None:
+        """The drawdown cap is a hard risk limit: judged on the worst OOS
+        fold, not the median."""
+        calls = {"n": 0}
+        inner = _landscape(spike=False)
+
+        def backtest(**kwargs):
+            out = inner(**kwargs)
+            if _rsi_periods(kwargs)[0] == 11:
+                calls["n"] += 1
+                if calls["n"] == 3:
+                    out["metrics"] = {**out["metrics"], "max_drawdown": -0.12}
+            return out
+
+        _, evidence = self._check(MagicMock(side_effect=backtest))
+        [period] = [
+            p for p in evidence.parameters if p.path == "entry.long.lhs.args[0]"
+        ]
+        up = period.variants[1]
+        assert up.status == "failed"
+        assert up.failures == ["Max DD 12.0% > cap 10%"]
+        assert up.metrics["max_drawdown"] == -0.04  # the median looks fine
+        assert up.metrics["worst_fold_drawdown"] == 0.12
+
+    def test_honours_the_runs_drawdown_cap(self) -> None:
+        _, evidence = self._check(
+            _landscape(spike=False), gate_b_overrides={"max_drawdown": 0.03}
+        )
+        assert evidence.max_drawdown_cap == 0.03
+        assert not evidence.passed
+        assert all(
+            "Max DD 4.0% > cap 3%" in v.failures
+            for p in evidence.parameters
+            for v in p.variants
+        )
+
+    def test_crashed_variant_backtest_fails_closed(self) -> None:
+        inner = _landscape(spike=False)
+
+        def backtest(**kwargs):
+            if _rsi_periods(kwargs)[1] == 9:
+                raise RuntimeError("db down")
+            return inner(**kwargs)
+
+        _, evidence = self._check(MagicMock(side_effect=backtest))
+        assert evidence.failed_parameters == ["entry.short.lhs.args[0]"]
+        [period] = [p for p in evidence.parameters if not p.passed]
+        assert [v.status for v in period.variants] == ["error", "passed"]
+        assert period.variants[0].failures == ["the backtest failed"]
+
+    def test_invalid_variant_is_recorded_but_not_held_against_the_genome(
+        self,
+    ) -> None:
+        spec = _rsi_spec()
+        spec = spec.model_copy(
+            update={"exit": spec.exit.model_copy(update={"stop_pips": 57})}
+        )
+        result, evidence = self._check(
+            _landscape(spike=False), result=self._finalist(spec)
+        )
+        [stop] = [p for p in evidence.parameters if p.path == "exit.stop_pips"]
+        assert [(v.direction, v.status) for v in stop.variants] == [
+            ("down", "passed"),
+            ("up", "invalid"),  # 63 pips would be past the 60-pip target
+        ]
+        assert stop.passed and evidence.passed
+
+    def test_evidence_is_json_serialisable_for_the_validation_record(self) -> None:
+        _, evidence = self._check(_landscape(spike=True))
+        record = json.loads(json.dumps(asdict(evidence)))
+        assert record["status"] == "failed"
+        assert record["failed_parameters"] == evidence.failed_parameters
+        assert record["parameters"][0]["variants"][0]["metrics"]["n_trades"] == 600
+
+    def test_anything_but_a_pass_rejects_the_genome(self) -> None:
+        def result() -> ValidationResult:
+            return ValidationResult(
+                spec=MA_CROSSOVER_SEED, folds=[], validator_passed=True
+            )
+
+        passed = result()
+        passed.apply_robustness(RobustnessEvidence(status="passed", reason="ok"))
+        assert passed.validator_passed and passed.validation_failures == []
+
+        for status in ("failed", "error"):
+            rejected = result()
+            rejected.apply_robustness(RobustnessEvidence(status=status, reason="why"))
+            assert not rejected.validator_passed
+            assert rejected.validation_failures == ["why"]
+
+
+def test_robustness_reads_each_oos_fold_from_the_database_once(monkeypatch):
+    """With the production backtest, all variants share one candle load
+    per OOS fold."""
+    import numpy as np
+    import pandas as pd
+
+    from agentfx.services import backtest as bt_module
+
+    times = pd.date_range("2024-01-01", periods=400, freq="min", tz="UTC")
+    close = 1.1 + np.cumsum(np.random.default_rng(7).normal(0, 0.0002, len(times)))
+    df = pd.DataFrame(
+        {"open": close, "high": close, "low": close, "close": close, "volume": 1},
+        index=times,
+    )
+    loads: list[tuple] = []
+
+    def load(**kwargs):
+        loads.append((kwargs["start"], kwargs["end"]))
+        return df
+
+    monkeypatch.setattr(bt_module, "load_price_df_from_db", load)
+    monkeypatch.setattr(bt_module, "_lookup_financing_rates", lambda _: (0.0, 0.0))
+    result = ValidatorAgent().validate(
+        _rsi_spec(),
+        instrument="EUR_USD",
+        start=_utc(2024, 1, 1),
+        end=_utc(2025, 1, 1),
+        backtest_fn=_landscape(spike=False),
+    )
+
+    evidence = ValidatorAgent().evaluate_robustness(
+        result, instrument="EUR_USD", spread_pips=0.5
+    )
+
+    folds = [(fe.fold.start, fe.fold.end) for fe in result.oos_evaluations]
+    assert loads == folds  # 16 variants × 5 folds, 5 loads
+    assert sum(len(p.variants) for p in evidence.parameters) == 16

@@ -170,6 +170,53 @@ def test_dsl_wick_exit_uses_half_the_pair_spread(
     assert trade["net_pips"] == pytest.approx(trade["pips"] - spread_pips)
 
 
+def test_reuse_candles_loads_each_window_once(monkeypatch):
+    """AFX-153: the robustness check backtests many variants of one
+    strategy on the same OOS folds; inside `reuse_candles` each window
+    is read from the database once."""
+    times = pd.date_range("2026-01-01", periods=50, freq="min", tz="UTC")
+    df = pd.DataFrame(
+        {col: 1.1 for col in ("open", "high", "low", "close")}, index=times
+    )
+    df["volume"] = 1
+    loads: list[tuple] = []
+
+    def load(**kwargs):
+        loads.append((kwargs["start"], kwargs["end"]))
+        return df
+
+    monkeypatch.setattr(bt_module, "load_price_df_from_db", load)
+    monkeypatch.setattr(bt_module, "_lookup_financing_rates", lambda _: (0.0, 0.0))
+    spec = StrategySpec(
+        entry=EntryConditions(
+            long=Comparison(lhs=IndicatorCall(ind="close"), cmp=">", rhs=0)
+        ),
+        exit=ExitRules(stop_pips=10, target_pips=20, max_hold_bars=240),
+        size=SizeRules(risk_pct=0.005),
+    )
+    window_a = (times[0].to_pydatetime(), times[20].to_pydatetime())
+    window_b = (times[21].to_pydatetime(), times[49].to_pydatetime())
+
+    def backtest(window):
+        return bt_module.run_backtest_from_db(
+            instrument="EUR_USD",
+            start=window[0],
+            end=window[1],
+            strategy_name="dsl",
+            strategy_params={"spec": spec},
+            spread_pips=0.5,
+        )
+
+    with bt_module.reuse_candles():
+        for _ in range(3):
+            backtest(window_a)
+            backtest(window_b)
+    assert loads == [window_a, window_b]
+
+    backtest(window_a)  # outside the block, every call reads again
+    assert loads == [window_a, window_b, window_a]
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Compounded sizing: a DSL strategy's position size on each new trade is
 # computed against the running balance (starting + realised P&L), not the

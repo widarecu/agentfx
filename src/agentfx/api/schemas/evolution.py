@@ -287,6 +287,35 @@ class ValidationHoldoutPublic(BaseSchema):
     blocked_by: str | None = None
 
 
+class RobustnessVariantPublic(BaseSchema):
+    direction: str  # down | up
+    value: float
+    status: str  # passed | failed | invalid | error
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    failures: list[str] = Field(default_factory=list)
+
+
+class RobustnessParameterPublic(BaseSchema):
+    path: str
+    description: str
+    baseline_value: float
+    passed: bool
+    variants: list[RobustnessVariantPublic] = Field(default_factory=list)
+
+
+class ValidationRobustnessPublic(BaseSchema):
+    """The ±10% parameter robustness check for one finalist (AFX-153)."""
+
+    status: str  # passed | failed | error
+    reason: str
+    perturbation: float = 0.0
+    min_retention: float = 0.0
+    max_drawdown_cap: float = 0.0
+    baseline: dict[str, Any] = Field(default_factory=dict)
+    parameters: list[RobustnessParameterPublic] = Field(default_factory=list)
+    failed_parameters: list[str] = Field(default_factory=list)
+
+
 class StrategyGenomePublic(BaseSchema):
     """Detail view for one genome.
 
@@ -314,6 +343,7 @@ class StrategyGenomePublic(BaseSchema):
     validation_failures: list[str] = Field(default_factory=list)
     validation_dsr: ValidationDsrPublic | None = None
     validation_holdout: ValidationHoldoutPublic | None = None
+    validation_robustness: ValidationRobustnessPublic | None = None
     llm_reasoning: str | None = None
     llm_call_id: str | None = None
     created_at: datetime
