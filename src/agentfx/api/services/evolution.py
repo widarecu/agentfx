@@ -176,7 +176,7 @@ def find_prior_winners(
     the reason so the audit trail is preserved.
 
     Returns a list of {id, dsl_json, fitness, source_run_id} dicts —
-    callers compile dsl_json via StrategySpec.model_validate for the
+    callers compile dsl_json via StrategySpec.from_stored_genome for the
     GA's population.
     """
     base_filters = [
@@ -914,6 +914,7 @@ def list_run_genome_summaries(
             "origin": g.origin.value if hasattr(g.origin, "value") else str(g.origin),
             "fitness": g.fitness,
             "validator_passed": g.validator_passed,
+            "risk_pct": ((g.dsl_json or {}).get("size") or {}).get("risk_pct"),
         }
         for g, gen_index in rows
     ]

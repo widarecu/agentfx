@@ -47,6 +47,7 @@ import {
   inferArchetype,
   summarizeDsl,
 } from '../utils/dslSummary';
+import { formatRiskPerTrade } from '../utils/riskPerTrade';
 import type {
   EvolutionRun,
   GenomeOrigin,
@@ -365,8 +366,9 @@ export default function GenomeDetail() {
           </span>
         </div>
 
-        <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
           <Stat label="Training fitness" value={fitnessText} />
+          <Stat label="Risk per trade" value={formatRiskPerTrade(genome.dsl_json?.size?.risk_pct)} />
           <Stat label="Parents" value={String(genome.parent_ids.length)} />
           <Stat label="Children" value={String(genome.children.length)} />
         </div>

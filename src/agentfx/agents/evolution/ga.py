@@ -5,7 +5,7 @@ mutation/crossover ourselves because DEAP's tree-GP primitives don't fit
 the nested Pydantic DSL we use.
 
 Mutation strategy:
-- Pick one of six mutation types uniformly at random.
+- Pick a mutation type uniformly at random.
 - Each operates on the spec's dict representation, applies a single
   change, then re-validates back to a `StrategySpec`.
 - If a chosen mutation has no candidate sites (e.g. "perturb exit numeric"
@@ -36,7 +36,7 @@ from pydantic import ValidationError
 from agentfx.agents.evolution.population import Genome, Population
 from agentfx.api.models import GenomeOrigin
 from agentfx.core.dsl import StrategySpec
-from agentfx.core.dsl.grammar import INDICATOR_NAMES
+from agentfx.core.dsl.grammar import INDICATOR_NAMES, MAX_RISK_PCT, MIN_RISK_PCT
 from agentfx.core.dsl.indicators import INDICATOR_ARG_BOUNDS
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -293,6 +293,22 @@ def _mut_toggle_eval_mode(spec_dict: dict, rng: Random) -> bool:
     return True
 
 
+def _mut_perturb_risk_pct(spec_dict: dict, rng: Random) -> bool:
+    size = spec_dict["size"]
+    current = size["risk_pct"]
+    new_value = min(MAX_RISK_PCT, max(MIN_RISK_PCT, current * rng.uniform(0.75, 1.25)))
+    size["risk_pct"] = new_value
+    return new_value != current
+
+
+def _offspring_spec(spec: StrategySpec) -> StrategySpec:
+    if spec.size.risk_pct >= MIN_RISK_PCT:
+        return spec
+    payload = spec.model_dump(mode="json")
+    payload["size"]["risk_pct"] = MIN_RISK_PCT
+    return StrategySpec.model_validate(payload)
+
+
 _MUTATIONS: tuple[Callable[[dict, Random], bool], ...] = (
     _mut_flip_comparator,
     _mut_perturb_threshold,
@@ -302,6 +318,7 @@ _MUTATIONS: tuple[Callable[[dict, Random], bool], ...] = (
     _mut_perturb_exit_numeric,
     _mut_perturb_min_hold,
     _mut_toggle_eval_mode,
+    _mut_perturb_risk_pct,
 )
 
 
@@ -312,6 +329,7 @@ def mutate_spec(spec: StrategySpec, rng: Random) -> StrategySpec:
     resulting dict fails, returns the original spec — the GA prefers
     losing one mutation opportunity to producing a malformed genome.
     """
+    spec = _offspring_spec(spec)
     base = spec.model_dump(mode="json")
 
     candidates = list(_MUTATIONS)
@@ -340,6 +358,7 @@ def crossover_specs(
     between parents to produce two children. Returns (a, b) unchanged if
     the swap produces an invalid spec.
     """
+    a, b = _offspring_spec(a), _offspring_spec(b)
     a_dict = a.model_dump(mode="json")
     b_dict = b.model_dump(mode="json")
 

@@ -41,6 +41,7 @@ References:
 
 ## 5) Execution & Rollout
 - Paper first: minimum 2 weeks of paper with metrics above thresholds before Live
+- Future live deploy flow: the operator chooses risk per trade for each deployment. Default to **Safer** (the genome's risk per trade, capped at the 0.5% MVP live limit). Offer **Same as paper** (the genome's own risk per trade) as an explicit choice. This requirement does not authorize relaxing the current live limit; any live use above that limit requires a separately approved policy change.
 - Latency SLOs: Paper p95 < 1s; Live p95 < 500ms end-to-end decision loop
 - Reliability: auto-retry with backoff; circuit breaker on 5 consecutive broker failures or p95 latency > 2x SLO for 10 minutes
 - Rollback: disable strategy via feature flag; fail-safe to flat positions
