@@ -116,6 +116,7 @@ def _to_public(
         completed_at=run.completed_at,
         user_id=run.user_id,
         name=(run.parameters or {}).get("name"),
+        forward_test_contract=(run.parameters or {}).get("forward_test_contract"),
     )
 
 
@@ -498,6 +499,91 @@ def get_paper_run_backtest_overlay(
         source=result["source"],
         reason=result["reason"],
     )
+
+
+def _forward_test_to_public(
+    run_id: str,
+    evaluation,
+) -> schemas.ForwardTestEvaluationPublic:
+    return schemas.ForwardTestEvaluationPublic(
+        run_id=run_id,
+        status=evaluation.status,
+        eligible_for_live=evaluation.eligible_for_live,
+        closed_trades=evaluation.closed_trades,
+        min_closed_trades=evaluation.min_closed_trades,
+        trades_remaining=evaluation.trades_remaining,
+        progress_pct=evaluation.progress_pct,
+        progress_label=evaluation.progress_label,
+        early_failure=evaluation.early_failure,
+        criteria=[
+            schemas.ForwardTestCriterionPublic(
+                name=c.name,
+                label=c.label,
+                status=c.status,
+                actual=c.actual,
+                threshold=c.threshold,
+                message=c.message,
+            )
+            for c in evaluation.criteria
+        ],
+        failures=list(evaluation.failures),
+        metrics=dict(evaluation.metrics),
+        contract=(
+            schemas.ForwardTestContractPublic(**evaluation.contract)
+            if evaluation.contract is not None
+            else None
+        ),
+    )
+
+
+@router.get(
+    "/paper-runs/{run_id}/forward-test",
+    response_model=schemas.ForwardTestEvaluationPublic,
+)
+def get_paper_run_forward_test(
+    run_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> schemas.ForwardTestEvaluationPublic:
+    """Return progress and per-criterion pass/fail status against the
+    paper run's locked forward-test contract (AFX-154)."""
+    run = _load_owned_paper_run(db, run_id, current_user)
+    evaluation = paper_service.evaluate_paper_run_forward_test(db, run)
+    return _forward_test_to_public(run.id, evaluation)
+
+
+@router.post(
+    "/paper-runs/{run_id}/live-eligibility",
+    response_model=schemas.ForwardTestEvaluationPublic,
+)
+def check_paper_run_live_eligibility(
+    run_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(user_service.get_current_active_user),
+) -> schemas.ForwardTestEvaluationPublic:
+    """Gate check for live nomination (AFX-154).
+
+    Returns 200 with the passing evaluation when eligible for live
+    nomination; returns 409 Conflict with structured failure reasons
+    when the run has insufficient closed trades, lacks a locked
+    contract, or fails any locked pass criterion. Never auto-deploys
+    to live.
+    """
+    _ensure_trader(current_user)
+    run = _load_owned_paper_run(db, run_id, current_user)
+    try:
+        evaluation = paper_service.assert_live_eligible(db, run)
+    except paper_service.LiveEligibilityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": str(exc),
+                "status": exc.evaluation.status,
+                "progress_label": exc.evaluation.progress_label,
+                "failures": exc.evaluation.failures,
+            },
+        ) from exc
+    return _forward_test_to_public(run.id, evaluation)
 
 
 # ─────────────────────────────────────────────────────────────────────

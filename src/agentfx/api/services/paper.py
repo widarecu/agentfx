@@ -25,7 +25,15 @@ from collections.abc import Iterable
 from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
+from agentfx.core.forward_test import (
+    ForwardTestContract,
+    ForwardTestEvaluation,
+    evaluate_forward_test,
+)
+from agentfx.core.metrics import summarize_from_trade_ledger
+
 from .. import models
+from ..core.config import settings
 from ..models.user_credentials import (
     UserOandaAccount,
     UserOandaAccountPoolStatus,
@@ -349,6 +357,14 @@ def approve_and_deploy(
     else:
         fold_length_days = 30
 
+    # AFX-154: lock the pre-agreed forward-test contract at paper start
+    # so pass criteria (min closed trades, net positive PnL, min Sharpe,
+    # live max drawdown cap, and backtest-vs-paper divergence baseline)
+    # cannot shift after seeing paper results.
+    forward_test_contract = _build_forward_test_contract(
+        oos_folds, locked_at=now
+    ).to_dict()
+
     run = models.Run(
         id=_new_paper_run_id(body.instrument, body.granularity),
         # `strategy_id` remains nullable for paper runs; the genome
@@ -367,6 +383,7 @@ def approve_and_deploy(
             # See `paper_runner._fold_anchor_from_time` for the semantic.
             "fold_length_days": fold_length_days,
             "current_fold_index": 0,
+            "forward_test_contract": forward_test_contract,
         },
         # Historical initial_balance column stays populated with the
         # snapshot's future landing value once the runner ticks; keep
@@ -428,6 +445,7 @@ def approve_and_deploy(
                 "granularity": body.granularity,
                 "oanda_account_id": body.oanda_account_id,
                 "risk_config": body.risk_config.model_dump(),
+                "forward_test_contract": forward_test_contract,
             },
         )
     )
@@ -1278,9 +1296,231 @@ def suggest_deployment_name(
     return name
 
 
+# ─────────────────────────────────────────────────────────────────────
+# AFX-154 — pre-agreed paper forward-test contract + live eligibility
+# ─────────────────────────────────────────────────────────────────────
+
+
+class LiveEligibilityError(ValueError):
+    """Raised when a paper run fails its locked forward-test contract."""
+
+    def __init__(self, evaluation: ForwardTestEvaluation) -> None:
+        self.evaluation = evaluation
+        summary = "; ".join(evaluation.failures) or (
+            f"Paper run is not eligible for live ({evaluation.status})"
+        )
+        super().__init__(summary)
+
+
+def _median_float(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return float(ordered[mid])
+    return float((ordered[mid - 1] + ordered[mid]) / 2.0)
+
+
+def _build_forward_test_contract(
+    oos_folds: list[models.ValidationFold],
+    *,
+    locked_at: datetime,
+) -> ForwardTestContract:
+    """Snapshot the configured forward-test thresholds and the genome's
+    OOS backtest reference metrics at paper-run approval time."""
+    sharpes = [float(f.sharpe) for f in oos_folds if f.sharpe is not None]
+    hit_rates = [float(f.hit_rate) for f in oos_folds if f.hit_rate is not None]
+    mdds = [float(f.max_drawdown) for f in oos_folds if f.max_drawdown is not None]
+
+    return ForwardTestContract.create(
+        min_closed_trades=settings.PAPER_FORWARD_TEST_MIN_TRADES,
+        min_net_pnl=0.0,
+        min_sharpe=settings.PAPER_FORWARD_TEST_MIN_SHARPE,
+        max_drawdown=settings.PAPER_FORWARD_TEST_MAX_DRAWDOWN,
+        max_divergence=settings.PAPER_FORWARD_TEST_MAX_DIVERGENCE,
+        backtest_oos_sharpe=_median_float(sharpes),
+        backtest_oos_hit_rate=_median_float(hit_rates),
+        backtest_oos_max_drawdown=min(mdds) if mdds else None,
+        locked_at=locked_at,
+    )
+
+
+def _list_all_equity_for_run(
+    db: Session,
+    run_id: str,
+) -> list[models.PaperEquitySnapshot]:
+    """Return every persisted equity snapshot for `run_id`, oldest first.
+
+    Unlike `list_equity_for_run` (which caps at 20,000 newest rows for UI
+    chart rendering), live-eligibility evaluation must inspect the full
+    run history so an earlier drawdown breach never rolls off the window.
+    """
+    return (
+        db.query(models.PaperEquitySnapshot)
+        .filter(models.PaperEquitySnapshot.run_id == run_id)
+        .order_by(
+            models.PaperEquitySnapshot.timestamp.asc(),
+            models.PaperEquitySnapshot.id.asc(),
+        )
+        .all()
+    )
+
+
+def _compute_equity_snapshot_drawdown(
+    snapshots: list[models.PaperEquitySnapshot],
+) -> float | None:
+    """Compute worst peak-to-trough drawdown magnitude from equity snapshots."""
+    if not snapshots:
+        return None
+    peak: float | None = None
+    worst_mag = 0.0
+    for snap in snapshots:
+        equity = float(snap.balance) + float(snap.unrealized_pnl or 0.0)
+        if peak is None or equity > peak:
+            peak = equity
+        if peak and peak > 0.0:
+            dd_mag = max(0.0, (peak - equity) / peak)
+            if dd_mag > worst_mag:
+                worst_mag = dd_mag
+    return worst_mag if peak is not None else None
+
+
+def evaluate_paper_run_forward_test(
+    db: Session,
+    run: models.Run,
+) -> ForwardTestEvaluation:
+    """Evaluate a paper run against its locked forward-test contract.
+
+    Uses closed trades only (`exit_timestamp IS NOT NULL` and `pnl IS NOT NULL`)
+    and computes net realized PnL (`pnl + financing - commission`), daily
+    Sharpe via `summarize_from_trade_ledger`, and worst-case drawdown across
+    both closed-trade equity and persisted equity snapshots.
+    """
+    closed_rows = (
+        db.query(models.Trade)
+        .filter(
+            models.Trade.run_id == run.id,
+            models.Trade.exit_timestamp.isnot(None),
+            models.Trade.pnl.isnot(None),
+        )
+        .order_by(models.Trade.exit_timestamp.asc())
+        .all()
+    )
+
+    trade_dicts: list[dict] = []
+    total_net_pnl = 0.0
+    for t in closed_rows:
+        net_pnl = float(t.pnl) + float(t.financing or 0.0) - float(t.commission or 0.0)
+        total_net_pnl += net_pnl
+        trade_dicts.append(
+            {
+                "exit_timestamp": t.exit_timestamp,
+                "net_pnl_dollars": net_pnl,
+            }
+        )
+
+    starting_balance = (
+        float(run.snapshot_balance)
+        if run.snapshot_balance and run.snapshot_balance > 0
+        else (
+            float(run.initial_balance)
+            if run.initial_balance and run.initial_balance > 0
+            else 10_000.0
+        )
+    )
+
+    now = datetime.now(UTC)
+    window_start = (
+        run.started_at
+        or run.created_at
+        or (closed_rows[0].entry_timestamp if closed_rows else now)
+    )
+    end_anchor = run.completed_at or now
+    last_exit = (
+        closed_rows[-1].exit_timestamp
+        if closed_rows and closed_rows[-1].exit_timestamp is not None
+        else None
+    )
+    window_end = end_anchor
+    if last_exit is not None:
+        end_utc = (
+            end_anchor.replace(tzinfo=UTC)
+            if end_anchor.tzinfo is None
+            else end_anchor.astimezone(UTC)
+        )
+        exit_utc = (
+            last_exit.replace(tzinfo=UTC)
+            if last_exit.tzinfo is None
+            else last_exit.astimezone(UTC)
+        )
+        if exit_utc > end_utc:
+            window_end = last_exit
+    start_utc = (
+        window_start.replace(tzinfo=UTC)
+        if window_start.tzinfo is None
+        else window_start.astimezone(UTC)
+    )
+    final_end_utc = (
+        window_end.replace(tzinfo=UTC)
+        if window_end.tzinfo is None
+        else window_end.astimezone(UTC)
+    )
+    if final_end_utc < start_utc:
+        window_end = window_start
+
+    ledger = summarize_from_trade_ledger(
+        trade_dicts,
+        starting_balance=starting_balance,
+        window_start=window_start,
+        window_end=window_end,
+    )
+
+    snapshots = _list_all_equity_for_run(db, run.id)
+    snapshot_mdd = _compute_equity_snapshot_drawdown(snapshots)
+
+    drawdown_candidates: list[float] = []
+    if closed_rows:
+        drawdown_candidates.append(abs(float(ledger["max_drawdown"])))
+    if snapshot_mdd is not None:
+        drawdown_candidates.append(snapshot_mdd)
+    if run.max_drawdown is not None:
+        drawdown_candidates.append(abs(float(run.max_drawdown)))
+    worst_drawdown = max(drawdown_candidates) if drawdown_candidates else None
+
+    metrics = {
+        "closed_trades": len(closed_rows),
+        "net_pnl": total_net_pnl if closed_rows else None,
+        "sharpe": float(ledger["sharpe"]) if closed_rows else None,
+        "max_drawdown": worst_drawdown,
+        "hit_rate": float(ledger["hit_rate"]) if closed_rows else None,
+    }
+    contract_dict = (run.parameters or {}).get("forward_test_contract")
+    return evaluate_forward_test(contract_dict, metrics)
+
+
+def assert_live_eligible(
+    db: Session,
+    run: models.Run,
+) -> ForwardTestEvaluation:
+    """Enforce the locked forward-test gate before live nomination.
+
+    Refuses (raises `LiveEligibilityError`) any paper run that lacks a
+    locked contract, has not reached its minimum closed trade count, or
+    fails any locked pass criterion.
+    """
+    evaluation = evaluate_paper_run_forward_test(db, run)
+    if not evaluation.eligible_for_live:
+        raise LiveEligibilityError(evaluation)
+    return evaluation
+
+
 __all__ = [
+    "LiveEligibilityError",
     "approve_and_deploy",
+    "assert_live_eligible",
     "delete_paper_run",
+    "evaluate_paper_run_forward_test",
     "find_orphaned_running_paper_runs",
     "get_paper_run",
     "list_approval_queue_for_user",

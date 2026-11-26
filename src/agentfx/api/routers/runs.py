@@ -76,7 +76,11 @@ def update_run(
     Update a run.
     """
     db_run = run_service.get_run(db, run_id=run_id)
-    if not db_run:
+    if not db_run or (
+        db_run.user_id is not None
+        and db_run.user_id != current_user.id
+        and current_user.role != models.UserRole.ADMIN
+    ):
         raise HTTPException(status_code=404, detail="Run not found")
     return run_service.update_run(db, db_run=db_run, run_in=run_in)
 

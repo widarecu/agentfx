@@ -296,6 +296,19 @@ def summarize_from_trade_ledger(
         window_start=window_start,
         window_end=window_end,
     )
+    if not isinstance(eq.index, pd.DatetimeIndex):
+        eq.index = pd.DatetimeIndex(
+            [pd.to_datetime(window_start, utc=True).normalize()]
+        )
+    # Prepend the pre-start baseline so Day 0's return and any Day 0
+    # drawdown below starting_balance are included rather than dropped by
+    # pct_change().dropna() / cummax().
+    baseline = pd.Series(
+        [float(starting_balance)],
+        index=pd.DatetimeIndex([eq.index[0] - pd.Timedelta(days=1)]),
+        dtype=float,
+    )
+    eq = pd.concat([baseline, eq])
 
     # Sharpe from daily equity returns, annualised √252.
     daily_returns = eq.pct_change().dropna()

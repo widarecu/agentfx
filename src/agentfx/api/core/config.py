@@ -805,6 +805,49 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Paper forward-test live-eligibility contract defaults (AFX-154).
+    # Locked onto each paper run at start time so pass criteria cannot
+    # shift mid-run. Governs live-nomination eligibility only; never
+    # auto-halts paper trading (CLAUDE.md rule 11).
+    PAPER_FORWARD_TEST_MIN_TRADES: int = Field(
+        default=100,
+        ge=1,
+        env="PAPER_FORWARD_TEST_MIN_TRADES",
+        description=(
+            "Minimum closed paper trades required before a paper run is "
+            "eligible for live nomination."
+        ),
+    )
+    PAPER_FORWARD_TEST_MIN_SHARPE: float = Field(
+        default=1.0,
+        env="PAPER_FORWARD_TEST_MIN_SHARPE",
+        description=(
+            "Minimum annualised daily Sharpe ratio required for a paper "
+            "forward test to qualify for live nomination."
+        ),
+    )
+    PAPER_FORWARD_TEST_MAX_DRAWDOWN: float = Field(
+        default=0.10,
+        gt=0.0,
+        le=1.0,
+        env="PAPER_FORWARD_TEST_MAX_DRAWDOWN",
+        description=(
+            "Maximum drawdown magnitude (fraction, e.g. 0.10 = 10% live cap) "
+            "allowed during the paper forward test. Exceeding this fails "
+            "live eligibility early without halting the paper run."
+        ),
+    )
+    PAPER_FORWARD_TEST_MAX_DIVERGENCE: float = Field(
+        default=0.30,
+        gt=0.0,
+        le=1.0,
+        env="PAPER_FORWARD_TEST_MAX_DIVERGENCE",
+        description=(
+            "Maximum allowed Sharpe degradation fraction vs the genome's "
+            "locked backtest OOS Sharpe (e.g. 0.30 = 30%)."
+        ),
+    )
+
     SOURCE_SHA: str = Field(
         default="",
         env="SOURCE_SHA",
