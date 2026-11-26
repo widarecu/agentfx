@@ -125,6 +125,7 @@ def _mock_validator_for_all_tests(monkeypatch):
         ValidationResult,
         ValidatorAgent,
     )
+    from agentfx.core.deflated_sharpe import SharpeSample
     from agentfx.core.validation import make_walk_forward_folds
 
     def _fake_validate(self, spec, *, instrument, granularity, start, end, **kwargs):
@@ -148,6 +149,7 @@ def _mock_validator_for_all_tests(monkeypatch):
             folds=fold_evals,
             validator_passed=True,
             validation_failures=[],
+            dsr_sample=SharpeSample(400, 0.5, 0.0, 3.0),
         )
 
     monkeypatch.setattr(ValidatorAgent, "validate", _fake_validate)

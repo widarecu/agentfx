@@ -8,7 +8,7 @@ should be marked `validator_passed=True`.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -51,6 +51,102 @@ def _backtest_returning(metrics_per_fold: list[dict]) -> MagicMock:
     """Build a mock backtest_fn whose i-th call returns metrics_per_fold[i]."""
     side_effect = [{"metrics": m} for m in metrics_per_fold]
     return MagicMock(side_effect=side_effect)
+
+
+@pytest.mark.parametrize("fold_sharpe", [1.5, 0.9])
+def test_full_oos_dsr_adds_to_gate_b(fold_sharpe):
+    def backtest(**kwargs):
+        if not kwargs.get("require_full_window"):
+            return {"metrics": _passing_metrics(sharpe=fold_sharpe)}
+        start = kwargs["start"]
+        assert start >= _utc(2024, 9, 1)
+        assert kwargs["end"] == _utc(2025, 1, 1) - timedelta(microseconds=1)
+        assert kwargs["capture_signals"] is True
+        balance = 10_000
+        trades = []
+        for day in range((kwargs["end"].date() - start.date()).days + 1):
+            pnl = balance * (0.0026 + (-1) ** day * 0.01)
+            trades.append(
+                {
+                    "exit_timestamp": start + timedelta(days=day),
+                    "net_pnl_dollars": pnl,
+                }
+            )
+            balance += pnl
+        return {"sizing": {"starting_balance": 10_000}, "trades": trades}
+
+    agent = ValidatorAgent()
+    fn = MagicMock(side_effect=backtest)
+
+    def validate(count):
+        result = agent.validate(
+            spec=MA_CROSSOVER_SEED,
+            instrument="EUR_USD",
+            start=_utc(2024, 1, 1),
+            end=_utc(2025, 1, 1),
+            backtest_fn=fn,
+            collect_dsr_sample=True,
+        )
+        assert fn.call_args.kwargs["start"] == result.oos_evaluations[0].fold.start
+        result.apply_dsr(trial_count=count, threshold=0.95)
+        return result
+
+    few = validate(1)
+    many = validate(3_075)
+    assert fn.call_count == 2 * 9  # eight folds and one full OOS pass per evaluation
+    assert few.dsr.passed is True
+    assert few.validator_passed is (fold_sharpe >= 1.0)
+    assert many.validator_passed is False
+    assert few.dsr.raw_sharpe == many.dsr.raw_sharpe
+    assert few.dsr.sharpe_bar < few.dsr.raw_sharpe < many.dsr.sharpe_bar
+    assert many.dsr.reason in many.validation_failures
+    assert "3075 trials" in many.dsr.reason
+
+
+def test_full_oos_dsr_excludes_fully_closed_fx_days():
+    fn = MagicMock(
+        return_value={
+            "metrics": _passing_metrics(),
+            "sizing": {"starting_balance": 10_000},
+            "trades": [
+                {"exit_timestamp": _utc(2024, 9, 16), "net_pnl_dollars": 100},
+                {"exit_timestamp": _utc(2024, 9, 17), "net_pnl_dollars": -50},
+            ],
+        }
+    )
+    result = ValidatorAgent().validate(
+        spec=MA_CROSSOVER_SEED,
+        instrument="EUR_USD",
+        start=_utc(2024, 1, 1),
+        end=_utc(2025, 1, 1),
+        backtest_fn=fn,
+        collect_dsr_sample=True,
+    )
+    # Sept 13–Dec 31 includes 16 closed Saturdays and Christmas Day.
+    # Sundays reopen in the evening and open days without trades still count.
+    assert result.dsr_sample.size == 93
+
+
+def test_full_oos_without_returns_fails_explicitly():
+    fn = MagicMock(
+        return_value={
+            "metrics": _passing_metrics(),
+            "sizing": {"starting_balance": 10_000},
+            "trades": [],
+        }
+    )
+    result = ValidatorAgent().validate(
+        spec=MA_CROSSOVER_SEED,
+        instrument="EUR_USD",
+        start=_utc(2024, 1, 1),
+        end=_utc(2024, 5, 1),
+        backtest_fn=fn,
+        collect_dsr_sample=True,
+    )
+    result.apply_dsr(trial_count=12, threshold=0.95)
+    assert result.validator_passed is False
+    assert result.dsr.probability is None
+    assert "no measurable variation" in result.validation_failures[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────

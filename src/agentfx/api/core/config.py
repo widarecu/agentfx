@@ -4,6 +4,8 @@ from typing import Any, Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from agentfx.core.deflated_sharpe import DEFAULT_DSR_THRESHOLD
+
 
 def get_env_file() -> str:
     """
@@ -53,6 +55,13 @@ class Settings(BaseSettings):
 
     API_V1_STR: str = Field(
         default="/api/v1", description="API version prefix for all endpoints"
+    )
+
+    AFX_DSR_THRESHOLD: float = Field(
+        default=DEFAULT_DSR_THRESHOLD,
+        gt=0.0,
+        lt=1.0,
+        description="Minimum full-OOS Deflated Sharpe probability for Gate B",
     )
 
     ENVIRONMENT: Literal["development", "staging", "production", "test", "uat"] = Field(

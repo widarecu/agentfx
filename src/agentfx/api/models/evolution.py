@@ -256,6 +256,7 @@ class StrategyGenome(Base):
     validator_passed = Column(Boolean, nullable=True)
     # Human-readable failure messages from evaluate_gate_b()
     validation_failures = Column(JSON, nullable=False, default=list)
+    validation_dsr = Column(JSON, nullable=True)
 
     # Only populated when origin='llm'
     llm_reasoning = Column(Text, nullable=True)
@@ -285,6 +286,37 @@ class StrategyGenome(Base):
 
     def __repr__(self) -> str:
         return f"<StrategyGenome {self.id} origin={self.origin} fitness={self.fitness}>"
+
+
+class ValidationAttempt(Base):
+    """Window exposure retained independently of the evolution run."""
+
+    __tablename__ = "validation_attempts"
+
+    id = Column(Integer, primary_key=True)
+    genome_id = Column(String(120), nullable=False)
+    instrument = Column(String(10), nullable=False)
+    granularity = Column(String(5), nullable=False)
+    oos_start = Column(DateTime(timezone=True), nullable=False)
+    oos_end = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "genome_id",
+            "instrument",
+            "granularity",
+            "oos_start",
+            "oos_end",
+            name="uq_validation_attempt_genome_window",
+        ),
+        Index(
+            "ix_validation_attempts_window",
+            "instrument",
+            "granularity",
+            "oos_start",
+            "oos_end",
+        ),
+    )
 
 
 class ValidationFold(Base):

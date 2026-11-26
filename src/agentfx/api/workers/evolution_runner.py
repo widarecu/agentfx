@@ -577,6 +577,7 @@ def _run_owned_evolution(run_id: str, owner_connection) -> None:
         OrchestratorAgent,
     )
     from agentfx.agents.validator import ValidatorAgent
+    from agentfx.api.core.config import settings
     from agentfx.api.core.database import SessionLocal
     from agentfx.api.models import EvolutionRunStatus
     from agentfx.api.services import evolution as evolution_service
@@ -836,6 +837,7 @@ def _run_owned_evolution(run_id: str, owner_connection) -> None:
             persister=persister,
             llm_injector=llm_injector,
             validator=validator,
+            dsr_threshold=settings.AFX_DSR_THRESHOLD,
             check_stop=lambda: persister.check_stop(run_id),
         )
 

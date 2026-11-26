@@ -42,17 +42,21 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from statistics import median
 from typing import Any, Protocol
 
 from agentfx.agents.base import AgentResult, BaseAgent
+from agentfx.api.workers.market_calendar import market_closure_at
+from agentfx.core.deflated_sharpe import SharpeSample, deflated_sharpe
 from agentfx.core.dsl import StrategySpec
 from agentfx.core.gates import GATE_B_THRESHOLDS, evaluate_gate_b
+from agentfx.core.metrics import daily_equity_from_trade_ledger
 from agentfx.core.regime import RegimeTag
 from agentfx.core.validation import (
     WalkForwardFold,
     make_rolling_walk_forward_folds,
+    oos_window,
 )
 
 logger = logging.getLogger(__name__)
@@ -103,6 +107,17 @@ class FoldEvaluation:
 
 
 @dataclass
+class DsrEvidence:
+    trial_count: int
+    threshold: float
+    probability: float | None
+    raw_sharpe: float | None
+    sharpe_bar: float | None
+    passed: bool
+    reason: str
+
+
+@dataclass
 class ValidationResult:
     """The output of validating one genome against a rolling walk-forward
     split.
@@ -126,6 +141,35 @@ class ValidationResult:
     validation_failures: list[str] = field(default_factory=list)
     oos_aggregate_metrics: dict[str, Any] = field(default_factory=dict)
     fold_failures: list[str] = field(default_factory=list)
+    dsr_sample: SharpeSample | str | None = None
+    dsr: DsrEvidence | None = None
+
+    def apply_dsr(self, *, trial_count: int, threshold: float) -> None:
+        probability = raw_sharpe = bar = None
+        passed = False
+        try:
+            if not isinstance(self.dsr_sample, SharpeSample):
+                raise ValueError(
+                    self.dsr_sample or "full OOS returns were not collected"
+                )
+            raw_sharpe = self.dsr_sample.annualized_sharpe
+            probability, bar = deflated_sharpe(
+                self.dsr_sample, trial_count=trial_count, threshold=threshold
+            )
+            passed = probability >= threshold
+            comparison = "meets" if passed else "is below"
+            reason = (
+                f"Deflated Sharpe {probability:.2%} {comparison} the {threshold:.2%} requirement "
+                f"({trial_count} trials; full OOS Sharpe {raw_sharpe:.2f}; required Sharpe {bar:.2f})"
+            )
+        except ValueError as exc:
+            reason = f"Deflated Sharpe unavailable ({trial_count} trials): {exc}"
+        self.dsr = DsrEvidence(
+            trial_count, threshold, probability, raw_sharpe, bar, passed, reason
+        )
+        if not passed:
+            self.validator_passed = False
+            self.validation_failures = [*self.validation_failures, reason]
 
     @property
     def oos_evaluations(self) -> list[FoldEvaluation]:
@@ -341,6 +385,7 @@ class ValidatorAgent(BaseAgent):
         backtest_fn: BacktestFn | None = None,
         gate_b_overrides: dict[str, float] | None = None,
         fold_regimes: dict[int, RegimeTag] | None = None,
+        collect_dsr_sample: bool = False,
         **backtest_kwargs: Any,
     ) -> ValidationResult:
         """Validate a single genome over the rolling walk-forward window.
@@ -359,6 +404,8 @@ class ValidatorAgent(BaseAgent):
                 index. When supplied, each FoldEvaluation gets its tag
                 attached. When omitted, regimes stay ``None`` (the
                 orchestrator usually computes and passes them in).
+            collect_dsr_sample: Run a separate, contiguous OOS backtest for
+                DSR. The orchestrator applies DSR after counting the batch.
             **backtest_kwargs: Forwarded to the backtest function
                 (e.g. ``spread_pips``, ``account_balance``,
                 ``leverage``).
@@ -416,6 +463,56 @@ class ValidatorAgent(BaseAgent):
         )
         fold_failures = _oos_fold_floor_failures(oos_folds, gate_b_overrides)
 
+        dsr_sample = None
+        if collect_dsr_sample:
+            oos_start, oos_end = oos_window(folds)
+            end_inclusive = oos_end - timedelta(microseconds=1)
+            try:
+                full_oos = fn(
+                    instrument=instrument,
+                    granularity=granularity,
+                    start=oos_start,
+                    end=end_inclusive,
+                    strategy_name="dsl",
+                    strategy_params=spec_params,
+                    **{
+                        **backtest_kwargs,
+                        "capture_signals": True,
+                        "require_full_window": True,
+                    },
+                )
+                starting_balance = float(full_oos["sizing"]["starting_balance"])
+                equity = daily_equity_from_trade_ledger(
+                    full_oos["trades"],
+                    starting_balance=starting_balance,
+                    window_start=oos_start,
+                    window_end=end_inclusive,
+                )
+                if min(starting_balance, equity.min()) <= 0:
+                    raise ValueError("the backtest account ran out of equity")
+                trading_equity = equity[
+                    [
+                        not (
+                            market_closure_at(max(day, oos_start))[0]
+                            and market_closure_at(
+                                min(
+                                    day + timedelta(days=1, microseconds=-1),
+                                    end_inclusive,
+                                )
+                            )[0]
+                        )
+                        for day in equity.index
+                    ]
+                ].to_numpy()
+                prior_balances = [starting_balance, *trading_equity[:-1]]
+                daily_returns = trading_equity / prior_balances - 1
+                dsr_sample = SharpeSample.from_returns(daily_returns)
+            except ValueError as exc:
+                dsr_sample = str(exc)
+            except Exception:  # noqa: BLE001
+                logger.exception("full OOS backtest failed")
+                dsr_sample = "the full OOS backtest did not produce a trade ledger"
+
         return ValidationResult(
             spec=spec,
             folds=fold_evaluations,
@@ -423,6 +520,7 @@ class ValidatorAgent(BaseAgent):
             validation_failures=agg_failures + fold_failures,
             oos_aggregate_metrics=aggregate,
             fold_failures=fold_failures,
+            dsr_sample=dsr_sample,
         )
 
     def run(self, **kwargs) -> AgentResult:
