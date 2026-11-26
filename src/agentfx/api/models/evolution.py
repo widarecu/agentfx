@@ -260,6 +260,9 @@ class StrategyGenome(Base):
     # Sealed final holdout check (AFX-151): window, metrics and verdict.
     # NULL when the genome never reached the holdout.
     validation_holdout = Column(JSON, nullable=True)
+    # ±10% parameter robustness check (AFX-153): per-parameter variant
+    # metrics and verdicts. NULL when the genome never reached the check.
+    validation_robustness = Column(JSON, nullable=True)
 
     # Only populated when origin='llm'
     llm_reasoning = Column(Text, nullable=True)

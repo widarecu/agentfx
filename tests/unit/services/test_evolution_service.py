@@ -8,6 +8,7 @@ orchestrator itself is tested with a mock recorder.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from random import Random
 
@@ -16,7 +17,12 @@ from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 
 from agentfx.agents.evolution import Genome, mutate_spec
-from agentfx.agents.validator import FoldEvaluation
+from agentfx.agents.validator import (
+    FoldEvaluation,
+    RobustnessEvidence,
+    RobustnessParameterResult,
+    RobustnessVariantResult,
+)
 from agentfx.api import models, schemas
 from agentfx.api.core.database import Base
 from agentfx.api.services import evolution as evolution_service
@@ -2425,3 +2431,92 @@ class TestSealedHoldoutLedger:
             db, instrument="EUR_USD", granularity="M1", limit=5
         )
         assert [row["id"] for row in picked] == [untested]
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ±10% parameter robustness on the validation record (AFX-153)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestParameterRobustnessRecord:
+    def _genome(self, db):
+        run = evolution_service.create_run(
+            db, schemas.EvolutionRunCreate(instrument="EUR_USD", granularity="M1")
+        )
+        genome = _make_genome(RSI_MEAN_REVERSION_SEED, 1.5)
+        SqlAlchemyPersister(db).save_generation(
+            run.id,
+            generation_index=0,
+            genomes=[genome],
+            llm_invoked=False,
+            llm_call_id=None,
+            best_fitness=1.5,
+        )
+        return run, genome.id
+
+    def test_per_parameter_results_are_saved_and_shown(self, db) -> None:
+        run, genome_id = self._genome(db)
+        evidence = RobustnessEvidence(
+            status="failed",
+            reason="Parameter robustness failed on 1 of 8 parameters: ...",
+            perturbation=0.10,
+            min_retention=0.5,
+            max_drawdown_cap=0.10,
+            baseline={"sharpe": 2.0, "cagr": 0.3},
+            parameters=[
+                RobustnessParameterResult(
+                    path="entry.long.lhs.args[0]",
+                    description="rsi argument 1",
+                    baseline_value=14.0,
+                    passed=False,
+                    variants=[
+                        RobustnessVariantResult(
+                            direction="down",
+                            value=13,
+                            status="failed",
+                            metrics={"sharpe": 0.3, "cagr": -0.02},
+                            failures=["net return -2.0% is not profitable"],
+                        ),
+                        RobustnessVariantResult(
+                            direction="up", value=15, status="passed"
+                        ),
+                    ],
+                )
+            ],
+            failed_parameters=["entry.long.lhs.args[0]"],
+        )
+        SqlAlchemyPersister(db).save_validation(
+            genome_id,
+            folds=[],
+            validator_passed=False,
+            validation_failures=[evidence.reason],
+            validation_robustness=asdict(evidence),
+        )
+
+        row = db.get(models.StrategyGenome, genome_id)
+        assert row.validation_robustness == asdict(evidence)
+        detail = evolution_service.get_genome_with_lineage(db, run.id, genome_id)
+        public = schemas.StrategyGenomePublic.model_validate(detail)
+        robustness = public.validation_robustness
+        assert robustness.status == "failed"
+        assert robustness.failed_parameters == ["entry.long.lhs.args[0]"]
+        [param] = robustness.parameters
+        assert (param.path, param.baseline_value, param.passed) == (
+            "entry.long.lhs.args[0]",
+            14.0,
+            False,
+        )
+        assert [(v.direction, v.value, v.status) for v in param.variants] == [
+            ("down", 13, "failed"),
+            ("up", 15, "passed"),
+        ]
+        assert param.variants[0].metrics == {"sharpe": 0.3, "cagr": -0.02}
+
+    def test_genome_that_never_reached_the_check_shows_none(self, db) -> None:
+        run, genome_id = self._genome(db)
+        SqlAlchemyPersister(db).save_validation(
+            genome_id, folds=[], validator_passed=False, validation_failures=["x"]
+        )
+        detail = evolution_service.get_genome_with_lineage(db, run.id, genome_id)
+        public = schemas.StrategyGenomePublic.model_validate(detail)
+        assert public.validation_robustness is None

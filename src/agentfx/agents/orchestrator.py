@@ -17,7 +17,9 @@ The loop:
      e. Every N generations: invoke the LLM injector, replace the
         bottom-K genomes with proposals (origin=LLM)
      f. GA step → next population (selection + crossover + mutation)
-  3. Validate the top-K with walk-forward + Gate B on held-out OOS
+  3. Validate the top-K with walk-forward + Gate B on held-out OOS; a
+     finalist then needs the deflated Sharpe bar, the ±10% parameter
+     robustness check and the sealed final holdout, in that order
   4. Mark the run COMPLETED with stop_reason and best_genome_id
 
 The persister Protocol lets the SQLAlchemy-backed implementation live in
@@ -55,6 +57,7 @@ from agentfx.agents.evolution.llm_client import (
 from agentfx.agents.validator import (
     FoldEvaluation,
     HoldoutEvidence,
+    RobustnessEvidence,
     ValidationResult,
     ValidatorAgent,
 )
@@ -250,6 +253,7 @@ class EvolutionStatePersister(Protocol):
         validation_failures: list[str],
         validation_dsr: dict[str, Any] | None = None,
         validation_holdout: dict[str, Any] | None = None,
+        validation_robustness: dict[str, Any] | None = None,
     ) -> None: ...
 
     def claim_holdout(
@@ -1604,6 +1608,33 @@ class OrchestratorAgent(BaseAgent):
             outcome = self._persist_validation_batch(evaluated, batch_size=len(top_k))
         return outcome
 
+    def _apply_robustness(self, genome: Genome, result: ValidationResult) -> None:
+        """Nudge each parameter of a Gate B finalist by ±10% on the
+        regular OOS folds (AFX-153) and fold the verdict into ``result``.
+        Runs before the sealed holdout, so a fragile genome never spends
+        it. Fails closed: if the check crashes, the genome is rejected."""
+        kwargs: dict[str, Any] = {
+            "account_balance": self.config.account_balance,
+            "leverage": self.config.leverage,
+        }
+        if self.config.spread_pips is not None:
+            kwargs["spread_pips"] = self.config.spread_pips
+        try:
+            evidence = self.validator.evaluate_robustness(
+                result,
+                instrument=self.config.instrument,
+                granularity=self.config.granularity,
+                gate_b_overrides={"min_cagr": self.config.min_cagr_pct},
+                **kwargs,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("robustness check crashed for genome %s", genome.id)
+            evidence = RobustnessEvidence(
+                status="error",
+                reason="Parameter robustness: the check crashed, so it cannot approve",
+            )
+        result.apply_robustness(evidence)
+
     def _apply_final_holdout(self, genome: Genome, result: ValidationResult) -> None:
         """Judge a Gate B finalist once on the sealed final holdout
         (AFX-151) and fold the verdict into ``result``.
@@ -1693,7 +1724,12 @@ class OrchestratorAgent(BaseAgent):
             result.apply_dsr(trial_count=trial_count, threshold=self.dsr_threshold)
             validation_dsr = asdict(result.dsr) if result.dsr is not None else None
             if result.validator_passed:
+                self._apply_robustness(genome, result)
+            if result.validator_passed:
                 self._apply_final_holdout(genome, result)
+            validation_robustness = (
+                asdict(result.robustness) if result.robustness is not None else None
+            )
             validation_holdout = (
                 asdict(result.holdout) if result.holdout is not None else None
             )
@@ -1704,6 +1740,7 @@ class OrchestratorAgent(BaseAgent):
                 validation_failures=result.validation_failures,
                 validation_dsr=validation_dsr,
                 validation_holdout=validation_holdout,
+                validation_robustness=validation_robustness,
             )
             oos_eval = result.oos_evaluation
             self.persister.log_decision(
@@ -1721,6 +1758,7 @@ class OrchestratorAgent(BaseAgent):
                     "validation_failures": result.validation_failures,
                     "validation_dsr": validation_dsr,
                     "validation_holdout": validation_holdout,
+                    "validation_robustness": validation_robustness,
                 },
                 reasoning_text=(
                     f"Walk-forward validation on genome {genome.id} "

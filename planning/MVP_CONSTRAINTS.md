@@ -42,6 +42,19 @@ References:
     later runs.
   - A run whose window is under 366 days reserves no holdout, and nothing
     from it can pass validation.
+  - Parameter robustness (AFX-153): a genome that passes Gate B and the
+    Deflated Sharpe bar has each tunable number in its strategy nudged
+    ±10%, one at a time, and every nudged copy is re-run on the
+    walk-forward OOS folds (never the sealed holdout). Tunable numbers
+    are indicator settings, nonzero entry thresholds, stop, target,
+    maximum and minimum hold; risk per trade is not nudged. Whole-number
+    settings move at least 1, and every value stays within the DSL's
+    allowed range. Every nudged copy must have positive median OOS net
+    return after costs, keep every OOS fold's drawdown at or under 10%,
+    and keep at least 50% of the genome's median OOS Sharpe and net
+    return. Every copy is tested and the record names each failing
+    number. A failure rejects the genome before it reaches the sealed
+    holdout.
 - Minimum trades in OOS: ≥ 300 trades or ≥ 3 months of activity (whichever later)
 - OOS thresholds to pass Gate B:
   - Sharpe ≥ 1.0

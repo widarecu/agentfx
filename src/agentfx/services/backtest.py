@@ -3,6 +3,9 @@ from __future__ import annotations
 import glob
 import logging
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -435,6 +438,24 @@ def _lookup_typical_spread(instrument: str) -> float | None:
     return found.get(instrument)
 
 
+_candle_cache: ContextVar[dict[tuple, pd.DataFrame] | None] = ContextVar(
+    "agentfx_candle_cache", default=None
+)
+
+
+@contextmanager
+def reuse_candles() -> Iterator[None]:
+    """Within this block, ``run_backtest_from_db`` loads each candle
+    window from the database once. Used by the ±10% robustness check
+    (AFX-153), which backtests many variants of one strategy on the same
+    OOS folds."""
+    token = _candle_cache.set({})
+    try:
+        yield
+    finally:
+        _candle_cache.reset(token)
+
+
 def run_backtest_from_db(
     instrument: str,
     granularity: str = "M1",
@@ -503,14 +524,21 @@ def run_backtest_from_db(
         else:
             spread_pips = looked_up
 
-    # Load data from database
-    df = load_price_df_from_db(
-        instrument=instrument,
-        granularity=granularity,
-        start=start,
-        end=end,
-        **({"require_full_window": True} if require_full_window else {}),
-    )
+    # Load data from database (once per window inside `reuse_candles`)
+    cache = _candle_cache.get()
+    cache_key = (instrument, granularity, start, end, require_full_window)
+    if cache is not None and cache_key in cache:
+        df = cache[cache_key]
+    else:
+        df = load_price_df_from_db(
+            instrument=instrument,
+            granularity=granularity,
+            start=start,
+            end=end,
+            **({"require_full_window": True} if require_full_window else {}),
+        )
+        if cache is not None:
+            cache[cache_key] = df
 
     # Pip size for the instrument — needed for both cost application and
     # DSL strategies (their stop/target are in pips).

@@ -895,6 +895,7 @@ def get_genome_with_lineage(
         "validation_failures": list(genome.validation_failures or []),
         "validation_dsr": genome.validation_dsr,
         "validation_holdout": genome.validation_holdout,
+        "validation_robustness": genome.validation_robustness,
         "llm_reasoning": genome.llm_reasoning,
         "llm_call_id": genome.llm_call_id,
         "created_at": genome.created_at,
@@ -1274,6 +1275,7 @@ class SqlAlchemyPersister:
         validation_failures: list[str],
         validation_dsr: dict[str, Any] | None = None,
         validation_holdout: dict[str, Any] | None = None,
+        validation_robustness: dict[str, Any] | None = None,
     ) -> None:
         # Persist each fold row
         for fe in folds:
@@ -1323,6 +1325,7 @@ class SqlAlchemyPersister:
             genome.validation_failures = list(validation_failures)
             genome.validation_dsr = validation_dsr
             genome.validation_holdout = validation_holdout
+            genome.validation_robustness = validation_robustness
 
         # Close this genome's holdout claim with the verdict. A claim whose
         # backtest crashed stays open (passed NULL): spent, no verdict.

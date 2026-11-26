@@ -31,6 +31,7 @@ from agentfx.agents.orchestrator import (
 from agentfx.agents.validator import (
     FoldEvaluation,
     HoldoutEvidence,
+    RobustnessEvidence,
     ValidationResult,
     ValidatorAgent,
 )
@@ -126,6 +127,7 @@ class MockPersister:
         validation_failures: list[str],
         validation_dsr: dict[str, Any] | None = None,
         validation_holdout: dict[str, Any] | None = None,
+        validation_robustness: dict[str, Any] | None = None,
     ) -> None:
         self.validations.append(
             {
@@ -135,6 +137,7 @@ class MockPersister:
                 "validation_failures": validation_failures,
                 "validation_dsr": validation_dsr,
                 "validation_holdout": validation_holdout,
+                "validation_robustness": validation_robustness,
             }
         )
 
@@ -264,14 +267,37 @@ def _holdout_evidence(status: str = "passed") -> HoldoutEvidence:
     )
 
 
+def _robustness_evidence(status: str = "passed") -> RobustnessEvidence:
+    return RobustnessEvidence(
+        status=status,
+        reason=(
+            "Parameter robustness passed: 12 ±10% variants of 8 parameters "
+            "held up on OOS"
+            if status == "passed"
+            else "Parameter robustness failed on 1 of 8 parameters: "
+            "entry.long.lhs.args[0] (rsi argument 1) down to 9: "
+            "Sharpe 0.30 keeps under 50% of baseline 1.50"
+        ),
+        perturbation=0.10,
+        min_retention=0.5,
+        max_drawdown_cap=0.10,
+        failed_parameters=[] if status == "passed" else ["entry.long.lhs.args[0]"],
+    )
+
+
 def _make_validator_returning(
     validator_passed: bool = True,
     failures: list[str] | None = None,
     holdout_status: str = "passed",
+    robustness_status: str = "passed",
 ) -> ValidatorAgent:
     """Build a ValidatorAgent whose .validate() returns a fixed result
-    and whose sealed-holdout check returns ``holdout_status``."""
+    and whose robustness and sealed-holdout checks return the given
+    statuses."""
     validator = ValidatorAgent(k=4)
+    validator.evaluate_robustness = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda *a, **k: _robustness_evidence(robustness_status)
+    )
     validator.evaluate_holdout = MagicMock(  # type: ignore[method-assign]
         side_effect=lambda *a, **k: _holdout_evidence(holdout_status)
     )
@@ -2022,3 +2048,90 @@ class TestSealedHoldout:
         assert max(seen) == cutoff
         # Only the holdout check itself is handed the holdout.
         assert validator.evaluate_holdout.call_args.kwargs["holdout_window"][1] > cutoff
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ±10% parameter robustness (AFX-153)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestParameterRobustness:
+    def test_finalist_is_checked_and_the_result_is_recorded(self) -> None:
+        validator = _make_validator_returning(validator_passed=True)
+        calls: list[str] = []
+        validator.evaluate_robustness.side_effect = lambda *a, **k: (
+            calls.append("robustness") or _robustness_evidence()
+        )
+        validator.evaluate_holdout.side_effect = lambda *a, **k: (
+            calls.append("holdout") or _holdout_evidence()
+        )
+        orchestrator, persister = _build_orchestrator(validator=validator)
+        summary = orchestrator.run_loop()
+
+        assert calls == ["robustness", "holdout"]
+        [call] = validator.evaluate_robustness.call_args_list
+        assert call.args[0] is validator.validate.return_value
+        assert call.kwargs["instrument"] == "EUR_USD"
+        assert call.kwargs["granularity"] == "M1"
+        assert call.kwargs["gate_b_overrides"] == {
+            "min_cagr": orchestrator.config.min_cagr_pct
+        }
+        assert "holdout_window" not in call.kwargs
+        [record] = persister.validations
+        assert record["validator_passed"] is True
+        assert record["validation_robustness"]["status"] == "passed"
+        assert record["validation_robustness"]["min_retention"] == 0.5
+        assert summary.validated_count == 1
+        [decision] = [d for d in persister.decisions if d.action == "validate"]
+        assert decision.outputs_json["validation_robustness"]["status"] == "passed"
+
+    def test_fragile_finalist_is_rejected_and_never_spends_the_holdout(self) -> None:
+        validator = _make_validator_returning(
+            validator_passed=True, robustness_status="failed"
+        )
+        orchestrator, persister = _build_orchestrator(validator=validator)
+        summary = orchestrator.run_loop()
+
+        [record] = persister.validations
+        assert record["validator_passed"] is False
+        assert record["validation_failures"] == [
+            _robustness_evidence("failed").reason
+        ]
+        assert record["validation_robustness"]["failed_parameters"] == [
+            "entry.long.lhs.args[0]"
+        ]
+        assert persister.holdout_claims == []
+        validator.evaluate_holdout.assert_not_called()
+        assert record["validation_holdout"] is None
+        assert summary.validated_count == 0
+
+    def test_gate_b_failure_is_never_checked(self) -> None:
+        validator = _make_validator_returning(
+            validator_passed=False, failures=["Sharpe 0.30 < 1.0"]
+        )
+        orchestrator, persister = _build_orchestrator(validator=validator)
+        orchestrator.run_loop()
+
+        validator.evaluate_robustness.assert_not_called()
+        [record] = persister.validations
+        assert record["validation_robustness"] is None
+
+    def test_deflated_sharpe_failure_is_never_checked(self) -> None:
+        validator = _make_validator_returning(validator_passed=True)
+        validator.validate.return_value.dsr_sample = "no full OOS returns"
+        orchestrator, persister = _build_orchestrator(validator=validator)
+        orchestrator.run_loop()
+
+        validator.evaluate_robustness.assert_not_called()
+
+    def test_crashed_check_rejects_without_spending_the_holdout(self) -> None:
+        validator = _make_validator_returning(validator_passed=True)
+        validator.evaluate_robustness.side_effect = RuntimeError("bug")
+        orchestrator, persister = _build_orchestrator(validator=validator)
+        orchestrator.run_loop()
+
+        [record] = persister.validations
+        assert record["validator_passed"] is False
+        assert record["validation_robustness"]["status"] == "error"
+        assert persister.holdout_claims == []
+        validator.evaluate_holdout.assert_not_called()
