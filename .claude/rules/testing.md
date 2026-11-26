@@ -20,7 +20,7 @@ Always run tests through `make`. The targets set `ENVIRONMENT=test` and `PYTHONP
 | One file / pattern | `make test-file FILE=...` / `make test-pattern PATTERN=...` | |
 | Indicator parity fixture | `make dump-indicator-fixtures` after editing `src/agentfx/core/dsl/indicators.py`; `make verify-fixtures` to check | CI also runs `verify-fixtures` |
 
-**Never** run bare `pytest`, `python -m pytest`, `npx vitest`, `cd portal/web && npm test` or `python scripts/dump_indicator_fixtures.py`. They load the wrong config or skip the fixture staleness check. The guard hook refuses the first three. If you truly must call pytest directly: `ENVIRONMENT=test PYTHONPATH=src .venv/bin/pytest tests/unit/ -v`. `cd portal/web && npm run test:watch` is acceptable during TDD only.
+**Never** run bare `pytest`, `python -m pytest`, `uv run pytest`, `npx vitest`, `cd portal/web && npm test` or `python scripts/dump_indicator_fixtures.py`. They load the wrong config or skip the fixture staleness check. The guard hook refuses the direct test runner commands. If you truly must call pytest directly: `ENVIRONMENT=test PYTHONPATH=src .venv/bin/pytest tests/unit/ -v`. `cd portal/web && npm run test:watch` is acceptable during TDD only.
 
 ## Markers
 

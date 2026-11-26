@@ -56,7 +56,7 @@ _PERMISSIVE_EXIT = ExitRules(
     opposite_signal=True,
 )
 
-_DEFAULT_SIZE = SizeRules(risk_pct=0.005)
+_DEFAULT_SIZE = SizeRules(risk_pct=0.01)
 
 
 def ma_crossover_seed(fast: int = 20, slow: int = 50) -> StrategySpec:

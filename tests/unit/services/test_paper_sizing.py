@@ -37,6 +37,7 @@ class TestComputePositionUnits:
             account_currency="USD",
             risk_pct=0.005,
             stop_pips=20,
+            entry_close=1.10,
             safety_cap_units=None,
             client=client,
         )
@@ -65,6 +66,7 @@ class TestComputePositionUnits:
             account_currency="AUD",
             risk_pct=0.005,
             stop_pips=22,
+            entry_close=1.10,
             safety_cap_units=None,
             client=client,
         )
@@ -84,6 +86,7 @@ class TestComputePositionUnits:
             account_currency="USD",
             risk_pct=0.005,
             stop_pips=20,
+            entry_close=1.10,
             safety_cap_units=500_000,
             client=client,
         )
@@ -101,6 +104,7 @@ class TestComputePositionUnits:
             account_currency="USD",
             risk_pct=0.005,
             stop_pips=0,
+            entry_close=1.10,
             safety_cap_units=None,
             client=client,
         )
@@ -119,9 +123,37 @@ class TestComputePositionUnits:
                 account_currency="ZWL",  # nonsense currency
                 risk_pct=0.005,
                 stop_pips=20,
+                entry_close=1.10,
                 safety_cap_units=None,
                 client=client,
             )
+
+    @pytest.mark.parametrize(
+        ("instrument", "entry_close", "currency", "quotes", "expected"),
+        [
+            ("EUR_USD", 1.12, "USD", [], 267_857),
+            ("EUR_USD", 1.10, "AUD", [[], [{"bid": 0.66, "ask": 0.66}]], 180_000),
+            ("USD_JPY", 150.0, "USD", [[], [{"bid": 150.0, "ask": 150.0}]], 300_000),
+        ],
+    )
+    def test_leverage_clamps_in_account_currency(
+        self, caplog, instrument, entry_close, currency, quotes, expected
+    ):
+        client = MagicMock()
+        client.get_pricing.side_effect = quotes
+        result = compute_position_units(
+            instrument=instrument,
+            balance=10_000,
+            account_currency=currency,
+            risk_pct=0.02,
+            stop_pips=5,
+            entry_close=entry_close,
+            safety_cap_units=None,
+            client=client,
+        )
+        assert result.desired_units > result.capped_units == expected
+        assert result.notes == "capped_at_leverage_limit_30_to_1"
+        assert "Paper leverage cap hit" in caplog.text
 
 
 class TestComputeFailsafeSLPips:

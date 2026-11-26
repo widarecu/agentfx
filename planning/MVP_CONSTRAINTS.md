@@ -46,6 +46,7 @@ References:
   - Sharpe ratio: ≥ 1.0 (`PAPER_FORWARD_TEST_MIN_SHARPE`)
   - Max drawdown: ≤ 10% live cap (`PAPER_FORWARD_TEST_MAX_DRAWDOWN`); breaching this fails live eligibility early without auto-halting paper trading
   - Backtest-vs-paper divergence: Sharpe degradation ≤ 30% vs the genome's locked OOS Sharpe (`PAPER_FORWARD_TEST_MAX_DIVERGENCE`)
+- Future live deploy flow: the operator chooses risk per trade for each deployment. Default to **Safer** (the genome's risk per trade, capped at the 0.5% MVP live limit). Offer **Same as paper** (the genome's own risk per trade) as an explicit choice. This requirement does not authorize relaxing the current live limit; any live use above that limit requires a separately approved policy change.
 - Latency SLOs: Paper p95 < 1s; Live p95 < 500ms end-to-end decision loop
 - Reliability: auto-retry with backoff; circuit breaker on 5 consecutive broker failures or p95 latency > 2x SLO for 10 minutes
 - Rollback: disable strategy via feature flag; fail-safe to flat positions

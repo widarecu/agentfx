@@ -27,6 +27,13 @@ from agentfx.api.models import AgentWorkspaceRun, AgentWorkspaceRunStatus
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _reset_devin_auth():
+    pe_workspace.reset_devin_auth_state()
+    yield
+    pe_workspace.reset_devin_auth_state()
+
+
 @pytest.fixture
 def engine():
     eng = create_engine("sqlite:///:memory:")
@@ -57,6 +64,18 @@ def _spec(**overrides) -> pe_workspace.WorkspaceTaskSpec:
     )
     defaults.update(overrides)
     return pe_workspace.WorkspaceTaskSpec(**defaults)
+
+
+@pytest.mark.parametrize(
+    "build_prompt",
+    [pe_workspace._build_managed_kickoff, pe_workspace._build_devin_prompt],
+)
+def test_workspace_prompt_requires_repo_guidance(build_prompt) -> None:
+    prompt = build_prompt(spec=_spec(), agent_branch="agent/example")
+    assert (
+        'Read `CLAUDE.md` first, then the files its "Read before changing" table '
+        "lists for the paths you will touch."
+    ) in prompt
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -565,6 +584,7 @@ class TestDevinPollRow:
 
     def test_still_running_leaves_row_alone(self, monkeypatch):
         monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_ORG_ID", "org-test")
 
         class _Resp:
             status_code = 200
@@ -582,6 +602,7 @@ class TestDevinPollRow:
     def test_idle_session_with_pr_flips_pr_open(self, monkeypatch):
         """AFX-134: a session waiting after its PR is done, not running."""
         monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_ORG_ID", "org-test")
 
         class _Resp:
             status_code = 200
@@ -604,6 +625,7 @@ class TestDevinPollRow:
 
     def test_finished_with_pr_url_flips_pr_open(self, monkeypatch):
         monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_ORG_ID", "org-test")
         monkeypatch.setattr(pe_workspace.settings, "DEVIN_ACU_USD_RATE", 2.5)
 
         class _Resp:
@@ -630,6 +652,7 @@ class TestDevinPollRow:
 
     def test_finished_without_pr_flips_failed(self, monkeypatch):
         monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_ORG_ID", "org-test")
 
         class _Resp:
             status_code = 200
@@ -649,6 +672,7 @@ class TestDevinPollRow:
         this row forever, mark it failed so the sweeper + budget can
         reconcile."""
         monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_ORG_ID", "org-test")
 
         class _Resp:
             status_code = 404
@@ -666,6 +690,7 @@ class TestDevinPollRow:
 
     def test_transient_http_error_leaves_row_alone(self, monkeypatch):
         monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_ORG_ID", "org-test")
 
         class _Resp:
             status_code = 500
@@ -684,6 +709,15 @@ class TestDevinPollRow:
         """No credential → can't poll. Row untouched; stuck-sweeper
         will reclaim on TTL if credentials don't come back."""
         monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "")
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_ORG_ID", "org-test")
+        row = self._row()
+        outcome = pe_workspace._poll_devin_row(row, now=datetime.now(UTC))
+        assert outcome == "poll_error"
+        assert row.status == AgentWorkspaceRunStatus.RUNNING
+
+    def test_missing_org_id_returns_poll_error(self, monkeypatch):
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_ORG_ID", "")
         row = self._row()
         outcome = pe_workspace._poll_devin_row(row, now=datetime.now(UTC))
         assert outcome == "poll_error"
@@ -1348,6 +1382,7 @@ class TestSessionHygiene:
 
     def _seed_devin(self, db, monkeypatch, body):
         monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_ORG_ID", "org-test")
 
         class _Resp:
             status_code = 200
@@ -1394,6 +1429,7 @@ class TestSessionHygiene:
     def test_pr_open_session_cost_refreshes_until_it_ends(self, db, monkeypatch):
         """AFX-135: spend after the PR opens still counts toward the cap."""
         monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_ORG_ID", "org-test")
         monkeypatch.setattr(pe_workspace.settings, "DEVIN_ACU_USD_RATE", 2.0)
         pr = {"url": "https://github.com/widarecu/agentfx/pull/9"}
         replies = iter(
@@ -1441,6 +1477,7 @@ class TestSessionHygiene:
 
     def test_pr_open_session_gone_keeps_pr_open(self, db, monkeypatch):
         monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_x")
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_ORG_ID", "org-test")
 
         class _Resp:
             status_code = 404
@@ -1708,3 +1745,394 @@ class TestSessionHygiene:
             )
             is True
         )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Devin v3 polling + consecutive 401/403 fail-fast / alert / pause (AFX-150)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestDevinPollV3AndAuthGuard:
+    """Covers AFX-150: v3 org session endpoint + schema, consecutive 401/403
+    fail-fast, Linear escalation, one-shot Wilson alert, single-403 recovery,
+    and Devin dispatch pause/resume."""
+
+    def _seed_devin_row(
+        self,
+        db,
+        *,
+        row_id="devin-row-1",
+        session_id="a6d66d71a2c149f79b2dd93adc9ef3a7",
+        identifier="AFX-150",
+        status=AgentWorkspaceRunStatus.RUNNING,
+    ) -> AgentWorkspaceRun:
+        now = datetime.now(UTC)
+        row = AgentWorkspaceRun(
+            id=row_id,
+            pe_proposal_decision_key=identifier,
+            linear_issue_identifier=identifier,
+            adapter="devin",
+            status=status,
+            provider_run_id=session_id,
+            created_at=now,
+            started_at=now,
+        )
+        db.add(row)
+        db.commit()
+        return row
+
+    def _patch_creds(self, monkeypatch):
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_API_KEY", "cog_test_key")
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_ORG_ID", "org-test-123")
+
+    def _patch_linear(self, monkeypatch):
+        from agentfx.agents.fleet import linear_pe_queue
+
+        calls: list[dict] = []
+
+        def fake_handle(identifier, *, comment_body, escalate):
+            calls.append(
+                {
+                    "identifier": identifier,
+                    "body": comment_body,
+                    "escalate": escalate,
+                }
+            )
+            return True
+
+        monkeypatch.setattr(
+            linear_pe_queue, "handle_stuck_session_failure", fake_handle
+        )
+        return calls
+
+    def _patch_alerts(self, monkeypatch):
+        from agentfx.notifications import email as email_mod
+
+        sent: list[dict] = []
+
+        def fake_send(*, agent_role, subject, body, html_body=None):
+            sent.append({"agent_role": agent_role, "subject": subject, "body": body})
+            return True
+
+        monkeypatch.setattr(email_mod, "send_agent_message", fake_send)
+        return sent
+
+    def test_v3_endpoint_url_and_response_schema(self, db, monkeypatch):
+        """Poller calls GET /v3/organizations/{org_id}/sessions/devin-{id}
+        and parses v3 fields (`status`, `status_detail`, `pull_requests`,
+        `acus_consumed`), preferring open/merged PR over closed ones."""
+        self._patch_creds(monkeypatch)
+        monkeypatch.setattr(pe_workspace.settings, "DEVIN_ACU_USD_RATE", 2.0)
+        seen_urls: list[str] = []
+
+        class _Resp:
+            status_code = 200
+            text = "{}"
+
+            def json(self_inner):
+                return {
+                    "session_id": "devin-a6d66d71a2c149f79b2dd93adc9ef3a7",
+                    "status": "suspended",
+                    "status_detail": "inactivity",
+                    "pull_requests": [
+                        {
+                            "pr_url": "https://github.com/widarecu/agentfx/pull/186",
+                            "pr_state": "closed",
+                        },
+                        {
+                            "pr_url": "https://github.com/widarecu/agentfx/pull/191",
+                            "pr_state": "open",
+                        },
+                    ],
+                    "acus_consumed": 1.5,
+                }
+
+        def fake_get(url, **kwargs):
+            seen_urls.append(url)
+            return _Resp()
+
+        monkeypatch.setattr(pe_workspace.requests, "get", fake_get)
+        self._seed_devin_row(db)
+
+        counts = pe_workspace.poll_running_dispatches(db)
+
+        assert seen_urls == [
+            "https://api.devin.ai/v3/organizations/org-test-123/sessions/"
+            "devin-a6d66d71a2c149f79b2dd93adc9ef3a7"
+        ]
+        assert counts["pr_open"] == 1
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.PR_OPEN
+        assert row.pr_url == "https://github.com/widarecu/agentfx/pull/191"
+        assert row.pr_number == 191
+        assert row.llm_usd == 3.0
+        assert row.ended_at is not None
+
+    def test_v3_session_id_already_prefixed_is_not_doubled(self, db, monkeypatch):
+        self._patch_creds(monkeypatch)
+        seen_urls: list[str] = []
+
+        class _Resp:
+            status_code = 200
+            text = "{}"
+
+            def json(self_inner):
+                return {"status": "running", "status_detail": "working"}
+
+        monkeypatch.setattr(
+            pe_workspace.requests,
+            "get",
+            lambda url, **kw: (seen_urls.append(url) or _Resp()),
+        )
+        self._seed_devin_row(db, session_id="devin-abc123")
+        pe_workspace.poll_running_dispatches(db)
+        assert seen_urls == [
+            "https://api.devin.ai/v3/organizations/org-test-123/sessions/devin-abc123"
+        ]
+
+    @pytest.mark.parametrize("status_code", [401, 403])
+    def test_consecutive_auth_refusals_fail_row_flag_linear_and_alert_once(
+        self, db, monkeypatch, status_code
+    ):
+        """After _DEVIN_AUTH_FAILURE_LIMIT consecutive 401/403 checks for the
+        same session: row is WORKSPACE_FAILED naming the status code, Linear
+        is flagged for attention, Wilson gets ONE alert (not one per check or
+        per session), and new Devin dispatches pause."""
+        self._patch_creds(monkeypatch)
+        linear_calls = self._patch_linear(monkeypatch)
+        alerts = self._patch_alerts(monkeypatch)
+
+        class _Resp:
+            text = '{"detail":"Unauthorized"}'
+
+        _Resp.status_code = status_code
+        monkeypatch.setattr(pe_workspace.requests, "get", lambda *a, **k: _Resp())
+
+        self._seed_devin_row(db, row_id="r1", session_id="aaa111", identifier="AFX-141")
+        self._seed_devin_row(db, row_id="r2", session_id="bbb222", identifier="AFX-142")
+
+        # Checks 1 and 2: below limit — rows stay RUNNING, no Linear call, no alert.
+        for _ in range(pe_workspace._DEVIN_AUTH_FAILURE_LIMIT - 1):
+            counts = pe_workspace.poll_running_dispatches(db)
+            assert counts["failed"] == 0
+            assert linear_calls == []
+            assert alerts == []
+            assert pe_workspace.devin_dispatch_pause_reason() is None
+
+        # Check 3: limit reached on both sessions.
+        counts = pe_workspace.poll_running_dispatches(db)
+        assert counts["failed"] == 2
+
+        rows = {r.id: r for r in db.query(AgentWorkspaceRun).all()}
+        for rid in ("r1", "r2"):
+            assert rows[rid].status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+            assert str(status_code) in (rows[rid].summary or "")
+            assert rows[rid].ended_at is not None
+
+        # Both Linear tickets flagged with the status code in the comment.
+        assert {c["identifier"] for c in linear_calls} == {"AFX-141", "AFX-142"}
+        for c in linear_calls:
+            assert str(status_code) in c["body"]
+
+        # Exactly ONE email alert to Wilson across all checks and both sessions.
+        assert len(alerts) == 1
+        assert alerts[0]["agent_role"] == "PE"
+        assert str(status_code) in alerts[0]["subject"]
+        assert str(status_code) in alerts[0]["body"]
+
+        # New Devin dispatches are now paused.
+        pause = pe_workspace.devin_dispatch_pause_reason()
+        assert pause is not None and str(status_code) in pause
+
+    def test_single_403_followed_by_success_does_not_fail(self, db, monkeypatch):
+        """A single 403 followed by a 200 resets the counter and marks nothing
+        failed."""
+        self._patch_creds(monkeypatch)
+        linear_calls = self._patch_linear(monkeypatch)
+        alerts = self._patch_alerts(monkeypatch)
+
+        class _Resp:
+            def __init__(self, code, payload=None):
+                self.status_code = code
+                self.text = ""
+                self._payload = payload or {}
+
+            def json(self):
+                return self._payload
+
+        responses = iter(
+            [
+                _Resp(403),
+                _Resp(200, {"status": "running", "status_detail": "working"}),
+                _Resp(403),
+                _Resp(403),
+            ]
+        )
+        monkeypatch.setattr(
+            pe_workspace.requests, "get", lambda *a, **k: next(responses)
+        )
+        self._seed_devin_row(db)
+
+        for _ in range(4):
+            counts = pe_workspace.poll_running_dispatches(db)
+            assert counts["failed"] == 0
+
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.RUNNING
+        assert linear_calls == []
+        assert alerts == []
+        assert pe_workspace.devin_dispatch_pause_reason() is None
+
+    def test_paused_devin_adapter_refuses_dispatch_until_probe_recovers(
+        self, db, monkeypatch
+    ):
+        """While paused, DevinWorkspaceAdapter.dispatch refuses without calling
+        sessions.create or inserting a DB row. After cooldown, a 200 recovery
+        probe clears the pause and allows dispatch again."""
+        self._patch_creds(monkeypatch)
+        self._patch_linear(monkeypatch)
+        alerts = self._patch_alerts(monkeypatch)
+        t0 = datetime(2026, 11, 25, 12, 0, tzinfo=UTC)
+
+        class _Resp:
+            def __init__(self, code, payload=None):
+                self.status_code = code
+                self.text = ""
+                self._payload = payload or {}
+
+            def json(self):
+                return self._payload
+
+        # Trip the pause with 3 consecutive 403s.
+        monkeypatch.setattr(pe_workspace.requests, "get", lambda *a, **k: _Resp(403))
+        self._seed_devin_row(db)
+        for _ in range(pe_workspace._DEVIN_AUTH_FAILURE_LIMIT):
+            pe_workspace.poll_running_dispatches(db, now=t0)
+
+        post_calls: list[str] = []
+
+        def fake_post(url, **kwargs):
+            post_calls.append(url)
+            return _Resp(200, {"session_id": "new_sess_1"})
+
+        monkeypatch.setattr(pe_workspace.requests, "post", fake_post)
+        adapter = pe_workspace.DevinWorkspaceAdapter()
+
+        # Before cooldown: refused immediately, no POST, no new row.
+        res1 = adapter.dispatch(db, spec=_spec(), now=t0 + timedelta(minutes=5))
+        assert res1.accepted is False
+        assert "devin_poll_auth_paused" in res1.reason
+        assert post_calls == []
+        assert db.query(AgentWorkspaceRun).count() == 1
+
+        # After cooldown, probe still returns 403 → stays paused, no extra alert.
+        t1 = t0 + timedelta(seconds=pe_workspace._DEVIN_AUTH_PROBE_COOLDOWN_SECONDS + 1)
+        res2 = adapter.dispatch(db, spec=_spec(), now=t1)
+        assert res2.accepted is False
+        assert post_calls == []
+        assert len(alerts) == 1
+
+        # After another cooldown, probe returns 200 → resumes and dispatches!
+        monkeypatch.setattr(pe_workspace.requests, "get", lambda *a, **k: _Resp(200))
+        t2 = t1 + timedelta(seconds=pe_workspace._DEVIN_AUTH_PROBE_COOLDOWN_SECONDS + 1)
+        res3 = adapter.dispatch(db, spec=_spec(), now=t2)
+        assert res3.accepted is True
+        assert res3.provider_run_id == "new_sess_1"
+        assert len(post_calls) == 1
+        assert pe_workspace.devin_dispatch_pause_reason(now=t2) is None
+
+    def test_other_session_succeeding_in_cycle_does_not_pause_dispatches(
+        self, db, monkeypatch
+    ):
+        """If session A polls 200 while session B hits 3 consecutive 403s,
+        session B fails and alerts once, but global dispatches stay enabled."""
+        self._patch_creds(monkeypatch)
+        self._patch_linear(monkeypatch)
+        alerts = self._patch_alerts(monkeypatch)
+
+        class _Resp:
+            def __init__(self, code, payload=None):
+                self.status_code = code
+                self.text = ""
+                self._payload = payload or {}
+
+            def json(self):
+                return self._payload
+
+        def fake_get(url, **kwargs):
+            if "devin-good" in url:
+                return _Resp(200, {"status": "running", "status_detail": "working"})
+            return _Resp(403)
+
+        monkeypatch.setattr(pe_workspace.requests, "get", fake_get)
+        self._seed_devin_row(
+            db, row_id="good-row", session_id="good", identifier="AFX-101"
+        )
+        self._seed_devin_row(
+            db, row_id="bad-row", session_id="bad", identifier="AFX-102"
+        )
+
+        for _ in range(pe_workspace._DEVIN_AUTH_FAILURE_LIMIT):
+            pe_workspace.poll_running_dispatches(db)
+
+        rows = {r.id: r for r in db.query(AgentWorkspaceRun).all()}
+        assert rows["good-row"].status == AgentWorkspaceRunStatus.RUNNING
+        assert rows["bad-row"].status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert len(alerts) == 1
+        assert pe_workspace.devin_dispatch_pause_reason() is None
+
+    def test_pr_open_cost_refresh_403_stops_polling_without_losing_pr_open(
+        self, db, monkeypatch
+    ):
+        self._patch_creds(monkeypatch)
+        linear_calls = self._patch_linear(monkeypatch)
+        alerts = self._patch_alerts(monkeypatch)
+
+        class _Resp:
+            status_code = 403
+            text = '{"detail":"Unauthorized"}'
+
+        monkeypatch.setattr(pe_workspace.requests, "get", lambda *a, **k: _Resp())
+        self._seed_devin_row(
+            db,
+            row_id="pr-row",
+            session_id="pr123",
+            status=AgentWorkspaceRunStatus.PR_OPEN,
+        )
+
+        for _ in range(pe_workspace._DEVIN_AUTH_FAILURE_LIMIT):
+            pe_workspace.poll_running_dispatches(db)
+
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.PR_OPEN
+        assert row.ended_at is not None
+        assert "403" in (row.summary or "")
+        assert linear_calls == []
+        assert len(alerts) == 1
+
+    def test_scan_and_dispatch_skips_linear_when_devin_paused(self, db, monkeypatch):
+        """platform_engineer.scan_and_dispatch should not touch Linear when
+        Devin dispatches are paused due to poll auth refusal."""
+        from agentfx.agents.fleet import platform_engineer
+
+        self._patch_creds(monkeypatch)
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_WORKSPACE_ENABLED", True)
+        monkeypatch.setattr(pe_workspace.settings, "AGENT_PE_BACKEND", "devin")
+        monkeypatch.setattr(pe_workspace.settings, "GITHUB_TOKEN", _FAKE_PAT)
+        pe_workspace._devin_auth_state.pause(
+            status_code=403, session_id="aaa", now=datetime.now(UTC)
+        )
+
+        linear_called = False
+
+        def fail_if_called(*a, **k):
+            nonlocal linear_called
+            linear_called = True
+            return []
+
+        monkeypatch.setattr(
+            platform_engineer, "list_ready_dispatch_candidates", fail_if_called
+        )
+        produced, attempted = platform_engineer.scan_and_dispatch(db=db)
+        assert (produced, attempted) == (0, 0)
+        assert linear_called is False

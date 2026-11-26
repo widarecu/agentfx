@@ -110,6 +110,22 @@ class TestDedupe:
         assert "dedupe_comment_failed" in result.action
         create.assert_not_called()
 
+    def test_open_match_comments_with_only_the_new_evidence(self, monkeypatch):
+        _enable(monkeypatch)
+        existing = {"id": "u", "identifier": "AFX-5", "url": "u"}
+        evidence = "Paper run: `run_new`\n\nTwo orders opened for a single signal."
+        spec = _spec(evidence=evidence, body="## Proposed fix\n\nGuard order dispatch.")
+        with (
+            patch.object(linear_client, "_build_client"),
+            patch.object(
+                linear_client, "_search_open_by_fingerprint", return_value=existing
+            ),
+            patch.object(linear_client, "_add_comment", return_value=True) as add,
+        ):
+            result = linear_client.file_finding(spec)
+        assert result.action == "commented"
+        assert add.call_args.kwargs == {"issue_id": "u", "body": evidence}
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Cap
@@ -254,6 +270,20 @@ class TestRendering:
         assert "Saw it again." in rendered
         assert "qa:test:xyz" in rendered
 
+    def test_reopen_comment_uses_new_evidence_and_retains_closure_context(self):
+        evidence = "Paper run: `run_new`\n\nTwo orders opened for a single signal."
+        spec = _spec(evidence=evidence, body="## Proposed fix\n\nGuard order dispatch.")
+        rendered = linear_client._render_reopen_comment(
+            spec,
+            closed_state="Done",
+            closed_at="2026-10-25T10:00:00Z",
+            now=datetime(2026, 10, 26, 10, 0, tzinfo=UTC),
+        )
+        assert "This issue has come back" in rendered
+        assert "previously closed as Done on 2026-10-25" in rendered
+        assert evidence in rendered
+        assert spec.body not in rendered
+
     def test_search_marker_is_substring_of_rendered_body(self):
         """AFX-76 pin: the string `_search_open_by_fingerprint` sends to
         Linear's `description: { contains }` filter MUST be a substring
@@ -373,3 +403,287 @@ class TestGqlErrorSurfacing:
         session.post.return_value = resp
         with pytest.raises(requests.exceptions.HTTPError):
             linear_client._gql(session, "query X { a }", {})
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Closed-issue reopening & Duplicate resolution (AFX-149)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestReopenClosedIssues:
+    """AFX-149: closed issues that recur are reopened to Triage instead
+    of re-filed, and Duplicate tickets resolve to their canonical target."""
+
+    def test_open_issue_returns_state_name(self, monkeypatch):
+        _enable(monkeypatch)
+        existing = {
+            "id": "uuid-open",
+            "identifier": "AFX-51",
+            "url": "https://linear.app/agentfx/issue/AFX-51",
+            "state": {"name": "In Progress", "type": "started"},
+        }
+        with (
+            patch.object(linear_client, "_build_client", return_value=MagicMock()),
+            patch.object(
+                linear_client, "_search_open_by_fingerprint", return_value=existing
+            ),
+            patch.object(
+                linear_client, "_search_closed_by_fingerprint"
+            ) as search_closed,
+            patch.object(linear_client, "_add_comment", return_value=True),
+            patch.object(linear_client, "_update_issue_state") as update_state,
+        ):
+            result = linear_client.file_finding(_spec())
+        assert result.filed is True
+        assert result.action == "commented"
+        assert result.identifier == "AFX-51"
+        assert result.state_name == "In Progress"
+        # Open match takes precedence — closed search and state updates never run.
+        search_closed.assert_not_called()
+        update_state.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "state_name,state_type,closed_field",
+        [
+            ("Done", "completed", "completedAt"),
+            ("Canceled", "canceled", "canceledAt"),
+        ],
+    )
+    def test_closed_done_or_canceled_reopens_to_triage_with_comment(
+        self, monkeypatch, state_name, state_type, closed_field
+    ):
+        _enable(monkeypatch)
+        # Even when daily cap is 0, reopens must still proceed.
+        monkeypatch.setattr(
+            linear_client.settings, "AGENT_LINEAR_DAILY_CAP_PER_AGENT", 0
+        )
+        closed_issue = {
+            "id": "uuid-closed",
+            "identifier": "AFX-88",
+            "url": "https://linear.app/agentfx/issue/AFX-88",
+            closed_field: "2026-11-20T14:30:00.000Z",
+            "state": {"name": state_name, "type": state_type},
+            "relations": {"nodes": []},
+        }
+        with (
+            patch.object(linear_client, "_build_client", return_value=MagicMock()),
+            patch.object(
+                linear_client, "_search_open_by_fingerprint", return_value=None
+            ),
+            patch.object(
+                linear_client,
+                "_search_closed_by_fingerprint",
+                return_value=[closed_issue],
+            ),
+            patch.object(
+                linear_client, "_resolve_triage_state_id", return_value="state-triage"
+            ),
+            patch.object(
+                linear_client, "_update_issue_state", return_value=True
+            ) as update_state,
+            patch.object(
+                linear_client, "_add_comment", return_value=True
+            ) as add_comment,
+            patch.object(linear_client, "_create_triage_issue") as create,
+        ):
+            result = linear_client.file_finding(
+                _spec(), now=datetime(2026, 11, 25, 12, 0, tzinfo=UTC)
+            )
+        assert result.filed is True
+        assert result.action == "reopened"
+        assert result.identifier == "AFX-88"
+        assert result.url == "https://linear.app/agentfx/issue/AFX-88"
+        assert result.state_name == state_name
+        update_state.assert_called_once()
+        assert update_state.call_args.kwargs["issue_id"] == "uuid-closed"
+        assert update_state.call_args.kwargs["state_id"] == "state-triage"
+        add_comment.assert_called_once()
+        comment_body = add_comment.call_args.kwargs["body"]
+        assert "come back" in comment_body.lower()
+        assert "2026-11-20" in comment_body
+        assert "Some details." in comment_body
+        create.assert_not_called()
+
+    def test_prefers_done_over_canceled_and_most_recent_within_tier(self, monkeypatch):
+        _enable(monkeypatch)
+        canceled_newer = {
+            "id": "uuid-can",
+            "identifier": "AFX-75",
+            "url": "https://linear.app/agentfx/issue/AFX-75",
+            "canceledAt": "2026-11-24T00:00:00Z",
+            "state": {"name": "Canceled", "type": "canceled"},
+            "relations": {"nodes": []},
+        }
+        done_older = {
+            "id": "uuid-done-1",
+            "identifier": "AFX-58",
+            "url": "https://linear.app/agentfx/issue/AFX-58",
+            "completedAt": "2026-11-10T00:00:00Z",
+            "state": {"name": "Done", "type": "completed"},
+            "relations": {"nodes": []},
+        }
+        done_newer = {
+            "id": "uuid-done-2",
+            "identifier": "AFX-60",
+            "url": "https://linear.app/agentfx/issue/AFX-60",
+            "completedAt": "2026-11-22T00:00:00Z",
+            "state": {"name": "Done", "type": "completed"},
+            "relations": {"nodes": []},
+        }
+        with (
+            patch.object(linear_client, "_build_client", return_value=MagicMock()),
+            patch.object(
+                linear_client, "_search_open_by_fingerprint", return_value=None
+            ),
+            patch.object(
+                linear_client,
+                "_search_closed_by_fingerprint",
+                return_value=[canceled_newer, done_older, done_newer],
+            ),
+            patch.object(
+                linear_client, "_resolve_triage_state_id", return_value="state-triage"
+            ),
+            patch.object(
+                linear_client, "_update_issue_state", return_value=True
+            ) as update_state,
+            patch.object(linear_client, "_add_comment", return_value=True),
+        ):
+            result = linear_client.file_finding(_spec())
+        assert result.filed is True
+        assert result.action == "reopened"
+        assert result.identifier == "AFX-60"
+        assert update_state.call_args.kwargs["issue_id"] == "uuid-done-2"
+
+    def test_duplicate_with_open_target_comments_on_target(self, monkeypatch):
+        _enable(monkeypatch)
+        dup_issue = {
+            "id": "uuid-dup",
+            "identifier": "AFX-90",
+            "url": "https://linear.app/agentfx/issue/AFX-90",
+            "canceledAt": "2026-11-21T00:00:00Z",
+            "state": {"name": "Duplicate", "type": "duplicate"},
+            "relations": {
+                "nodes": [
+                    {
+                        "type": "duplicate",
+                        "relatedIssue": {
+                            "id": "uuid-canon",
+                            "identifier": "AFX-49",
+                            "url": "https://linear.app/agentfx/issue/AFX-49",
+                            "state": {"name": "In Progress", "type": "started"},
+                        },
+                    }
+                ]
+            },
+        }
+        with (
+            patch.object(linear_client, "_build_client", return_value=MagicMock()),
+            patch.object(
+                linear_client, "_search_open_by_fingerprint", return_value=None
+            ),
+            patch.object(
+                linear_client,
+                "_search_closed_by_fingerprint",
+                return_value=[dup_issue],
+            ),
+            patch.object(
+                linear_client, "_add_comment", return_value=True
+            ) as add_comment,
+            patch.object(linear_client, "_update_issue_state") as update_state,
+            patch.object(linear_client, "_create_triage_issue") as create,
+        ):
+            result = linear_client.file_finding(_spec())
+        assert result.filed is True
+        assert result.action == "commented"
+        assert result.identifier == "AFX-49"
+        assert result.state_name == "In Progress"
+        add_comment.assert_called_once()
+        assert add_comment.call_args.kwargs["issue_id"] == "uuid-canon"
+        update_state.assert_not_called()
+        create.assert_not_called()
+
+    def test_duplicate_with_closed_target_reopens_target_not_duplicate(
+        self, monkeypatch
+    ):
+        _enable(monkeypatch)
+        dup_issue = {
+            "id": "uuid-dup",
+            "identifier": "AFX-91",
+            "url": "https://linear.app/agentfx/issue/AFX-91",
+            "canceledAt": "2026-11-21T00:00:00Z",
+            "state": {"name": "Duplicate", "type": "duplicate"},
+            "relations": {
+                "nodes": [
+                    {
+                        "type": "duplicate",
+                        "relatedIssue": {
+                            "id": "uuid-canon",
+                            "identifier": "AFX-50",
+                            "url": "https://linear.app/agentfx/issue/AFX-50",
+                            "completedAt": "2026-11-18T00:00:00Z",
+                            "state": {"name": "Done", "type": "completed"},
+                        },
+                    }
+                ]
+            },
+        }
+        with (
+            patch.object(linear_client, "_build_client", return_value=MagicMock()),
+            patch.object(
+                linear_client, "_search_open_by_fingerprint", return_value=None
+            ),
+            patch.object(
+                linear_client,
+                "_search_closed_by_fingerprint",
+                return_value=[dup_issue],
+            ),
+            patch.object(
+                linear_client, "_resolve_triage_state_id", return_value="state-triage"
+            ),
+            patch.object(
+                linear_client, "_update_issue_state", return_value=True
+            ) as update_state,
+            patch.object(
+                linear_client, "_add_comment", return_value=True
+            ) as add_comment,
+            patch.object(linear_client, "_create_triage_issue") as create,
+        ):
+            result = linear_client.file_finding(_spec())
+        assert result.filed is True
+        assert result.action == "reopened"
+        assert result.identifier == "AFX-50"
+        assert result.state_name == "Done"
+        assert update_state.call_args.kwargs["issue_id"] == "uuid-canon"
+        assert add_comment.call_args.kwargs["issue_id"] == "uuid-canon"
+        create.assert_not_called()
+
+    def test_reopen_failure_does_not_create_duplicate(self, monkeypatch):
+        _enable(monkeypatch)
+        closed_issue = {
+            "id": "uuid-closed",
+            "identifier": "AFX-88",
+            "url": "https://linear.app/agentfx/issue/AFX-88",
+            "completedAt": "2026-11-20T00:00:00Z",
+            "state": {"name": "Done", "type": "completed"},
+            "relations": {"nodes": []},
+        }
+        with (
+            patch.object(linear_client, "_build_client", return_value=MagicMock()),
+            patch.object(
+                linear_client, "_search_open_by_fingerprint", return_value=None
+            ),
+            patch.object(
+                linear_client,
+                "_search_closed_by_fingerprint",
+                return_value=[closed_issue],
+            ),
+            patch.object(
+                linear_client, "_resolve_triage_state_id", return_value="state-triage"
+            ),
+            patch.object(linear_client, "_update_issue_state", return_value=False),
+            patch.object(linear_client, "_create_triage_issue") as create,
+        ):
+            result = linear_client.file_finding(_spec())
+        assert result.filed is False
+        assert result.action == "skipped:reopen_failed"
+        create.assert_not_called()

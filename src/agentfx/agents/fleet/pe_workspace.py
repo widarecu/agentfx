@@ -54,6 +54,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from threading import Lock
 from typing import Protocol
 
 import requests
@@ -65,9 +66,236 @@ from agentfx.api.models import AgentWorkspaceRun, AgentWorkspaceRunStatus
 
 logger = logging.getLogger(__name__)
 
+# Keep workspace state and spend checks ordered across the fleet and webhook workers.
+pe_workspace_operation_lock = Lock()
+
 _DEVIN_API_BASE = "https://api.devin.ai"
 _DEVIN_HTTP_TIMEOUT_SECONDS = 30.0
-_DEVIN_TERMINAL_STATUSES = {"finished", "expired", "stopped", "failed"}
+# v3 session `status` values that mean the session is no longer active
+# (plus legacy v1 values retained for backward compatibility).
+_DEVIN_TERMINAL_STATUSES = {
+    "exit",
+    "error",
+    "suspended",
+    "finished",
+    "expired",
+    "stopped",
+    "failed",
+}
+_DEVIN_TERMINAL_STATUS_DETAILS = {
+    "finished",
+    "error",
+    "usage_limit_exceeded",
+    "out_of_credits",
+    "out_of_quota",
+    "no_quota_allocation",
+    "payment_declined",
+    "org_usage_limit_exceeded",
+    "user_usage_limit_exceeded",
+    "total_session_limit_exceeded",
+    "contract_expired",
+}
+_DEVIN_AUTH_HTTP_CODES = frozenset({401, 403})
+_DEVIN_AUTH_FAILURE_LIMIT = 3
+_DEVIN_AUTH_PROBE_COOLDOWN_SECONDS = 30 * 60
+
+
+class _DevinPollAuthState:
+    """Tracks consecutive Devin poll 401/403 refusals, one-shot Wilson
+    alerting, and the dispatch pause gate (AFX-150).
+
+    Per-session counts reset on any 200 for that session so a single
+    transient 403 never fails a work order. Once a session hits
+    `_DEVIN_AUTH_FAILURE_LIMIT` consecutive 401/403s, Wilson is alerted
+    once for the episode and new Devin dispatches pause until a poll (or
+    a cooldown recovery probe) succeeds again.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.consecutive_failures: dict[str, int] = {}
+        self.paused_reason: str | None = None
+        self.paused_at: datetime | None = None
+        self.last_probe_at: datetime | None = None
+        self.probe_session_id: str | None = None
+        self.alert_sent: bool = False
+        self.last_success_at: datetime | None = None
+
+    def record_success(self, row_id: str, *, now: datetime) -> None:
+        self.consecutive_failures.pop(row_id, None)
+        self.last_success_at = now
+        self.paused_reason = None
+        self.paused_at = None
+        self.last_probe_at = None
+        self.probe_session_id = None
+        self.alert_sent = False
+
+    def record_auth_failure(self, row_id: str) -> int:
+        count = self.consecutive_failures.get(row_id, 0) + 1
+        self.consecutive_failures[row_id] = count
+        return count
+
+    def clear_row(self, row_id: str) -> None:
+        self.consecutive_failures.pop(row_id, None)
+
+    def pause(self, *, status_code: int, session_id: str, now: datetime) -> None:
+        if self.paused_reason is None:
+            self.paused_reason = f"devin_poll_auth_paused:HTTP {status_code}"
+            self.paused_at = now
+        self.last_probe_at = now
+        self.probe_session_id = session_id
+
+
+_devin_auth_state = _DevinPollAuthState()
+
+
+def reset_devin_auth_state() -> None:
+    """Clear in-memory Devin poll auth-failure and dispatch-pause state.
+    Intended for unit tests and manual recovery."""
+    _devin_auth_state.reset()
+
+
+def _format_devin_session_id(session_id: str) -> str:
+    """Devin API v3 expects `devin-<hex>` in path parameters."""
+    return session_id if session_id.startswith("devin-") else f"devin-{session_id}"
+
+
+def _devin_session_get_url(org_id: str, session_id: str) -> str:
+    return (
+        f"{_DEVIN_API_BASE}/v3/organizations/{org_id}/sessions/"
+        f"{_format_devin_session_id(session_id)}"
+    )
+
+
+def _extract_devin_pr_url(data: dict) -> str | None:
+    """Extract the best PR URL from a Devin v3 (or legacy v1) session payload.
+
+    v3 returns `pull_requests: [{"pr_url": "...", "pr_state": "..."}]`.
+    Prefer the latest open/merged PR; fall back to the latest entry with a
+    valid URL, then to legacy v1 `pull_request.url`.
+    """
+    prs = data.get("pull_requests")
+    if isinstance(prs, list):
+        preferred: str | None = None
+        fallback: str | None = None
+        for item in prs:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("pr_url") or item.get("url")
+            if not isinstance(url, str) or not url:
+                continue
+            fallback = url
+            state = (item.get("pr_state") or item.get("state") or "").lower()
+            if state in ("open", "merged"):
+                preferred = url
+        if preferred:
+            return preferred
+        if fallback:
+            return fallback
+
+    pr_block = data.get("pull_request")
+    if isinstance(pr_block, dict):
+        url = pr_block.get("url") or pr_block.get("pr_url")
+        if isinstance(url, str) and url:
+            return url
+    return None
+
+
+def _send_devin_auth_alert_once(
+    *,
+    status_code: int,
+    session_id: str,
+    issue_identifier: str | None,
+    attempts: int,
+    paused: bool,
+) -> bool:
+    """Send at most one PE alert email to Wilson per Devin auth-outage
+    episode. Never raises; never includes credentials."""
+    if _devin_auth_state.alert_sent:
+        return False
+    _devin_auth_state.alert_sent = True
+    try:
+        from agentfx.notifications.email import send_agent_message
+
+        issue_note = f" (ticket {issue_identifier})" if issue_identifier else ""
+        pause_note = (
+            "New Devin dispatches have been paused until status checks succeed again."
+            if paused
+            else "Other Devin sessions are still polling normally, so new "
+            "dispatches remain enabled."
+        )
+        body = (
+            f"Devin status checks failed {attempts} consecutive times with "
+            f"HTTP {status_code} on session {session_id}{issue_note}.\n\n"
+            f"The affected work order has been marked WORKSPACE_FAILED and "
+            f"flagged on Linear.\n\n"
+            f"{pause_note}\n\n"
+            f"Check DEVIN_API_KEY and DEVIN_ORG_ID on staging."
+        )
+        return send_agent_message(
+            agent_role="PE",
+            subject=f"Devin status checks refused (HTTP {status_code})",
+            body=body,
+        )
+    except Exception:
+        logger.exception("pe_workspace[devin-poll]: failed to send auth alert email")
+        return False
+
+
+def devin_dispatch_pause_reason(*, now: datetime | None = None) -> str | None:
+    """Return the pause reason if Devin dispatches are currently paused due
+    to repeated poll 401/403 refusals, or None if dispatches may proceed.
+
+    When paused and `_DEVIN_AUTH_PROBE_COOLDOWN_SECONDS` have elapsed since
+    the last check, sends one lightweight GET against the last refused
+    session to detect recovery automatically (200 or 404 proves auth is
+    accepted again). Never raises; never logs credentials.
+    """
+    reason = _devin_auth_state.paused_reason
+    if reason is None:
+        return None
+    now = now or datetime.now(UTC)
+    last_probe = _devin_auth_state.last_probe_at
+    probe_sid = _devin_auth_state.probe_session_id
+    if (
+        last_probe is not None
+        and probe_sid
+        and (now - last_probe).total_seconds() >= _DEVIN_AUTH_PROBE_COOLDOWN_SECONDS
+    ):
+        api_key = (getattr(settings, "DEVIN_API_KEY", "") or "").strip()
+        org_id = (getattr(settings, "DEVIN_ORG_ID", "") or "").strip()
+        _devin_auth_state.last_probe_at = now
+        if api_key and org_id:
+            try:
+                resp = requests.get(
+                    _devin_session_get_url(org_id, probe_sid),
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=_DEVIN_HTTP_TIMEOUT_SECONDS,
+                )
+                if resp.status_code not in _DEVIN_AUTH_HTTP_CODES and (
+                    resp.status_code in (200, 404)
+                ):
+                    logger.info(
+                        "pe_workspace[devin]: auth recovery probe returned HTTP %s "
+                        "— resuming Devin dispatches",
+                        resp.status_code,
+                    )
+                    _devin_auth_state.record_success(probe_sid, now=now)
+                    return None
+                logger.warning(
+                    "pe_workspace[devin]: auth recovery probe returned HTTP %s "
+                    "— keeping Devin dispatches paused",
+                    resp.status_code,
+                )
+            except requests.RequestException:
+                logger.warning(
+                    "pe_workspace[devin]: auth recovery probe failed — keeping "
+                    "Devin dispatches paused"
+                )
+    return _devin_auth_state.paused_reason
+
 
 # Managed Agents mounts this repo into every PE session as a
 # `github_repository` resource. Its `authorization_token` is what the
@@ -76,6 +304,11 @@ _DEVIN_TERMINAL_STATUSES = {"finished", "expired", "stopped", "failed"}
 # that work for `gh` but not for git over HTTPS (AFX-73).
 _TARGET_REPO_URL = "https://github.com/widarecu/agentfx"
 _SANDBOX_REPO_PATH = "/workspace/agentfx"
+
+_REPO_GUIDANCE = (
+    'Read `CLAUDE.md` first, then the files its "Read before changing" table '
+    "lists for the paths you will touch."
+)
 
 _REDACTED = "[REDACTED]"
 _GITHUB_TOKEN_RE = re.compile(
@@ -685,6 +918,10 @@ class DevinWorkspaceAdapter:
         now: datetime | None = None,
     ) -> WorkspaceDispatchResult:
         now = now or datetime.now(UTC)
+        pause_reason = devin_dispatch_pause_reason(now=now)
+        if pause_reason is not None:
+            logger.warning("pe_workspace[devin]: dispatch refused — %s", pause_reason)
+            return WorkspaceDispatchResult(accepted=False, reason=pause_reason)
         trigger = spec.trigger
         ok, reason = check_budget_before_dispatch(db, now=now, trigger=trigger)
         if not ok:
@@ -868,6 +1105,7 @@ def _build_managed_kickoff(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str
         f"- `widarecu/agentfx` is already cloned at `{_SANDBOX_REPO_PATH}` "
         f"(checked out on `{spec.target_branch}`) with git push credentials "
         "configured. Work in that checkout.",
+        f"- {_REPO_GUIDANCE}",
         "- Do NOT `git clone` the repo again or change the `origin` remote — "
         "a fresh clone has no push credentials.",
         f"- Publish with `git push -u origin {branch}`, then open the PR with "
@@ -903,6 +1141,7 @@ def _build_devin_prompt(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str:
         "# Repository + branch instructions",
         "",
         "- Work in the `@widarecu/agentfx` repository.",
+        f"- {_REPO_GUIDANCE}",
         f"- Base your PR against the `{spec.target_branch}` branch. "
         "Never push to it directly.",
     ]
@@ -923,9 +1162,8 @@ def _build_devin_prompt(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str:
         "- All code changes must be covered by unit tests. Add or "
         "update tests alongside the fix. Do not land a PR without "
         "`make test-unit` green locally in the sandbox.",
-        "- Follow the repository's `CLAUDE.md` work-tracking + "
-        "testing conventions (Docker test profile only, never touch "
-        "`dev`/`uat` profiles, never push to `main` directly).",
+        "- Use only the Docker test profile; never touch `dev`/`uat` profiles "
+        "or push directly to `main`.",
     ]
     return "\n".join(lines)
 
@@ -1186,7 +1424,7 @@ def _render_stuck_session_comment(
 
 
 def _reclaim_stuck_session(
-    db: Session,
+    db: Session | None,
     row: AgentWorkspaceRun,
     *,
     reason: str,
@@ -1194,10 +1432,10 @@ def _reclaim_stuck_session(
     now: datetime,
     client: object | None = None,
 ) -> None:
-    """Shared path for sweeper TTL, per-session cost cap and
-    publish-failed: cancel the provider session (managed_agents only),
-    flip the row to WORKSPACE_FAILED, then Linear hygiene. Never
-    raises; caller commits."""
+    """Shared path for sweeper TTL, per-session cost cap, publish-failed,
+    and Devin poll auth refusal: cancel the provider session
+    (managed_agents only), flip the row to WORKSPACE_FAILED, then Linear
+    hygiene. Never raises; caller commits."""
     cancelled = False
     if row.adapter == "managed_agents" and row.provider_run_id and client is not None:
         try:
@@ -1216,7 +1454,7 @@ def _reclaim_stuck_session(
     try:
         from agentfx.agents.fleet.linear_pe_queue import handle_stuck_session_failure
 
-        escalate = _is_repeat_stuck_failure(db, row)
+        escalate = _is_repeat_stuck_failure(db, row) if db is not None else False
         body = _render_stuck_session_comment(
             row, reason=reason, now=now, escalate=escalate, cancelled=cancelled
         )
@@ -1257,17 +1495,20 @@ def sweep_stuck_runs(db: Session, *, now: datetime | None = None) -> int:
         for row in rows:
             # A Devin session that opened its PR is done, not stuck: one
             # last poll records it instead of flagging the ticket (AFX-134).
-            if (
-                row.adapter == "devin"
-                and row.provider_run_id
-                and _poll_devin_row(row, now=now) == "pr_open"
-            ):
-                logger.info(
-                    "pe_workspace: not reclaiming row id=%s — its PR is open (%s)",
-                    row.id,
-                    row.pr_url,
-                )
-                continue
+            if row.adapter == "devin" and row.provider_run_id:
+                poll_outcome = _poll_devin_row(row, now=now, db=db)
+                if poll_outcome == "pr_open":
+                    logger.info(
+                        "pe_workspace: not reclaiming row id=%s — its PR is open (%s)",
+                        row.id,
+                        row.pr_url,
+                    )
+                    continue
+                if row.status != AgentWorkspaceRunStatus.RUNNING:
+                    # Final poll already transitioned the row (e.g. 404 or
+                    # consecutive 401/403 auth refusal); don't reclaim twice.
+                    reclaimed += 1
+                    continue
             reclaimed += 1
             logger.warning(
                 "pe_workspace: reclaiming stuck RUNNING row id=%s started_at=%s",
@@ -1461,8 +1702,8 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
 
     Handles both `adapter="managed_agents"` rows (Anthropic session
     retrieve + events) and `adapter="devin"` rows (Cognition Labs
-    HTTP GET on `/v1/sessions/{id}`). Devin rows use the row's
-    `provider_run_id` and the `DEVIN_API_KEY` credential.
+    HTTP GET on `/v3/organizations/{org_id}/sessions/{devin_id}`). Devin
+    rows use the row's `provider_run_id` and `DEVIN_API_KEY`/`DEVIN_ORG_ID`.
     """
     now = now or datetime.now(UTC)
     counts = {"checked": 0, "pr_open": 0, "tests_failed": 0, "failed": 0}
@@ -1510,10 +1751,22 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
 
     # Devin rows first — they don't need the Anthropic SDK and the HTTP
     # client is cheap. Updates go through `_poll_devin_row`.
+    devin_cycle_had_success = False
     for row in devin_rows:
         counts["checked"] += 1
         was_running = row.status == AgentWorkspaceRunStatus.RUNNING
-        outcome = _poll_devin_row(row, now=now)
+        outcome = _poll_devin_row(
+            row,
+            now=now,
+            db=db,
+            other_session_succeeded=devin_cycle_had_success,
+        )
+        if outcome in ("pr_open", "still_running") or (
+            outcome == "failed"
+            and row.summary
+            and "[devin-poll] auth refused" not in row.summary
+        ):
+            devin_cycle_had_success = True
         if outcome == "pr_open" and was_running:
             counts["pr_open"] += 1
         elif outcome == "tests_failed":
@@ -1637,9 +1890,15 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
     return counts
 
 
-def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
-    """Poll one Devin workspace row. Updates row in place (caller
-    commits). Returns one of:
+def _poll_devin_row(
+    row: AgentWorkspaceRun,
+    *,
+    now: datetime,
+    db: Session | None = None,
+    other_session_succeeded: bool = False,
+) -> str:
+    """Poll one Devin workspace row via the Devin API v3 org endpoint.
+    Updates row in place (caller commits). Returns one of:
       - "pr_open"       → row flipped PR_OPEN with pr_url set
       - "tests_failed"  → row flipped TESTS_FAILED
       - "failed"        → row flipped WORKSPACE_FAILED
@@ -1649,8 +1908,9 @@ def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
     Never raises. Credentials (DEVIN_API_KEY) never logged.
     """
     api_key = (getattr(settings, "DEVIN_API_KEY", "") or "").strip()
-    if not api_key:
-        # Flag on but credentials absent — can't poll. Leave row for
+    org_id = (getattr(settings, "DEVIN_ORG_ID", "") or "").strip()
+    if not api_key or not org_id:
+        # Flag on but credentials/org absent — can't poll. Leave row for
         # the stuck-row sweeper to eventually reclaim on TTL.
         return "poll_error"
 
@@ -1658,19 +1918,19 @@ def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
     if not session_id:
         return "poll_error"
 
+    url = _devin_session_get_url(org_id, session_id)
     try:
         resp = requests.get(
-            f"{_DEVIN_API_BASE}/v1/sessions/{session_id}",
+            url,
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=_DEVIN_HTTP_TIMEOUT_SECONDS,
         )
     except requests.RequestException:
-        logger.exception(
-            "pe_workspace[devin-poll]: GET /v1/sessions/%s failed", session_id
-        )
+        logger.exception("pe_workspace[devin-poll]: GET %s failed", url)
         return "poll_error"
 
     if resp.status_code == 404:
+        _devin_auth_state.clear_row(row.id)
         if row.status == AgentWorkspaceRunStatus.PR_OPEN:
             # The PR already shipped; the session just aged out. Stop
             # refreshing its cost but keep the outcome.
@@ -1687,6 +1947,53 @@ def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
         row.ended_at = now
         return "failed"
 
+    if resp.status_code in _DEVIN_AUTH_HTTP_CODES:
+        body_snippet = (resp.text or "")[:200]
+        count = _devin_auth_state.record_auth_failure(row.id)
+        logger.warning(
+            "pe_workspace[devin-poll]: HTTP %s on session %s (%d/%d) body=%r",
+            resp.status_code,
+            session_id,
+            count,
+            _DEVIN_AUTH_FAILURE_LIMIT,
+            body_snippet,
+        )
+        if count < _DEVIN_AUTH_FAILURE_LIMIT:
+            return "poll_error"
+
+        _devin_auth_state.clear_row(row.id)
+        should_pause = not other_session_succeeded
+        if should_pause:
+            _devin_auth_state.pause(
+                status_code=resp.status_code, session_id=session_id, now=now
+            )
+        _send_devin_auth_alert_once(
+            status_code=resp.status_code,
+            session_id=session_id,
+            issue_identifier=row.linear_issue_identifier,
+            attempts=count,
+            paused=should_pause,
+        )
+        summary_line = (
+            f"[devin-poll] auth refused: {count} consecutive HTTP "
+            f"{resp.status_code} responses on session {session_id}"
+        )
+        if row.status == AgentWorkspaceRunStatus.PR_OPEN:
+            row.summary = ((row.summary or "") + "\n" + summary_line).strip()
+            row.ended_at = now
+            return "pr_open"
+        _reclaim_stuck_session(
+            db,
+            row,
+            reason=(
+                f"Devin status check refused with HTTP {resp.status_code} "
+                f"({count} consecutive checks)"
+            ),
+            summary_line=summary_line + "; marked WORKSPACE_FAILED.",
+            now=now,
+        )
+        return "failed"
+
     if resp.status_code != 200:
         body_snippet = (resp.text or "")[:200]
         logger.warning(
@@ -1697,6 +2004,8 @@ def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
         )
         return "poll_error"
 
+    _devin_auth_state.record_success(row.id, now=now)
+
     try:
         data = resp.json()
     except ValueError:
@@ -1706,19 +2015,26 @@ def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
         )
         return "poll_error"
 
-    status_enum = (data.get("status_enum") or data.get("status") or "").lower()
-    pr_block = data.get("pull_request") or {}
-    pr_url = pr_block.get("url") if isinstance(pr_block, dict) else None
+    status_enum = (data.get("status") or data.get("status_enum") or "").lower()
+    status_detail = (data.get("status_detail") or "").lower()
+    pr_url = _extract_devin_pr_url(data)
     # A session that opened its PR has delivered, even while it idles in a
-    # non-terminal status (blocked, suspended) waiting on review (AFX-134).
-    has_pr = bool(pr_url and isinstance(pr_url, str))
-    session_done = not status_enum or status_enum in _DEVIN_TERMINAL_STATUSES
+    # non-terminal status (blocked, waiting_for_user) waiting on review (AFX-134).
+    has_pr = bool(pr_url)
+    session_done = (
+        not status_enum
+        or status_enum in _DEVIN_TERMINAL_STATUSES
+        or status_detail in _DEVIN_TERMINAL_STATUS_DETAILS
+    )
     if not session_done and not has_pr:
         return "still_running"
     first_report = row.status != AgentWorkspaceRunStatus.PR_OPEN
 
     # Terminal or PR opened — record PR url + ACU consumed if present.
-    acu_consumed = data.get("acu_consumed")
+    # v3 returns `acus_consumed` (plural); keep v1 `acu_consumed` fallback.
+    acu_consumed = data.get("acus_consumed")
+    if acu_consumed is None:
+        acu_consumed = data.get("acu_consumed")
     rate = float(getattr(settings, "DEVIN_ACU_USD_RATE", 2.25) or 2.25)
     cost_usd = None
     if isinstance(acu_consumed, (int, float)) and acu_consumed >= 0:
@@ -1727,9 +2043,10 @@ def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
 
     summary_tail = json.dumps(
         {
-            "status_enum": status_enum or "<missing>",
+            "status": status_enum or "<missing>",
+            "status_detail": status_detail or None,
             "pull_request_url": pr_url,
-            "acu_consumed": acu_consumed,
+            "acus_consumed": acu_consumed,
             "estimated_usd": (round(cost_usd, 4) if cost_usd is not None else None),
         },
         default=str,
@@ -1750,7 +2067,7 @@ def _poll_devin_row(row: AgentWorkspaceRun, *, now: datetime) -> str:
         return "pr_open"
 
     # Terminal without a PR URL — treat as WORKSPACE_FAILED. Devin's
-    # `finished` status without a pull_request means the session
+    # terminal status without a pull_request means the session
     # completed but didn't ship code (ran out of ACUs, hit a block,
     # etc.). TESTS_FAILED could be inferred from session events in a
     # follow-up; for the initial trial we classify as plain failed.
@@ -1769,6 +2086,8 @@ __all__ = [
     "dispatches_today",
     "spent_usd_today",
     "check_budget_before_dispatch",
+    "devin_dispatch_pause_reason",
+    "reset_devin_auth_state",
     "resolve_adapter",
     "sweep_stuck_runs",
     "poll_running_dispatches",

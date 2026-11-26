@@ -577,6 +577,7 @@ def failure_signature(summary: str | None) -> str:
 _STUCK_SESSION_SIGNATURES = (
     ("[publish-failed]", "stuck-session: publish failed after fallbacks"),
     ("[cost-cap] exceeded", "stuck-session: cost-cap exceeded n tokens"),
+    ("[devin-poll] auth refused", "stuck-session: devin poll auth refused"),
     ("exceeded 4h ttl", "stuck-session: exceeded 4h ttl"),
 )
 

@@ -104,6 +104,13 @@ label_groups:
       - name: Money-path
         description: "Order execution, sizing, kill switch, credentials, deploy gates. The PR into main needs Wilson's approval of its latest commit before it merges."
       - { name: Normal }
+  - name: Size
+    color: "#6B7280"
+    description: "The size of the proposed work. Split L before filing."
+    labels:
+      - { name: S }
+      - { name: M }
+      - { name: L }
 
 # Ungrouped flags (several allowed per issue).
 labels:

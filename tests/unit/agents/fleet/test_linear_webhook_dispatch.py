@@ -20,17 +20,22 @@ Failure branches pinned:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime
+from threading import Event
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agentfx.agents.fleet import linear_webhook_dispatch as lwd
+from agentfx.agents.fleet import pe_workspace
 from agentfx.agents.fleet.pe_workspace import (
     WorkspaceDispatchResult,
     WorkspaceTaskSpec,
 )
 from agentfx.api.models.agent_workspace_run import AgentWorkspaceRun
+from agentfx.services import agent_orchestrator
 
 pytestmark = pytest.mark.unit
 
@@ -135,6 +140,131 @@ def _patch_bg(
         "resolve": mock_resolve,
         "build_slug": mock_build_slug,
     }
+
+
+def test_webhook_sweeps_only_after_inflight_workspace_poll(monkeypatch):
+    mocks = _patch_bg(monkeypatch)
+    poll_started, finish_poll = Event(), Event()
+    picked_up, swept = Event(), Event()
+    refreshed_cost = 0
+    observed_pr_open = []
+
+    def poll(db):
+        nonlocal refreshed_cost
+        poll_started.set()
+        assert finish_poll.wait(5)
+        refreshed_cost = 3
+        return {}
+
+    def pick_up(*args):
+        picked_up.set()
+        return True, ""
+
+    def sweep(db, *, now):
+        observed_pr_open.append(finish_poll.is_set())
+        swept.set()
+        return 0
+
+    monkeypatch.setattr(agent_orchestrator, "SessionLocal", MagicMock())
+    monkeypatch.setattr(pe_workspace, "poll_running_dispatches", poll)
+    mocks["thought"].side_effect = pick_up
+    mocks["sweep"].side_effect = sweep
+    mocks["budget"].side_effect = lambda *args, **kwargs: (
+        (False, "cap") if refreshed_cost >= 3 else (True, "")
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        poll_job = workers.submit(agent_orchestrator._pe_workspace_poll_tick)
+        try:
+            assert poll_started.wait(5)
+            webhook_job = workers.submit(
+                lwd.dispatch_from_linear_webhook,
+                delivery_id=_DELIVERY_ID,
+                payload=_real_payload(),
+                now=_NOW,
+            )
+            assert picked_up.wait(5)
+            assert not swept.wait(0.1)
+        finally:
+            finish_poll.set()
+        poll_job.result(timeout=5)
+        assert webhook_job.result(timeout=5) == (False, "budget:cap")
+
+    assert observed_pr_open == [True]
+    mocks["adapter"].dispatch.assert_not_called()
+
+
+def test_workspace_poll_cannot_interleave_webhook_budget_check_and_dispatch(
+    monkeypatch,
+):
+    mocks = _patch_bg(monkeypatch)
+    building_spec, finish_spec = Event(), Event()
+    poll_started, cost_refreshed = Event(), Event()
+
+    def build_slug(*args, **kwargs):
+        building_spec.set()
+        assert finish_spec.wait(5)
+        return "afx-8-qa-tech-health"
+
+    def poll(db):
+        cost_refreshed.set()
+        return {}
+
+    def poll_tick():
+        poll_started.set()
+        agent_orchestrator._pe_workspace_poll_tick()
+
+    monkeypatch.setattr(agent_orchestrator, "SessionLocal", MagicMock())
+    monkeypatch.setattr(pe_workspace, "poll_running_dispatches", poll)
+    mocks["build_slug"].side_effect = build_slug
+    mocks["adapter"].dispatch.side_effect = lambda *args, **kwargs: (
+        WorkspaceDispatchResult(
+            accepted=False,
+            reason="cost_changed_after_gate" if cost_refreshed.is_set() else "test",
+        )
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        webhook_job = workers.submit(
+            lwd.dispatch_from_linear_webhook,
+            delivery_id=_DELIVERY_ID,
+            payload=_real_payload(),
+            now=_NOW,
+        )
+        try:
+            assert building_spec.wait(5)
+            poll_job = workers.submit(poll_tick)
+            assert poll_started.wait(5)
+            assert not cost_refreshed.wait(0.1)
+        finally:
+            finish_spec.set()
+        assert webhook_job.result(timeout=5) == (False, "adapter_refused:test")
+        poll_job.result(timeout=5)
+
+    assert cost_refreshed.is_set()
+
+
+def test_queued_webhook_uses_dispatch_day_after_utc_midnight(monkeypatch):
+    mocks = _patch_bg(monkeypatch)
+    before_midnight = datetime(2026, 11, 6, 23, 59, 59, tzinfo=UTC)
+    after_midnight = datetime(2026, 11, 7, tzinfo=UTC)
+    clock = MagicMock(wraps=datetime)
+    clock.now.return_value = before_midnight
+
+    @contextmanager
+    def lock():
+        clock.now.return_value = after_midnight
+        yield
+
+    monkeypatch.setattr(lwd, "datetime", clock)
+    monkeypatch.setattr(pe_workspace, "pe_workspace_operation_lock", lock())
+
+    lwd.dispatch_from_linear_webhook(delivery_id=_DELIVERY_ID, payload=_real_payload())
+
+    mocks["budget"].assert_called_once_with(
+        mocks["db"], now=after_midnight, trigger="webhook"
+    )
+    assert mocks["adapter"].dispatch.call_args.kwargs["now"] == after_midnight
 
 
 # ─────────────────────────────────────────────────────────────────────

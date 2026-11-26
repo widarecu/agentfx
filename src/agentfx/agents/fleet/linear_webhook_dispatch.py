@@ -106,8 +106,6 @@ def dispatch_from_linear_webhook(
     exists; the actual PR open happens asynchronously via the poll
     loop as usual.
     """
-    now = now or datetime.now(UTC)
-
     extracted = _extract_payload_fields(payload)
     if extracted is None:
         return False, "payload_missing_required_fields"
@@ -134,6 +132,28 @@ def dispatch_from_linear_webhook(
             err,
         )
 
+    from agentfx.agents.fleet.pe_workspace import pe_workspace_operation_lock
+
+    with pe_workspace_operation_lock:
+        return _dispatch_workspace(
+            delivery_id=delivery_id,
+            session_id=session_id,
+            identifier=identifier,
+            title=title,
+            narrative=narrative,
+            now=now or datetime.now(UTC),
+        )
+
+
+def _dispatch_workspace(
+    *,
+    delivery_id: str,
+    session_id: str,
+    identifier: str,
+    title: str,
+    narrative: str,
+    now: datetime,
+) -> tuple[bool, str]:
     # Everything from here on needs a DB session. Open a fresh one —
     # the FastAPI request-scoped Depends(get_db) session closed when
     # the webhook handler returned.

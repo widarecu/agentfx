@@ -10,15 +10,52 @@
       "Bash(make typecheck:*)",
       "Bash(make verify-fixtures:*)",
       "Bash(make check-env-example:*)",
-      "Bash(make check-settings-vitest:*)"
+      "Bash(make check-settings-vitest:*)",
+      "Bash(git status *)",
+      "Bash(git diff --no-ext-diff --no-textconv)",
+      "Bash(git diff --stat)",
+      "Bash(git log --oneline)",
+      "Bash(git log -1 --oneline)",
+      "Bash(git branch --show-current)",
+      "Bash(git rev-parse --show-toplevel)",
+      "Bash(git rev-parse --abbrev-ref HEAD)",
+      "Bash(git ls-files *)",
+      "Bash(gh pr list *)",
+      "Bash(gh pr view *)",
+      "Bash(gh pr checks *)",
+      "Bash(gh issue list *)",
+      "Bash(gh issue view *)",
+      "mcp__linear-server__get_issue",
+      "mcp__linear-server__list_issues",
+      "mcp__linear-server__list_comments",
+      "mcp__linear-server__list_teams",
+      "mcp__linear-server__list_issue_statuses",
+      "mcp__claude_ai_Linear__get_issue",
+      "mcp__claude_ai_Linear__list_issues",
+      "mcp__claude_ai_Linear__list_comments",
+      "mcp__claude_ai_Linear__list_teams",
+      "mcp__claude_ai_Linear__list_issue_statuses"
     ],
     "deny": [
       "Edit(.env.development)",
       "Edit(.env.test)",
-      "Edit(.env.uat)"
+      "Edit(.env.uat)",
+      "Read(/.env.uat)"
     ]
   },
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.py\"",
+            "timeout": 550
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",

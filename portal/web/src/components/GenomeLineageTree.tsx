@@ -29,6 +29,7 @@ import type {
   GenomeOrigin,
   StrategyGenomeSummary,
 } from '../types/evolution';
+import { formatRiskPerTrade } from '../utils/riskPerTrade';
 
 interface GenomeLineageTreeProps {
   runId: string;
@@ -314,6 +315,7 @@ export default function GenomeLineageTree({
                   n.genome.id,
                   `gen ${n.genome.generation_index}`,
                   `origin: ${n.genome.origin}`,
+                  `Risk per trade: ${formatRiskPerTrade(n.genome.risk_pct)}`,
                   n.genome.fitness != null && Number.isFinite(n.genome.fitness)
                     ? `fitness ${n.genome.fitness.toFixed(3)}`
                     : 'no fitness',
@@ -364,7 +366,7 @@ export default function GenomeLineageTree({
             </svg>
           </div>
           <p className="mt-2 text-xs text-slate-500 dark:text-slate-400 italic">
-            Hover any node for genome id + fitness + origin. Click to drill in.
+            Hover any node for its risk per trade, fitness and origin. Click to drill in.
             {bestGenomeId &&
               ' Amber edges + ring trace the lineage of the run-best genome back to its gen-0 ancestors.'}
           </p>

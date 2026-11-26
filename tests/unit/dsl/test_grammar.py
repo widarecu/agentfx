@@ -49,12 +49,28 @@ class TestStrategySpec:
             ExitRules(stop_pips=50, target_pips=20, max_hold_bars=100)
 
     def test_risk_pct_bounds(self) -> None:
-        SizeRules(risk_pct=0.001)  # lower bound ok
-        SizeRules(risk_pct=0.005)  # upper bound ok
+        SizeRules(risk_pct=0.0025)  # lower bound ok
+        SizeRules(risk_pct=0.005)
+        SizeRules(risk_pct=0.02)  # upper bound ok
         with pytest.raises(ValidationError):
             SizeRules(risk_pct=0.0005)  # below lower
         with pytest.raises(ValidationError):
-            SizeRules(risk_pct=0.01)  # above upper
+            SizeRules(risk_pct=0.0024)
+        with pytest.raises(ValidationError):
+            SizeRules(risk_pct=0.0201)  # above upper
+
+    @pytest.mark.parametrize("risk_pct", [0.001, 0.0024, 0.005])
+    def test_stored_risk_pct_is_preserved(self, risk_pct: float) -> None:
+        payload = _minimal_spec().model_dump()
+        payload["size"]["risk_pct"] = risk_pct
+        assert StrategySpec.from_stored_genome(payload).model_dump() == payload
+
+    @pytest.mark.parametrize("risk_pct", [0.0009, 0.0201])
+    def test_stored_risk_pct_still_has_bounds(self, risk_pct: float) -> None:
+        payload = _minimal_spec().model_dump()
+        payload["size"]["risk_pct"] = risk_pct
+        with pytest.raises(ValidationError):
+            StrategySpec.from_stored_genome(payload)
 
     def test_stop_pips_bounds(self) -> None:
         with pytest.raises(ValidationError):
