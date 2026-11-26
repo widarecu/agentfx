@@ -274,6 +274,19 @@ class ValidationDsrPublic(BaseSchema):
     reason: str
 
 
+class ValidationHoldoutPublic(BaseSchema):
+    """The sealed final holdout check for one finalist (AFX-151)."""
+
+    status: str  # passed | failed | blocked | unavailable | error
+    reason: str
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    min_trades: int | None = None
+    failures: list[str] = Field(default_factory=list)
+    blocked_by: str | None = None
+
+
 class StrategyGenomePublic(BaseSchema):
     """Detail view for one genome.
 
@@ -300,6 +313,7 @@ class StrategyGenomePublic(BaseSchema):
     validator_passed: bool | None = None
     validation_failures: list[str] = Field(default_factory=list)
     validation_dsr: ValidationDsrPublic | None = None
+    validation_holdout: ValidationHoldoutPublic | None = None
     llm_reasoning: str | None = None
     llm_call_id: str | None = None
     created_at: datetime

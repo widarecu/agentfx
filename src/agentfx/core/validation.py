@@ -11,8 +11,9 @@ shuffled k-fold leaks future information into training and is wrong here.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 @dataclass(frozen=True)
@@ -211,8 +212,62 @@ def make_rolling_walk_forward_folds(
     return folds
 
 
+# The sealed final holdout (AFX-151): the latest six months of a run's
+# data window. MVP_CONSTRAINTS §4 requires "final OOS holdout ≥ 6 months".
+FINAL_HOLDOUT = timedelta(days=183)
+
+Window = tuple[datetime, datetime]
+
+
+def split_final_holdout(
+    start: datetime,
+    end: datetime,
+    *,
+    holdout: timedelta = FINAL_HOLDOUT,
+) -> tuple[Window, Window | None]:
+    """Reserve the latest ``holdout`` of ``[start, end]`` as the sealed
+    final holdout. Returns ``(search_window, holdout_window)``.
+
+    Evolution, warm-start matching and the walk-forward folds use only the
+    search window, which ends where the holdout begins. The holdout is
+    judged once per finalist, after Gate B.
+
+    When what is left for the search would be shorter than the holdout
+    itself, no holdout is reserved: the whole window is returned for the
+    search with ``None``, and the caller must not approve anything from
+    that run.
+    """
+    if start.tzinfo is None or end.tzinfo is None:
+        raise ValueError("start and end must be tz-aware datetimes")
+    if end <= start:
+        raise ValueError(f"end ({end}) must be > start ({start})")
+    if holdout <= timedelta(0):
+        raise ValueError(f"holdout must be positive (got {holdout})")
+    cutoff = end - holdout
+    if cutoff - start < holdout:
+        return (start, end), None
+    return (start, cutoff), (cutoff, end)
+
+
+def holdout_min_trades(min_trades: float, holdout_window: Window, oos: Window) -> int:
+    """Gate B's trade minimum scaled to the holdout's length.
+
+    Gate B asks for ``min_trades`` across the whole walk-forward OOS
+    span. The holdout asks for the same trading rate over its own,
+    usually shorter, span, and never for more than ``min_trades``.
+    """
+    oos_span = (oos[1] - oos[0]).total_seconds()
+    if oos_span <= 0:
+        return math.ceil(min_trades)
+    share = (holdout_window[1] - holdout_window[0]).total_seconds() / oos_span
+    return math.ceil(min_trades * min(1.0, share))
+
+
 __all__ = [
+    "FINAL_HOLDOUT",
     "WalkForwardFold",
+    "holdout_min_trades",
+    "split_final_holdout",
     "make_rolling_walk_forward_folds",
     "make_walk_forward_folds",
     "oos_window",

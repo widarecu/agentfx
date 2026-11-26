@@ -448,6 +448,31 @@ def _assert_window_covered(
         )
 
 
+def _seal_final_holdout(
+    config_dict: dict, data_window: tuple[datetime, datetime]
+) -> tuple[tuple[datetime, datetime], tuple[datetime, datetime] | None]:
+    """Seal the latest six months of the run's window (AFX-151).
+
+    Returns ``(search_window, holdout_window)``. The caller must use the
+    search window as the run's data window from then on, including the
+    ``effective_data_window_*`` snapshot: the portal's on-demand backtests
+    and warm-start matching read that snapshot, so they can't reach into
+    the holdout either. The holdout's bounds go into ``config_dict`` for
+    the audit trail (both ``None`` when the window is too short to spare a
+    holdout; nothing in such a run can pass validation).
+    """
+    from agentfx.core.validation import split_final_holdout
+
+    search_window, holdout_window = split_final_holdout(*data_window)
+    config_dict["holdout_window_start"] = (
+        holdout_window[0].isoformat() if holdout_window else None
+    )
+    config_dict["holdout_window_end"] = (
+        holdout_window[1].isoformat() if holdout_window else None
+    )
+    return search_window, holdout_window
+
+
 def _resolve_requested_window(config_dict: dict) -> tuple[datetime, datetime]:
     """Return the *requested* (pre-clamp) data window for this run.
 
@@ -698,13 +723,21 @@ def _run_owned_evolution(run_id: str, owner_connection) -> None:
                     requested=requested_window,
                     available=None,
                 )
+        # AFX-151: from here on `data_window` is only what evolution,
+        # warm start and the walk-forward folds may see.
+        data_window, holdout_window = _seal_final_holdout(config_dict, data_window)
         logger.info(
-            "data window for run %s: requested=%s..%s clamped=%s..%s",
+            "data window for run %s: requested=%s..%s search=%s..%s holdout=%s",
             run_id,
             requested_window[0].isoformat(),
             requested_window[1].isoformat(),
             data_window[0].isoformat(),
             data_window[1].isoformat(),
+            (
+                f"{holdout_window[0].isoformat()}..{holdout_window[1].isoformat()}"
+                if holdout_window
+                else "none (window too short)"
+            ),
         )
 
         # Resolve effective spreads NOW so the run is reproducible.
@@ -834,6 +867,7 @@ def _run_owned_evolution(run_id: str, owner_connection) -> None:
             config=config,
             stop_conditions=stop_conditions,
             data_window=data_window,
+            holdout_window=holdout_window,
             persister=persister,
             llm_injector=llm_injector,
             validator=validator,

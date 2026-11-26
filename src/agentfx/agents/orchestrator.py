@@ -52,7 +52,12 @@ from agentfx.agents.evolution.llm_client import (
     InjectionResult,
     LLMHypothesisInjector,
 )
-from agentfx.agents.validator import FoldEvaluation, ValidationResult, ValidatorAgent
+from agentfx.agents.validator import (
+    FoldEvaluation,
+    HoldoutEvidence,
+    ValidationResult,
+    ValidatorAgent,
+)
 from agentfx.api.models import GenomeOrigin
 from agentfx.core.deflated_sharpe import DEFAULT_DSR_THRESHOLD
 from agentfx.core.dsl import StrategySpec
@@ -244,7 +249,23 @@ class EvolutionStatePersister(Protocol):
         validator_passed: bool,
         validation_failures: list[str],
         validation_dsr: dict[str, Any] | None = None,
+        validation_holdout: dict[str, Any] | None = None,
     ) -> None: ...
+
+    def claim_holdout(
+        self, run_id: str, genome_id: str, window: tuple[datetime, datetime]
+    ) -> str | None:
+        """Spend the sealed holdout for one finalist (AFX-151).
+
+        Returns ``None`` when the claim is recorded and the genome may be
+        judged on ``window`` once. Returns why not when the genome or an
+        identical strategy already used an overlapping holdout, this
+        exact strategy ever failed one, or the genome was bred from an
+        ancestor after that ancestor was judged on an overlapping
+        holdout. Nothing is recorded then and the genome must not be
+        evaluated.
+        """
+        ...
 
     def log_decision(
         self,
@@ -342,13 +363,24 @@ class OrchestratorAgent(BaseAgent):
         rng: Random | None = None,
         clock: Callable[[], float] = time.monotonic,
         check_stop: Callable[[], None] | None = None,
+        holdout_window: tuple[datetime, datetime] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.run_id = run_id
         self.config = config
         self.stop_conditions = stop_conditions
+        # `data_window` is everything evolution, warm-start matching and
+        # the walk-forward folds may see. The sealed final holdout
+        # (AFX-151) lies strictly after it and is read only by
+        # `_apply_final_holdout`. Without one, nothing in the run passes.
+        if holdout_window is not None and holdout_window[0] < data_window[1]:
+            raise ValueError(
+                "the sealed holdout must start at or after the data window's end "
+                f"({holdout_window[0]} < {data_window[1]})"
+            )
         self.data_window = data_window
+        self.holdout_window = holdout_window
         self.persister = persister
         self.dsr_threshold = dsr_threshold
 
@@ -453,6 +485,11 @@ class OrchestratorAgent(BaseAgent):
                     self.data_window[0].isoformat(),
                     self.data_window[1].isoformat(),
                 ],
+                "holdout_window": (
+                    [w.isoformat() for w in self.holdout_window]
+                    if self.holdout_window
+                    else None
+                ),
             },
             reasoning_text="Evolution run starting.",
         )
@@ -1567,6 +1604,72 @@ class OrchestratorAgent(BaseAgent):
             outcome = self._persist_validation_batch(evaluated, batch_size=len(top_k))
         return outcome
 
+    def _apply_final_holdout(self, genome: Genome, result: ValidationResult) -> None:
+        """Judge a Gate B finalist once on the sealed final holdout
+        (AFX-151) and fold the verdict into ``result``.
+
+        Fails closed: no reserved holdout, a holdout this lineage already
+        used, or a crashed backtest all reject the genome. The claim is
+        recorded before the backtest, so a crash still spends the holdout
+        and the genome can't be tried on it again.
+        """
+        assert genome.id is not None
+        if self.holdout_window is None:
+            result.apply_holdout(
+                HoldoutEvidence(
+                    status="unavailable",
+                    reason=(
+                        "Sealed holdout unavailable: the data window is too "
+                        "short to reserve a final holdout, so nothing from "
+                        "this run can be approved"
+                    ),
+                )
+            )
+            return
+        start, end = self.holdout_window
+        window = {"window_start": start.isoformat(), "window_end": end.isoformat()}
+        try:
+            blocker = self.persister.claim_holdout(
+                self.run_id, genome.id, self.holdout_window
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("sealed holdout claim failed for genome %s", genome.id)
+            result.apply_holdout(
+                HoldoutEvidence(
+                    status="error",
+                    reason="Sealed holdout: the single-use claim could not be recorded",
+                    **window,
+                )
+            )
+            return
+        if blocker is not None:
+            result.apply_holdout(
+                HoldoutEvidence(
+                    status="blocked",
+                    reason=f"Sealed holdout already used: {blocker}",
+                    blocked_by=blocker,
+                    **window,
+                )
+            )
+            return
+        kwargs: dict[str, Any] = {
+            "account_balance": self.config.account_balance,
+            "leverage": self.config.leverage,
+        }
+        if self.config.spread_pips is not None:
+            kwargs["spread_pips"] = self.config.spread_pips
+        result.apply_holdout(
+            self.validator.evaluate_holdout(
+                genome.spec,
+                instrument=self.config.instrument,
+                granularity=self.config.granularity,
+                holdout_window=self.holdout_window,
+                oos=oos_window([fe.fold for fe in result.folds]),
+                gate_b_overrides={"min_cagr": self.config.min_cagr_pct},
+                **kwargs,
+            )
+        )
+
     def _persist_validation_batch(
         self,
         evaluated: list[tuple[int, Genome, ValidationResult]],
@@ -1589,12 +1692,18 @@ class OrchestratorAgent(BaseAgent):
             assert genome.id is not None
             result.apply_dsr(trial_count=trial_count, threshold=self.dsr_threshold)
             validation_dsr = asdict(result.dsr) if result.dsr is not None else None
+            if result.validator_passed:
+                self._apply_final_holdout(genome, result)
+            validation_holdout = (
+                asdict(result.holdout) if result.holdout is not None else None
+            )
             self.persister.save_validation(
                 genome.id,
                 folds=result.folds,
                 validator_passed=result.validator_passed,
                 validation_failures=result.validation_failures,
                 validation_dsr=validation_dsr,
+                validation_holdout=validation_holdout,
             )
             oos_eval = result.oos_evaluation
             self.persister.log_decision(
@@ -1611,6 +1720,7 @@ class OrchestratorAgent(BaseAgent):
                     "oos_n_trades": oos_eval.metrics.get("n_trades"),
                     "validation_failures": result.validation_failures,
                     "validation_dsr": validation_dsr,
+                    "validation_holdout": validation_holdout,
                 },
                 reasoning_text=(
                     f"Walk-forward validation on genome {genome.id} "

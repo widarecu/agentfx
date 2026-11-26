@@ -22,6 +22,7 @@ from agentfx.api.workers.evolution_runner import (
     _build_orchestrator_config,
     _build_stop_conditions,
     _resolve_requested_window,
+    _seal_final_holdout,
     _was_window_explicitly_pinned,
 )
 
@@ -346,3 +347,35 @@ def test_stop_conditions_empty_dict_uses_defaults():
         "silently restore the early-stop-on-training-fitness behaviour."
     )
     assert sc.no_improvement_generations == 5
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Sealed final holdout (AFX-151)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_run_window_is_cut_six_months_short_and_holdout_recorded():
+    """The run's data window (which also becomes the effective window the
+    portal and warm start read) ends where the sealed holdout begins."""
+    start = datetime(2021, 11, 26, tzinfo=UTC)
+    end = datetime(2026, 11, 26, tzinfo=UTC)
+    config: dict = {}
+
+    search, holdout = _seal_final_holdout(config, (start, end))
+
+    cutoff = end - timedelta(days=183)
+    assert search == (start, cutoff)
+    assert holdout == (cutoff, end)
+    assert config == {
+        "holdout_window_start": cutoff.isoformat(),
+        "holdout_window_end": end.isoformat(),
+    }
+
+
+def test_short_window_runs_whole_with_no_holdout_recorded():
+    start = datetime(2026, 10, 12, tzinfo=UTC)
+    end = start + timedelta(days=1)  # e.g. the E2E run's one-day window
+    config: dict = {}
+
+    assert _seal_final_holdout(config, (start, end)) == ((start, end), None)
+    assert config == {"holdout_window_start": None, "holdout_window_end": None}

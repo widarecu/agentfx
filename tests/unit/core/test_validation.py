@@ -11,7 +11,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from agentfx.core.validation import (
+    FINAL_HOLDOUT,
     WalkForwardFold,
+    holdout_min_trades,
+    split_final_holdout,
     make_rolling_walk_forward_folds,
     make_walk_forward_folds,
     oos_window,
@@ -325,3 +328,64 @@ class TestMakeRollingWalkForwardFolds:
             make_rolling_walk_forward_folds(
                 start=_utc(2024, 12, 31), end=_utc(2024, 1, 1)
             )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Sealed final holdout (AFX-151)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestSplitFinalHoldout:
+    def test_reserves_the_latest_six_months(self) -> None:
+        start, end = _utc(2021, 11, 26), _utc(2026, 11, 26)
+        search, holdout = split_final_holdout(start, end)
+
+        assert holdout == (end - FINAL_HOLDOUT, end)
+        assert search == (start, end - FINAL_HOLDOUT)
+        assert FINAL_HOLDOUT >= timedelta(days=183)  # MVP_CONSTRAINTS §4
+
+    def test_no_fold_built_on_the_search_window_reaches_the_holdout(self) -> None:
+        search, holdout = split_final_holdout(_utc(2021, 11, 26), _utc(2026, 11, 26))
+        folds = make_rolling_walk_forward_folds(*search)
+
+        assert max(f.end for f in folds) == holdout[0]
+        assert training_window(folds)[1] < holdout[0]
+        assert oos_window(folds)[1] == holdout[0]
+
+    def test_search_exactly_as_long_as_the_holdout_still_gets_one(self) -> None:
+        start = _utc(2025, 1, 1)
+        search, holdout = split_final_holdout(start, start + 2 * FINAL_HOLDOUT)
+        assert holdout == (start + FINAL_HOLDOUT, start + 2 * FINAL_HOLDOUT)
+        assert search == (start, start + FINAL_HOLDOUT)
+
+    def test_window_too_short_reserves_nothing(self) -> None:
+        start = _utc(2025, 1, 1)
+        end = start + 2 * FINAL_HOLDOUT - timedelta(seconds=1)
+        assert split_final_holdout(start, end) == ((start, end), None)
+
+    def test_bad_inputs_raise(self) -> None:
+        with pytest.raises(ValueError, match="tz-aware"):
+            split_final_holdout(datetime(2024, 1, 1), _utc(2026, 1, 1))
+        with pytest.raises(ValueError, match="must be >"):
+            split_final_holdout(_utc(2026, 1, 1), _utc(2026, 1, 1))
+        with pytest.raises(ValueError, match="positive"):
+            split_final_holdout(
+                _utc(2024, 1, 1), _utc(2026, 1, 1), holdout=timedelta(0)
+            )
+
+
+class TestHoldoutMinTrades:
+    def test_scales_to_the_holdout_share_of_the_oos_span(self) -> None:
+        holdout = (_utc(2026, 1, 1), _utc(2026, 1, 1) + timedelta(days=183))
+        oos = (_utc(2024, 9, 1), _utc(2024, 9, 1) + timedelta(days=488))
+        # 300 * 183 / 488 = 112.5 → rounds up
+        assert holdout_min_trades(300, holdout, oos) == 113
+
+    def test_never_asks_for_more_than_gate_b(self) -> None:
+        holdout = (_utc(2026, 1, 1), _utc(2026, 7, 3))
+        oos = (_utc(2025, 10, 1), _utc(2026, 1, 1))
+        assert holdout_min_trades(300, holdout, oos) == 300
+
+    def test_empty_oos_span_keeps_the_full_minimum(self) -> None:
+        holdout = (_utc(2026, 1, 1), _utc(2026, 7, 3))
+        assert holdout_min_trades(300, holdout, (_utc(2025, 1, 1),) * 2) == 300

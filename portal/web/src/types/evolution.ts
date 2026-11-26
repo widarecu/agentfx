@@ -77,6 +77,9 @@ export interface EvolutionRun {
      * actually used" and to make the run reproducible weeks later. */
     effective_data_window_start?: string;
     effective_data_window_end?: string;
+    /** AFX-151: the sealed final holdout after the effective window. */
+    holdout_window_start?: string | null;
+    holdout_window_end?: string | null;
     /** Legacy scalar — single spread for the whole run. Always set for
      * v0.3.0+ runs that completed snapshotting. v0.4.0 single-pair
      * runs still set this so portal back-compat isn't lost; the new
@@ -414,6 +417,24 @@ export interface ValidationDsr {
   reason: string;
 }
 
+/** Sealed final holdout check for one Gate B finalist (AFX-151). */
+export interface ValidationHoldout {
+  status: 'passed' | 'failed' | 'blocked' | 'unavailable' | 'error';
+  reason: string;
+  window_start: string | null;
+  window_end: string | null;
+  metrics: {
+    sharpe?: number | null;
+    max_drawdown?: number | null;
+    hit_rate?: number | null;
+    n_trades?: number | null;
+    cagr?: number | null;
+  };
+  min_trades: number | null;
+  failures: string[];
+  blocked_by: string | null;
+}
+
 export interface StrategyGenome {
   id: string;
   generation_id: string;
@@ -428,6 +449,7 @@ export interface StrategyGenome {
   validator_passed: boolean | null;
   validation_failures: string[];
   validation_dsr?: ValidationDsr | null;
+  validation_holdout?: ValidationHoldout | null;
   llm_reasoning: string | null;
   llm_call_id: string | null;
   created_at: string;

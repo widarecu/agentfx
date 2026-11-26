@@ -55,6 +55,7 @@ from agentfx.core.metrics import daily_equity_from_trade_ledger
 from agentfx.core.regime import RegimeTag
 from agentfx.core.validation import (
     WalkForwardFold,
+    holdout_min_trades,
     make_rolling_walk_forward_folds,
     oos_window,
 )
@@ -118,6 +119,33 @@ class DsrEvidence:
 
 
 @dataclass
+class HoldoutEvidence:
+    """The sealed final holdout check for one finalist (AFX-151).
+
+    ``status`` is ``passed`` or ``failed`` when the holdout backtest ran,
+    ``blocked`` when the genome or its lineage had already used this
+    holdout, ``unavailable`` when the run reserved no holdout, and
+    ``error`` when the backtest crashed. Only ``passed`` approves.
+    """
+
+    status: str
+    reason: str
+    window_start: str | None = None
+    window_end: str | None = None
+    metrics: dict[str, Any] = field(default_factory=dict)
+    min_trades: int | None = None
+    failures: list[str] = field(default_factory=list)
+    blocked_by: str | None = None
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "passed"
+
+
+_HOLDOUT_METRICS = ("sharpe", "max_drawdown", "hit_rate", "n_trades", "cagr")
+
+
+@dataclass
 class ValidationResult:
     """The output of validating one genome against a rolling walk-forward
     split.
@@ -143,6 +171,14 @@ class ValidationResult:
     fold_failures: list[str] = field(default_factory=list)
     dsr_sample: SharpeSample | str | None = None
     dsr: DsrEvidence | None = None
+    holdout: HoldoutEvidence | None = None
+
+    def apply_holdout(self, evidence: HoldoutEvidence) -> None:
+        """Record the sealed holdout check. Anything but a pass rejects."""
+        self.holdout = evidence
+        if not evidence.passed:
+            self.validator_passed = False
+            self.validation_failures = [*self.validation_failures, evidence.reason]
 
     def apply_dsr(self, *, trial_count: int, threshold: float) -> None:
         probability = raw_sharpe = bar = None
@@ -523,6 +559,68 @@ class ValidatorAgent(BaseAgent):
             dsr_sample=dsr_sample,
         )
 
+    def evaluate_holdout(
+        self,
+        spec: StrategySpec,
+        *,
+        instrument: str,
+        granularity: str = "M1",
+        holdout_window: tuple[datetime, datetime],
+        oos: tuple[datetime, datetime],
+        backtest_fn: BacktestFn | None = None,
+        gate_b_overrides: dict[str, float] | None = None,
+        **backtest_kwargs: Any,
+    ) -> HoldoutEvidence:
+        """Judge a Gate B finalist once on the sealed final holdout.
+
+        One backtest over the holdout, then Gate B with the trade minimum
+        scaled to the holdout's length (``holdout_min_trades``). The
+        caller must have claimed the holdout for this genome first: this
+        method does not know whether the holdout was already used.
+
+        The candle loader includes both ends of a window, and the last
+        walk-forward fold ends on the holdout's first instant, so the
+        holdout backtest starts one microsecond later. No candle is in
+        both.
+        """
+        fn = backtest_fn or self._backtest_fn or _default_backtest_fn
+        start, end = holdout_window
+        thresholds = {**GATE_B_THRESHOLDS, **(gate_b_overrides or {})}
+        min_trades = holdout_min_trades(thresholds["min_trades"], holdout_window, oos)
+        evidence = HoldoutEvidence(
+            status="error",
+            reason="Sealed holdout: the backtest failed, so the holdout is spent",
+            window_start=start.isoformat(),
+            window_end=end.isoformat(),
+            min_trades=min_trades,
+        )
+        try:
+            result = fn(
+                instrument=instrument,
+                granularity=granularity,
+                start=start + timedelta(microseconds=1),
+                end=end,
+                strategy_name="dsl",
+                strategy_params={"spec": spec.model_dump(mode="json")},
+                **{**backtest_kwargs, "capture_signals": True},
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("sealed holdout backtest failed")
+            return evidence
+        metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
+        passed, failures = evaluate_gate_b(
+            metrics, overrides={**(gate_b_overrides or {}), "min_trades": min_trades}
+        )
+        evidence.metrics = {k: metrics.get(k) for k in _HOLDOUT_METRICS}
+        evidence.failures = failures
+        evidence.status = "passed" if passed else "failed"
+        evidence.reason = (
+            "Sealed holdout passed"
+            if passed
+            else "Sealed holdout failed: " + "; ".join(failures)
+        )
+        return evidence
+
     def run(self, **kwargs) -> AgentResult:
         """BaseAgent contract entry point — wraps ``validate(...)``."""
         self.started_at = datetime.utcnow()
@@ -594,6 +692,7 @@ def _default_backtest_fn(**kwargs: Any) -> dict[str, Any]:
 __all__ = [
     "BacktestFn",
     "FoldEvaluation",
+    "HoldoutEvidence",
     "ValidationResult",
     "ValidatorAgent",
 ]

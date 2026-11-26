@@ -54,6 +54,7 @@ import type {
   StrategyGenome,
 } from '../types/evolution';
 import { selectGenomeDsr } from './genomeDsrView';
+import { selectGenomeHoldout } from './genomeHoldoutView';
 
 const ORIGIN_BADGE_COLORS: Record<GenomeOrigin, string> = {
   seed: 'bg-slate-200 text-slate-800 dark:bg-slate-600 dark:text-slate-100',
@@ -198,6 +199,7 @@ export default function GenomeDetail() {
   const summary = summarizeDsl(genome.dsl_json);
   const archetype = inferArchetype(genome.dsl_json);
   const dsr = selectGenomeDsr(genome.validation_dsr);
+  const holdout = selectGenomeHoldout(genome.validation_holdout);
   const fitnessText =
     genome.fitness != null && Number.isFinite(genome.fitness)
       ? genome.fitness.toFixed(3)
@@ -388,6 +390,24 @@ export default function GenomeDetail() {
             </div>
             <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
               {dsr.reason}
+            </p>
+          </section>
+        )}
+
+        {holdout && (
+          <section className="mt-4 rounded-md border border-slate-200 p-3 dark:border-slate-700">
+            <h2 className="mb-2 text-sm font-semibold">
+              Sealed 6-month holdout: {holdout.label}
+            </h2>
+            <div className="grid grid-cols-2 gap-4 text-sm md:grid-cols-5">
+              <Stat label="Holdout window" value={holdout.window} />
+              <Stat label="Sharpe" value={holdout.sharpe} />
+              <Stat label="Max drawdown" value={holdout.maxDrawdown} />
+              <Stat label="Net return (annualised)" value={holdout.cagr} />
+              <Stat label="Trades" value={holdout.trades} />
+            </div>
+            <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+              {holdout.reason}
             </p>
           </section>
         )}
