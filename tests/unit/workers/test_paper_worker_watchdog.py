@@ -569,6 +569,8 @@ class TestScanZombieRunning:
         approved_at,
         parameters: dict | None = None,
         run_id: str = "run_zombie_x",
+        last_heartbeat_at=None,
+        last_loop_progress_at=None,
     ):
         from agentfx.api.models import RunStatus
 
@@ -582,6 +584,8 @@ class TestScanZombieRunning:
             process_pid=process_pid,
             pair="EUR_USD",
             user_id=42,
+            last_heartbeat_at=last_heartbeat_at,
+            last_loop_progress_at=last_loop_progress_at,
         )
 
     def _fake_db(self, candidates):
@@ -637,11 +641,11 @@ class TestScanZombieRunning:
         )
 
         now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC)
-        stale_hb = (now - timedelta(seconds=_HEARTBEAT_STALE_SECONDS + 60)).isoformat()
+        stale_hb = now - timedelta(seconds=_HEARTBEAT_STALE_SECONDS + 60)
         run = self._stub_run(
             process_pid=12345,
             approved_at=now - timedelta(days=2),
-            parameters={"last_heartbeat_at": stale_hb},
+            last_heartbeat_at=stale_hb,
         )
         db = self._fake_db([run])
         scheduled: list[str] = []
@@ -673,11 +677,11 @@ class TestScanZombieRunning:
         )
 
         now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC)
-        fresh_hb = (now - timedelta(seconds=60)).isoformat()
+        fresh_hb = now - timedelta(seconds=60)
         run = self._stub_run(
             process_pid=12345,
             approved_at=now - timedelta(days=2),
-            parameters={"last_heartbeat_at": fresh_hb},
+            last_heartbeat_at=fresh_hb,
         )
         db = self._fake_db([run])
         scheduled: list[str] = []
@@ -770,10 +774,12 @@ class TestZombieLivePid:
             stop_reason=None,
             completed_at=None,
             approved_at=now - timedelta(days=12),
-            parameters={"last_heartbeat_at": stale_hb.isoformat()},
+            parameters={},
             process_pid=pid,
             pair="AUD_USD",
             user_id=42,
+            last_heartbeat_at=stale_hb,
+            last_loop_progress_at=None,
         )
         return run, now
 
@@ -975,6 +981,7 @@ class TestZombieLivePid:
         from agentfx.api.workers import paper_runner as worker
 
         run, now = self._stale_run(793)
+        run.last_heartbeat_at = None
         run.parameters = {
             "auto_restart_attempts": 1,
             "auto_restart_last_at": (now - timedelta(seconds=240)).isoformat(),
@@ -993,3 +1000,164 @@ class TestZombieLivePid:
         ensure_dead.assert_not_called()
         schedule.assert_not_called()
         assert run.status == RunStatus.RUNNING
+
+
+class TestScanStuckRunning:
+    """AFX-99: fresh heartbeat (process alive) but no loop progress is
+    stuck, not dead. Wilson 2026-11-26: stop the runner and restart only
+    once its exit is confirmed; if it can't be confirmed, don't restart."""
+
+    def _run(self, *, heartbeat_age: float, progress_age: float | None, pid=37):
+        from datetime import UTC, datetime, timedelta
+
+        from agentfx.api.models import RunStatus
+
+        now = datetime(2026, 11, 26, 12, 0, 0, tzinfo=UTC)
+        run = SimpleNamespace(
+            id="run_afx99_stuck",
+            status=RunStatus.RUNNING,
+            stop_reason=None,
+            completed_at=None,
+            approved_at=now - timedelta(days=3),
+            parameters={},
+            process_pid=pid,
+            pair="AUD_USD",
+            user_id=42,
+            last_heartbeat_at=now - timedelta(seconds=heartbeat_age),
+            last_loop_progress_at=(
+                None if progress_age is None else now - timedelta(seconds=progress_age)
+            ),
+        )
+        return run, now
+
+    def _scan(self, run, now, *, children=None, pid_alive=None):
+        from agentfx.api.workers import paper_runner as worker
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = [run]
+        scheduled: list[str] = []
+        patches = [
+            patch.dict(worker._CHILDREN, children or {}, clear=True),
+            patch.object(worker, "_TERMINATE_GRACE_SECONDS", 0.01),
+            patch.object(worker, "_KILL_GRACE_SECONDS", 0.01),
+            patch.object(
+                worker, "schedule_paper_run", side_effect=lambda r: scheduled.append(r)
+            ),
+            patch("sqlalchemy.orm.attributes.flag_modified", MagicMock()),
+        ]
+        if pid_alive is not None:
+            patches.append(patch.object(worker, "_pid_alive", return_value=pid_alive))
+        for p in patches:
+            p.start()
+        try:
+            restarted = worker.scan_and_restart_zombie_running(db=db, now=now)
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        return restarted, scheduled, db
+
+    def test_stuck_unmanaged_live_pid_is_not_restarted(self):
+        """Exit can't be confirmed for a pid this supervisor didn't spawn:
+        never start a second runner on the sub-account."""
+        from agentfx.api.models import RunStatus
+        from agentfx.api.workers.paper_runner import _LOOP_PROGRESS_STALE_SECONDS
+
+        run, now = self._run(
+            heartbeat_age=30, progress_age=_LOOP_PROGRESS_STALE_SECONDS + 60
+        )
+        restarted, scheduled, _ = self._scan(run, now, pid_alive=True)
+
+        assert restarted == 0
+        assert scheduled == []
+        assert run.status == RunStatus.RUNNING
+        assert "auto_restart_attempts" not in run.parameters
+
+    def test_stuck_managed_child_that_survives_sigkill_is_not_restarted(self):
+        import threading
+
+        from agentfx.api.models import RunStatus
+        from agentfx.api.workers import paper_runner as worker
+        from agentfx.api.workers.paper_runner import _LOOP_PROGRESS_STALE_SECONDS
+
+        proc = MagicMock()
+        proc.pid = 37
+        handle = worker._ChildHandle(
+            proc=proc, exited=threading.Event(), run_id="run_afx99_stuck"
+        )
+        run, now = self._run(
+            heartbeat_age=30, progress_age=_LOOP_PROGRESS_STALE_SECONDS + 60
+        )
+        restarted, scheduled, _ = self._scan(run, now, children={37: handle})
+
+        proc.terminate.assert_called_once()
+        proc.kill.assert_called_once()
+        assert restarted == 0
+        assert scheduled == []
+        assert run.status == RunStatus.RUNNING
+
+    def test_stuck_run_whose_runner_exited_is_restarted_as_stuck(self):
+        from agentfx.api.models import RunStatus
+        from agentfx.api.workers.paper_runner import _LOOP_PROGRESS_STALE_SECONDS
+
+        run, now = self._run(
+            heartbeat_age=30, progress_age=_LOOP_PROGRESS_STALE_SECONDS + 60
+        )
+        restarted, scheduled, db = self._scan(run, now, pid_alive=False)
+
+        assert restarted == 1
+        assert scheduled == [run.id]
+        assert run.status == RunStatus.APPROVED
+        assert (
+            run.parameters["auto_restart_prior_reason"] == "stuck:loop progress stale"
+        )
+        assert run.parameters["auto_restart_attempts"] == 1
+        decision = db.add.call_args.args[0]
+        assert decision.outputs_json["prior_stop_reason"].startswith("stuck:")
+        assert decision.outputs_json["waited_seconds"] == pytest.approx(
+            _LOOP_PROGRESS_STALE_SECONDS + 60
+        )
+
+    def test_slow_iteration_under_the_progress_window_is_left_alone(self):
+        from agentfx.api.workers.paper_runner import _LOOP_PROGRESS_STALE_SECONDS
+
+        run, now = self._run(
+            heartbeat_age=30, progress_age=_LOOP_PROGRESS_STALE_SECONDS - 60
+        )
+        restarted, scheduled, _ = self._scan(run, now, pid_alive=False)
+
+        assert (restarted, scheduled) == (0, [])
+
+    def test_no_progress_stamp_yet_is_never_stuck(self):
+        run, now = self._run(heartbeat_age=30, progress_age=None)
+        restarted, scheduled, _ = self._scan(run, now, pid_alive=False)
+
+        assert (restarted, scheduled) == (0, [])
+
+    def test_no_heartbeat_is_never_stuck(self):
+        """Legacy row (no approved_at, so no startup grace) whose first
+        beat never landed: stale progress alone isn't proof of life."""
+        from agentfx.api.workers.paper_runner import _LOOP_PROGRESS_STALE_SECONDS
+
+        run, now = self._run(
+            heartbeat_age=0, progress_age=_LOOP_PROGRESS_STALE_SECONDS + 60
+        )
+        run.last_heartbeat_at = None
+        run.approved_at = None
+        restarted, scheduled, _ = self._scan(run, now, pid_alive=False)
+
+        assert (restarted, scheduled) == (0, [])
+
+    def test_stale_heartbeat_is_dead_even_if_progress_is_stale_too(self):
+        from agentfx.api.workers.paper_runner import (
+            _HEARTBEAT_STALE_SECONDS,
+            _LOOP_PROGRESS_STALE_SECONDS,
+        )
+
+        run, now = self._run(
+            heartbeat_age=_HEARTBEAT_STALE_SECONDS + 60,
+            progress_age=_LOOP_PROGRESS_STALE_SECONDS + 60,
+        )
+        restarted, _, _ = self._scan(run, now, pid_alive=False)
+
+        assert restarted == 1
+        assert run.parameters["auto_restart_prior_reason"] == "zombie:heartbeat stale"
