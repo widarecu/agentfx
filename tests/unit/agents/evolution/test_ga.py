@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from random import Random
+from unittest.mock import Mock
 
 import pytest
 
 from agentfx.agents.evolution.ga import (
+    _mut_perturb_risk_pct,
     crossover_specs,
     elite_select,
     evolve_to_next_generation,
@@ -35,6 +37,34 @@ from agentfx.core.dsl.seeds import (
 
 
 class TestMutateSpec:
+    @pytest.mark.parametrize(
+        ("risk_pct", "factor", "expected"),
+        [(0.003, 0.75, 0.0025), (0.019, 1.25, 0.02), (0.01, 1.25, 0.0125)],
+    )
+    def test_risk_pct_perturbation(self, risk_pct, factor, expected) -> None:
+        payload = MA_CROSSOVER_SEED.model_dump()
+        payload["size"]["risk_pct"] = risk_pct
+        rng = Mock(spec=Random)
+        rng.uniform.return_value = factor
+        assert _mut_perturb_risk_pct(payload, rng)
+        rng.uniform.assert_called_once_with(0.75, 1.25)
+        assert StrategySpec.model_validate(payload).size.risk_pct == expected
+
+    def test_evolved_offspring_does_not_rewrite_legacy_parent(self) -> None:
+        payload = MA_CROSSOVER_SEED.model_dump()
+        payload["size"]["risk_pct"] = 0.001
+        parent = StrategySpec.from_stored_genome(payload)
+        assert mutate_spec(parent, Random(0)).size.risk_pct >= 0.0025
+        child, _ = crossover_specs(parent, MA_CROSSOVER_SEED, Random(0))
+        assert child.size.risk_pct >= 0.0025
+        assert parent.size.risk_pct == 0.001
+
+    def test_risk_pct_is_explored_from_one_percent_seeds(self) -> None:
+        assert all(seed.size.risk_pct == 0.01 for seed in SEED_SPECS)
+        rng = Random(0)
+        risks = {mutate_spec(MA_CROSSOVER_SEED, rng).size.risk_pct for _ in range(100)}
+        assert min(risks) < 0.01 < max(risks)
+
     def test_returns_valid_spec(self) -> None:
         rng = Random(0)
         for _ in range(50):

@@ -32,11 +32,11 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from random import Random
 from typing import Any, Protocol
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 from agentfx.agents.base import AgentResult, BaseAgent
 from agentfx.agents.evolution import (
@@ -54,11 +54,14 @@ from agentfx.agents.evolution.llm_client import (
 )
 from agentfx.agents.validator import FoldEvaluation, ValidationResult, ValidatorAgent
 from agentfx.api.models import GenomeOrigin
+from agentfx.core.deflated_sharpe import DEFAULT_DSR_THRESHOLD
 from agentfx.core.dsl import StrategySpec
 from agentfx.core.dsl.seeds import SEED_SPECS
+from agentfx.core.position_sizing import DEFAULT_LEVERAGE
 from agentfx.core.regime import RegimeTag, compute_regime, regimes_match
 from agentfx.core.validation import (
     make_rolling_walk_forward_folds,
+    oos_window,
     training_window,
 )
 
@@ -128,7 +131,7 @@ class OrchestratorConfig:
     account_balance: float = 10000.0
     position_size: int = 10000
     spread_pips: float | None = None  # None = use default
-    leverage: int = 30  # 30:1 OANDA retail default, 50:1 opt-in
+    leverage: int = DEFAULT_LEVERAGE  # 30:1 retail default, 50:1 opt-in
 
     # Gen-0 seeding strategy. The canonical SEED_SPECS are always
     # included; these flags layer additional starting points on top.
@@ -229,6 +232,10 @@ class EvolutionStatePersister(Protocol):
         """
         ...
 
+    def register_validation_attempts(
+        self, run_id: str, genome_ids: list[str], window: tuple[datetime, datetime]
+    ) -> int: ...
+
     def save_validation(
         self,
         genome_id: str,
@@ -236,6 +243,7 @@ class EvolutionStatePersister(Protocol):
         *,
         validator_passed: bool,
         validation_failures: list[str],
+        validation_dsr: dict[str, Any] | None = None,
     ) -> None: ...
 
     def log_decision(
@@ -328,6 +336,7 @@ class OrchestratorAgent(BaseAgent):
         *,
         llm_injector: LLMHypothesisInjector | None = None,
         validator: ValidatorAgent | None = None,
+        dsr_threshold: float = DEFAULT_DSR_THRESHOLD,
         compute_fitness_fn: Callable[..., tuple[float, dict]] | None = None,
         seed_specs: list[StrategySpec] | None = None,
         rng: Random | None = None,
@@ -341,6 +350,7 @@ class OrchestratorAgent(BaseAgent):
         self.stop_conditions = stop_conditions
         self.data_window = data_window
         self.persister = persister
+        self.dsr_threshold = dsr_threshold
 
         self.llm_injector = llm_injector  # may be None — runs without LLM injection
         # v0.4.0 rolling validator — overridable via tests/injection.
@@ -582,7 +592,7 @@ class OrchestratorAgent(BaseAgent):
                     try:
                         # Pre-validate the spec so bad rows fail at stash
                         # time rather than at injection time mid-loop.
-                        StrategySpec.model_validate(row["dsl_json"])
+                        StrategySpec.from_stored_genome(row["dsl_json"])
                         self._pending_warm_starts.append(row)
                     except Exception as e:
                         logger.warning(
@@ -604,7 +614,7 @@ class OrchestratorAgent(BaseAgent):
                 # explicitly disables the new scheduling).
                 for row in prior:
                     try:
-                        spec = StrategySpec.model_validate(row["dsl_json"])
+                        spec = StrategySpec.from_stored_genome(row["dsl_json"])
                         composite_seed_genomes.append(
                             Genome(
                                 spec=spec,
@@ -1323,7 +1333,7 @@ class OrchestratorAgent(BaseAgent):
         actually_injected = 0
         for row in picks:
             try:
-                spec = StrategySpec.model_validate(row["dsl_json"])
+                spec = StrategySpec.from_stored_genome(row["dsl_json"])
             except Exception as e:
                 logger.warning(
                     "warm-start deferred injection: spec %s failed "
@@ -1440,14 +1450,11 @@ class OrchestratorAgent(BaseAgent):
     @staticmethod
     def _oos_robustness_score(
         result: ValidationResult,
-    ) -> tuple[int, float, int]:
+    ) -> tuple[bool, int, float, int]:
         """Score a validated genome on OOS robustness for champion selection.
 
-        Returns a tuple ``(n_gate_b_criteria_passed, median_oos_sharpe,
-        total_oos_trades)`` — Python's tuple comparison gives lexicographic
-        ranking: more Gate B criteria passed wins first; ties broken by
-        OOS Sharpe; further ties broken by trade count (statistical
-        confidence).
+        Passers rank ahead of failures, then fewer reported failures,
+        higher median OOS Sharpe, and higher trade count win in that order.
 
         Why this composite rather than just OOS Sharpe: we observed (UAT
         2026-06-26) that the GA's #1 by training fitness often has
@@ -1458,21 +1465,61 @@ class OrchestratorAgent(BaseAgent):
         to passing they are; when some genomes pass, those rank above
         non-passers automatically.
 
-        Five Gate B criteria are tracked in ``validation_failures`` as
-        human-readable strings; the count of NON-failures is
-        ``5 - len(failures)``.
+        Seven criteria count: the five aggregate Gate B checks, DSR, and
+        the per-fold floor. Several failing OOS folds count as one failure.
         """
-        # The validation_failures list contains one string per failed
-        # criterion (sharpe / max_dd / hit_rate / n_trades / cagr).
-        # 5 total criteria; non-failing count = 5 - len(failures).
-        # Use a generous denominator so future Gate B additions don't
-        # break the score; pass-count is the primary discriminator
-        # regardless.
-        n_passed = 5 - len(result.validation_failures)
+        n_fold = len(result.fold_failures)
+        n_failed = len(result.validation_failures) - n_fold + bool(n_fold)
         agg = result.oos_aggregate_metrics or {}
         median_sharpe = float(agg.get("sharpe", float("-inf")))
         total_trades = int(agg.get("n_trades", 0) or 0)
-        return (n_passed, median_sharpe, total_trades)
+        return (
+            result.validator_passed,
+            7 - n_failed,
+            median_sharpe,
+            total_trades,
+        )
+
+    def _evaluate_validation_batch(
+        self, top_k: list[Genome]
+    ) -> Iterator[tuple[int, Genome, ValidationResult]]:
+        for rank, genome in enumerate(top_k, start=1):
+            self._ensure_not_stopped()
+            if genome.id is None:
+                logger.warning(
+                    "skipping validation for genome with no ID at rank %d", rank
+                )
+                continue
+
+            try:
+                # The runner pins spread at run-start so validation pays
+                # the same cost as the GA's training backtests.
+                validator_kwargs: dict[str, Any] = {
+                    "account_balance": self.config.account_balance,
+                    "leverage": self.config.leverage,
+                }
+                if self.config.spread_pips is not None:
+                    validator_kwargs["spread_pips"] = self.config.spread_pips
+                result = self.validator.validate(
+                    spec=genome.spec,
+                    instrument=self.config.instrument,
+                    granularity=self.config.granularity,
+                    start=self.data_window[0],
+                    end=self.data_window[1],
+                    gate_b_overrides={"min_cagr": self.config.min_cagr_pct},
+                    fold_regimes=getattr(self, "_fold_regimes", None),
+                    collect_dsr_sample=True,
+                    **validator_kwargs,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "validator crashed for genome %s (rank %d/%d)",
+                    genome.id,
+                    rank,
+                    len(top_k),
+                )
+                continue
+            yield rank, genome, result
 
     def _validate_top_genomes(
         self, best_genome_overall: Genome | None
@@ -1513,64 +1560,41 @@ class OrchestratorAgent(BaseAgent):
             # at least validate the run-best so the old contract holds.
             top_k = [best_genome_overall]
 
+        evaluated: list[tuple[int, Genome, ValidationResult]] = []
+        try:
+            evaluated.extend(self._evaluate_validation_batch(top_k))
+        finally:
+            outcome = self._persist_validation_batch(evaluated, batch_size=len(top_k))
+        return outcome
+
+    def _persist_validation_batch(
+        self,
+        evaluated: list[tuple[int, Genome, ValidationResult]],
+        *,
+        batch_size: int,
+    ) -> tuple[int, Genome | None]:
+        if not evaluated:
+            return 0, None
+        genome_ids = [genome.id for _, genome, _ in evaluated if genome.id is not None]
+        trial_count = self.persister.register_validation_attempts(
+            self.run_id,
+            genome_ids,
+            oos_window([fe.fold for fe in evaluated[0][2].folds]),
+        )
         passed = 0
-        # Track best-by-OOS for champion-by-OOS selection (2026-06-27).
-        # We collect (score_tuple, genome) pairs as each validation
-        # completes; the best after the loop becomes the run's champion
-        # if it differs from best_genome_overall (the training-fitness
-        # leader). See _oos_robustness_score for the score definition.
-        best_oos_score: tuple[int, float, int] | None = None
+        best_oos_score: tuple[bool, int, float, int] | None = None
         oos_champion: Genome | None = None
-        for rank, genome in enumerate(top_k, start=1):
-            self._ensure_not_stopped()
-            if genome.id is None:
-                logger.warning(
-                    "skipping validation for genome with no ID at rank %d "
-                    "(should have been assigned by save_generation)",
-                    rank,
-                )
-                continue
 
-            try:
-                # Validator backtests must pay the *same* spread the GA's
-                # fitness paid — otherwise the OOS verdict is being
-                # judged at a different cost level than training. Pass
-                # config.spread_pips through if pinned; otherwise the
-                # backtest's live lookup applies, which means the
-                # validator could drift from the GA. The runner pins
-                # `config.spread_pips` at run-start (resolved live or
-                # user-provided) precisely so we never hit the drift
-                # case here.
-                validator_kwargs: dict[str, Any] = {
-                    "account_balance": self.config.account_balance,
-                    "leverage": self.config.leverage,
-                }
-                if self.config.spread_pips is not None:
-                    validator_kwargs["spread_pips"] = self.config.spread_pips
-                result = self.validator.validate(
-                    spec=genome.spec,
-                    instrument=self.config.instrument,
-                    granularity=self.config.granularity,
-                    start=self.data_window[0],
-                    end=self.data_window[1],
-                    gate_b_overrides={"min_cagr": self.config.min_cagr_pct},
-                    fold_regimes=getattr(self, "_fold_regimes", None),
-                    **validator_kwargs,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "validator crashed for genome %s (rank %d/%d)",
-                    genome.id,
-                    rank,
-                    len(top_k),
-                )
-                continue
-
+        for rank, genome, result in evaluated:
+            assert genome.id is not None
+            result.apply_dsr(trial_count=trial_count, threshold=self.dsr_threshold)
+            validation_dsr = asdict(result.dsr) if result.dsr is not None else None
             self.persister.save_validation(
                 genome.id,
                 folds=result.folds,
                 validator_passed=result.validator_passed,
                 validation_failures=result.validation_failures,
+                validation_dsr=validation_dsr,
             )
             oos_eval = result.oos_evaluation
             self.persister.log_decision(
@@ -1586,10 +1610,11 @@ class OrchestratorAgent(BaseAgent):
                     "oos_max_drawdown": oos_eval.metrics.get("max_drawdown"),
                     "oos_n_trades": oos_eval.metrics.get("n_trades"),
                     "validation_failures": result.validation_failures,
+                    "validation_dsr": validation_dsr,
                 },
                 reasoning_text=(
                     f"Walk-forward validation on genome {genome.id} "
-                    f"(rank {rank}/{len(top_k)} by training fitness): "
+                    f"(rank {rank}/{batch_size} by training fitness): "
                     f"{'passed' if result.validator_passed else 'failed'} "
                     f"on OOS fold (Sharpe={oos_eval.metrics.get('sharpe', '?')})."
                 ),

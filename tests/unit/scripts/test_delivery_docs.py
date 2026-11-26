@@ -111,6 +111,13 @@ def test_branch_flow_is_only_a_pointer() -> None:
     assert len(text.splitlines()) < 10
 
 
+def test_agents_md_is_a_short_pointer_to_repo_guidance() -> None:
+    text = _read("AGENTS.md")
+    assert len(text.splitlines()) < 15
+    assert "CLAUDE.md" in text
+    assert "Read before changing" in text
+
+
 @pytest.mark.parametrize("rel", _WORKFLOW_DOCS)
 def test_workflow_docs_teach_the_canonical_commands(rel: str) -> None:
     text = _read(rel)

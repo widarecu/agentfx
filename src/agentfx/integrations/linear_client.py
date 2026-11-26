@@ -44,6 +44,8 @@ _HTTP_TIMEOUT_SECONDS = 10.0
 # match against it with a simple substring search. Kept intentionally
 # verbose so a human reading the issue in Linear sees why it's there.
 _FINGERPRINT_MARKER = "**Fingerprint:**"
+_CLOSED_STATE_TYPES = ("completed", "canceled", "duplicate")
+_MAX_DUPLICATE_CHAIN_HOPS = 5
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -66,6 +68,7 @@ class FindingSpec:
     area_label: str  # "Backtest" / "Paper runner" / "Agent fleet" / etc.
     risk_label: str = "Normal"  # "Normal" or "Money-path"
     extra_labels: list[str] = field(default_factory=list)  # e.g. "Found in: Staging"
+    evidence: str | None = None
 
 
 @dataclass
@@ -77,8 +80,13 @@ class FilingResult:
     issue_id: str | None = None  # Linear's internal uuid
     identifier: str | None = None  # Human-readable, e.g. "AFX-42"
     url: str | None = None
-    action: str = ""  # "created" / "commented" / "skipped:<why>"
+    action: str = (
+        ""  # "created" / "commented" / "reopened" / "benign" / "skipped:<why>"
+    )
     reason: str = ""  # Human-readable detail (success → "" / "ok")
+    state_name: str | None = (
+        None  # Existing or prior Linear state (e.g. "In Progress", "Done")
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -126,37 +134,37 @@ def file_finding(spec: FindingSpec, *, now: datetime | None = None) -> FilingRes
         existing = None
 
     if existing is not None:
-        comment_body = _render_dedupe_comment(spec, now=now)
-        try:
-            ok = _add_comment(client, issue_id=existing["id"], body=comment_body)
-            if ok:
-                logger.info(
-                    "linear_client: appended evidence to open issue=%s "
-                    "(fingerprint=%s)",
-                    existing["identifier"],
-                    spec.fingerprint,
-                )
-                return FilingResult(
-                    filed=True,
-                    issue_id=existing["id"],
-                    identifier=existing["identifier"],
-                    url=existing.get("url"),
-                    action="commented",
-                )
-        except Exception:
-            logger.exception(
-                "linear_client: comment append failed for issue=%s",
-                existing.get("identifier"),
-            )
-        # Comment attempt failed — fall through so the finding is at
-        # least logged at the caller rather than lost. We return
-        # action="skipped:dedupe_comment_failed" so the caller can
-        # retry via its email path if desired.
-        return FilingResult(
-            filed=False,
-            issue_id=existing["id"],
-            identifier=existing["identifier"],
-            action="skipped:dedupe_comment_failed",
+        return _comment_on_open_issue(client, existing, spec, now=now)
+
+    # 1b. Closed-issue lookup (AFX-149) — if this finding matches a
+    #     closed ticket (Done / Canceled / Duplicate), reopen it to
+    #     Triage (or follow Duplicate to its canonical ticket and
+    #     comment or reopen) instead of filing a brand new ticket.
+    #     Reopens do not count against the daily cap.
+    try:
+        closed_nodes = _search_closed_by_fingerprint(client, team_key, spec.fingerprint)
+    except Exception:
+        logger.exception(
+            "linear_client: closed-issue search failed for fingerprint=%s",
+            spec.fingerprint,
+        )
+        closed_nodes = []
+
+    closed_match = _pick_closed_candidate(closed_nodes)
+    if closed_match is not None:
+        target = (
+            _resolve_duplicate_target(client, closed_match)
+            if _is_duplicate_issue(closed_match)
+            else closed_match
+        )
+        if not _is_closed_issue(target):
+            return _comment_on_open_issue(client, target, spec, now=now)
+        return _reopen_closed_issue(
+            client,
+            team_key=team_key,
+            issue=target,
+            spec=spec,
+            now=now,
         )
 
     # 2. Per-agent daily cap — bail out before creating if the cap
@@ -268,9 +276,8 @@ def _search_open_by_fingerprint(
     `Fingerprint: <fingerprint>`, or None.
 
     "Open" = any non-terminal state (Triage / Backlog / Ready /
-    In Progress / In Review / Blocked). We treat Done / Canceled /
-    Duplicate as closed — a historical Done issue should not block a
-    fresh report of the same problem.
+    In Progress / In Review / Blocked). Done / Canceled / Duplicate
+    are handled separately by `_search_closed_by_fingerprint`.
 
     AFX-76: the marker must mirror exactly what `_render_body_with_fingerprint`
     writes, including the backticks around the fingerprint value.
@@ -285,17 +292,376 @@ def _search_open_by_fingerprint(
         first: 10,
         filter: {
           team: { key: { eq: $teamKey } },
-          state: { type: { nin: ["completed", "canceled"] } },
+          state: { type: { nin: ["completed", "canceled", "duplicate"] } },
           description: { contains: $query }
         }
       ) {
-        nodes { id identifier url state { name } }
+        nodes { id identifier url state { name type } }
       }
     }
     """
     data = _gql(client, query, {"query": marker, "teamKey": team_key})
     nodes = (data.get("issues") or {}).get("nodes") or []
-    return nodes[0] if nodes else None
+    for node in nodes:
+        if not _is_closed_issue(node):
+            return node
+    return None
+
+
+def _search_closed_by_fingerprint(
+    client: requests.Session, team_key: str, fingerprint: str
+) -> list[dict]:
+    """Return closed issues (Done / Canceled / Duplicate) whose
+    description contains the fingerprint marker, including duplicate
+    relations so a Duplicate can be resolved to its canonical ticket."""
+    marker = f"{_FINGERPRINT_MARKER} `{fingerprint}`"
+    query = """
+    query SearchClosedByFingerprint($query: String!, $teamKey: String!) {
+      issues(
+        first: 10,
+        filter: {
+          team: { key: { eq: $teamKey } },
+          state: { type: { in: ["completed", "canceled", "duplicate"] } },
+          description: { contains: $query }
+        }
+      ) {
+        nodes {
+          id
+          identifier
+          url
+          completedAt
+          canceledAt
+          updatedAt
+          state { name type }
+          relations(first: 5) {
+            nodes {
+              type
+              relatedIssue {
+                id
+                identifier
+                url
+                completedAt
+                canceledAt
+                updatedAt
+                state { name type }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    data = _gql(client, query, {"query": marker, "teamKey": team_key})
+    return (data.get("issues") or {}).get("nodes") or []
+
+
+def _fetch_issue_with_relations(client: requests.Session, issue_id: str) -> dict | None:
+    """Fetch one issue with its duplicate relations (used only when
+    following a multi-hop Duplicate chain)."""
+    query = """
+    query IssueWithRelations($id: String!) {
+      issue(id: $id) {
+        id
+        identifier
+        url
+        completedAt
+        canceledAt
+        updatedAt
+        state { name type }
+        relations(first: 5) {
+          nodes {
+            type
+            relatedIssue {
+              id
+              identifier
+              url
+              completedAt
+              canceledAt
+              updatedAt
+              state { name type }
+            }
+          }
+        }
+      }
+    }
+    """
+    data = _gql(client, query, {"id": issue_id})
+    return data.get("issue") or None
+
+
+def _is_closed_issue(issue: dict) -> bool:
+    state = issue.get("state") or {}
+    state_type = (state.get("type") or "").strip().lower()
+    state_name = (state.get("name") or "").strip().lower()
+    return state_type in _CLOSED_STATE_TYPES or state_name in (
+        "done",
+        "canceled",
+        "cancelled",
+        "duplicate",
+    )
+
+
+def _is_duplicate_issue(issue: dict) -> bool:
+    state = issue.get("state") or {}
+    if (state.get("type") or "").strip().lower() == "duplicate":
+        return True
+    if (state.get("name") or "").strip().lower() == "duplicate":
+        return True
+    return _duplicate_target(issue) is not None
+
+
+def _duplicate_target(issue: dict) -> dict | None:
+    relations = (issue.get("relations") or {}).get("nodes") or []
+    for rel in relations:
+        if (rel.get("type") or "").strip().lower() == "duplicate":
+            target = rel.get("relatedIssue")
+            if isinstance(target, dict) and target.get("id"):
+                return target
+    return None
+
+
+def _closed_timestamp(issue: dict) -> str:
+    return (
+        issue.get("completedAt")
+        or issue.get("canceledAt")
+        or issue.get("updatedAt")
+        or ""
+    )
+
+
+def _pick_closed_candidate(nodes: list[dict]) -> dict | None:
+    """Choose the best closed ticket to reopen from matching nodes.
+
+    Preference order (AFX-149):
+    1. Non-duplicate Done (`completed`), most recently closed first.
+    2. Non-duplicate Canceled, most recently closed first.
+    3. Duplicate (or Canceled-as-duplicate), most recently closed first
+       — caller resolves this to its canonical target.
+    """
+    if not nodes:
+        return None
+    non_dup_done: list[dict] = []
+    non_dup_canceled: list[dict] = []
+    dups: list[dict] = []
+    for node in nodes:
+        if _is_duplicate_issue(node):
+            dups.append(node)
+        else:
+            state = node.get("state") or {}
+            st_type = (state.get("type") or "").strip().lower()
+            st_name = (state.get("name") or "").strip().lower()
+            if st_type == "completed" or st_name == "done":
+                non_dup_done.append(node)
+            else:
+                non_dup_canceled.append(node)
+    for bucket in (non_dup_done, non_dup_canceled, dups):
+        if bucket:
+            bucket.sort(key=_closed_timestamp, reverse=True)
+            return bucket[0]
+    return None
+
+
+def _resolve_duplicate_target(client: requests.Session, issue: dict) -> dict:
+    """Follow `duplicate` relations to the canonical ticket, guarded
+    against cycles and bounded to `_MAX_DUPLICATE_CHAIN_HOPS`."""
+    current = issue
+    visited: set[str] = {str(current.get("id") or "")}
+    for _ in range(_MAX_DUPLICATE_CHAIN_HOPS):
+        target = _duplicate_target(current)
+        if target is None:
+            break
+        target_id = str(target.get("id") or "")
+        if not target_id or target_id in visited:
+            break
+        visited.add(target_id)
+        current = target
+        if _is_duplicate_issue(current) and "relations" not in current:
+            try:
+                fetched = _fetch_issue_with_relations(client, target_id)
+                if fetched:
+                    current = fetched
+            except Exception:
+                logger.exception(
+                    "linear_client: failed to follow duplicate chain from %s",
+                    current.get("identifier"),
+                )
+                break
+    return current
+
+
+def _comment_on_open_issue(
+    client: requests.Session,
+    issue: dict,
+    spec: FindingSpec,
+    *,
+    now: datetime,
+) -> FilingResult:
+    state_name = (issue.get("state") or {}).get("name") or None
+    comment_body = _render_dedupe_comment(spec, now=now)
+    try:
+        ok = _add_comment(client, issue_id=issue["id"], body=comment_body)
+        if ok:
+            logger.info(
+                "linear_client: appended evidence to open issue=%s (fingerprint=%s)",
+                issue["identifier"],
+                spec.fingerprint,
+            )
+            return FilingResult(
+                filed=True,
+                issue_id=issue["id"],
+                identifier=issue["identifier"],
+                url=issue.get("url"),
+                action="commented",
+                state_name=state_name,
+            )
+    except Exception:
+        logger.exception(
+            "linear_client: comment append failed for issue=%s",
+            issue.get("identifier"),
+        )
+    return FilingResult(
+        filed=False,
+        issue_id=issue["id"],
+        identifier=issue["identifier"],
+        url=issue.get("url"),
+        action="skipped:dedupe_comment_failed",
+        state_name=state_name,
+    )
+
+
+def _resolve_triage_state_id(client: requests.Session, team_key: str) -> str | None:
+    """Look up the team's Triage workflow state ID."""
+    query = """
+    query ResolveTriageState($teamKey: String!) {
+      teams(filter: { key: { eq: $teamKey } }) {
+        nodes {
+          id
+          states(first: 25) {
+            nodes { id name type }
+          }
+        }
+      }
+    }
+    """
+    data = _gql(client, query, {"teamKey": team_key})
+    teams = (data.get("teams") or {}).get("nodes") or []
+    if not teams:
+        return None
+    states = (teams[0].get("states") or {}).get("nodes") or []
+    for st in states:
+        if (st.get("type") or "").strip().lower() == "triage":
+            return st.get("id")
+    for st in states:
+        if (st.get("name") or "").strip().lower() == "triage":
+            return st.get("id")
+    return None
+
+
+def _update_issue_state(
+    client: requests.Session, *, issue_id: str, state_id: str
+) -> bool:
+    mutation = """
+    mutation UpdateIssueState($id: String!, $stateId: String!) {
+      issueUpdate(id: $id, input: { stateId: $stateId }) {
+        success
+      }
+    }
+    """
+    data = _gql(client, mutation, {"id": issue_id, "stateId": state_id})
+    return bool((data.get("issueUpdate") or {}).get("success"))
+
+
+def _reopen_closed_issue(
+    client: requests.Session,
+    *,
+    team_key: str,
+    issue: dict,
+    spec: FindingSpec,
+    now: datetime,
+) -> FilingResult:
+    """Move a closed issue back to Triage and append a recurrence comment."""
+    prev_state = (issue.get("state") or {}).get("name") or "Closed"
+    closed_at = _closed_timestamp(issue)
+    try:
+        triage_state_id = _resolve_triage_state_id(client, team_key)
+        if not triage_state_id:
+            logger.error(
+                "linear_client: Triage state not found on team %s; cannot reopen %s",
+                team_key,
+                issue.get("identifier"),
+            )
+            return FilingResult(
+                filed=False,
+                issue_id=issue["id"],
+                identifier=issue["identifier"],
+                url=issue.get("url"),
+                action="skipped:reopen_failed",
+                state_name=prev_state,
+            )
+        moved = _update_issue_state(
+            client, issue_id=issue["id"], state_id=triage_state_id
+        )
+        if not moved:
+            logger.error(
+                "linear_client: issueUpdate failed reopening %s",
+                issue.get("identifier"),
+            )
+            return FilingResult(
+                filed=False,
+                issue_id=issue["id"],
+                identifier=issue["identifier"],
+                url=issue.get("url"),
+                action="skipped:reopen_failed",
+                state_name=prev_state,
+            )
+        comment_body = _render_reopen_comment(
+            spec,
+            closed_state=prev_state,
+            closed_at=closed_at,
+            now=now,
+        )
+        commented = _add_comment(client, issue_id=issue["id"], body=comment_body)
+        if not commented:
+            logger.error(
+                "linear_client: reopen comment failed for %s",
+                issue.get("identifier"),
+            )
+            return FilingResult(
+                filed=False,
+                issue_id=issue["id"],
+                identifier=issue["identifier"],
+                url=issue.get("url"),
+                action="skipped:reopen_failed",
+                state_name=prev_state,
+            )
+        logger.info(
+            "linear_client: reopened closed issue=%s (was %s) to Triage "
+            "(fingerprint=%s)",
+            issue["identifier"],
+            prev_state,
+            spec.fingerprint,
+        )
+        return FilingResult(
+            filed=True,
+            issue_id=issue["id"],
+            identifier=issue["identifier"],
+            url=issue.get("url"),
+            action="reopened",
+            state_name=prev_state,
+        )
+    except Exception:
+        logger.exception(
+            "linear_client: failed to reopen closed issue=%s",
+            issue.get("identifier"),
+        )
+        return FilingResult(
+            filed=False,
+            issue_id=issue["id"],
+            identifier=issue["identifier"],
+            url=issue.get("url"),
+            action="skipped:reopen_failed",
+            state_name=prev_state,
+        )
 
 
 def _count_files_today(
@@ -483,10 +849,32 @@ def _render_body_with_fingerprint(spec: FindingSpec, *, now: datetime) -> str:
 def _render_dedupe_comment(spec: FindingSpec, *, now: datetime) -> str:
     """What we post as a new comment when dedupe matches an existing
     open issue — the fresh evidence, not the whole template again."""
+    if spec.evidence is not None:
+        return spec.evidence.strip()
     ts = now.strftime("%Y-%m-%d %H:%M UTC")
     return (
         f"**{spec.source_label} saw this again at {ts}.**\n\n"
         f"{spec.body.strip()}\n\n"
+        f"_(Dedupe fingerprint: `{spec.fingerprint}`)_"
+    )
+
+
+def _render_reopen_comment(
+    spec: FindingSpec,
+    *,
+    closed_state: str,
+    closed_at: str,
+    now: datetime,
+) -> str:
+    """Comment posted when a previously closed issue recurs and is
+    reopened to Triage (AFX-149)."""
+    ts = now.strftime("%Y-%m-%d %H:%M UTC")
+    closed_date = closed_at[:10] if len(closed_at) >= 10 else "an earlier date"
+    details = spec.evidence if spec.evidence is not None else spec.body
+    return (
+        f"**This issue has come back** (previously closed as {closed_state} on "
+        f"{closed_date}). Reopened to Triage by {spec.source_label} at {ts}.\n\n"
+        f"{details.strip()}\n\n"
         f"_(Dedupe fingerprint: `{spec.fingerprint}`)_"
     )
 

@@ -34,6 +34,7 @@ from agentfx.agents.validator import (
     ValidatorAgent,
 )
 from agentfx.api.models import GenomeOrigin
+from agentfx.core.deflated_sharpe import SharpeSample
 from agentfx.core.dsl import StrategySpec
 from agentfx.core.dsl.seeds import (
     DONCHIAN_BREAKOUT_SEED,
@@ -75,6 +76,7 @@ class MockPersister:
         self.run_updates: list[dict] = []
         self.generations: list[_PersistedGen] = []
         self.validations: list[dict] = []
+        self.validation_batches: list[list[str]] = []
         self.decisions: list[_PersistedDecision] = []
         self._next_id = 0
 
@@ -106,6 +108,10 @@ class MockPersister:
             )
         )
 
+    def register_validation_attempts(self, run_id, genome_ids, window) -> int:
+        self.validation_batches.append(genome_ids)
+        return 100 + sum(len(batch) for batch in self.validation_batches)
+
     def save_validation(
         self,
         genome_id: str,
@@ -113,6 +119,7 @@ class MockPersister:
         *,
         validator_passed: bool,
         validation_failures: list[str],
+        validation_dsr: dict[str, Any] | None = None,
     ) -> None:
         self.validations.append(
             {
@@ -120,6 +127,7 @@ class MockPersister:
                 "n_folds": len(folds),
                 "validator_passed": validator_passed,
                 "validation_failures": validation_failures,
+                "validation_dsr": validation_dsr,
             }
         )
 
@@ -236,6 +244,7 @@ def _make_validator_returning(
             folds=_passing_fold_evals(MA_CROSSOVER_SEED),
             validator_passed=validator_passed,
             validation_failures=failures or [],
+            dsr_sample=SharpeSample(400, 0.5, 0.0, 3.0),
         )
     )
     return validator
@@ -779,6 +788,54 @@ class TestLLMInjection:
 
 
 class TestValidation:
+    def test_full_batch_gets_same_count_including_current_attempts(self):
+        validator = ValidatorAgent(k=4)
+        validator.validate = MagicMock(
+            side_effect=lambda **kwargs: ValidationResult(
+                spec=kwargs["spec"],
+                folds=_passing_fold_evals(kwargs["spec"]),
+                validator_passed=True,
+                dsr_sample=SharpeSample(400, 0.5, 0.0, 3.0),
+            )
+        )
+        orchestrator, persister = _build_orchestrator(validator=validator)
+        orchestrator.config.top_n_to_validate = 2
+        orchestrator.run_loop()
+
+        [batch] = persister.validation_batches
+        assert len(batch) == 2
+        assert [v["genome_id"] for v in persister.validations] == batch
+        assert [v["validation_dsr"]["trial_count"] for v in persister.validations] == [
+            102,
+            102,
+        ]
+        assert all(
+            c.kwargs["collect_dsr_sample"] for c in validator.validate.call_args_list
+        )
+
+    def test_stop_between_validations_preserves_completed_result(self):
+        class RunStopped(Exception):
+            pass
+
+        validator = _make_validator_returning()
+
+        def check_stop():
+            if validator.validate.call_count:
+                raise RunStopped
+
+        orchestrator, persister = _build_orchestrator(
+            validator=validator, check_stop=check_stop
+        )
+        orchestrator.config.top_n_to_validate = 2
+        with pytest.raises(RunStopped):
+            orchestrator.run_loop()
+
+        validator.validate.assert_called_once()
+        [batch] = persister.validation_batches
+        [record] = persister.validations
+        assert batch == [record["genome_id"]]
+        assert record["validation_dsr"]["trial_count"] == 101
+
     def test_validator_called_on_run_completion(self) -> None:
         validator = _make_validator_returning(validator_passed=True)
         orchestrator, persister = _build_orchestrator(
@@ -823,6 +880,15 @@ class TestValidation:
         orchestrator, _ = _build_orchestrator(validator=validator)
         summary = orchestrator.run_loop()
         assert summary.validated_count == 1
+
+    def test_missing_full_window_sample_cannot_pass(self):
+        validator = _make_validator_returning(validator_passed=True)
+        validator.validate.return_value.dsr_sample = None
+        orchestrator, persister = _build_orchestrator(validator=validator)
+        assert orchestrator.run_loop().validated_count == 0
+        [record] = persister.validations
+        assert record["validation_dsr"]["trial_count"] == 101
+        assert "full OOS returns were not collected" in record["validation_failures"][0]
 
     def test_top_k_validation_runs_k_distinct_validations(self) -> None:
         """When top_n_to_validate=5, validator must be called up to 5 times
@@ -1149,14 +1215,14 @@ class TestChampionByOOS:
             spec=MA_CROSSOVER_SEED,
             folds=[],
             validator_passed=False,
-            validation_failures=["a", "b"],  # 2 failures = 3 passed
+            validation_failures=["a", "b"],  # 2 failures = 5 passed
             oos_aggregate_metrics={"sharpe": 0.5, "n_trades": 100},
         )
         result_4_failures = ValidationResult(
             spec=MA_CROSSOVER_SEED,
             folds=[],
             validator_passed=False,
-            validation_failures=["a", "b", "c", "d"],  # 4 failures = 1 passed
+            validation_failures=["a", "b", "c", "d"],  # 4 failures = 3 passed
             oos_aggregate_metrics={"sharpe": 2.0, "n_trades": 500},
         )
 
@@ -1176,6 +1242,50 @@ class TestChampionByOOS:
         )
         s3 = OrchestratorAgent._oos_robustness_score(result_better_sharpe)
         assert s3 > s1
+
+        result_better_sharpe.validation_failures = []
+        result_better_sharpe.oos_aggregate_metrics["sharpe"] = 99
+        result_passed = ValidationResult(
+            spec=MA_CROSSOVER_SEED,
+            folds=[],
+            validator_passed=True,
+            oos_aggregate_metrics={"sharpe": 1.1, "n_trades": 300},
+        )
+        assert OrchestratorAgent._oos_robustness_score(
+            result_passed
+        ) > OrchestratorAgent._oos_robustness_score(result_better_sharpe)
+
+    def test_oos_robustness_score_counts_fold_floor_once(self) -> None:
+        """Several failing OOS folds count as one failed criterion, not one
+        per fold, so they do not outweigh aggregate Gate B failures."""
+        from agentfx.core.dsl.seeds import MA_CROSSOVER_SEED
+
+        folds_fail = [
+            "OOS fold 1/5: CAGR -2.0% is not profitable",
+            "OOS fold 2/5: CAGR -1.0% is not profitable",
+            "OOS fold 3/5: Max DD 25.0% > cap 10%",
+        ]
+        aggregate_ok_bad_folds = ValidationResult(
+            spec=MA_CROSSOVER_SEED,
+            folds=[],
+            validator_passed=False,
+            validation_failures=list(folds_fail),
+            oos_aggregate_metrics={"sharpe": 1.5, "n_trades": 400},
+            fold_failures=list(folds_fail),
+        )
+        two_aggregate_failures = ValidationResult(
+            spec=MA_CROSSOVER_SEED,
+            folds=[],
+            validator_passed=False,
+            validation_failures=["a", "b"],
+            oos_aggregate_metrics={"sharpe": 0.5, "n_trades": 100},
+        )
+
+        s_folds = OrchestratorAgent._oos_robustness_score(aggregate_ok_bad_folds)
+        s_agg = OrchestratorAgent._oos_robustness_score(two_aggregate_failures)
+        assert s_folds[1] == 6
+        assert s_agg[1] == 5
+        assert s_folds > s_agg
 
 
 # ─────────────────────────────────────────────────────────────────────────

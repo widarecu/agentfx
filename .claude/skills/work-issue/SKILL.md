@@ -18,6 +18,7 @@ Canonical flow: `planning/runbooks/delivery-pipeline.md`. Use the Linear MCP too
 5. **Build to the issue's "Done when"**, nothing more. Don't change approved scope; propose changes as a comment or a new Triage issue. If a product decision blocks you: `python3 scripts/afx.py block AFX-<n> "<question>"` (Blocked + `needs-wilson` + the question), and stop.
 6. **Before the PR**, run the `pr-preflight` skill.
 7. **Open one PR into `main`.** Its title and branch name exactly one AFX ticket: this one. Only mention another ticket in the body if needed, and never after "Fixes", "Closes", "Resolves", "Part of", "Related to" or "Refs": Linear acts on those.
+   - In Claude Code, pass your ticket branch explicitly: `gh pr create --base main --head agent/AFX-<n>-<slug>`.
    - Add the `agent-authored` label (`gh pr edit <number> --add-label agent-authored`) so `pr-policy` can auto-merge it. Money-path too: `pr-policy` holds it for Wilson's approval. Don't add `needs-wilson` for risk alone.
 8. **Comment on the issue**: what was tested, and the CI link. Then **stop**.
 

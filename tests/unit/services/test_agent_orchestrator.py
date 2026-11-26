@@ -13,11 +13,19 @@ testing the sleep loop directly would be slow and brittle.
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from datetime import UTC, datetime
+from threading import Event, get_ident
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agentfx.agents.fleet import (
+    pe_workspace,
+    platform_engineer,
+    portfolio_manager,
+    quant_analyst,
+)
 from agentfx.services import agent_orchestrator
 
 pytestmark = pytest.mark.unit
@@ -164,3 +172,79 @@ class TestLifespanGating:
                 "fleet_pe_workspace_poll",
             }
             await agent_orchestrator.shutdown_lifespan_tasks()
+
+
+@pytest.mark.parametrize(
+    ("agent_module", "entry_point", "result"),
+    [
+        (portfolio_manager, "run_morning_brief_if_due", None),
+        (portfolio_manager, "run_evolution_filler", 0),
+        (quant_analyst, "scan_and_run_reports", 0),
+        (platform_engineer, "scan_and_dispatch", (0, 0)),
+        (pe_workspace, "poll_running_dispatches", {}),
+    ],
+)
+async def test_fleet_tick_keeps_event_loop_responsive(
+    monkeypatch, agent_module, entry_point, result
+):
+    loop = asyncio.get_running_loop()
+    loop_thread = get_ident()
+    heartbeat = loop.create_future()
+    release = Event()
+    db = object()
+    opened_in = []
+    called_in = []
+    closed_in = []
+
+    @contextmanager
+    def session():
+        opened_in.append(get_ident())
+        try:
+            yield db
+        finally:
+            closed_in.append(get_ident())
+
+    def block(db_arg):
+        assert db_arg is db
+        called_in.append(get_ident())
+        loop.call_soon_threadsafe(lambda: heartbeat.set_result(not closed_in))
+        release.wait(timeout=0.1 if get_ident() == loop_thread else 5)
+        return result
+
+    monkeypatch.setattr(agent_module, entry_point, lambda db: block(db))
+    monkeypatch.setattr(agent_orchestrator, "SessionLocal", session)
+    monkeypatch.setattr(agent_orchestrator, "is_within_daily_budget", lambda db: True)
+    monkeypatch.setattr(agent_orchestrator.settings, "AGENT_FLEET_ENABLED", True)
+    monkeypatch.setattr(
+        agent_orchestrator.settings,
+        "AGENT_PE_WORKSPACE_ENABLED",
+        agent_module is pe_workspace,
+    )
+    monkeypatch.setattr(
+        quant_analyst, "scan_for_technical_anomalies", lambda *, db: False
+    )
+
+    async def idle():
+        return None
+
+    task_for_entry_point = {
+        "run_morning_brief_if_due": "_pm_daily_loop",
+        "run_evolution_filler": "_evolution_filler_loop",
+        "scan_and_run_reports": "_qa_scan_loop",
+        "scan_and_dispatch": "_pe_scan_loop",
+        "poll_running_dispatches": "_pe_workspace_poll_loop",
+    }
+    for loop_name in task_for_entry_point.values():
+        if loop_name != task_for_entry_point[entry_point]:
+            monkeypatch.setattr(agent_orchestrator, loop_name, idle)
+
+    agent_orchestrator.register_lifespan_tasks()
+    try:
+        assert await asyncio.wait_for(asyncio.shield(heartbeat), timeout=5)
+        assert opened_in == called_in
+        assert called_in[0] != loop_thread
+    finally:
+        release.set()
+        await agent_orchestrator.shutdown_lifespan_tasks()
+
+    assert called_in == closed_in

@@ -278,6 +278,24 @@ class TestEvolutionPipeline:
         oos = [f for f in folds if f.is_oos]
         assert len(oos) == 5
         assert [f.fold_index for f in oos] == [3, 4, 5, 6, 7]
+        genome = db_session.get(models.StrategyGenome, run.best_genome_id)
+        attempt = (
+            db_session.query(models.ValidationAttempt)
+            .filter_by(genome_id=genome.id)
+            .one()
+        )
+        assert (attempt.oos_start, attempt.oos_end) == (
+            oos[0].fold_start,
+            oos[-1].fold_end,
+        )
+        assert genome.validation_dsr["trial_count"] >= 1
+        assert genome.validation_dsr["reason"]
+        assert (
+            SqlAlchemyPersister(db_session).register_validation_attempts(
+                run.id, [genome.id], (attempt.oos_start, attempt.oos_end)
+            )
+            == genome.validation_dsr["trial_count"]
+        )
 
     def test_run_best_genome_is_recorded(self, db_session, seed_evolution_candles):
         run = _make_run(db_session)

@@ -542,3 +542,19 @@ class TestSummarizeFromTradeLedger:
         # Net: +150 → ending 10,150, total_return = 1.5%, 2 trades.
         assert out["ending_balance"] == pytest.approx(10_150.0)
         assert out["n_trades"] == 2
+
+    def test_opening_day_return_and_drawdown_are_included(self):
+        """Day 0 P&L must count in daily_returns (Sharpe) and max_drawdown."""
+        # Day 0 loses $1,000 (-10% from $10k), Day 1 gains $1,000 (+11.1%).
+        out = summarize_from_trade_ledger(
+            [
+                self._trade(day=0, pnl=-1_000.0),
+                self._trade(day=1, pnl=1_000.0),
+            ],
+            starting_balance=10_000.0,
+            window_start=datetime(2024, 1, 1),
+            window_end=datetime(2024, 1, 2),
+        )
+        assert out["max_drawdown"] == pytest.approx(-0.10, abs=1e-6)
+        # Two distinct daily returns (-10% and +11.11%) -> non-zero variance & Sharpe.
+        assert out["sharpe"] != 0.0

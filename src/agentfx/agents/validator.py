@@ -15,13 +15,20 @@ generation loop completes. The validator:
    hit rate, CAGR — and sums ``n_trades`` across them. Robust to one
    inverted regime slice that would have failed a single-OOS-fold design.
 4. Applies Gate B (see `core/gates.evaluate_gate_b`) to the aggregated
-   metrics. The genome passes iff Gate B passes on the median.
+   metrics, and requires **every** OOS fold to be net profitable after
+   costs (CAGR > 0) and within the Gate B drawdown cap. The genome passes
+   iff both hold. Per-fold Sharpe, hit rate and trade count are not
+   checked: one short fold is too noisy to judge on them.
 
 Why median and not mean: the analysis on 2026-06-07 showed the single-OOS
 design routinely surfaced training-fold Sharpes of +1.5 to +3 and OOS
 Sharpes of −1 to −2 on the same Apr-Jul 2024 EUR_USD slice — a regime
 shift, not GA overfit. Median across 5 sliding OOS slices is robust to one
 inverted regime; one terrible fold can't poison the verdict.
+
+Why the per-fold floor (AFX-49): the median alone passed genomes that lost
+money or breached the drawdown cap on most OOS folds, as long as the
+middle values looked fine.
 
 Backwards compatibility: callers that pass ``k=K`` (legacy K=4 design)
 get a single OOS fold (``n_train_folds=K-1, n_oos_folds=1``) — median of
@@ -35,17 +42,21 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from statistics import median
 from typing import Any, Protocol
 
 from agentfx.agents.base import AgentResult, BaseAgent
+from agentfx.api.workers.market_calendar import market_closure_at
+from agentfx.core.deflated_sharpe import SharpeSample, deflated_sharpe
 from agentfx.core.dsl import StrategySpec
-from agentfx.core.gates import evaluate_gate_b
+from agentfx.core.gates import GATE_B_THRESHOLDS, evaluate_gate_b
+from agentfx.core.metrics import daily_equity_from_trade_ledger
 from agentfx.core.regime import RegimeTag
 from agentfx.core.validation import (
     WalkForwardFold,
     make_rolling_walk_forward_folds,
+    oos_window,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,13 +107,25 @@ class FoldEvaluation:
 
 
 @dataclass
+class DsrEvidence:
+    trial_count: int
+    threshold: float
+    probability: float | None
+    raw_sharpe: float | None
+    sharpe_bar: float | None
+    passed: bool
+    reason: str
+
+
+@dataclass
 class ValidationResult:
     """The output of validating one genome against a rolling walk-forward
     split.
 
     ``validator_passed`` is the Gate B verdict on the *aggregated* OOS
     metrics (median across OOS folds for Sharpe/MDD/hit-rate/CAGR; sum for
-    trade count). ``oos_aggregate_metrics`` exposes those aggregates so
+    trade count), AND'd with the per-fold floor: every OOS fold net
+    profitable and within the drawdown cap. ``oos_aggregate_metrics`` exposes those aggregates so
     the UI can show "Median OOS Sharpe" without recomputing.
 
     For backward compatibility with the v0.3.0-era K=4 design,
@@ -117,6 +140,36 @@ class ValidationResult:
     validator_passed: bool
     validation_failures: list[str] = field(default_factory=list)
     oos_aggregate_metrics: dict[str, Any] = field(default_factory=dict)
+    fold_failures: list[str] = field(default_factory=list)
+    dsr_sample: SharpeSample | str | None = None
+    dsr: DsrEvidence | None = None
+
+    def apply_dsr(self, *, trial_count: int, threshold: float) -> None:
+        probability = raw_sharpe = bar = None
+        passed = False
+        try:
+            if not isinstance(self.dsr_sample, SharpeSample):
+                raise ValueError(
+                    self.dsr_sample or "full OOS returns were not collected"
+                )
+            raw_sharpe = self.dsr_sample.annualized_sharpe
+            probability, bar = deflated_sharpe(
+                self.dsr_sample, trial_count=trial_count, threshold=threshold
+            )
+            passed = probability >= threshold
+            comparison = "meets" if passed else "is below"
+            reason = (
+                f"Deflated Sharpe {probability:.2%} {comparison} the {threshold:.2%} requirement "
+                f"({trial_count} trials; full OOS Sharpe {raw_sharpe:.2f}; required Sharpe {bar:.2f})"
+            )
+        except ValueError as exc:
+            reason = f"Deflated Sharpe unavailable ({trial_count} trials): {exc}"
+        self.dsr = DsrEvidence(
+            trial_count, threshold, probability, raw_sharpe, bar, passed, reason
+        )
+        if not passed:
+            self.validator_passed = False
+            self.validation_failures = [*self.validation_failures, reason]
 
     @property
     def oos_evaluations(self) -> list[FoldEvaluation]:
@@ -195,6 +248,37 @@ def _aggregate_oos_metrics(
     aggregate["n_trades"] = n_trades_total
 
     return aggregate
+
+
+def _oos_fold_floor_failures(
+    oos_folds: list[FoldEvaluation],
+    overrides: dict[str, float] | None = None,
+) -> list[str]:
+    """Failures for OOS folds that lose money or breach the drawdown cap.
+
+    CAGR is net of spread, slippage and swap, so ``cagr > 0`` means the
+    fold made money after costs. A missing metric fails, as in Gate B.
+    """
+    cap = {**GATE_B_THRESHOLDS, **(overrides or {})}["max_drawdown"]
+    failures: list[str] = []
+    for n, fe in enumerate(oos_folds, start=1):
+        label = f"OOS fold {n}/{len(oos_folds)}"
+        cagr = _as_float(fe.metrics.get("cagr"), default=-1.0)
+        if cagr <= 0:
+            failures.append(f"{label}: CAGR {cagr * 100:+.1f}% is not profitable")
+        max_dd = abs(_as_float(fe.metrics.get("max_drawdown"), default=1.0))
+        if max_dd > cap:
+            failures.append(
+                f"{label}: Max DD {max_dd * 100:.1f}% > cap {cap * 100:.0f}%"
+            )
+    return failures
+
+
+def _as_float(value: Any, *, default: float) -> float:
+    try:
+        return default if value is None else float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 class ValidatorAgent(BaseAgent):
@@ -301,6 +385,7 @@ class ValidatorAgent(BaseAgent):
         backtest_fn: BacktestFn | None = None,
         gate_b_overrides: dict[str, float] | None = None,
         fold_regimes: dict[int, RegimeTag] | None = None,
+        collect_dsr_sample: bool = False,
         **backtest_kwargs: Any,
     ) -> ValidationResult:
         """Validate a single genome over the rolling walk-forward window.
@@ -319,6 +404,8 @@ class ValidatorAgent(BaseAgent):
                 index. When supplied, each FoldEvaluation gets its tag
                 attached. When omitted, regimes stay ``None`` (the
                 orchestrator usually computes and passes them in).
+            collect_dsr_sample: Run a separate, contiguous OOS backtest for
+                DSR. The orchestrator applies DSR after counting the batch.
             **backtest_kwargs: Forwarded to the backtest function
                 (e.g. ``spread_pips``, ``account_balance``,
                 ``leverage``).
@@ -374,13 +461,66 @@ class ValidatorAgent(BaseAgent):
         agg_passed, agg_failures = evaluate_gate_b(
             aggregate, overrides=gate_b_overrides
         )
+        fold_failures = _oos_fold_floor_failures(oos_folds, gate_b_overrides)
+
+        dsr_sample = None
+        if collect_dsr_sample:
+            oos_start, oos_end = oos_window(folds)
+            end_inclusive = oos_end - timedelta(microseconds=1)
+            try:
+                full_oos = fn(
+                    instrument=instrument,
+                    granularity=granularity,
+                    start=oos_start,
+                    end=end_inclusive,
+                    strategy_name="dsl",
+                    strategy_params=spec_params,
+                    **{
+                        **backtest_kwargs,
+                        "capture_signals": True,
+                        "require_full_window": True,
+                    },
+                )
+                starting_balance = float(full_oos["sizing"]["starting_balance"])
+                equity = daily_equity_from_trade_ledger(
+                    full_oos["trades"],
+                    starting_balance=starting_balance,
+                    window_start=oos_start,
+                    window_end=end_inclusive,
+                )
+                if min(starting_balance, equity.min()) <= 0:
+                    raise ValueError("the backtest account ran out of equity")
+                trading_equity = equity[
+                    [
+                        not (
+                            market_closure_at(max(day, oos_start))[0]
+                            and market_closure_at(
+                                min(
+                                    day + timedelta(days=1, microseconds=-1),
+                                    end_inclusive,
+                                )
+                            )[0]
+                        )
+                        for day in equity.index
+                    ]
+                ].to_numpy()
+                prior_balances = [starting_balance, *trading_equity[:-1]]
+                daily_returns = trading_equity / prior_balances - 1
+                dsr_sample = SharpeSample.from_returns(daily_returns)
+            except ValueError as exc:
+                dsr_sample = str(exc)
+            except Exception:  # noqa: BLE001
+                logger.exception("full OOS backtest failed")
+                dsr_sample = "the full OOS backtest did not produce a trade ledger"
 
         return ValidationResult(
             spec=spec,
             folds=fold_evaluations,
-            validator_passed=agg_passed,
-            validation_failures=agg_failures,
+            validator_passed=agg_passed and not fold_failures,
+            validation_failures=agg_failures + fold_failures,
             oos_aggregate_metrics=aggregate,
+            fold_failures=fold_failures,
+            dsr_sample=dsr_sample,
         )
 
     def run(self, **kwargs) -> AgentResult:

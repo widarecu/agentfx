@@ -26,13 +26,28 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from sqlalchemy import and_, case, desc, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from agentfx.agents.evolution import Genome
 from agentfx.agents.validator import FoldEvaluation
 from agentfx.api import models, schemas
+from agentfx.core.deflated_sharpe import DSR_WINDOW_OVERLAP
 
 logger = logging.getLogger(__name__)
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+def _shares_dsr_window(
+    start: datetime, end: datetime, other_start: datetime, other_end: datetime
+) -> bool:
+    shared = min(end, other_end) - max(start, other_start)
+    shorter = min(end - start, other_end - other_start)
+    return shorter.total_seconds() > 0 and shared >= shorter * DSR_WINDOW_OVERLAP
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -176,7 +191,7 @@ def find_prior_winners(
     the reason so the audit trail is preserved.
 
     Returns a list of {id, dsl_json, fitness, source_run_id} dicts —
-    callers compile dsl_json via StrategySpec.model_validate for the
+    callers compile dsl_json via StrategySpec.from_stored_genome for the
     GA's population.
     """
     base_filters = [
@@ -845,6 +860,7 @@ def get_genome_with_lineage(
         "metrics_json": genome.metrics_json,
         "validator_passed": genome.validator_passed,
         "validation_failures": list(genome.validation_failures or []),
+        "validation_dsr": genome.validation_dsr,
         "llm_reasoning": genome.llm_reasoning,
         "llm_call_id": genome.llm_call_id,
         "created_at": genome.created_at,
@@ -914,6 +930,7 @@ def list_run_genome_summaries(
             "origin": g.origin.value if hasattr(g.origin, "value") else str(g.origin),
             "fitness": g.fitness,
             "validator_passed": g.validator_passed,
+            "risk_pct": ((g.dsl_json or {}).get("size") or {}).get("risk_pct"),
         }
         for g, gen_index in rows
     ]
@@ -1152,6 +1169,68 @@ class SqlAlchemyPersister:
 
     # ── save_validation ─────────────────────────────────────────────
 
+    def register_validation_attempts(
+        self,
+        run_id: str,
+        genome_ids: list[str],
+        window: tuple[datetime, datetime],
+    ) -> int:
+        run = self.db.get(models.EvolutionRun, run_id)
+        if run is None or run.imported_from_run_id is not None:
+            raise ValueError("validation attempts require a native evolution run")
+        start, end = map(_as_utc, window)
+        if end <= start:
+            raise ValueError("validation attempts require a nonempty OOS window")
+        instrument, granularity = run.instrument, run.granularity
+        is_postgres = self.db.get_bind().dialect.name == "postgresql"
+        if is_postgres:
+            # Overlapping windows must share the lock, not just exact matches.
+            lock = f"agentfx:dsr:{instrument}:{granularity}"
+            self.db.execute(
+                select(func.pg_advisory_xact_lock(func.hashtextextended(lock, 0)))
+            )
+        attempt = models.ValidationAttempt
+        if genome_ids:
+            insert = pg_insert if is_postgres else sqlite_insert
+            self.db.execute(
+                insert(attempt).on_conflict_do_nothing(
+                    index_elements=[
+                        attempt.genome_id,
+                        attempt.instrument,
+                        attempt.granularity,
+                        attempt.oos_start,
+                        attempt.oos_end,
+                    ]
+                ),
+                [
+                    {
+                        "genome_id": genome_id,
+                        "instrument": instrument,
+                        "granularity": granularity,
+                        "oos_start": start,
+                        "oos_end": end,
+                    }
+                    for genome_id in genome_ids
+                ],
+            )
+        windows = self.db.execute(
+            select(attempt.oos_start, attempt.oos_end, func.count())
+            .where(
+                attempt.instrument == instrument,
+                attempt.granularity == granularity,
+                attempt.oos_start < end,
+                attempt.oos_end > start,
+            )
+            .group_by(attempt.oos_start, attempt.oos_end)
+        )
+        trial_count = sum(
+            count
+            for other_start, other_end, count in windows
+            if _shares_dsr_window(start, end, _as_utc(other_start), _as_utc(other_end))
+        )
+        self.db.commit()
+        return trial_count
+
     def save_validation(
         self,
         genome_id: str,
@@ -1159,6 +1238,7 @@ class SqlAlchemyPersister:
         *,
         validator_passed: bool,
         validation_failures: list[str],
+        validation_dsr: dict[str, Any] | None = None,
     ) -> None:
         # Persist each fold row
         for fe in folds:
@@ -1206,6 +1286,7 @@ class SqlAlchemyPersister:
         if genome is not None:
             genome.validator_passed = validator_passed
             genome.validation_failures = list(validation_failures)
+            genome.validation_dsr = validation_dsr
 
         self.db.commit()
 

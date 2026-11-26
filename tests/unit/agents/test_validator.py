@@ -8,7 +8,7 @@ should be marked `validator_passed=True`.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -51,6 +51,102 @@ def _backtest_returning(metrics_per_fold: list[dict]) -> MagicMock:
     """Build a mock backtest_fn whose i-th call returns metrics_per_fold[i]."""
     side_effect = [{"metrics": m} for m in metrics_per_fold]
     return MagicMock(side_effect=side_effect)
+
+
+@pytest.mark.parametrize("fold_sharpe", [1.5, 0.9])
+def test_full_oos_dsr_adds_to_gate_b(fold_sharpe):
+    def backtest(**kwargs):
+        if not kwargs.get("require_full_window"):
+            return {"metrics": _passing_metrics(sharpe=fold_sharpe)}
+        start = kwargs["start"]
+        assert start >= _utc(2024, 9, 1)
+        assert kwargs["end"] == _utc(2025, 1, 1) - timedelta(microseconds=1)
+        assert kwargs["capture_signals"] is True
+        balance = 10_000
+        trades = []
+        for day in range((kwargs["end"].date() - start.date()).days + 1):
+            pnl = balance * (0.0026 + (-1) ** day * 0.01)
+            trades.append(
+                {
+                    "exit_timestamp": start + timedelta(days=day),
+                    "net_pnl_dollars": pnl,
+                }
+            )
+            balance += pnl
+        return {"sizing": {"starting_balance": 10_000}, "trades": trades}
+
+    agent = ValidatorAgent()
+    fn = MagicMock(side_effect=backtest)
+
+    def validate(count):
+        result = agent.validate(
+            spec=MA_CROSSOVER_SEED,
+            instrument="EUR_USD",
+            start=_utc(2024, 1, 1),
+            end=_utc(2025, 1, 1),
+            backtest_fn=fn,
+            collect_dsr_sample=True,
+        )
+        assert fn.call_args.kwargs["start"] == result.oos_evaluations[0].fold.start
+        result.apply_dsr(trial_count=count, threshold=0.95)
+        return result
+
+    few = validate(1)
+    many = validate(3_075)
+    assert fn.call_count == 2 * 9  # eight folds and one full OOS pass per evaluation
+    assert few.dsr.passed is True
+    assert few.validator_passed is (fold_sharpe >= 1.0)
+    assert many.validator_passed is False
+    assert few.dsr.raw_sharpe == many.dsr.raw_sharpe
+    assert few.dsr.sharpe_bar < few.dsr.raw_sharpe < many.dsr.sharpe_bar
+    assert many.dsr.reason in many.validation_failures
+    assert "3075 trials" in many.dsr.reason
+
+
+def test_full_oos_dsr_excludes_fully_closed_fx_days():
+    fn = MagicMock(
+        return_value={
+            "metrics": _passing_metrics(),
+            "sizing": {"starting_balance": 10_000},
+            "trades": [
+                {"exit_timestamp": _utc(2024, 9, 16), "net_pnl_dollars": 100},
+                {"exit_timestamp": _utc(2024, 9, 17), "net_pnl_dollars": -50},
+            ],
+        }
+    )
+    result = ValidatorAgent().validate(
+        spec=MA_CROSSOVER_SEED,
+        instrument="EUR_USD",
+        start=_utc(2024, 1, 1),
+        end=_utc(2025, 1, 1),
+        backtest_fn=fn,
+        collect_dsr_sample=True,
+    )
+    # Sept 13–Dec 31 includes 16 closed Saturdays and Christmas Day.
+    # Sundays reopen in the evening and open days without trades still count.
+    assert result.dsr_sample.size == 93
+
+
+def test_full_oos_without_returns_fails_explicitly():
+    fn = MagicMock(
+        return_value={
+            "metrics": _passing_metrics(),
+            "sizing": {"starting_balance": 10_000},
+            "trades": [],
+        }
+    )
+    result = ValidatorAgent().validate(
+        spec=MA_CROSSOVER_SEED,
+        instrument="EUR_USD",
+        start=_utc(2024, 1, 1),
+        end=_utc(2024, 5, 1),
+        backtest_fn=fn,
+        collect_dsr_sample=True,
+    )
+    result.apply_dsr(trial_count=12, threshold=0.95)
+    assert result.validator_passed is False
+    assert result.dsr.probability is None
+    assert "no measurable variation" in result.validation_failures[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -548,3 +644,87 @@ class TestRollingValidation:
             backtest_fn=_backtest_returning(train + oos),
         )
         assert result.oos_evaluation.metrics["sharpe"] == 2.0
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Every OOS fold must be profitable (AFX-49)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestEveryOosFoldProfitable:
+    """The median aggregate alone let a genome pass while most OOS folds
+    failed Gate B. Every OOS fold must now be net profitable after costs
+    and within the drawdown cap, on top of Gate B on the aggregate."""
+
+    def _validate(
+        self,
+        oos_metrics: list[dict],
+        gate_b_overrides: dict[str, float] | None = None,
+    ) -> ValidationResult:
+        train = [_passing_metrics() for _ in range(3)]
+        return ValidatorAgent().validate(
+            spec=MA_CROSSOVER_SEED,
+            instrument="EUR_USD",
+            start=_utc(2024, 1, 1),
+            end=_utc(2024, 12, 31),
+            backtest_fn=_backtest_returning(train + oos_metrics),
+            gate_b_overrides=gate_b_overrides,
+        )
+
+    def test_fails_when_most_oos_folds_fail_gate_b(self) -> None:
+        # 3 of 5 OOS folds fail Gate B (two lose money, one breaches the
+        # drawdown cap), yet every median clears Gate B.
+        oos = [
+            {**_passing_metrics(), "cagr": -0.10},
+            {**_passing_metrics(), "max_drawdown": -0.25, "cagr": 0.30},
+            {**_passing_metrics(), "cagr": -0.05},
+            {**_passing_metrics(), "cagr": 0.30},
+            {**_passing_metrics(), "cagr": 0.30},
+        ]
+        result = self._validate(oos)
+        assert sum(not fe.passed_gate_b for fe in result.oos_evaluations) == 3
+        aggregate = result.oos_aggregate_metrics
+        assert aggregate["cagr"] == pytest.approx(0.30)
+        assert result.validator_passed is False
+        assert len(result.validation_failures) == 3
+        assert result.fold_failures == result.validation_failures
+        assert any("OOS fold 1/5" in f for f in result.validation_failures)
+        assert any("OOS fold 2/5" in f for f in result.validation_failures)
+        assert any("OOS fold 3/5" in f for f in result.validation_failures)
+
+    def test_fails_when_one_oos_fold_loses_money(self) -> None:
+        oos = [_passing_metrics() for _ in range(4)]
+        oos.insert(2, {**_passing_metrics(), "cagr": -0.01})
+        result = self._validate(oos)
+        assert result.validator_passed is False
+        assert result.validation_failures == [
+            "OOS fold 3/5: CAGR -1.0% is not profitable"
+        ]
+
+    def test_fails_when_one_oos_fold_breaches_drawdown_cap(self) -> None:
+        oos = [_passing_metrics() for _ in range(4)]
+        oos.append({**_passing_metrics(), "max_drawdown": -0.12})
+        result = self._validate(oos)
+        assert result.validator_passed is False
+        assert result.validation_failures == ["OOS fold 5/5: Max DD 12.0% > cap 10%"]
+
+    def test_fold_with_missing_metrics_fails(self) -> None:
+        oos = [_passing_metrics() for _ in range(4)] + [{}]
+        result = self._validate(oos)
+        assert result.validator_passed is False
+        assert any("OOS fold 5/5" in f for f in result.validation_failures)
+
+    def test_per_fold_sharpe_and_hit_rate_do_not_block(self) -> None:
+        # One short fold is too noisy to judge on Sharpe or hit rate: a
+        # profitable fold within the cap does not block the genome.
+        oos = [_passing_metrics() for _ in range(4)]
+        oos.append({**_passing_metrics(sharpe=0.4), "hit_rate": 0.40})
+        result = self._validate(oos)
+        assert result.validator_passed is True
+        assert result.validation_failures == []
+
+    def test_fold_drawdown_cap_honours_override(self) -> None:
+        oos = [_passing_metrics() for _ in range(4)]
+        oos.append({**_passing_metrics(), "max_drawdown": -0.12})
+        result = self._validate(oos, gate_b_overrides={"max_drawdown": 0.15})
+        assert result.validator_passed is True

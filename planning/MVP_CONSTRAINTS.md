@@ -34,13 +34,32 @@ References:
 - Minimum trades in OOS: ≥ 300 trades or ≥ 3 months of activity (whichever later)
 - OOS thresholds to pass Gate B:
   - Sharpe ≥ 1.0
+  - Deflated Sharpe probability ≥ 95% by default (`AFX_DSR_THRESHOLD`).
+    Calculated once over the contiguous walk-forward OOS period from daily
+    net equity returns (annualized with √252 for display). UTC days wholly
+    closed under the FX market calendar are excluded; open days count even
+    if the strategy does not trade. The zero-edge
+    variance of the daily Sharpe estimates is approximated as `1/(T-1)`
+    for `T` daily observations; the candidate's sampling error also
+    accounts for skewness and kurtosis.
+  - The Deflated Sharpe trial count includes each genome evaluated in the
+    batch and prior evaluations across runs and warm-start lineages on the
+    same instrument and granularity. Two windows pool attempts when their
+    shared interval is at least 50% of the shorter window. Training-only
+    trials and imported copies do not count.
   - Max drawdown ≤ 10%
   - Hit rate ≥ 48%
   - Turnover within broker limits; average holding period ≥ 5 minutes (no HFT)
   - PnL after slippage and spread positive and stable across regimes
 
 ## 5) Execution & Rollout
-- Paper first: minimum 2 weeks of paper with metrics above thresholds before Live
+- Paper first (pre-agreed forward test): every paper run locks its pass contract at start time before it can be nominated for Live:
+  - Minimum closed paper trades: ≥ 100 closed trades (configurable via `PAPER_FORWARD_TEST_MIN_TRADES`, replacing the 2-week-only minimum)
+  - Net realized PnL (after financing and commission): > 0
+  - Sharpe ratio: ≥ 1.0 (`PAPER_FORWARD_TEST_MIN_SHARPE`)
+  - Max drawdown: ≤ 10% live cap (`PAPER_FORWARD_TEST_MAX_DRAWDOWN`); breaching this fails live eligibility early without auto-halting paper trading
+  - Backtest-vs-paper divergence: Sharpe degradation ≤ 30% vs the genome's locked OOS Sharpe (`PAPER_FORWARD_TEST_MAX_DIVERGENCE`)
+- Future live deploy flow: the operator chooses risk per trade for each deployment. Default to **Safer** (the genome's risk per trade, capped at the 0.5% MVP live limit). Offer **Same as paper** (the genome's own risk per trade) as an explicit choice. This requirement does not authorize relaxing the current live limit; any live use above that limit requires a separately approved policy change.
 - Latency SLOs: Paper p95 < 1s; Live p95 < 500ms end-to-end decision loop
 - Reliability: auto-retry with backoff; circuit breaker on 5 consecutive broker failures or p95 latency > 2x SLO for 10 minutes
 - Rollback: disable strategy via feature flag; fail-safe to flat positions

@@ -29,6 +29,7 @@ import threading
 from datetime import UTC, datetime, timedelta
 
 from agentfx.agents.evolution import ResourceLimits, apply_resource_limits
+from agentfx.core.position_sizing import configured_leverage
 
 from .ownership import try_recovery_lock, worker_lock
 
@@ -347,7 +348,7 @@ def _build_orchestrator_config(
         account_balance=float(config_dict.get("account_balance", 10000.0)),
         position_size=int(config_dict.get("position_size", 10000)),
         spread_pips=config_dict.get("spread_pips"),
-        leverage=int(config_dict.get("leverage", 30)),
+        leverage=configured_leverage(config_dict),
         use_prior_winners=bool(config_dict.get("use_prior_winners", True)),
         n_prior_winners=int(config_dict.get("n_prior_winners", 3)),
         llm_seed_gen0=bool(config_dict.get("llm_seed_gen0", True)),
@@ -576,6 +577,7 @@ def _run_owned_evolution(run_id: str, owner_connection) -> None:
         OrchestratorAgent,
     )
     from agentfx.agents.validator import ValidatorAgent
+    from agentfx.api.core.config import settings
     from agentfx.api.core.database import SessionLocal
     from agentfx.api.models import EvolutionRunStatus
     from agentfx.api.services import evolution as evolution_service
@@ -835,6 +837,7 @@ def _run_owned_evolution(run_id: str, owner_connection) -> None:
             persister=persister,
             llm_injector=llm_injector,
             validator=validator,
+            dsr_threshold=settings.AFX_DSR_THRESHOLD,
             check_stop=lambda: persister.check_stop(run_id),
         )
 

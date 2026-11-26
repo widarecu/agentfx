@@ -202,7 +202,11 @@ class TestHappyPath:
         )
         _patch_adapter(monkeypatch, adapter)
 
-        _, attempted = platform_engineer.scan_and_dispatch(db=db)
+        # Pin the clock: the claim link carries the dispatch date, so an
+        # unpinned run only passes on the day the literal was written.
+        _, attempted = platform_engineer.scan_and_dispatch(
+            db=db, now=datetime(2026, 11, 25, 12, 0, tzinfo=UTC)
+        )
         assert attempted == 1
         assert linear_recorder["transitions_to_in_progress"] == ["uuid-afx-200"]
         [link] = linear_recorder["claim_links"]

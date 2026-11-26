@@ -21,8 +21,10 @@ from agentfx.api import models, schemas
 from agentfx.api.core.database import Base
 from agentfx.api.services import evolution as evolution_service
 from agentfx.api.services.evolution import SqlAlchemyPersister
+from agentfx.core.dsl import StrategySpec
 from agentfx.core.dsl.seeds import MA_CROSSOVER_SEED, RSI_MEAN_REVERSION_SEED
 from agentfx.core.validation import make_walk_forward_folds
+from agentfx.services.paper_runner import _snapshot_validated_leverage
 
 
 @pytest.fixture
@@ -638,6 +640,33 @@ class TestSqlAlchemyPersisterUpdateRun:
 
 
 class TestSqlAlchemyPersisterSaveGeneration:
+    def test_paper_leverage_snapshot_follows_source_evolution_run(self, db: Session):
+        run = evolution_service.create_run(
+            db,
+            schemas.EvolutionRunCreate(instrument="EUR_USD", config={"leverage": 50}),
+        )
+        genome = _make_genome(MA_CROSSOVER_SEED, 1.5)
+        SqlAlchemyPersister(db).save_generation(
+            run.id,
+            generation_index=0,
+            genomes=[genome],
+            llm_invoked=False,
+            llm_call_id=None,
+            best_fitness=1.5,
+        )
+        paper = models.Run(
+            strategy_genome_id=genome.id, parameters={"instrument": run.instrument}
+        )
+
+        _snapshot_validated_leverage(db, paper)
+        assert paper.parameters == {"instrument": "EUR_USD", "leverage": 50}
+
+        paper.strategy_genome_id = None
+        _snapshot_validated_leverage(db, paper)
+        assert paper.parameters["leverage"] == 50
+        _snapshot_validated_leverage(db, legacy := models.Run(parameters={}))
+        assert legacy.parameters["leverage"] == 30
+
     def test_save_assigns_genome_ids(self, db: Session) -> None:
         run = evolution_service.create_run(
             db, schemas.EvolutionRunCreate(instrument="EUR_USD")
@@ -706,6 +735,32 @@ class TestSqlAlchemyPersisterSaveGeneration:
         assert gens[0].llm_invoked is True
         assert gens[0].llm_call_id == "llm_call_xyz"
 
+    @pytest.mark.parametrize("risk_pct", [0.001, 0.005, 0.02])
+    def test_run_summary_shows_stored_risk_without_rewriting_genome(
+        self, db: Session, risk_pct: float
+    ) -> None:
+        run = evolution_service.create_run(
+            db, schemas.EvolutionRunCreate(instrument="EUR_USD")
+        )
+        payload = MA_CROSSOVER_SEED.model_dump(mode="json")
+        payload["size"]["risk_pct"] = risk_pct
+        genome = _make_genome(StrategySpec.from_stored_genome(payload), 1.5)
+        SqlAlchemyPersister(db).save_generation(
+            run.id,
+            generation_index=0,
+            genomes=[genome],
+            llm_invoked=False,
+            llm_call_id=None,
+            best_fitness=1.5,
+        )
+
+        (row,) = evolution_service.list_run_genome_summaries(db, run.id)
+        summary = schemas.StrategyGenomeSummary.model_validate(row)
+        assert summary.risk_pct == risk_pct
+        assert summary.fitness == 1.5
+        assert "dsl_json" not in row
+        assert db.get(models.StrategyGenome, genome.id).dsl_json == payload
+
 
 class TestSqlAlchemyPersisterSaveValidation:
     def test_persists_folds_and_marks_genome(self, db: Session) -> None:
@@ -745,11 +800,21 @@ class TestSqlAlchemyPersisterSaveValidation:
             for f in folds
         ]
 
+        evidence = {
+            "trial_count": 3_075,
+            "threshold": 0.95,
+            "probability": 0.97,
+            "raw_sharpe": 3.8,
+            "sharpe_bar": 3.4,
+            "passed": True,
+            "reason": "Deflated Sharpe meets the threshold",
+        }
         persister.save_validation(
             genome.id,
             folds=fold_evals,
             validator_passed=True,
             validation_failures=[],
+            validation_dsr=evidence,
         )
 
         fold_rows = db.scalars(select(models.ValidationFold)).all()
@@ -763,6 +828,83 @@ class TestSqlAlchemyPersisterSaveValidation:
         db.refresh(_orm_genome := db.get(models.StrategyGenome, genome.id))
         assert _orm_genome.validator_passed is True
         assert _orm_genome.validation_failures == []
+        assert _orm_genome.validation_dsr == evidence
+        detail = evolution_service.get_genome_with_lineage(db, run.id, genome.id)
+        assert (
+            schemas.StrategyGenomePublic.model_validate(
+                detail
+            ).validation_dsr.model_dump()
+            == evidence
+        )
+
+
+class TestValidationAttemptLedger:
+    def test_counts_overlap_against_shorter_window_and_survives_deletion(self, db):
+        def run(instrument="EUR_USD", granularity="M1"):
+            return evolution_service.create_run(
+                db,
+                schemas.EvolutionRunCreate(
+                    instrument=instrument, granularity=granularity
+                ),
+            )
+
+        persister = SqlAlchemyPersister(db)
+        start = datetime(2024, 1, 1, tzinfo=UTC)
+
+        def register(source, genomes, lo, hi):
+            return persister.register_validation_attempts(
+                source.id,
+                genomes,
+                (start + timedelta(days=lo), start + timedelta(days=hi)),
+            )
+
+        previous = run()
+        assert register(previous, ["legacy-1", "legacy-2"], 0, 20) == 2
+        assert register(run("GBP_USD"), ["other-pair"], 15, 25) == 1
+        assert register(run(granularity="M5"), ["other-timeframe"], 15, 25) == 1
+        assert register(run(), ["too-little-overlap"], 21, 31) == 1
+        db.delete(previous)
+        db.commit()
+        # Overlap [15, 20) is exactly half of the shorter [15, 25);
+        # the [21, 31) window overlaps by only 40%.
+        assert register(run(), ["warm-start", "current-2"], 15, 25) == 4
+
+    def test_replayed_genome_and_window_do_not_add_attempts(self, db):
+        run = evolution_service.create_run(
+            db, schemas.EvolutionRunCreate(instrument="EUR_USD")
+        )
+        persister = SqlAlchemyPersister(db)
+        start = datetime(2024, 1, 1, tzinfo=UTC)
+        end = start + timedelta(days=10)
+
+        assert (
+            persister.register_validation_attempts(run.id, ["existing"], (start, end))
+            == 1
+        )
+        assert (
+            persister.register_validation_attempts(
+                run.id, ["existing", "new", "new"], (start, end)
+            )
+            == 2
+        )
+        assert (
+            persister.register_validation_attempts(
+                run.id, ["existing"], (start, end + timedelta(days=1))
+            )
+            == 3
+        )
+
+    def test_imported_shadows_cannot_register(self, db):
+        run = evolution_service.create_run(
+            db, schemas.EvolutionRunCreate(instrument="EUR_USD")
+        )
+        run.imported_from_run_id = "some-origin"
+        db.commit()
+        start = datetime(2024, 1, 1, tzinfo=UTC)
+        with pytest.raises(ValueError, match="native evolution run"):
+            SqlAlchemyPersister(db).register_validation_attempts(
+                run.id, ["imported"], (start, start + timedelta(days=10))
+            )
 
 
 class TestSqlAlchemyPersisterLogDecision:

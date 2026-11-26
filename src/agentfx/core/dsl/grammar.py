@@ -12,7 +12,15 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    TypeAdapter,
+    ValidationInfo,
+    ValidatorFunctionWrapHandler,
+    field_validator,
+    model_validator,
+)
 
 INDICATOR_NAMES = (
     "close",
@@ -328,10 +336,24 @@ class ExitRules(BaseModel):
         return self
 
 
+MIN_RISK_PCT = 0.0025
+MAX_RISK_PCT = 0.02
+_STORED_RISK_PCT = TypeAdapter(Annotated[float, Field(ge=0.001, le=MAX_RISK_PCT)])
+
+
 class SizeRules(BaseModel):
     """Position sizing. risk_pct is a fraction of account balance per trade."""
 
-    risk_pct: float = Field(ge=0.001, le=0.005)
+    risk_pct: float = Field(ge=MIN_RISK_PCT, le=MAX_RISK_PCT)
+
+    @field_validator("risk_pct", mode="wrap")
+    @classmethod
+    def _validate_risk_pct(
+        cls, value: object, handler: ValidatorFunctionWrapHandler, info: ValidationInfo
+    ) -> float:
+        if info.context and info.context.get("stored_genome"):
+            return _STORED_RISK_PCT.validate_python(value)
+        return handler(value)
 
     model_config = {"frozen": True}
 
@@ -349,6 +371,11 @@ class StrategySpec(BaseModel):
     size: SizeRules
 
     model_config = {"frozen": True}
+
+    @classmethod
+    def from_stored_genome(cls, payload: object) -> StrategySpec:
+        """Read a persisted genome without altering historical risk or results."""
+        return cls.model_validate(payload, context={"stored_genome": True})
 
 
 # Resolve forward references in recursive types

@@ -19,6 +19,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from agentfx.core.position_sizing import DEFAULT_LEVERAGE
+
 from .base import BaseSchema
 
 
@@ -93,7 +95,7 @@ class OrchestratorConfigSchema(BaseModel):
     # same risk_pct + stop combination, so a tight-stop strategy can
     # use the extra leverage to amplify dollar P&L without changing
     # its risk-per-trade % budget.
-    leverage: int = Field(default=30, ge=1, le=100)
+    leverage: int = Field(default=DEFAULT_LEVERAGE, ge=1, le=100)
     # Gen-0 seeding layers — see OrchestratorConfig docstring.
     use_prior_winners: bool = True
     n_prior_winners: int = Field(default=3, ge=0, le=20)
@@ -262,6 +264,16 @@ class ValidationFoldPublic(BaseSchema):
     regime_direction: str | None = None
 
 
+class ValidationDsrPublic(BaseSchema):
+    trial_count: int
+    threshold: float
+    probability: float | None
+    raw_sharpe: float | None
+    sharpe_bar: float | None
+    passed: bool
+    reason: str
+
+
 class StrategyGenomePublic(BaseSchema):
     """Detail view for one genome.
 
@@ -287,6 +299,7 @@ class StrategyGenomePublic(BaseSchema):
     metrics_json: dict[str, Any] | None = None
     validator_passed: bool | None = None
     validation_failures: list[str] = Field(default_factory=list)
+    validation_dsr: ValidationDsrPublic | None = None
     llm_reasoning: str | None = None
     llm_call_id: str | None = None
     created_at: datetime
@@ -309,6 +322,7 @@ class StrategyGenomeSummary(BaseSchema):
     origin: str
     fitness: float | None = None
     validator_passed: bool | None = None
+    risk_pct: float | None = None
 
 
 class StrategyGenomeSummaryList(BaseModel):
