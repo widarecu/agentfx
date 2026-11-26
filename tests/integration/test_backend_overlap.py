@@ -1,5 +1,13 @@
 import asyncio
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import uuid
 from contextlib import ExitStack
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -12,7 +20,7 @@ from agentfx.api.services.evolution import (
 )
 from agentfx.api.workers import candle_ingestion, evolution_runner, paper_runner
 from agentfx.api.workers.ownership import worker_lock
-from sqlalchemy import event, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session
 
 pytestmark = pytest.mark.integration
@@ -291,3 +299,195 @@ async def test_candle_ingestion_waits_for_the_existing_owner(test_engine, monkey
         stop.set()
         if standby is not None:
             await asyncio.wait_for(standby, timeout=1)
+
+
+_REPO = Path(__file__).resolve().parents[2]
+
+
+def _events(path):
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def _wait_for(path, predicate, timeout=60.0):
+    deadline = time.monotonic() + timeout
+    while True:
+        events = _events(path)
+        if predicate(events):
+            return events
+        if time.monotonic() > deadline:
+            raise AssertionError(f"timed out; events so far: {events}")
+        time.sleep(0.2)
+
+
+@pytest.fixture
+def overlap_database(test_engine):
+    from agentfx.api.core.database import Base
+
+    name = f"agentfx_overlap_{uuid.uuid4().hex[:12]}"
+    admin = test_engine.execution_options(isolation_level="AUTOCOMMIT")
+    with admin.connect() as connection:
+        connection.exec_driver_sql(f'CREATE DATABASE "{name}"')
+    url = test_engine.url.set(database=name)
+    engine = create_engine(url)
+    try:
+        Base.metadata.create_all(engine)
+        yield engine, url.render_as_string(hide_password=False)
+    finally:
+        engine.dispose()
+        with admin.connect() as connection:
+            connection.exec_driver_sql(f'DROP DATABASE "{name}" WITH (FORCE)')
+
+
+def test_backend_processes_hand_live_work_to_exactly_one_successor(
+    overlap_database, tmp_path
+):
+    """Three real backend processes overlap as on a deploy: the first owns a
+    live paper run, an evolution run and the candle writer through spawned
+    workers; two successors start while it lives and must leave all three
+    alone; once the first backend dies, exactly one worker resumes each."""
+    engine, database_url = overlap_database
+    with Session(engine) as db:
+        db.add(
+            models.Run(
+                id="run_overlap_paper",
+                pair="EURUSD",
+                environment=models.RunEnvironment.PAPER,
+                status=models.RunStatus.APPROVED,
+                parameters={},
+            )
+        )
+        evolution_id = create_run(
+            db, schemas.EvolutionRunCreate(instrument="EUR_USD")
+        ).id
+        db.commit()
+    paper_id = "run_overlap_paper"
+
+    events_path = tmp_path / "events.jsonl"
+    events_path.touch()
+    backends = {}
+
+    def start(name):
+        env = {
+            **os.environ,
+            "ENVIRONMENT": "test",
+            "TESTING": "true",
+            "DATABASE_URL": database_url,
+            "TEST_DATABASE_URL": database_url,
+            "INGESTION_ENABLED": "true",
+            "OANDA_API_KEY": "overlap-test-key",
+            "AGENT_FLEET_ENABLED": "false",
+            "PYTHONPATH": os.pathsep.join([str(_REPO / "src"), str(_REPO)]),
+            "AFX_OVERLAP_BACKEND": name,
+            "AFX_OVERLAP_EVENTS": str(events_path),
+        }
+        workdir = tmp_path / name
+        workdir.mkdir()
+        backends[name] = subprocess.Popen(
+            [sys.executable, "-m", "tests.integration.overlap_backend"],
+            cwd=workdir,
+            env=env,
+            start_new_session=True,
+        )
+
+    def stop(name):
+        process = backends.pop(name)
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=10)
+
+    def starts(events, *, backends=None):
+        return [
+            event
+            for event in events
+            if event["kind"] in ("worker", "ingestion")
+            and (backends is None or event["backend"] in backends)
+        ]
+
+    def owners():
+        with Session(engine) as db:
+            paper = db.get(models.Run, paper_id)
+            evolution = db.get(models.EvolutionRun, evolution_id)
+            return {
+                paper_id: (paper.status, paper.process_pid),
+                evolution_id: (evolution.status, evolution.process_pid),
+            }
+
+    try:
+        start("old")
+        events = _wait_for(events_path, lambda e: len(starts(e)) == 3)
+        old_workers = {
+            event["run_id"]: event["pid"]
+            for event in events
+            if event["kind"] == "worker"
+        }
+        assert set(old_workers) == {paper_id, evolution_id}
+        assert owners() == {
+            paper_id: (models.RunStatus.RUNNING, old_workers[paper_id]),
+            evolution_id: (
+                models.EvolutionRunStatus.RUNNING,
+                old_workers[evolution_id],
+            ),
+        }
+
+        start("new_a")
+        start("new_b")
+
+        def successors_deferred_twice(events):
+            for backend in ("new_a", "new_b"):
+                for recover, run_id in (
+                    ("recover_orphaned_paper_runs", paper_id),
+                    ("recover_queued_evolution_runs", evolution_id),
+                ):
+                    passes = [
+                        event
+                        for event in events
+                        if event["backend"] == backend and event["kind"] == recover
+                    ]
+                    if len(passes) < 2:
+                        return False
+                    assert all(
+                        event["scheduled"] == 0 and event["deferred"] == [run_id]
+                        for event in passes
+                    ), passes
+            return True
+
+        events = _wait_for(events_path, successors_deferred_twice)
+        assert starts(events) == starts(events, backends={"old"})
+        assert len(starts(events)) == 3
+        assert owners() == {
+            paper_id: (models.RunStatus.RUNNING, old_workers[paper_id]),
+            evolution_id: (
+                models.EvolutionRunStatus.RUNNING,
+                old_workers[evolution_id],
+            ),
+        }
+
+        stop("old")
+        successors = {"new_a", "new_b"}
+        events = _wait_for(
+            events_path, lambda e: len(starts(e, backends=successors)) == 3
+        )
+        # Let both successors finish another recovery and ingestion retry.
+        time.sleep(7)
+        events = _events(events_path)
+        taken_over = starts(events, backends=successors)
+        assert sorted(event.get("run_id", "ingestion") for event in taken_over) == (
+            sorted([paper_id, evolution_id, "ingestion"])
+        )
+        new_workers = {
+            event["run_id"]: event["pid"]
+            for event in taken_over
+            if event["kind"] == "worker"
+        }
+        assert owners() == {
+            paper_id: (models.RunStatus.RUNNING, new_workers[paper_id]),
+            evolution_id: (
+                models.EvolutionRunStatus.RUNNING,
+                new_workers[evolution_id],
+            ),
+        }
+    finally:
+        for name in list(backends):
+            stop(name)
