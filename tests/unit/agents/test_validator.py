@@ -944,7 +944,9 @@ class TestParameterRobustness:
             "entry.long.lhs.args[0]",
             "entry.short.lhs.args[0]",
         ]
-        [period] = [p for p in evidence.parameters if p.path == "entry.long.lhs.args[0]"]
+        [period] = [
+            p for p in evidence.parameters if p.path == "entry.long.lhs.args[0]"
+        ]
         assert period.description == "rsi argument 1"
         assert period.baseline_value == 10.7525
         assert [(v.direction, v.value, v.status) for v in period.variants] == [
@@ -959,7 +961,9 @@ class TestParameterRobustness:
         ]
         # Thresholds and exits don't move this strategy: they pass.
         assert all(
-            p.passed for p in evidence.parameters if p.path not in evidence.failed_parameters
+            p.passed
+            for p in evidence.parameters
+            if p.path not in evidence.failed_parameters
         )
         assert evidence.reason.startswith(
             "Parameter robustness failed on 2 of 8 parameters: "
@@ -1033,7 +1037,9 @@ class TestParameterRobustness:
             return {"metrics": {**base, **variant} if nudged else base}
 
         _, evidence = self._check(MagicMock(side_effect=backtest))
-        [period] = [p for p in evidence.parameters if p.path == "entry.long.lhs.args[0]"]
+        [period] = [
+            p for p in evidence.parameters if p.path == "entry.long.lhs.args[0]"
+        ]
         if failure is None:
             assert evidence.passed
         else:
@@ -1055,7 +1061,9 @@ class TestParameterRobustness:
             return out
 
         _, evidence = self._check(MagicMock(side_effect=backtest))
-        [period] = [p for p in evidence.parameters if p.path == "entry.long.lhs.args[0]"]
+        [period] = [
+            p for p in evidence.parameters if p.path == "entry.long.lhs.args[0]"
+        ]
         up = period.variants[1]
         assert up.status == "failed"
         assert up.failures == ["Max DD 12.0% > cap 10%"]

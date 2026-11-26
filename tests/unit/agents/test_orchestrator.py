@@ -2094,9 +2094,7 @@ class TestParameterRobustness:
 
         [record] = persister.validations
         assert record["validator_passed"] is False
-        assert record["validation_failures"] == [
-            _robustness_evidence("failed").reason
-        ]
+        assert record["validation_failures"] == [_robustness_evidence("failed").reason]
         assert record["validation_robustness"]["failed_parameters"] == [
             "entry.long.lhs.args[0]"
         ]
