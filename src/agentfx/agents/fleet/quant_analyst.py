@@ -792,11 +792,18 @@ def _render_work_order_finding(
     ]
     done_when = [] if checklist else [_NOT_STATED]
     done_when.extend(f"- [ ] {item}" for item in checklist + standard_checks)
+    # Keys are the headings in `config/linear/templates/finding.md`. The
+    # template folds the observation and the proposed change into "What"
+    # and the profit impact into "Why" (AFX-102); a key that matches no
+    # heading is silently dropped, which is how AFX-160 blanked tickets.
     sections = {
-        "What I observed": wo.observation.strip() or _NOT_STATED,
+        "Why": wo.expected_profit_impact.strip() or _NOT_STATED,
+        "What": (
+            f"**Observed:** {wo.observation.strip() or _NOT_STATED}\n\n"
+            f"**Proposed fix:** {wo.proposed_fix.strip() or _NOT_STATED}\n\n"
+            f"Area: {area}. {target}"
+        ),
         "Evidence": evidence,
-        "Why it matters": wo.expected_profit_impact.strip() or _NOT_STATED,
-        "Proposed fix": f"{wo.proposed_fix.strip() or _NOT_STATED}\n\nArea: {area}. {target}",
         "Done when": "\n".join(done_when),
     }
     template = _FINDING_TEMPLATE.read_text(encoding="utf-8")

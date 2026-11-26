@@ -628,9 +628,13 @@ class TestLinearFiling:
             headings, template, flags=re.MULTILINE
         )
         assert "**Confidence:** High" in spec.body
-        assert "## What I observed\n\nThe paper account placed two orders" in spec.body
-        assert "## Why it matters\n\nDuplicate orders increase exposure." in spec.body
-        assert "## Proposed fix\n\nSubmit at most one order per signal." in spec.body
+        assert "## Why\n\nDuplicate orders increase exposure." in spec.body
+        assert (
+            "## What\n\n"
+            "**Observed:** The paper account placed two orders for one signal.\n\n"
+            "**Proposed fix:** Submit at most one order per signal.\n\n"
+            "Area: Paper runner. File was not identified."
+        ) in spec.body
         assert "Trades 8 and 9 motivate" not in spec.body
         assert "## Evidence\n\n" + spec.evidence in spec.body
         assert spec.evidence == (
@@ -673,11 +677,33 @@ class TestLinearFiling:
     def test_missing_ticket_fields_are_not_stated(self):
         spec = self._file_one()
         assert "**Confidence:** (not stated)" in spec.body
-        assert "## What I observed\n\n(not stated)" in spec.body
+        assert "## Why\n\n(not stated)" in spec.body
+        assert (
+            "## What\n\n"
+            "**Observed:** (not stated)\n\n"
+            "**Proposed fix:** (not stated)\n\n"
+            "Area: Paper runner. File was not identified."
+        ) in spec.body
         assert spec.evidence.endswith("\n\n(not stated)")
-        assert "## Why it matters\n\n(not stated)" in spec.body
-        assert "## Proposed fix\n\n(not stated)" in spec.body
         assert "## Done when\n\n(not stated)" in spec.body
+
+    def test_every_filled_section_is_a_template_heading(self):
+        """A section keyed by a heading the template no longer has is
+        dropped without error, leaving `(not stated)` (AFX-160)."""
+        template = (
+            Path(__file__).resolve().parents[4] / "config/linear/templates/finding.md"
+        ).read_text(encoding="utf-8")
+        spec = self._file_one(
+            observation="OBSERVED-MARKER",
+            evidence="EVIDENCE-MARKER",
+            expected_profit_impact="IMPACT-MARKER",
+            proposed_fix="FIX-MARKER",
+            done_when=["DONE-MARKER"],
+        )
+        for marker in ("OBSERVED", "EVIDENCE", "IMPACT", "FIX", "DONE"):
+            assert f"{marker}-MARKER" in spec.body
+        for heading in ("Why", "What", "Evidence", "Done when"):
+            assert f"## {heading}\n" in template
 
     def test_filing_exception_does_not_raise(self):
         from unittest.mock import patch
