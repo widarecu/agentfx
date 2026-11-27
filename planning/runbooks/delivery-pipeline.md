@@ -66,6 +66,7 @@ When all pass on an `agent-authored` PR, `pr-policy` turns on auto-merge (squash
 
 - **Normal risk:** auto-merges on green, no human review, unless the diff touches a code-owned path.
 - **Money-path code:** `.github/CODEOWNERS` lists the files that implement order execution, sizing, kill switch, credentials and deploy gates (plus `.github/` and the delivery scripts). Any PR touching them needs Wilson's code-owner review, whatever the ticket's Risk label.
+- A Money-path PR authored by the approver (Wilson's laptop PRs) can't be approved, since GitHub bars self-approval. `pr-policy` fails it saying so, and Wilson merges it by hand. Only a person's review counts, never a GitHub App's.
 - Don't add `needs-wilson` for risk alone; it is for real blockers.
 - A review triggers the "PR review relay" workflow, which re-runs `pr-policy`, so Wilson's approval takes effect without a new push.
 
