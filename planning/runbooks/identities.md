@@ -87,7 +87,7 @@ One row per actor. Each has exactly one GitHub identity and one Linear identity.
 | In-platform Research agent | None | None | None. It does not write to Linear | None |
 | Pipeline automation (merge, claim, deploy sync, reconcile) | `agentfx-fleet-bot[bot]` (exists) for merges. Commit statuses and tags keep using the built-in workflow token, which shows as `github-actions[bot]`, lasts one run and cannot be held by anyone else | Contents write, Pull requests write | AgentFX Pipeline (new app user) | Read, write. The only machine identity that changes ticket status |
 
-"AgentFX Fleet" is retired once QA, PM and Research have their own app users.
+"AgentFX Fleet" is retired once QA and the PE queue are seen acting under their own app users on staging; Wilson then revokes it.
 
 ### How the practices are met
 
@@ -149,7 +149,7 @@ After any rotation, update the "Expires" and "Verified" columns in section 1. Ro
 
 Wilson read the settings pages on 2026-11-27 (AFX-166) and section 1 carries the results. What remains:
 
-- **L4:** what kind of token the backend's `LINEAR_API_KEY` is and how long it was meant to last. It stops mattering once each role fetches its own token (AFX-174).
+- **L4:** QA filing and the PE queue acting under their own app users on staging, after AFX-174 deploys.
 - **L7:** the permissions of Devin's Linear integration. Cognition sets them.
 - **G5:** a PR from a Devin session Wilson starts himself, under today's "Open PRs as: Devin" setting (AFX-171).
 - A test in Linear: can an app user with only "create issues" and "create comments" set labels when it files a ticket (AFX-175)?
