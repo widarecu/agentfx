@@ -67,9 +67,9 @@ Users in the Linear workspace: Wilson Reyes (admin), and the app users Devin, Ag
 2. **The pipeline writes to Linear as Wilson** (L1). Every claim, every move to Done and every Blocked move is recorded as done by him. The daily check for "Backlog/Ready moves not made by Wilson" trusts exactly the identity the pipeline holds.
 3. **Wilson cannot approve a PR authored as Wilson.** GitHub does not let an author approve their own PR. This blocked PR #199 and PR #207, and PRs #207 to #209 were merged by hand.
 4. **Any holder of the laptop token can merge past the `main` ruleset**, because the ruleset lets the admin role bypass on a pull request and the token is Wilson's. Today that is prevented only by instruction.
-5. **A code-owner approval survives later pushes.** The `main` ruleset has "dismiss stale reviews" off. `pr-policy` re-checks approval of the latest commit only for tickets labelled Money-path. So on a Normal-risk ticket that touches a code-owned file, Wilson's approval of an early commit still counts after the agent pushes more.
+5. **Fixed 2026-11-27 (AFX-167):** a code-owner approval used to survive later pushes, so on a Normal-risk ticket touching a code-owned file Wilson's approval of an early commit still counted after the agent pushed more. The `main` ruleset now dismisses approvals on every new push.
 6. **All in-platform roles share one Linear identity** (L4); the role is only a label any actor can set.
-7. **Leftover:** the `fleet-fast-gate` ruleset still exists for the deleted `feat/agent-fleet` branch.
+7. **Fixed 2026-11-27 (AFX-167):** the leftover `fleet-fast-gate` ruleset for the deleted `feat/agent-fleet` branch is deleted.
 
 ## 3. Target model
 
@@ -109,12 +109,12 @@ What must be true for a Money-path PR, or any PR touching a path in `.github/COD
 
 Changes proposed to make this hold without relying on convention:
 
-1. **Ruleset on `main`: turn on "dismiss stale pull request approvals when new commits are pushed".** Closes problem 5: every approval then refers to the commit that merges.
+1. **Ruleset on `main`: "dismiss stale pull request approvals when new commits are pushed" is on** (applied 2026-11-27). Every approval refers to the commit that merges.
 2. **Ruleset bypass list stays "admin role, pull request only", and Wilson stays the only admin.** No App is ever added to the bypass list. This is a standing rule for the new-actor checklist.
 3. **`pr-policy` approver.** Keep one named approver, but take it from the repo's code owners rather than a login written in the script, and accept a review only from a person's account with admin permission on the repo, never from an App. The login `widarecu` then lives in one place (`.github/CODEOWNERS`), which is itself code-owned.
 4. **`pr-policy` when author and approver are the same person:** fail with a clear message naming the by-hand merge, and never enable auto-merge on such a PR when the ticket is Money-path or the diff is code-owned.
 5. **Reconcile digest:** list every merge to `main` not made by `agentfx-fleet-bot` (that is, every by-hand merge) so each one is seen the next morning. With the pipeline on its own Linear identity (AgentFX Pipeline), "moves not made by Wilson" also becomes a true statement.
-6. **Delete the `fleet-fast-gate` ruleset.**
+6. **The `fleet-fast-gate` ruleset is deleted** (2026-11-27).
 
 The limit that remains: while Claude Code on the laptop uses Wilson's own `gh` login, it holds a token that could merge by hand. Wilson accepted this on 2026-11-27 (decision 1). Giving laptop sessions their own App would remove it.
 
