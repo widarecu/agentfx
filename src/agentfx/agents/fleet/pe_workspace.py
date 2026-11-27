@@ -63,6 +63,7 @@ from sqlalchemy.orm import Session
 
 from agentfx.agents.fleet import github_app
 from agentfx.api.core.config import settings
+from agentfx.integrations import linear_agent_api
 from agentfx.api.models import AgentWorkspaceRun, AgentWorkspaceRunStatus
 
 logger = logging.getLogger(__name__)
@@ -599,6 +600,26 @@ class StubWorkspaceAdapter:
 # ─────────────────────────────────────────────────────────────────────
 
 
+def _update_vault_credential(
+    client: object, vault_id: str, credential_id: str, auth: dict, *, what: str
+) -> str | None:
+    """Write a fresh secret into a vault credential. Returns None on
+    success, else a refusal reason. The reason and logs carry only the
+    exception class and an HTTP status code, never the secret."""
+    try:
+        # `environment_variable` is a valid `auth` type on the API (same
+        # beta header) but only has a type hint from anthropic 2.14.0;
+        # a plain dict works on 0.100.0 too.
+        client.beta.vaults.credentials.update(  # type: ignore[attr-defined]
+            credential_id, vault_id=vault_id, auth=auth
+        )
+    except Exception as exc:
+        status = getattr(exc, "status_code", None)
+        detail = f"{type(exc).__name__}" + (f" (HTTP {status})" if status else "")
+        return f"could not update the vault credential for the {what} — {detail}"
+    return None
+
+
 class ManagedAgentsAdapter:
     """Dispatches to Anthropic Managed Agents (Beta).
 
@@ -736,30 +757,72 @@ class ManagedAgentsAdapter:
         env_id = settings.AGENT_PE_WORKSPACE_ENVIRONMENT_ID
         vault_id = settings.AGENT_PE_WORKSPACE_VAULT_ID
 
-        # Which token authorises the mounted repo (route A). With the
-        # GitHub App configured, mint a fresh one-hour token per dispatch
-        # and never fall back to the personal token if that fails.
+        # One GitHub App token per dispatch, used for BOTH routes: the
+        # mounted repo's authorization_token (git) and the vault's
+        # `GITHUB_TOKEN` environment-variable credential (`gh`). Never
+        # falls back to the personal token once the App is configured.
+        #
+        # Overlap: the vault credential is shared, so a later dispatch
+        # replaces the GitHub token seen by a session still running.
+        # That is safe because every token is valid for an hour from its
+        # own minting, and the kickoff tells the agent to publish within
+        # about 40 minutes.
         repo_token = settings.GITHUB_TOKEN
+        refusal = None
         if github_app.app_state() == "on":
-            owner, _, repo_name = _TARGET_REPO_URL.removeprefix(
-                "https://github.com/"
-            ).partition("/")
-            minted = github_app.mint_installation_token(owner=owner, repo=repo_name)
-            if not minted.ok:
-                reason = f"GitHub App token could not be minted — {minted.reason}"
-                row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
-                row.summary = f"ManagedAgentsAdapter: {reason}"
-                row.started_at = now
-                row.ended_at = now
-                db.commit()
-                logger.error("pe_workspace[managed]: dispatch refused — %s", reason)
-                return WorkspaceDispatchResult(
-                    accepted=True,
-                    workspace_run_id=row.id,
-                    agent_branch=row.agent_branch,
-                    reason=reason,
+            credential_id = (
+                getattr(settings, "AGENT_PE_GITHUB_VAULT_CREDENTIAL_ID", "") or ""
+            )
+            if not credential_id:
+                refusal = (
+                    "GitHub App is configured but AGENT_PE_GITHUB_VAULT_CREDENTIAL_ID "
+                    "is empty, so `gh` would keep using the personal token"
                 )
-            repo_token = minted.token
+            else:
+                owner, _, repo_name = _TARGET_REPO_URL.removeprefix(
+                    "https://github.com/"
+                ).partition("/")
+                minted = github_app.mint_installation_token(owner=owner, repo=repo_name)
+                if not minted.ok:
+                    refusal = f"GitHub App token could not be minted — {minted.reason}"
+                else:
+                    repo_token = minted.token
+                    refusal = _update_vault_credential(
+                        client,
+                        vault_id,
+                        credential_id,
+                        {"type": "environment_variable", "secret_value": repo_token},
+                        what="GitHub token (gh)",
+                    )
+        linear_credential_id = (
+            getattr(settings, "AGENT_PE_LINEAR_VAULT_CREDENTIAL_ID", "") or ""
+        )
+        if refusal is None and linear_credential_id:
+            linear_token, linear_err = linear_agent_api.get_app_token()
+            if not linear_token:
+                refusal = f"Linear app token unavailable — {linear_err}"
+            else:
+                refusal = _update_vault_credential(
+                    client,
+                    vault_id,
+                    linear_credential_id,
+                    {"type": "static_bearer", "token": linear_token},
+                    what="Linear connector token",
+                )
+        if refusal is not None:
+            refusal = _redact_secrets(refusal)
+            row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+            row.summary = f"ManagedAgentsAdapter: {refusal}"
+            row.started_at = now
+            row.ended_at = now
+            db.commit()
+            logger.error("pe_workspace[managed]: dispatch refused — %s", refusal)
+            return WorkspaceDispatchResult(
+                accepted=True,
+                workspace_run_id=row.id,
+                agent_branch=row.agent_branch,
+                reason=refusal,
+            )
 
         try:
             session = client.beta.sessions.create(
@@ -1145,8 +1208,9 @@ def _build_managed_kickoff(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str
         f"`gh pr create --base {spec.target_branch}`. If the push is refused, "
         "follow the Publishing fallback sequence above (gh api git/commits + "
         "git/refs, then a `[NEEDS WILSON]` PR) — never stop silently.",
-        "- The git push credential expires one hour after this session "
-        "starts. Push your branch and open the PR well within the hour "
+        "- `git` and `gh` both act as the AgentFX GitHub App identity "
+        "(`agentfx-pe[bot]`). Its credential expires one hour after this "
+        "session starts. Push your branch and open the PR well within the hour "
         "(aim for 40 minutes); if a push is refused with an auth error "
         "after that, stop and report it rather than retrying.",
         "- Never print, echo, or commit tokens or credential files "
