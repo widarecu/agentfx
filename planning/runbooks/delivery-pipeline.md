@@ -93,7 +93,7 @@ Railway's service settings for the backend (Dockerfile builder, `/health` check,
 
 ## 7. Daily reconciliation
 
-`delivery-reconcile.yml` runs daily at 08:17 Sydney. It replays a missed deploy sync for the current `deployed/staging` (in `apply` mode only), then publishes one drift digest on the run summary without moving any ticket: In Progress for more than 3 days with no PR, In Review with no open PR, Done without a deploy-sync marker, Backlog/Ready moves not made by Wilson, and anything it couldn't check. Wilson acts on the digest.
+`delivery-reconcile.yml` runs daily at 08:17 Sydney. It replays a missed deploy sync for the current `deployed/staging` (in `apply` mode only), then publishes one drift digest on the run summary without moving any ticket: In Progress for more than 3 days with no PR, In Review with no open PR, Done without a deploy-sync marker, Backlog/Ready moves not made by Wilson (matched by Linear user ID), PRs merged into `main` by anyone other than `agentfx-fleet-bot`, and anything it couldn't check. Wilson acts on the digest.
 
 ## 8. Wilson's part
 

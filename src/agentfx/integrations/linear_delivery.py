@@ -277,12 +277,12 @@ class LinearClient:
         )
 
     def state_moves(self, issue_id: str) -> list[dict]:
-        """Status changes, oldest first: createdAt, actor (id, name, email;
-        None for integrations), fromState and toState names."""
+        """Status changes, oldest first: createdAt, actor (id, name, email), botActor (id, name,
+        userDisplayName; integrations), fromState and toState names."""
         nodes = self.paginate(
             "query($id: String!, $after: String) { issue(id: $id) { "
             f"history(first: {PAGE_SIZE}, after: $after) {{ nodes {{ createdAt "
-            "actor { id name email } fromState { name } toState { name } } "
+            "actor { id name email } botActor { id name userDisplayName } fromState { name } toState { name } } "
             "pageInfo { hasNextPage endCursor } } } }",
             {"id": issue_id},
             ["issue", "history"],

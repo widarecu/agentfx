@@ -58,7 +58,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           AFX_DEPLOY_SYNC_MODE: ${{ vars.AFX_DEPLOY_SYNC_MODE || 'dry-run' }}
-          AFX_WILSON_LINEAR_EMAIL: ${{ vars.AFX_WILSON_LINEAR_EMAIL }}
+          AFX_WILSON_LINEAR_USER_ID: ${{ vars.AFX_WILSON_LINEAR_USER_ID }}
 
       - name: Keep digest marker
         if: always()

@@ -31,7 +31,7 @@ REPO = "widarecu/agentfx"
 NOW = datetime(2026, 11, 23, 12, 0, tzinfo=UTC)
 OLD = "2026-11-10T00:00:00.000Z"
 RECENT = "2026-11-22T09:00:00.000Z"
-WILSON = "wreyes06@outlook.com"
+WILSON = dr.DEFAULT_WILSON_USER_ID
 BASE = "b" * 40
 SHA = "a" * 40
 RUN = "https://github.com/widarecu/agentfx/actions/runs/7"
@@ -45,6 +45,11 @@ class FakeGitHub(SyncGitHub):
     def __init__(self, *, pr_states=None, **kw):
         super().__init__(**kw)
         self.pr_states: dict[int, str] = dict(pr_states or {})
+        self.merged: list[dict] = []
+
+    def merged_pulls(self, since):
+        self._check()
+        return list(self.merged)
 
     def pull_state(self, number):
         self._check()
@@ -53,13 +58,25 @@ class FakeGitHub(SyncGitHub):
         return self.pr_states[number]
 
 
-def _move(to, *, frm="Triage", at=RECENT, email="pe@bot", name="PE bot"):
+def _move(
+    to,
+    *,
+    frm="Triage",
+    at=RECENT,
+    email="pe@bot",
+    name="PE bot",
+    user_id=None,
+    bot=None,
+):
     actor = (
-        None if email is None else {"id": f"u-{email}", "name": name, "email": email}
+        None
+        if email is None and user_id is None
+        else {"id": user_id or f"u-{email}", "name": name, "email": email}
     )
     return {
         "createdAt": at,
         "actor": actor,
+        "botActor": bot,
         "fromState": {"name": frm},
         "toState": {"name": to},
     }
@@ -82,7 +99,7 @@ def _run(gh, lin, *, apply=False, previous=None, window_days=7):
         repo=REPO,
         now=NOW,
         window_days=window_days,
-        wilson_email=WILSON,
+        wilson_user_id=WILSON,
         run_url=RUN,
         apply=apply,
         previous=previous,
@@ -112,7 +129,7 @@ class TestNoDrift:
             "AFX-4",
             "Ready",
             updated_at=RECENT,
-            history=[_move("Ready", email=WILSON.upper())],
+            history=[_move("Ready", user_id=WILSON, email=None, name="Wilson")],
         )
         assert _run(gh, lin).findings == []
 
@@ -239,6 +256,85 @@ class TestDriftClasses:
         ]
 
 
+def _merged(n, merged_by, *, author="agent-author", title=None):
+    return {
+        "number": n,
+        "title": title or f"AFX-{n}: change",
+        "author": author,
+        "merged_by": merged_by,
+        "merged_at": "2026-11-22T10:00:00Z",
+    }
+
+
+class TestByHandMerges:
+    def test_only_non_bot_merges_are_listed(self, gh, lin):
+        gh.merged = [
+            _merged(20, "agentfx-fleet-bot[bot]"),
+            _merged(21, "agentfx-fleet-bot"),
+            _merged(22, "wilson", author="widarecu", title="AFX-22: by hand"),
+        ]
+        result = _run(gh, lin)
+        assert _kinds(result) == [(dr.BY_HAND, "PR #22")]
+        detail = result.findings[0].detail
+        assert "AFX-22: by hand" in detail
+        assert "author widarecu" in detail
+        assert "merged by wilson" in detail
+        assert "## Delivery drift digest" in result.summary
+
+    def test_same_by_hand_merge_is_not_repeated(self, gh, lin):
+        gh.merged = [_merged(22, "wilson")]
+        first = _run(gh, lin)
+        second = _run(gh, lin, previous=first.state)
+        assert "not repeated" in second.summary
+
+    def test_unreadable_merge_data_is_unchecked(self, gh, lin):
+        gh.fail = True
+        result = _run(gh, lin)
+        assert (dr.UNCHECKED, "merges") in _kinds(result)
+
+
+class TestActors:
+    def test_app_user_move_is_flagged_and_named(self, gh, lin):
+        lin.add(
+            "AFX-6",
+            "Ready",
+            updated_at=RECENT,
+            history=[_move("Ready", email=None, bot={"id": "b1", "name": "Devin"})],
+        )
+        result = _run(gh, lin)
+        assert _kinds(result) == [(dr.TRANSITION, "AFX-6")]
+        assert "by Devin" in result.findings[0].detail
+
+    def test_app_user_actor_with_name_is_named(self, gh, lin):
+        lin.add(
+            "AFX-6",
+            "Ready",
+            updated_at=RECENT,
+            history=[_move("Ready", email=None, name="AgentFX Fleet", user_id="app1")],
+        )
+        assert "by AgentFX Fleet" in _run(gh, lin).findings[0].detail
+
+    def test_wilson_user_id_is_not_flagged_without_email(self, gh, lin):
+        lin.add(
+            "AFX-6",
+            "Ready",
+            updated_at=RECENT,
+            history=[_move("Ready", user_id=WILSON, email=None, name="Wilson")],
+        )
+        assert _run(gh, lin).findings == []
+
+    def test_other_human_is_flagged(self, gh, lin):
+        lin.add(
+            "AFX-6",
+            "Ready",
+            updated_at=RECENT,
+            history=[_move("Ready", email="sam@example.com", name="Sam")],
+        )
+        result = _run(gh, lin)
+        assert _kinds(result) == [(dr.TRANSITION, "AFX-6")]
+        assert "by Sam" in result.findings[0].detail
+
+
 class TestReopened:
     def test_replay_leaves_a_reopened_ticket_alone(self, lin):
         lin.add("AFX-9", "In Progress", comments=[ds.done_marker(SHA)])
@@ -291,7 +387,7 @@ class TestMissedSync:
         lin.add("AFX-1", "In Progress", started_at=OLD)
         result = _run(gh, lin)
         assert result.exit_code == 1
-        assert _kinds(result) == [(dr.STALE, "AFX-1")]
+        assert _kinds(result) == [(dr.STALE, "AFX-1"), (dr.UNCHECKED, "merges")]
         assert "GitHub API failed" in result.summary
 
 
@@ -321,7 +417,7 @@ class TestDedupe:
             ld.LinearClient("k", opener=lin.opener),
             repo=REPO,
             now=NOW + timedelta(days=1),
-            wilson_email=WILSON,
+            wilson_user_id=WILSON,
             run_url=RUN,
             apply=False,
             previous=first.state,
@@ -434,3 +530,60 @@ class TestGhCliPullState:
 
         with pytest.raises(ds.GitHubError):
             ds.GhCli(REPO, runner=runner).pull_state(9)
+
+
+class TestGhCliMergedPulls:
+    """The real client, not the fake: the daily workflow calls this one."""
+
+    def test_keeps_in_window_merges_and_reads_merged_by(self):
+        listing = [
+            {
+                "number": 12,
+                "title": "AFX-2: by hand",
+                "user": {"login": "widarecu"},
+                "merged_at": "2026-11-22T09:00:00Z",
+                "updated_at": "2026-11-22T09:00:00Z",
+            },
+            {
+                "number": 11,
+                "title": "closed, never merged",
+                "user": {"login": "widarecu"},
+                "merged_at": None,
+                "updated_at": "2026-11-21T09:00:00Z",
+            },
+            {
+                "number": 10,
+                "title": "AFX-1: before the window",
+                "user": {"login": "devin-ai-integration[bot]"},
+                "merged_at": "2026-11-01T09:00:00Z",
+                "updated_at": "2026-11-20T09:00:00Z",
+            },
+        ]
+        calls: list[str] = []
+
+        def runner(args):
+            calls.append(args[1])
+            if "pulls?" in args[1]:
+                return json.dumps(listing)
+            return json.dumps({"merged_by": {"login": "widarecu"}})
+
+        pulls = ds.GhCli(REPO, runner=runner).merged_pulls("2026-11-16T12:00:00Z")
+
+        assert pulls == [
+            {
+                "number": 12,
+                "title": "AFX-2: by hand",
+                "author": "widarecu",
+                "merged_by": "widarecu",
+                "merged_at": "2026-11-22T09:00:00Z",
+            }
+        ]
+        assert calls[-1] == f"repos/{REPO}/pulls/12"
+        assert "base=main" in calls[0] and "state=closed" in calls[0]
+
+    def test_api_failure_raises_github_error(self):
+        def runner(args):
+            raise ds.GitHubError("HTTP 502", 502)
+
+        with pytest.raises(ds.GitHubError):
+            ds.GhCli(REPO, runner=runner).merged_pulls("2026-11-16T12:00:00Z")
