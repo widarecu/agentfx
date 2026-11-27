@@ -530,3 +530,60 @@ class TestGhCliPullState:
 
         with pytest.raises(ds.GitHubError):
             ds.GhCli(REPO, runner=runner).pull_state(9)
+
+
+class TestGhCliMergedPulls:
+    """The real client, not the fake: the daily workflow calls this one."""
+
+    def test_keeps_in_window_merges_and_reads_merged_by(self):
+        listing = [
+            {
+                "number": 12,
+                "title": "AFX-2: by hand",
+                "user": {"login": "widarecu"},
+                "merged_at": "2026-11-22T09:00:00Z",
+                "updated_at": "2026-11-22T09:00:00Z",
+            },
+            {
+                "number": 11,
+                "title": "closed, never merged",
+                "user": {"login": "widarecu"},
+                "merged_at": None,
+                "updated_at": "2026-11-21T09:00:00Z",
+            },
+            {
+                "number": 10,
+                "title": "AFX-1: before the window",
+                "user": {"login": "devin-ai-integration[bot]"},
+                "merged_at": "2026-11-01T09:00:00Z",
+                "updated_at": "2026-11-20T09:00:00Z",
+            },
+        ]
+        calls: list[str] = []
+
+        def runner(args):
+            calls.append(args[1])
+            if "pulls?" in args[1]:
+                return json.dumps(listing)
+            return json.dumps({"merged_by": {"login": "widarecu"}})
+
+        pulls = ds.GhCli(REPO, runner=runner).merged_pulls("2026-11-16T12:00:00Z")
+
+        assert pulls == [
+            {
+                "number": 12,
+                "title": "AFX-2: by hand",
+                "author": "widarecu",
+                "merged_by": "widarecu",
+                "merged_at": "2026-11-22T09:00:00Z",
+            }
+        ]
+        assert calls[-1] == f"repos/{REPO}/pulls/12"
+        assert "base=main" in calls[0] and "state=closed" in calls[0]
+
+    def test_api_failure_raises_github_error(self):
+        def runner(args):
+            raise ds.GitHubError("HTTP 502", 502)
+
+        with pytest.raises(ds.GitHubError):
+            ds.GhCli(REPO, runner=runner).merged_pulls("2026-11-16T12:00:00Z")
