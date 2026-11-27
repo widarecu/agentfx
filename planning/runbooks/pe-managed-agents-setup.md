@@ -25,8 +25,8 @@ this bootstrap exactly once (idempotent — safe to re-run):
 
   echo "$GITHUB_TOKEN" | gh auth login --with-token
   gh auth setup-git
-  git config --global user.email "wilson@plusfx.net"
-  git config --global user.name  "AgentFX Fleet PE"
+  git config --global user.email "<APP_USER_ID>+agentfx-pe[bot]@users.noreply.github.com"
+  git config --global user.name  "agentfx-pe[bot]"
   mkdir -p /workspace && cd /workspace
   if [ ! -d agentfx ]; then
     git clone --depth 50 https://github.com/widarecu/agentfx.git
@@ -66,7 +66,7 @@ HARD RULES:
    names, plus their tests. No drive-by refactors.
 
 6. cwd is /workspace/agentfx. Use the pre-installed `gh`, `git`,
-   and `make`. `GITHUB_TOKEN` is injected from the vault.
+   and `make`. `GITHUB_TOKEN` is injected from the vault (see "Where the GitHub token comes from").
 
 7. The PR title and branch name exactly one `AFX-<n>`: the issue
    this PR closes. Linear also acts on IDs in the body after
@@ -85,7 +85,23 @@ HARD RULES:
    only through the deploy pipeline on `main`.
 ```
 
+## Where the GitHub token comes from (AFX-172)
+
+Two routes put a token in the sandbox:
+
+- **git (clone and push):** the backend passes it as the mounted repository's `authorization_token` on every `sessions.create`. With `AGENT_PE_GITHUB_APP_CLIENT_ID` and `AGENT_PE_GITHUB_APP_PRIVATE_KEY` set on Railway, the backend mints a fresh one-hour token for the `agentfx-pe` GitHub App (restricted to `widarecu/agentfx`; Contents write, Pull requests write, Metadata read) at each dispatch. If minting fails the dispatch is refused with the reason; it never falls back to the personal token. With neither variable set, the personal `GITHUB_TOKEN` is used as before. Setting only one is refused as a configuration error.
+- **`gh` (opening the PR):** the vault's `GITHUB_TOKEN` environment-variable credential, still a copy of the personal token. The Anthropic SDK (0.100.0) can only create or update vault credentials of type `mcp_oauth` and `static_bearer` (both tied to an MCP server URL), so the backend cannot refresh this one. Until it is replaced, PRs opened by `gh pr create` are recorded as Wilson even though pushes come from the App.
+- **Lifetime:** an App token lasts one hour from dispatch; a session can run up to 4 hours before the sweeper reclaims it. The kickoff tells the agent to push and open the PR within the hour and to stop and report on an auth error.
+
 ## Change log
+
+**AFX-172 (GitHub identity), for Wilson to apply in the Console and on Railway after merge. Not yet live:**
+
+| Change | Why |
+|---|---|
+| Bootstrap: `git config --global user.name "agentfx-pe[bot]"` and email `<APP_USER_ID>+agentfx-pe[bot]@users.noreply.github.com`. Placeholder: replace `<APP_USER_ID>` with the numeric id from `https://api.github.com/users/agentfx-pe%5Bbot%5D` (field `id`) | Commits are attributed to the App, not to Wilson's address |
+| Railway: set `AGENT_PE_GITHUB_APP_CLIENT_ID` and `AGENT_PE_GITHUB_APP_PRIVATE_KEY` (done 2026-11-28) | The backend mints the App token for git at each dispatch |
+| Open decision: how `gh` gets an App token (see the AFX-172 report) | The vault copy of the personal token still decides who opens the PR |
 
 **AFX-126 (single-branch cutover), for Wilson to apply in the Console before `feat/agent-fleet` is deleted:**
 

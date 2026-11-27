@@ -61,6 +61,7 @@ import requests
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
+from agentfx.agents.fleet import github_app
 from agentfx.api.core.config import settings
 from agentfx.api.models import AgentWorkspaceRun, AgentWorkspaceRunStatus
 
@@ -325,6 +326,8 @@ def _redact_secrets(text: str) -> str:
     pat = getattr(settings, "GITHUB_TOKEN", "") or ""
     if pat:
         text = text.replace(pat, _REDACTED)
+    for minted in github_app.minted_tokens():
+        text = text.replace(minted, _REDACTED)
     text = _GITHUB_TOKEN_RE.sub(_REDACTED, text)
     return _URL_CREDENTIAL_RE.sub(rf"\1{_REDACTED}@", text)
 
@@ -673,16 +676,21 @@ class ManagedAgentsAdapter:
         env_id = getattr(settings, "AGENT_PE_WORKSPACE_ENVIRONMENT_ID", "") or ""
         vault_id = getattr(settings, "AGENT_PE_WORKSPACE_VAULT_ID", "") or ""
         github_token = getattr(settings, "GITHUB_TOKEN", "") or ""
-        missing = [
-            name
-            for name, val in [
-                ("AGENT_PE_WORKSPACE_AGENT_ID", agent_id),
-                ("AGENT_PE_WORKSPACE_ENVIRONMENT_ID", env_id),
-                ("AGENT_PE_WORKSPACE_VAULT_ID", vault_id),
-                ("GITHUB_TOKEN", github_token),
-            ]
-            if not val
+        app_state = github_app.app_state()
+        if app_state == "partial":
+            return None, (
+                "GitHub App misconfigured — set both "
+                "AGENT_PE_GITHUB_APP_CLIENT_ID and "
+                "AGENT_PE_GITHUB_APP_PRIVATE_KEY, or neither"
+            )
+        checks = [
+            ("AGENT_PE_WORKSPACE_AGENT_ID", agent_id),
+            ("AGENT_PE_WORKSPACE_ENVIRONMENT_ID", env_id),
+            ("AGENT_PE_WORKSPACE_VAULT_ID", vault_id),
         ]
+        if app_state == "off":
+            checks.append(("GITHUB_TOKEN", github_token))
+        missing = [name for name, val in checks if not val]
         if missing:
             return None, (
                 "missing managed-agents config — "
@@ -728,6 +736,31 @@ class ManagedAgentsAdapter:
         env_id = settings.AGENT_PE_WORKSPACE_ENVIRONMENT_ID
         vault_id = settings.AGENT_PE_WORKSPACE_VAULT_ID
 
+        # Which token authorises the mounted repo (route A). With the
+        # GitHub App configured, mint a fresh one-hour token per dispatch
+        # and never fall back to the personal token if that fails.
+        repo_token = settings.GITHUB_TOKEN
+        if github_app.app_state() == "on":
+            owner, _, repo_name = _TARGET_REPO_URL.removeprefix(
+                "https://github.com/"
+            ).partition("/")
+            minted = github_app.mint_installation_token(owner=owner, repo=repo_name)
+            if not minted.ok:
+                reason = f"GitHub App token could not be minted — {minted.reason}"
+                row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+                row.summary = f"ManagedAgentsAdapter: {reason}"
+                row.started_at = now
+                row.ended_at = now
+                db.commit()
+                logger.error("pe_workspace[managed]: dispatch refused — %s", reason)
+                return WorkspaceDispatchResult(
+                    accepted=True,
+                    workspace_run_id=row.id,
+                    agent_branch=row.agent_branch,
+                    reason=reason,
+                )
+            repo_token = minted.token
+
         try:
             session = client.beta.sessions.create(
                 # 2026-11-01 fix: the SDK requires a selector `type`
@@ -744,7 +777,7 @@ class ManagedAgentsAdapter:
                     {
                         "type": "github_repository",
                         "url": _TARGET_REPO_URL,
-                        "authorization_token": settings.GITHUB_TOKEN,
+                        "authorization_token": repo_token,
                         "mount_path": _SANDBOX_REPO_PATH,
                         "checkout": {"type": "branch", "name": spec.target_branch},
                     }
@@ -1112,6 +1145,10 @@ def _build_managed_kickoff(*, spec: WorkspaceTaskSpec, agent_branch: str) -> str
         f"`gh pr create --base {spec.target_branch}`. If the push is refused, "
         "follow the Publishing fallback sequence above (gh api git/commits + "
         "git/refs, then a `[NEEDS WILSON]` PR) — never stop silently.",
+        "- The git push credential expires one hour after this session "
+        "starts. Push your branch and open the PR well within the hour "
+        "(aim for 40 minutes); if a push is refused with an auth error "
+        "after that, stop and report it rather than retrying.",
         "- Never print, echo, or commit tokens or credential files "
         "(e.g. `env`, `git config --list --show-origin`, `~/.git-credentials`).",
     ]
@@ -1258,7 +1295,9 @@ def resolve_adapter(spec: WorkspaceTaskSpec | None = None) -> WorkspaceAdapter:
         backend = "managed_agents"
 
     pat = getattr(settings, "GITHUB_TOKEN", "") or ""
-    if not pat:
+    # With any GitHub App setting present the adapter itself decides
+    # (mint, or refuse a half-configured App with a clear reason).
+    if not pat and github_app.app_state() == "off":
         logger.warning(
             "pe_workspace: AGENT_PE_WORKSPACE_ENABLED=true but GITHUB_TOKEN is "
             "empty; falling back to stub adapter so no cost is incurred."

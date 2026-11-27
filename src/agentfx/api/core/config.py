@@ -572,6 +572,27 @@ class Settings(BaseSettings):
             "through). Never logged; redacted from run summaries."
         ),
     )
+    AGENT_PE_GITHUB_APP_CLIENT_ID: str = Field(
+        default="",
+        env="AGENT_PE_GITHUB_APP_CLIENT_ID",
+        description=(
+            "Client ID of the `agentfx-pe` GitHub App (AFX-172). With the "
+            "private key, lets each PE dispatch mint a one-hour token "
+            "restricted to this repository, so the hosted PE pushes as "
+            "`agentfx-pe[bot]` instead of Wilson. Both settings empty = "
+            "the personal GITHUB_TOKEN is used as before; only one set = "
+            "dispatch refused as a configuration error."
+        ),
+    )
+    AGENT_PE_GITHUB_APP_PRIVATE_KEY: str = Field(
+        default="",
+        env="AGENT_PE_GITHUB_APP_PRIVATE_KEY",
+        description=(
+            "Full PEM text of the `agentfx-pe` App's private key (literal "
+            "backslash-n sequences are accepted for newlines). Secret; "
+            "never logged."
+        ),
+    )
     # Managed Agents (Beta) resource IDs — created once by the operator
     # via console or a setup script, then referenced per-dispatch. All
     # three must be set for ManagedAgentsAdapter to actually dispatch;
