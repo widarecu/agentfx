@@ -18,6 +18,8 @@ Read `planning/runbooks/delivery-pipeline.md` before changing any of:
 - `deploy.yml` "Sync tickets" (`scripts/afx.py deploy-sync`): the only thing allowed to set Linear issues to Done or (after a failed deploy) Blocked.
 - `delivery-reconcile.yml`: daily replay of a missed sync plus the drift digest; it never moves other tickets.
 
+Changing which token, App or Linear key a workflow uses, or who may approve: read the matching section of `planning/runbooks/identities.md` first (its opening lines say which section).
+
 Deploy facts:
 - `deploy.yml` runs on every push to `main` (each merged PR): plan, then Railway (`scripts/railway_deploy.py`: `railway up --detach`, then polls the deployment until Railway reports it built and healthy, so a failed build or health check fails the job) and Vercel (`vercel deploy --prod`), then staging verification, then the `deployed/staging` tag and ticket sync.
 - CI E2E still uses a GitHub Actions Postgres service on 5432 and runs uvicorn/vite on 8000/5173, pinned with `PLAYWRIGHT_BASE_URL` and `API_BASE_URL`. Local E2E uses the Docker test profile (5174/8001). Moving CI to `make e2e` is a pending follow-up.

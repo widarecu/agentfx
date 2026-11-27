@@ -104,13 +104,15 @@ Linear is not a test-case manager. We don't need one.
 
 ## 9. Who does the work, in phases
 
-| Phase | Picks up Ready work | Files Triage issues | Identity in Linear |
-|---|---|---|---|
-| **1 (now)** | Cloud Claude Code via the Linear MCP connector. Either a scheduled routine (e.g. nightly: "take the top Ready issue") or Wilson from the phone: "work on AFX-12". | Claude Code sessions | Acts as Wilson; distinguished by the *Source: Coding agent* label and signed comments |
-| **2** | Same | In-platform fleet agents (QA/PE/PM) through a small `linear_client.py`. Replaces "email Wilson a proposal" with "file Triage issue + daily email digest". | **AgentFX Fleet** app user (Linear `actor=app`; free, not a seat) |
-| **3 (optional)** | Delegating an issue to the AgentFX app in Linear triggers a cloud coding run via webhook | All agents | One app user per agent role |
+| Phase | Picks up Ready work | Files Triage issues |
+|---|---|---|
+| **1 (now)** | Cloud Claude Code via the Linear MCP connector. Either a scheduled routine (e.g. nightly: "take the top Ready issue") or Wilson from the phone: "work on AFX-12". | Claude Code sessions |
+| **2** | Same | In-platform fleet agents (QA/PE/PM) through a small `linear_client.py`. Replaces "email Wilson a proposal" with "file Triage issue + daily email digest". |
+| **3 (optional)** | Delegating an issue to the AgentFX app in Linear triggers a cloud coding run via webhook | All agents |
 
 Phase 2 also answers the PE Phase 2b question (ticket T6). PE files issues, and the same coding agent does the work.
+
+**Which identity each actor uses in Linear and GitHub** (today and the target) is in [identities.md](identities.md), not here.
 
 ## 10. Wilson's routine (on the phone)
 
