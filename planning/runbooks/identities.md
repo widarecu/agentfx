@@ -16,39 +16,39 @@ Terms used here:
 
 ## 1. Inventory (read 2026-11-27)
 
-No values are shown anywhere in this file. "Verified" means read from the platform or the repo on that date. "Not verified" means it could not be read from the laptop and needs Wilson to look (section 7).
+No values are shown anywhere in this file. "Verified" means read from the platform or the repo on that date. "Not verified" means nobody has been able to read it yet (section 7).
 
 ### GitHub: credentials that can write
 
 | # | Credential | Stored in | Used by | Appears in GitHub as | Type | Can do | Expires | Verified |
 |---|---|---|---|---|---|---|---|---|
 | G1 | `gh` login on the laptop | macOS keychain | Wilson by hand; Claude Code on the laptop | `widarecu` (Wilson) | Personal OAuth token | Scopes `repo`, `workflow`, `gist`, `read:org`. Because `widarecu` is the repo admin, this includes merging past the `main` ruleset | No expiry | Yes |
-| G2 | `FLEET_BOT_PRIVATE_KEY` + `FLEET_BOT_CLIENT_ID` | GitHub environment `fleet-bot` (secret + variable), usable only by workflows on allowed branches | `pr-policy.yml`, to turn auto-merge on or off | `agentfx-fleet-bot[bot]` | GitHub App | Token requested with Contents write and Pull requests write only. What the App itself is allowed is not verified | Minted token: 1 hour. Private key: none | Partly |
+| G2 | `FLEET_BOT_PRIVATE_KEY` + `FLEET_BOT_CLIENT_ID` | GitHub environment `fleet-bot` (secret + variable), usable only by workflows on `main` | `pr-policy.yml`, to turn auto-merge on or off | `agentfx-fleet-bot[bot]` | GitHub App owned by `widarecu` | Installed on `widarecu/agentfx` only. Metadata read; code and pull requests read and write | Minted token: 1 hour. Private key: none | Yes |
 | G3 | Built-in workflow token (`github.token`) | Created by GitHub for each workflow run | `pr-policy.yml` (commit status), `afx-request.yml` (claim tags, verdict status), `deploy.yml` (deploy tags), `delivery-reconcile.yml` | `github-actions[bot]` | Built-in, per run | Only what each job declares; at most Contents write and Statuses write | End of the run | Yes |
-| G4 | Devin's GitHub integration | Devin (Cognition) | Devin sessions: branches, commits, PRs | `devin-ai-integration[bot]` | GitHub App owned by Cognition | Not verified (set in GitHub → Settings → Applications) | Managed by Devin | Identity yes, permissions no |
-| G5 | `GH_TOKEN` in Devin sessions | Devin's secrets | Devin sessions, to read claim verdicts. PR #199 shows a Devin session opened a PR as `widarecu`, so some Devin session held a token of Wilson's that can write | Not verified; at least once `widarecu` | Not verified | Not verified | Not verified | No |
-| G6 | `GITHUB_TOKEN` for cloud Claude Code | The cloud environment's secrets | Cloud Claude Code sessions | `widarecu` (the old setup told Wilson to create it in his account) | Fine-grained personal token | As documented: this repo only; Contents write, Pull requests write, Metadata read | Not verified | No (cannot be read from here) |
-| G7 | `GITHUB_TOKEN` for the hosted PE | Railway variable `GITHUB_TOKEN` on the backend, sent to each Managed Agents session; a copy in the Managed Agents vault | The hosted Platform Engineer agent (`agentfx-fleet-pe`) | Not verified. `config.py` describes it as a fine-grained personal token for this repo, and `widarecu` is the only user on the repo, so almost certainly `widarecu` | Fine-grained personal token | Not verified | Not verified | No |
-| G8 | GitHub MCP connector of the hosted PE | Anthropic Console (agent config) | Hosted PE | Not verified | Not verified | Every tool enabled | Not verified | No |
-| G9 | Linear's GitHub integration | Linear | Linking PRs to tickets | `linear[bot]` (comments only) | GitHub App owned by Linear | Not verified | Managed by Linear | No |
+| G4 | Devin's GitHub integration ("Devin.ai Integration") | Devin (Cognition) | Devin sessions: branches, commits, PRs | `devin-ai-integration[bot]` | GitHub App owned by Cognition (`usacognition`) | Installed on **all repositories**. Read and write on code, pull requests, workflows, actions, checks, commit statuses, issues, discussions, projects and repository creation; read on security alerts and more. The permission list is Cognition's; only the repository selection is Wilson's to narrow | Managed by Devin | Yes |
+| G5 | Devin's App acting on Wilson's behalf | No stored token: "Devin.ai Integration" is listed under Wilson's Authorized GitHub Apps, which lets it act as him | Devin sessions a person starts, when Devin's "Open PRs as" setting is User | `widarecu`. PRs #192, #195 and #199 (2026-11-25) were created this way; the session's command-line sign-in is the bot's | User authorization of a GitHub App | Whatever the App can do, recorded as Wilson | Until Wilson revokes the authorization | Yes. Devin's "Open PRs as" is Devin as of 2026-11-27; not yet observed on a new PR (AFX-171) |
+| G6 | Cloud Claude Code | None | Not in use: Wilson uses Claude Code only on the laptop (2026-11-27) | Nothing | None exists (one personal token on the account, and it is G7) | Nothing | n/a | Yes |
+| G7 | `GITHUB_TOKEN` for the hosted PE (personal token `agentfx-fleet-pe`) | Railway variable `GITHUB_TOKEN` on the backend, sent to each Managed Agents session; a copy in the vault `agentfx-fleet-pe-vault` in the Claude Console | The hosted Platform Engineer agent (`agentfx-fleet-pe`) | `widarecu` | Fine-grained personal token, the only personal token on the account (no classic tokens) | `widarecu/agentfx` only. Metadata read; code, pull requests and **workflows** read and write | **2027-01-28** (created 2026-10-30) | Yes |
+| G8 | GitHub connector of the hosted PE (`api.githubcopilot.com/mcp`) | Vault `agentfx-fleet-pe-vault` in the Claude Console | Hosted PE | `widarecu` (an OAuth sign-in Wilson made) | OAuth sign-in | Every connector tool is enabled in the agent's configuration | Managed by the connector (credential updated 2026-11-19) | Yes |
+| G9 | Linear's GitHub integration ("Linear Code") | Linear | Linking PRs to tickets | Linear's App; it is also under Wilson's Authorized GitHub Apps, so it can act as `widarecu` | GitHub App owned by Linear | Installed on **all repositories**. Read and write on code, pull requests, workflows, actions, checks, commit statuses and issues | Managed by Linear | Yes |
 
-Also checked: the repo has one collaborator (`widarecu`, admin), no deploy keys and no webhooks. The repo-level Actions secrets are `LINEAR_API_KEY`, `RAILWAY_TOKEN`, `RAILWAY_BACKEND_URL`, `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID`.
+Also checked: the repo has one collaborator (`widarecu`, admin), no deploy keys and no webhooks. The repo-level Actions secrets are `LINEAR_API_KEY`, `LINEAR_PIPELINE_CLIENT_ID`, `LINEAR_PIPELINE_CLIENT_SECRET`, `RAILWAY_TOKEN`, `RAILWAY_BACKEND_URL`, `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID`; any workflow on any pushed branch can read them (AFX-179). Wilson's Authorized OAuth Apps: GitHub CLI (the laptop, G1) and Visual Studio Code are in use; Cursor, Devin Desktop, GitHub iOS and Resend have never been used. Copilot SWE Agent is authorized but Wilson does not use it.
 
 ### Linear: credentials that can write
 
 | # | Credential | Stored in | Used by | Appears in Linear as | Type | Can do | Expires | Verified |
 |---|---|---|---|---|---|---|---|---|
-| L1 | `LINEAR_PIPELINE_CLIENT_ID` / `LINEAR_PIPELINE_CLIENT_SECRET` (the old personal `LINEAR_API_KEY` secret stays only until Wilson deletes it after live verification) | GitHub Actions secrets | The pipeline: claims (`afx-request.yml`), `pr-policy`, deploy sync, daily reconcile | **AgentFX Pipeline** (app user). Before AFX-169 it was Wilson Reyes: the claim comment on AFX-163 of 2026-11-27 is recorded as authored by Wilson | "AgentFX Pipeline" OAuth application, client-credentials grant | Read and write | Token about 30 days, minted per run. Client secret: none | Yes (GitHub Actions run 45993119320, 2026-11-27) |
+| L1 | `LINEAR_PIPELINE_CLIENT_ID` / `LINEAR_PIPELINE_CLIENT_SECRET` (the old personal `LINEAR_API_KEY` secret stays only until Wilson deletes it after live verification) | GitHub Actions secrets | The pipeline: claims (`afx-request.yml`), `pr-policy`, deploy sync, daily reconcile | **AgentFX Pipeline** (app user). Before AFX-169 it was Wilson Reyes: the claim comment on AFX-163 of 2026-11-27 is recorded as authored by Wilson | "AgentFX Pipeline" OAuth application, client-credentials grant | Read and write | Token about 30 days, minted per run. Client secret: none | Yes. Live since 2026-11-27: the Done comment on AFX-169 and the claim on AFX-166 are recorded as AgentFX Pipeline |
 | L2 | Linear connector in Claude Code on the laptop | Claude's Linear connector (OAuth, signed in as Wilson) | Wilson by hand; Claude Code on the laptop | Wilson Reyes | Personal OAuth | Everything Wilson can do (admin) | Managed by Linear | Yes |
-| L3 | `LINEAR_API_KEY` for cloud Claude Code | The cloud environment's secrets | Cloud Claude Code sessions | Wilson Reyes (the old setup told Wilson to create a personal key) | Personal API key | Everything Wilson can do | No expiry | No |
-| L4 | `LINEAR_API_KEY` on the backend | Railway variable | In-platform fleet (QA, PE, PM, Research) filing findings | Tickets filed by the fleet show as **AgentFX Fleet**, so this is most likely that app user's token. One identity for all roles | Not verified (app token or key) | Not verified | Not verified | No |
-| L5 | `LINEAR_AGENT_CLIENT_ID` + `LINEAR_AGENT_CLIENT_SECRET` | Railway variables | The PE's Linear agent (delegation webhook, session replies) | **AgentFX Platform Engineer** (inferred from the user list) | OAuth application, `actor=app` | Scopes requested in code: read, write, assignable, mentionable | Token about 30 days, renewed automatically. Client secret: none | Partly |
-| L6 | `LINEAR_AGENT_WEBHOOK_SECRET` | Railway variable | Checks that webhook calls really come from Linear | Nobody (it cannot write) | Signing secret | Nothing | None | No |
+| L3 | Cloud Claude Code | None | Not in use (see G6) | Nothing | None exists (the two personal keys on the workspace are both pipeline keys) | Nothing | n/a | Yes |
+| L4 | `LINEAR_API_KEY` on the backend | Railway variable | In-platform fleet (QA, PE, PM, Research) filing findings and reading the Ready queue | **AgentFX Fleet** (app user). One identity for all roles | A token of the "AgentFX Fleet" application, pasted in by hand. Confirmed not a personal key; the token's kind and lifetime are not confirmed | Not verified | Rejected by Linear (401) since 2026-11-27 00:10 UTC, most likely expired (AFX-177) | Partly |
+| L5 | `LINEAR_AGENT_CLIENT_ID` + `LINEAR_AGENT_CLIENT_SECRET` | Railway variables | The PE's Linear agent (delegation webhook, session replies) | **AgentFX Platform Engineer** (app user, installed 2026-11-05) | OAuth application, `actor=app` | Scopes requested in code: read, write, assignable, mentionable | Token about 30 days, renewed automatically. Client secret: none | Yes (presence and application; scopes from the code) |
+| L6 | `LINEAR_AGENT_WEBHOOK_SECRET` | Railway variable | Checks that webhook calls really come from Linear | Nobody (it cannot write) | Signing secret | Nothing | None | Yes (present) |
 | L7 | Devin's Linear integration | Devin (Cognition) | Devin sessions: tickets, comments | **Devin** (app user) | OAuth application owned by Cognition | Not verified | Managed by Devin | Identity yes, scopes no |
-| L8 | Linear connector of the hosted PE | Anthropic Console (agent config) | Hosted PE | Not verified | Not verified | Every tool enabled | Not verified | No |
-| L9 | `bootstrap` personal API key | Wilson's machine, if it still exists | `scripts/linear/bootstrap.py` | Wilson Reyes | Personal API key | Everything Wilson can do | No expiry | No. The operating model asked for it to be revoked |
+| L8 | Linear connector of the hosted PE (`mcp.linear.app/mcp`) | Vault `agentfx-fleet-pe-vault` in the Claude Console | Hosted PE | **Wilson Reyes** (an OAuth sign-in Wilson made; "MCP" on Linear's Applications page) | OAuth sign-in | Every connector tool is enabled; everything Wilson's sign-in allows | Managed by the connector (credential updated 2026-11-19) | Yes |
+| L9 | Old personal API keys | Linear → Settings → API | Nothing now | Wilson Reyes | Personal API keys | The `bootstrap` key no longer exists. "agentfx-github-actions" (2 permissions, one team, created 2026-11-11) was the previous pipeline key, last used 2026-11-18. "GitHuib Actions Key" (4 permissions, one team, created 2026-11-25) is the `LINEAR_API_KEY` Actions secret that L1 replaces | No expiry | Yes. Both are for Wilson to revoke (AFX-169 step 3, AFX-176) |
 
-Users in the Linear workspace: Wilson Reyes (admin), and the app users Devin, AgentFX Fleet, AgentFX Platform Engineer and Linear's own.
+Users in the Linear workspace: Wilson Reyes (admin), and the app users Devin, AgentFX Fleet, AgentFX Platform Engineer, AgentFX Pipeline and Linear's own. OAuth applications owned by the workspace: AgentFX Fleet, AgentFX Platform Engineer, AgentFX Pipeline.
 
 ### Other platforms (listed for completeness, not designed here)
 
@@ -56,14 +56,14 @@ Users in the Linear workspace: Wilson Reyes (admin), and the app users Devin, Ag
 |---|---|---|
 | `RAILWAY_TOKEN` | GitHub Actions secret | Backend deploy |
 | `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID` | GitHub Actions secrets | Frontend deploy |
-| Railway connector (read-only tools) | Anthropic Console | Hosted PE |
-| `ANTHROPIC_API_KEY` | Railway; the cloud environment | Fleet agents; cloud Claude Code |
+| Railway connector (an OAuth sign-in Wilson made; nine read-only tools enabled) | Vault `agentfx-fleet-pe-vault` in the Claude Console | Hosted PE |
+| `ANTHROPIC_API_KEY` | Railway | Fleet agents |
 | `DEVIN_API_KEY`, `DEVIN_ORG_ID` | Railway | The backend, to start Devin sessions |
-| `OANDA_API_KEY`, `OANDA_ACCOUNT_ID` (practice only) | Railway; the cloud environment. `ci.yml` reads them as Actions secrets, but no secret of that name is listed on the repo | Paper trading; integration tests |
+| `OANDA_API_KEY`, `OANDA_ACCOUNT_ID` (practice only) | Railway. `ci.yml` reads them as Actions secrets, but no secret of that name is listed on the repo | Paper trading; integration tests |
 
 ## 2. What is wrong today
 
-1. **Four agent paths write to GitHub as Wilson**: the laptop (G1), cloud Claude Code (G6), the hosted PE (G7, almost certainly) and at least one Devin session (G5). Of the last 30 PRs, 8 were authored by `widarecu`; the rest by Devin's App.
+1. **Three agent paths write to GitHub as Wilson**: the laptop (G1), the hosted PE (its token G7 and its connector G8) and Devin sessions a person starts (G5). Of the 30 PRs up to #210, 8 were authored by `widarecu`: 5 from the laptop and 3 from Devin acting on his behalf. The hosted PE also writes to Linear as Wilson through its connector (L8).
 2. **Fixed 2026-11-27 (AFX-169):** the pipeline used to write to Linear as Wilson (L1), so every claim, Done move and Blocked move was recorded as done by him. It now authenticates as the "AgentFX Pipeline" app user; the personal key is removed once that is proven live.
 3. **Wilson cannot approve a PR authored as Wilson.** GitHub does not let an author approve their own PR. This blocked PR #199 and PR #207, and PRs #207 to #209 were merged by hand.
 4. **Any holder of the laptop token can merge past the `main` ruleset**, because the ruleset lets the admin role bypass on a pull request and the token is Wilson's. Today that is prevented only by instruction.
@@ -145,19 +145,17 @@ After any rotation, update the "Expires" and "Verified" columns in section 1. Ro
 2. **In-platform agents in Linear: one app user per role** (QA, PM, Research; PE already has its own). App users are free, and each role can be revoked alone.
 3. **Cloud Claude Code and the hosted PE: separate identities** (`agentfx-claude` and `agentfx-pe`). Their credentials live in different places and they are started by different things.
 
-## 7. What only Wilson can check
+## 7. What is still not verified
 
-These complete the "Not verified" rows. Report the account name, type, permissions and expiry, never the value.
+Wilson read the settings pages on 2026-11-27 (AFX-166) and section 1 carries the results. What remains:
 
-- GitHub → Settings → Applications → Installed GitHub Apps: the permissions of `agentfx-fleet-bot`, `devin-ai-integration` and Linear (G2, G4, G9).
-- GitHub → Settings → Developer settings → Personal access tokens: every token, what it can do, when it expires, and which of G5, G6, G7 it is.
-- Devin → secrets and integrations: which token is `GH_TOKEN` (G5), and whether Devin can be made to use only its App for every session.
-- The cloud Claude Code environment: which `GITHUB_TOKEN` and `LINEAR_API_KEY` it holds (G6, L3).
-- Railway → backend variables: which account `GITHUB_TOKEN` and `LINEAR_API_KEY` belong to (G7, L4).
-- Anthropic Console → `agentfx-fleet-pe`: how its GitHub and Linear connectors sign in, and what the vault holds (G7, G8, L8).
-- Linear → Settings → API: the list of personal API keys (L1, L3, L9) and of OAuth applications with their permissions (L4, L5, L7).
-- A test in Linear: can an app user with only "create issues" and "create comments" set labels when it files a ticket?
-- Whether the Actions secrets `OANDA_API_KEY` and `OANDA_ACCOUNT_ID` exist under another scope.
+- **L4:** what kind of token the backend's `LINEAR_API_KEY` is and how long it was meant to last. It stops mattering once each role fetches its own token (AFX-174).
+- **L7:** the permissions of Devin's Linear integration. Cognition sets them.
+- **G5:** a PR from a Devin session Wilson starts himself, under today's "Open PRs as: Devin" setting (AFX-171).
+- A test in Linear: can an app user with only "create issues" and "create comments" set labels when it files a ticket (AFX-175)?
+- Whether the Actions secrets `OANDA_API_KEY` and `OANDA_ACCOUNT_ID` exist under another scope. `ci.yml` reads them, and no secret of that name is listed on the repo.
+
+Cloud Claude Code is not in use (G6, L3), so its row in section 3 and step 8 of the migration describe an actor that does not exist today.
 
 ## 8. Migration plan
 
