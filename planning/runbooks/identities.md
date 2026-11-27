@@ -4,6 +4,8 @@
 
 The rule Wilson set on 2026-11-26: every action in GitHub and Linear is recorded against the actor that really performed it. His approval is the gate on Money-path changes (order execution, sizing, kill switch, credentials, deploy gates), and that gate only means something if the platforms can tell him apart from an agent.
 
+**Read only the part you need:** which identity an actor uses → section 3. How a Money-path PR gets approved → section 4. Adding an actor, rotating or revoking → section 5. Which credential is stored where → section 1. Sections 2, 6, 7 and 8 are background for the migration.
+
 Terms used here:
 
 - **Personal token**: a key created inside a person's account. Whatever uses it appears as that person.
@@ -159,18 +161,18 @@ These complete the "Not verified" rows. Report the account name, type, permissio
 
 ## 8. Migration plan
 
-Each step is one PR or one settings change and leaves the pipeline working. Steps marked **W** are settings only Wilson can apply. The tickets were filed in Triage on 2026-11-27.
+Eleven steps, in this order, each one PR or one settings change. Linear holds the detail of each; the table is only the order. **W** marks a step that starts with a setting only Wilson can apply.
 
-| # | Ticket | Step | Kind |
-|---|---|---|---|
-| 1 | AFX-166 | Complete the inventory: Wilson reads the items in section 7, and section 1 is updated | W + docs PR |
-| 2 | AFX-167 | Ruleset on `main`: dismiss stale approvals on push; delete `fleet-fast-gate` | W |
-| 3 | AFX-168 | `pr-policy`: clear result when the author is the approver; approver taken from code owners; accept only a person's review | PR (code-owned, Money-path) |
-| 4 | AFX-169 | Pipeline's Linear identity: create "AgentFX Pipeline" (W), teach the workflows to use its app token, then delete the personal key behind `LINEAR_API_KEY` (W) | W + PR + W |
-| 5 | AFX-170 | Reconcile digest: use real actors, and list by-hand merges to `main` | PR |
-| 6 | AFX-171 | Devin: remove any token of Wilson's from Devin's secrets; if a token is still needed to read claim verdicts, make it read-only | W |
-| 7 | AFX-172 | Hosted PE on GitHub: create `agentfx-pe` (W), have the backend mint an App token per session in place of the personal token, then delete the personal token (W) | W + PR + W |
-| 8 | AFX-173 | Cloud Claude Code: create `agentfx-claude` and "AgentFX Claude" (W), update the cloud setup, then delete the personal token and key (W) | W + docs PR + W |
-| 9 | AFX-174 | In-platform roles in Linear: create the per-role app users (W), have the fleet file as its role, retire "AgentFX Fleet" (W) | W + PR + W |
-| 10 | AFX-175 | Narrow the Linear permissions of filing-only agents to read, create issues, create comments, if the test in section 7 passes | W |
-| 11 | AFX-176 | Revoke the `bootstrap` Linear key if it still exists; mark this document as current state | W + docs PR |
+| # | Ticket | Step |
+|---|---|---|
+| 1 | AFX-166 | W: complete the inventory (section 7) |
+| 2 | AFX-167 | W: `main` ruleset drops approvals on new pushes; delete `fleet-fast-gate` |
+| 3 | AFX-168 | `pr-policy` handles author-is-approver; approver from code owners |
+| 4 | AFX-169 | W: the pipeline's own Linear identity |
+| 5 | AFX-170 | Reconcile digest: real actors, by-hand merges |
+| 6 | AFX-171 | W: no token of Wilson's in Devin sessions |
+| 7 | AFX-172 | W: hosted PE on its own GitHub App |
+| 8 | AFX-173 | W: cloud Claude Code on its own GitHub App and Linear app user |
+| 9 | AFX-174 | W: one Linear app user per in-platform role |
+| 10 | AFX-175 | W: narrow Linear permissions for filing-only agents |
+| 11 | AFX-176 | W: revoke leftovers; mark this document as current state |
