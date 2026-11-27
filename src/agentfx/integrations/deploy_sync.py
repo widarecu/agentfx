@@ -65,6 +65,43 @@ class GitHub(Protocol):
     def delete_tag_ref(self, name: str, sha: str) -> None: ...
     def list_tag_refs(self, prefix: str) -> dict[str, str]: ...
     def compare(self, base: str, head: str) -> tuple[str, list[str]]: ...
+    def merged_pulls(self, since: str) -> list[dict]:
+        """PRs merged into `main` at or after `since` (ISO, UTC): number,
+        title, author, merged_by, merged_at. Needs `pull-requests: read`."""
+        merged: list[dict] = []
+        page = 1
+        while True:
+            batch = (
+                self._get(
+                    "pulls?state=closed&base=main&sort=updated&direction=desc"
+                    f"&per_page={_PAGE}&page={page}"
+                )
+                or []
+            )
+            for pr in batch:
+                if (pr.get("merged_at") or "") >= since:
+                    merged.append(pr)
+            # A merge bumps updated_at, so older rows cannot be in the window.
+            if len(batch) < _PAGE or (batch[-1].get("updated_at") or "") < since:
+                break
+            page += 1
+        out = []
+        for pr in merged:
+            # The list endpoint omits merged_by; the single-PR read has it.
+            full = self._get(f"pulls/{pr['number']}")
+            if full is None:
+                raise GitHubError(f"PR #{pr['number']} not found", 404)
+            out.append(
+                {
+                    "number": pr["number"],
+                    "title": pr.get("title"),
+                    "author": (pr.get("user") or {}).get("login"),
+                    "merged_by": (full.get("merged_by") or {}).get("login"),
+                    "merged_at": pr.get("merged_at"),
+                }
+            )
+        return out
+
     def commit_pulls(self, sha: str) -> list[dict]: ...
 
 

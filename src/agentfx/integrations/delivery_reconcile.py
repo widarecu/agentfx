@@ -10,6 +10,7 @@
    * In Review with no open PR,
    * Done in the window without a deploy-sync (or legacy promote) marker,
    * Backlog/Ready moves in the window by anyone other than Wilson,
+   * PRs merged into `main` in the window by anyone other than the fleet bot,
    * anything that could not be checked (history or PR state unavailable).
 3. Publishes one digest: the GitHub Actions job summary. `digest.json`
    (uploaded as an artifact) carries the window and a fingerprint of the
@@ -33,7 +34,8 @@ WATCHED_STATES = [ld.IN_PROGRESS, ld.IN_REVIEW]
 HUMAN_OWNED_STATES = ("Backlog", ld.READY)
 STALE_AFTER = timedelta(days=3)
 DEFAULT_WINDOW_DAYS = 7
-DEFAULT_WILSON_EMAIL = "wreyes06@outlook.com"
+DEFAULT_WILSON_USER_ID = "4c000ffe-cccc-4d3c-bd74-04a3a009032c"
+FLEET_BOT_LOGIN = "agentfx-fleet-bot"
 DEPLOY_MARKERS = (ds._DONE_PREFIX, "<!-- afx-70:promoted-to-main:")
 MARKER = "<!-- afx-reconcile:window"
 _PR_URL = re.compile(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
@@ -42,6 +44,7 @@ STALE = "stale-in-progress"
 REVIEW = "in-review-no-open-pr"
 UNMARKED = "done-without-deploy"
 TRANSITION = "status-set-by-other"
+BY_HAND = "merged-by-hand"
 UNCHECKED = "unchecked"
 
 _TITLES = {
@@ -49,6 +52,7 @@ _TITLES = {
     REVIEW: "In Review, no open PR",
     UNMARKED: "Done without a deploy marker",
     TRANSITION: "Backlog/Ready set by someone other than Wilson",
+    BY_HAND: "PR merged into main by someone other than the fleet bot",
     UNCHECKED: "Could not be checked",
 }
 
@@ -109,7 +113,7 @@ def find_drift(
     repo: str,
     now: datetime,
     since: datetime,
-    wilson_email: str,
+    wilson_user_id: str,
 ) -> list[Finding]:
     """Read-only. Linear failures listing issues propagate; per-issue
     failures become `unchecked` findings so one bad issue never hides the
@@ -149,7 +153,8 @@ def find_drift(
                 if not any(m in b for b in bodies for m in DEPLOY_MARKERS):
                     out.append(Finding(UNMARKED, ident, "no staging deploy recorded"))
         if (_parse(issue.get("updatedAt")) or now) >= since:
-            out.extend(_transition_drift(client, issue, since, wilson_email))
+            out.extend(_transition_drift(client, issue, since, wilson_user_id))
+    out.extend(_by_hand_merges(gh, since))
     return out
 
 
@@ -176,7 +181,7 @@ def _review_drift(gh, ident: str, prs: list[int]) -> list[Finding]:
 
 
 def _transition_drift(
-    client: ld.LinearClient, issue: dict, since: datetime, wilson_email: str
+    client: ld.LinearClient, issue: dict, since: datetime, wilson_user_id: str
 ) -> list[Finding]:
     ident = issue["identifier"]
     try:
@@ -190,16 +195,52 @@ def _transition_drift(
         if to not in HUMAN_OWNED_STATES or at is None or at < since:
             continue
         actor = move.get("actor") or {}
-        if (actor.get("email") or "").lower() == wilson_email.lower():
+        bot = move.get("botActor") or {}
+        if actor.get("id") and actor["id"] == wilson_user_id:
             continue
-        who = actor.get("name") or actor.get("email") or "unknown actor (integration)"
+        who = (
+            actor.get("name")
+            or bot.get("name")
+            or bot.get("userDisplayName")
+            or actor.get("email")
+            or "unknown actor (integration)"
+        )
+        actor_id = actor.get("id") or bot.get("id") or "-"
         frm = (move.get("fromState") or {}).get("name") or "new"
         out.append(
             Finding(
                 TRANSITION,
                 ident,
                 f"{frm} -> {to} by {who} at {_iso(at)}",
-                key=f"{to}|{actor.get('id') or '-'}|{move.get('createdAt')}",
+                key=f"{to}|{actor_id}|{move.get('createdAt')}",
+            )
+        )
+    return out
+
+
+def _is_fleet_bot(login: str | None) -> bool:
+    return (login or "").lower().removesuffix("[bot]") == FLEET_BOT_LOGIN
+
+
+def _by_hand_merges(gh, since: datetime) -> list[Finding]:
+    try:
+        pulls = gh.merged_pulls(_iso(since))
+    except ds.GitHubError as exc:
+        return [
+            Finding(UNCHECKED, "merges", f"merged PRs unavailable: {exc}", "merges")
+        ]
+    out = []
+    for pr in sorted(pulls, key=lambda p: p["number"]):
+        if _is_fleet_bot(pr.get("merged_by")):
+            continue
+        n = pr["number"]
+        out.append(
+            Finding(
+                BY_HAND,
+                f"PR #{n}",
+                f"{pr.get('title')} (author {pr.get('author') or 'unknown'}, "
+                f"merged by {pr.get('merged_by') or 'unknown'})",
+                key=f"#{n}|{pr.get('merged_at')}",
             )
         )
     return out
@@ -258,7 +299,7 @@ def reconcile(
     repo: str,
     now: datetime,
     window_days: int = DEFAULT_WINDOW_DAYS,
-    wilson_email: str = DEFAULT_WILSON_EMAIL,
+    wilson_user_id: str = DEFAULT_WILSON_USER_ID,
     run_url: str = "",
     apply: bool,
     previous: dict | None = None,
@@ -270,7 +311,7 @@ def reconcile(
     result.errors += report.errors
     try:
         result.findings = find_drift(
-            gh, client, repo=repo, now=now, since=since, wilson_email=wilson_email
+            gh, client, repo=repo, now=now, since=since, wilson_user_id=wilson_user_id
         )
     except ld.LinearError as exc:
         result.errors += 1

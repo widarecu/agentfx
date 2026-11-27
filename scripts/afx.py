@@ -112,8 +112,9 @@ def _add_reconcile(sub) -> None:
     rec.add_argument("--run-url", default="")
     rec.add_argument("--window-days", type=int, default=dr.DEFAULT_WINDOW_DAYS)
     rec.add_argument(
-        "--wilson-email",
-        default=os.environ.get("AFX_WILSON_LINEAR_EMAIL") or dr.DEFAULT_WILSON_EMAIL,
+        "--wilson-user-id",
+        default=os.environ.get("AFX_WILSON_LINEAR_USER_ID")
+        or dr.DEFAULT_WILSON_USER_ID,
     )
     rec.add_argument("--previous", help="digest.json from the last run, if any")
     rec.add_argument("--state-out", help="Where to write this run's digest.json")
@@ -143,7 +144,7 @@ def reconcile(args, *, gh=None, client=None, now: datetime | None = None) -> int
         repo=args.repo,
         now=now or datetime.now(UTC),
         window_days=args.window_days,
-        wilson_email=args.wilson_email,
+        wilson_user_id=args.wilson_user_id,
         run_url=args.run_url,
         apply=args.mode == "apply",
         previous=_read_previous(args.previous),
