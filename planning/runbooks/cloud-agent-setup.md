@@ -11,8 +11,8 @@ Create an environment for this repo (`widarecu/agentfx`) and set **these secrets
 | Env var | What it's for | Where to get it |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | the cloud agent's own LLM calls | `console.anthropic.com → API keys` |
-| `LINEAR_API_KEY` | `.mcp.json`'s Linear server. `scripts/afx.py start/block` use it when present; without it they send the same claim through the `afx-request.yml` workflow | `linear.app → Settings → API → Personal API keys` |
-| `GITHUB_TOKEN` | push `agent/AFX-*` branches + open PRs on this repo | GitHub → Settings → Developer settings → Personal access tokens → Fine-grained; scope: `widarecu/agentfx` only; permissions: `Contents: write`, `Pull requests: write`, `Metadata: read` |
+| `LINEAR_API_KEY` | `.mcp.json`'s Linear server. `scripts/afx.py start/block` use it when present; without it they send the same claim through the `afx-request.yml` workflow | See [identities.md](identities.md) for which Linear identity this must belong to |
+| `GITHUB_TOKEN` | push `agent/AFX-*` branches + open PRs on this repo | See [identities.md](identities.md) for which GitHub identity this must belong to; permissions on `widarecu/agentfx` only: `Contents: write`, `Pull requests: write`, `Metadata: read` |
 | `OANDA_API_KEY` | local integration tests that hit OANDA (optional: they skip without it, as on PR CI) | OANDA practice account (**never** live) |
 | `OANDA_ACCOUNT_ID` | ditto | same OANDA practice account |
 
@@ -71,7 +71,7 @@ Pick a small Ready issue and follow [delivery-pipeline.md](delivery-pipeline.md)
 - **Agent picks up a Money-path issue**: that's fine. Its PR still gets `agent-authored`; `pr-policy` holds it until Wilson approves the latest commit, then merges it.
 - **`make test-integration` fails with "could not connect to server"**: Docker-in-Docker not enabled on the cloud agent provider. Fall back to the agent provider's hosted Postgres and set `DATABASE_URL` manually; the test profile uses port 5433 by default.
 - **Linear MCP times out**: usually means `LINEAR_API_KEY` isn't set in the agent env. Check with `env | grep LINEAR_` (never log the value itself).
-- **GitHub push rejected (403)**: `GITHUB_TOKEN` scope is wrong. Fine-grained tokens need `Contents: write` + `Pull requests: write` on this repo specifically.
+- **GitHub push rejected (403)**: `GITHUB_TOKEN` scope is wrong. It needs `Contents: write` + `Pull requests: write` on this repo specifically.
 
 ## 5. Off-limits (same as every agent)
 
