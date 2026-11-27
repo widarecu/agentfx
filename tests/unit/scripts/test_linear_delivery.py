@@ -7,7 +7,10 @@ name-based lookups are covered without any network call.
 
 from __future__ import annotations
 
+import io
+import json
 import urllib.error
+import urllib.parse
 
 import pytest
 
@@ -332,3 +335,164 @@ class TestReleaseOwnClaim:
             ld.release_own_claim(client, "AFX-1", workspace_started=False).ok is False
         )
         assert fake.mutations == []
+
+
+# ── Pipeline app identity (AFX-169) ──────────────────────────────────
+
+_ID, _SECRET, _TOKEN, _KEY = "cid_pub", "csecret_hidden", "tok_app_123", "lin_personal"
+_ALL = (ld.API_KEY_ENV, ld.CLIENT_ID_ENV, ld.CLIENT_SECRET_ENV)
+
+
+class _Body:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def read(self) -> bytes:
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TokenOpener:
+    """Answers the token endpoint and GraphQL; records every request."""
+
+    def __init__(self, token_response=None, error=None):
+        self.token_response = (
+            {"access_token": _TOKEN, "token_type": "Bearer", "expires_in": 2591999}
+            if token_response is None
+            else token_response
+        )
+        self.error = error
+        self.token_requests: list = []
+        self.gql_requests: list = []
+
+    def __call__(self, req, timeout=None):
+        if req.full_url == ld.LINEAR_TOKEN_URL:
+            self.token_requests.append(req)
+            if self.error is not None:
+                raise self.error
+            return _Body(json.dumps(self.token_response).encode())
+        self.gql_requests.append(req)
+        return _Body(json.dumps({"data": {"viewer": {"id": "v"}}}).encode())
+
+
+def _http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        ld.LINEAR_TOKEN_URL, code, "no", {}, io.BytesIO(b'{"error":"x"}')
+    )
+
+
+def _clean_env(monkeypatch, **values):
+    for name in _ALL:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+
+def _pipeline_env(monkeypatch, **extra):
+    _clean_env(
+        monkeypatch,
+        **{ld.CLIENT_ID_ENV: _ID, ld.CLIENT_SECRET_ENV: _SECRET},
+        **extra,
+    )
+
+
+class TestPipelineIdentity:
+    def test_pair_mints_token_once_and_sends_bearer(self, monkeypatch):
+        _pipeline_env(monkeypatch)
+        opener = TokenOpener()
+        client = ld.LinearClient.from_env(opener=opener)
+        assert opener.token_requests == []  # lazy: nothing minted yet
+        client.gql("query { viewer { id } }")
+        client.gql("query { viewer { id } }")
+        assert len(opener.token_requests) == 1
+        form = urllib.parse.parse_qs(opener.token_requests[0].data.decode())
+        assert form == {
+            "grant_type": ["client_credentials"],
+            "client_id": [_ID],
+            "client_secret": [_SECRET],
+            "scope": ["read,write"],
+        }
+        assert [r.get_header("Authorization") for r in opener.gql_requests] == [
+            f"Bearer {_TOKEN}"
+        ] * 2
+
+    def test_api_key_only_sends_bare_key_and_never_mints(self, monkeypatch):
+        _clean_env(monkeypatch, **{ld.API_KEY_ENV: _KEY})
+        opener = TokenOpener()
+        ld.LinearClient.from_env(opener=opener).gql("query { viewer { id } }")
+        assert opener.token_requests == []
+        assert opener.gql_requests[0].get_header("Authorization") == _KEY
+
+    def test_pair_wins_over_api_key(self, monkeypatch):
+        _pipeline_env(monkeypatch, **{ld.API_KEY_ENV: _KEY})
+        opener = TokenOpener()
+        ld.LinearClient.from_env(opener=opener).gql("query { viewer { id } }")
+        assert opener.gql_requests[0].get_header("Authorization") == f"Bearer {_TOKEN}"
+
+    @pytest.mark.parametrize(
+        "opener",
+        [
+            TokenOpener(error=_http_error(401)),
+            TokenOpener(token_response={"token_type": "Bearer"}),
+            TokenOpener(token_response={"error": "invalid_client"}),
+            TokenOpener(error=urllib.error.URLError("down")),
+            TokenOpener(error=TimeoutError("slow")),
+        ],
+        ids=["http-401", "no-token", "error-body", "network", "timeout"],
+    )
+    def test_token_failure_raises_and_never_uses_api_key(self, monkeypatch, opener):
+        _pipeline_env(monkeypatch, **{ld.API_KEY_ENV: _KEY})
+        client = ld.LinearClient.from_env(opener=opener)
+        with pytest.raises(ld.LinearError) as caught:
+            client.gql("query { viewer { id } }")
+        text = str(caught.value)
+        assert "token endpoint" in text
+        for secret in (_SECRET, _TOKEN, _KEY):
+            assert secret not in text
+        assert opener.gql_requests == []
+
+    def test_http_status_is_named(self, monkeypatch):
+        _pipeline_env(monkeypatch)
+        client = ld.LinearClient.from_env(opener=TokenOpener(error=_http_error(401)))
+        with pytest.raises(ld.LinearError, match="http 401"):
+            client.gql("query { viewer { id } }")
+
+    @pytest.mark.parametrize(
+        ("present", "missing"),
+        [
+            (ld.CLIENT_ID_ENV, ld.CLIENT_SECRET_ENV),
+            (ld.CLIENT_SECRET_ENV, ld.CLIENT_ID_ENV),
+        ],
+    )
+    def test_half_pair_is_a_configuration_error(self, monkeypatch, present, missing):
+        _clean_env(monkeypatch, **{present: "x", ld.API_KEY_ENV: _KEY})
+        with pytest.raises(ld.LinearError, match=f"{missing} is not set"):
+            ld.LinearClient.from_env()
+
+    def test_no_credentials_rejected(self, monkeypatch):
+        _clean_env(monkeypatch)
+        with pytest.raises(ld.LinearError):
+            ld.LinearClient.from_env()
+
+
+class TestHasCredentials:
+    def test_key_only(self):
+        assert ld.has_credentials({ld.API_KEY_ENV: _KEY})
+
+    def test_full_pair(self):
+        assert ld.has_credentials(
+            {ld.CLIENT_ID_ENV: _ID, ld.CLIENT_SECRET_ENV: _SECRET}
+        )
+
+    def test_neither(self):
+        assert not ld.has_credentials({})
+        assert not ld.has_credentials({ld.API_KEY_ENV: "  "})
+
+    def test_half_pair_is_not_credentials(self):
+        assert not ld.has_credentials({ld.CLIENT_ID_ENV: _ID})
+        assert not ld.has_credentials({ld.CLIENT_SECRET_ENV: _SECRET})

@@ -485,3 +485,38 @@ class TestDeliveryReconcileWorkflow:
         assert upload["with"]["name"] == "reconcile-digest"
         assert upload["with"]["overwrite"] is True
         assert upload["if"] == "always()"
+
+
+class TestPipelineLinearIdentity:
+    """AFX-169: every step that passes LINEAR_API_KEY also passes the
+    AgentFX Pipeline app's client ID and secret."""
+
+    @staticmethod
+    def _env_steps():
+        for path in sorted(_WORKFLOWS.glob("*.yml")):
+            jobs = _load(path.name).get("jobs") or {}
+            for job_name, job in jobs.items():
+                for step in job.get("steps", []):
+                    env = step.get("env") or {}
+                    if "LINEAR_API_KEY" in env:
+                        yield f"{path.name}:{job_name}", env
+
+    def test_all_four_workflows_pass_linear_credentials(self):
+        files = {label.split(":")[0] for label, _ in self._env_steps()}
+        assert files == {
+            "afx-request.yml",
+            "pr-policy.yml",
+            "deploy.yml",
+            "delivery-reconcile.yml",
+        }
+
+    def test_every_api_key_step_also_passes_the_pipeline_pair(self):
+        for label, env in self._env_steps():
+            assert (
+                env.get("LINEAR_PIPELINE_CLIENT_ID")
+                == "${{ secrets.LINEAR_PIPELINE_CLIENT_ID }}"
+            ), label
+            assert (
+                env.get("LINEAR_PIPELINE_CLIENT_SECRET")
+                == "${{ secrets.LINEAR_PIPELINE_CLIENT_SECRET }}"
+            ), label
