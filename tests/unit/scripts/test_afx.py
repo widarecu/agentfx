@@ -121,6 +121,27 @@ def test_missing_key_without_github_errors(monkeypatch, capsys):
     assert "LINEAR_API_KEY" in capsys.readouterr().err
 
 
+def test_pipeline_pair_alone_takes_the_keyed_path(monkeypatch, fake):
+    """AFX-169: the app credentials count as Linear credentials."""
+    for var in ("LINEAR_API_KEY", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("LINEAR_PIPELINE_CLIENT_ID", "id")
+    monkeypatch.setenv("LINEAR_PIPELINE_CLIENT_SECRET", "secret")
+    monkeypatch.setattr(
+        ld.LinearClient,
+        "from_env",
+        classmethod(lambda cls, **kw: ld.LinearClient("k", opener=fake.opener)),
+    )
+
+    def no_keyless(*a, **kw):
+        raise AssertionError("took the keyless path")
+
+    monkeypatch.setattr(afx, "keyless", no_keyless)
+    fake.add("AFX-1", "Ready")
+    assert afx.main(["start", "AFX-1"], claims=FakeClaims()) == afx.EXIT_OK
+    assert fake.issues["AFX-1"].state == "In Progress"
+
+
 def test_runs_as_standalone_script_without_backend_env():
     """The CLI must import with only the repo on disk: no PYTHONPATH,
     no ENVIRONMENT, no LINEAR_API_KEY (fails cleanly, exit 2)."""

@@ -17,7 +17,8 @@ it); everyone else is refused. Assignee and delegate are never touched.
 `block` moves an active ticket to Blocked, adds `needs-wilson` and
 posts the question once, however often it is retried.
 
-With LINEAR_API_KEY set, both run here. Without it (Devin and other
+With Linear credentials set (LINEAR_API_KEY, or the pipeline app's
+LINEAR_PIPELINE_CLIENT_ID and _SECRET), both run here. Without it (Devin and other
 keyless sessions) they push an `afx-request/*` branch; the
 `afx-request.yml` workflow runs the same `start`/`block` with the repo's
 key and reports back as the `afx/request` commit status, which this
@@ -215,12 +216,15 @@ def deploy_sync(args, *, gh=None, linear=None) -> int:
     if args.action == "record":
         report = ds.record(gh, args.sha, apply=apply)
     else:
-        if linear is None and os.environ.get("LINEAR_API_KEY", "").strip():
+        if linear is None and linear_delivery.has_credentials():
             linear = linear_delivery.DeployIssues(
                 linear_delivery.LinearClient.from_env()
             )
         if apply and linear is None:
-            print("::error ::LINEAR_API_KEY is not set; cannot apply ticket sync")
+            print(
+                "::error ::no Linear credentials (LINEAR_API_KEY or the "
+                "LINEAR_PIPELINE_CLIENT_ID/SECRET pair); cannot apply ticket sync"
+            )
             return 1
         if args.action == "run":
             verdict = ds.classify({c: getattr(args, c) for c in ds.COMPONENTS})
@@ -451,7 +455,7 @@ def main(
         return reconcile(args, client=client)
     if args.command == "request":
         return run_request(client=client)
-    if client is None and not os.environ.get("LINEAR_API_KEY", "").strip():
+    if client is None and not linear_delivery.has_credentials():
         return keyless(args)
     try:
         client = client or linear_delivery.LinearClient.from_env()

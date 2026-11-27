@@ -38,7 +38,7 @@ Also checked: the repo has one collaborator (`widarecu`, admin), no deploy keys 
 
 | # | Credential | Stored in | Used by | Appears in Linear as | Type | Can do | Expires | Verified |
 |---|---|---|---|---|---|---|---|---|
-| L1 | `LINEAR_API_KEY` | GitHub Actions secret (set 2026-11-25) | The pipeline: claims (`afx-request.yml`), `pr-policy`, deploy sync, daily reconcile | **Wilson Reyes.** The claim comment on AFX-163, written by `afx-request.yml` on 2026-11-27, is recorded as authored by Wilson | Personal API key | Everything Wilson can do, including moving tickets into Ready | No expiry | Yes |
+| L1 | `LINEAR_PIPELINE_CLIENT_ID` / `LINEAR_PIPELINE_CLIENT_SECRET` (the old personal `LINEAR_API_KEY` secret stays only until Wilson deletes it after live verification) | GitHub Actions secrets | The pipeline: claims (`afx-request.yml`), `pr-policy`, deploy sync, daily reconcile | **AgentFX Pipeline** (app user). Before AFX-169 it was Wilson Reyes: the claim comment on AFX-163 of 2026-11-27 is recorded as authored by Wilson | "AgentFX Pipeline" OAuth application, client-credentials grant | Read and write | Token about 30 days, minted per run | Yes (rotate the client secret) |
 | L2 | Linear connector in Claude Code on the laptop | Claude's Linear connector (OAuth, signed in as Wilson) | Wilson by hand; Claude Code on the laptop | Wilson Reyes | Personal OAuth | Everything Wilson can do (admin) | Managed by Linear | Yes |
 | L3 | `LINEAR_API_KEY` for cloud Claude Code | The cloud environment's secrets | Cloud Claude Code sessions | Wilson Reyes (the old setup told Wilson to create a personal key) | Personal API key | Everything Wilson can do | No expiry | No |
 | L4 | `LINEAR_API_KEY` on the backend | Railway variable | In-platform fleet (QA, PE, PM, Research) filing findings | Tickets filed by the fleet show as **AgentFX Fleet**, so this is most likely that app user's token. One identity for all roles | Not verified (app token or key) | Not verified | Not verified | No |
@@ -64,7 +64,7 @@ Users in the Linear workspace: Wilson Reyes (admin), and the app users Devin, Ag
 ## 2. What is wrong today
 
 1. **Four agent paths write to GitHub as Wilson**: the laptop (G1), cloud Claude Code (G6), the hosted PE (G7, almost certainly) and at least one Devin session (G5). Of the last 30 PRs, 8 were authored by `widarecu`; the rest by Devin's App.
-2. **The pipeline writes to Linear as Wilson** (L1). Every claim, every move to Done and every Blocked move is recorded as done by him. The daily check for "Backlog/Ready moves not made by Wilson" trusts exactly the identity the pipeline holds.
+2. **Fixed 2026-11-27 (AFX-169):** the pipeline used to write to Linear as Wilson (L1), so every claim, Done move and Blocked move was recorded as done by him. It now authenticates as the "AgentFX Pipeline" app user; the personal key is removed once that is proven live.
 3. **Wilson cannot approve a PR authored as Wilson.** GitHub does not let an author approve their own PR. This blocked PR #199 and PR #207, and PRs #207 to #209 were merged by hand.
 4. **Any holder of the laptop token can merge past the `main` ruleset**, because the ruleset lets the admin role bypass on a pull request and the token is Wilson's. Today that is prevented only by instruction.
 5. **Fixed 2026-11-27 (AFX-167):** a code-owner approval used to survive later pushes, so on a Normal-risk ticket touching a code-owned file Wilson's approval of an early commit still counted after the agent pushed more. The `main` ruleset now dismisses approvals on every new push.

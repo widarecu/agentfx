@@ -27,14 +27,19 @@ import hashlib
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 from agentfx.integrations.claim_store import ClaimStore, Taker, claim_tag
 
 LINEAR_URL = "https://api.linear.app/graphql"
+LINEAR_TOKEN_URL = "https://api.linear.app/oauth/token"
+API_KEY_ENV = "LINEAR_API_KEY"
+CLIENT_ID_ENV = "LINEAR_PIPELINE_CLIENT_ID"
+CLIENT_SECRET_ENV = "LINEAR_PIPELINE_CLIENT_SECRET"
 DEFAULT_TIMEOUT_SECONDS = 20.0
 PAGE_SIZE = 100
 # Smaller pages for the reconcile issue list: each node carries attachments.
@@ -79,20 +84,58 @@ class TransitionResult:
     reason: str = ""
 
 
+def _env_value(env: Mapping[str, str], name: str) -> str:
+    return (env.get(name) or "").strip()
+
+
+def has_pipeline_credentials(env: Mapping[str, str] | None = None) -> bool:
+    """True when the "AgentFX Pipeline" app's ID and secret are both set."""
+    env = os.environ if env is None else env
+    return bool(_env_value(env, CLIENT_ID_ENV) and _env_value(env, CLIENT_SECRET_ENV))
+
+
+def has_credentials(env: Mapping[str, str] | None = None) -> bool:
+    """The one answer to "do I have Linear credentials here?": a personal
+    API key, or the complete pipeline app pair. A half pair is not enough
+    (`LinearClient.from_env` reports it as a configuration error)."""
+    env = os.environ if env is None else env
+    return bool(_env_value(env, API_KEY_ENV)) or has_pipeline_credentials(env)
+
+
 class LinearClient:
-    """Minimal GraphQL client: errors, pagination and name lookups."""
+    """Minimal GraphQL client: errors, pagination and name lookups.
+
+    Authenticates as the "AgentFX Pipeline" app user when given a client ID
+    and secret (client-credentials grant, `Authorization: Bearer <token>`),
+    else with a personal API key (sent bare). The app token is minted once,
+    on the first request, and lasts about 30 days, so there is no refresh."""
 
     def __init__(
         self,
-        api_key: str,
+        api_key: str = "",
         *,
+        client_id: str = "",
+        client_secret: str = "",
         url: str = LINEAR_URL,
+        token_url: str = LINEAR_TOKEN_URL,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         opener: Opener | None = None,
     ) -> None:
-        if not api_key:
-            raise LinearError("LINEAR_API_KEY is empty")
+        if bool(client_id) != bool(client_secret):
+            missing = CLIENT_SECRET_ENV if client_id else CLIENT_ID_ENV
+            raise LinearError(
+                f"{missing} is not set: the pipeline app needs both "
+                f"{CLIENT_ID_ENV} and {CLIENT_SECRET_ENV}"
+            )
+        if not api_key and not client_id:
+            raise LinearError(
+                f"{API_KEY_ENV} is empty (or set {CLIENT_ID_ENV} and {CLIENT_SECRET_ENV})"
+            )
         self._api_key = api_key
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._token: str | None = None
+        self._token_url = token_url
         self._url = url
         self._timeout = timeout
         self._opener = opener or urllib.request.urlopen
@@ -102,7 +145,60 @@ class LinearClient:
 
     @classmethod
     def from_env(cls, **kwargs: Any) -> LinearClient:
-        return cls(os.environ.get("LINEAR_API_KEY", "").strip(), **kwargs)
+        env = os.environ
+        return cls(
+            _env_value(env, API_KEY_ENV),
+            client_id=_env_value(env, CLIENT_ID_ENV),
+            client_secret=_env_value(env, CLIENT_SECRET_ENV),
+            **kwargs,
+        )
+
+    def _authorization(self) -> str:
+        """The Authorization header value. With the pipeline pair the app
+        token is minted on first use and cached for this client; there is
+        no fallback to the API key if minting fails."""
+        if not self._client_id:
+            return self._api_key
+        if self._token is None:
+            self._token = self._mint_token()
+        return f"Bearer {self._token}"
+
+    def _mint_token(self) -> str:
+        # Error text never includes the client secret or any token.
+        form = urllib.parse.urlencode(
+            {
+                "grant_type": "client_credentials",
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+                "scope": "read,write",
+            }
+        ).encode()
+        req = urllib.request.Request(
+            self._token_url,
+            data=form,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        try:
+            with self._opener(req, timeout=self._timeout) as resp:
+                body = resp.read()
+        except urllib.error.HTTPError as err:
+            raise LinearError(
+                f"linear token endpoint failed: http {err.code}"
+            ) from None
+        except (urllib.error.URLError, TimeoutError, OSError) as err:
+            raise LinearError(
+                f"linear token endpoint unreachable: {type(err).__name__}"
+            ) from None
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            payload = None
+        token = payload.get("access_token") if isinstance(payload, dict) else None
+        if not isinstance(token, str) or not token:
+            error = payload.get("error") if isinstance(payload, dict) else None
+            detail = f"error {error}" if isinstance(error, str) else "no access_token"
+            raise LinearError(f"linear token endpoint failed: {detail} in response")
+        return token
 
     def gql(self, query: str, variables: dict[str, Any] | None = None) -> dict:
         """Run one request and return `data`. Linear puts the real error
@@ -111,7 +207,7 @@ class LinearClient:
             self._url,
             data=json.dumps({"query": query, "variables": variables or {}}).encode(),
             headers={
-                "Authorization": self._api_key,
+                "Authorization": self._authorization(),
                 "Content-Type": "application/json",
             },
         )
