@@ -69,9 +69,16 @@ class FakeGitHub:
         self.reviews.setdefault(number, [])
         return pr
 
-    def review(self, number: int, login: str, state: str, sha: str = HEAD) -> None:
+    def review(
+        self,
+        number: int,
+        login: str,
+        state: str,
+        sha: str = HEAD,
+        kind: str = "User",
+    ) -> None:
         self.reviews[number].append(
-            {"user": {"login": login}, "state": state, "commit_id": sha}
+            {"user": {"login": login, "type": kind}, "state": state, "commit_id": sha}
         )
 
     def opener(self, req, timeout=None):
@@ -157,20 +164,36 @@ class TestTicketIds:
 class TestApproval:
     def test_latest_verdict_must_approve_head(self):
         reviews = [
-            {"user": {"login": "widarecu"}, "state": "APPROVED", "commit_id": HEAD}
+            {
+                "user": {"login": "widarecu", "type": "User"},
+                "state": "APPROVED",
+                "commit_id": HEAD,
+            }
         ]
         assert pp.approved_by(reviews, "widarecu", HEAD)
 
     def test_login_match_is_case_insensitive(self):
         reviews = [
-            {"user": {"login": "Widarecu"}, "state": "APPROVED", "commit_id": HEAD}
+            {
+                "user": {"login": "Widarecu", "type": "User"},
+                "state": "APPROVED",
+                "commit_id": HEAD,
+            }
         ]
         assert pp.approved_by(reviews, "widarecu", HEAD)
 
     def test_comment_after_approval_keeps_it(self):
         reviews = [
-            {"user": {"login": "widarecu"}, "state": "APPROVED", "commit_id": HEAD},
-            {"user": {"login": "widarecu"}, "state": "COMMENTED", "commit_id": HEAD},
+            {
+                "user": {"login": "widarecu", "type": "User"},
+                "state": "APPROVED",
+                "commit_id": HEAD,
+            },
+            {
+                "user": {"login": "widarecu", "type": "User"},
+                "state": "COMMENTED",
+                "commit_id": HEAD,
+            },
         ]
         assert pp.approved_by(reviews, "widarecu", HEAD)
 
@@ -178,13 +201,35 @@ class TestApproval:
         "reviews",
         [
             [],
-            [{"user": {"login": "someone"}, "state": "APPROVED", "commit_id": HEAD}],
-            [{"user": {"login": "widarecu"}, "state": "APPROVED", "commit_id": OLD}],
-            [{"user": {"login": "widarecu"}, "state": "DISMISSED", "commit_id": HEAD}],
             [
-                {"user": {"login": "widarecu"}, "state": "APPROVED", "commit_id": HEAD},
                 {
-                    "user": {"login": "widarecu"},
+                    "user": {"login": "someone", "type": "User"},
+                    "state": "APPROVED",
+                    "commit_id": HEAD,
+                }
+            ],
+            [
+                {
+                    "user": {"login": "widarecu", "type": "User"},
+                    "state": "APPROVED",
+                    "commit_id": OLD,
+                }
+            ],
+            [
+                {
+                    "user": {"login": "widarecu", "type": "User"},
+                    "state": "DISMISSED",
+                    "commit_id": HEAD,
+                }
+            ],
+            [
+                {
+                    "user": {"login": "widarecu", "type": "User"},
+                    "state": "APPROVED",
+                    "commit_id": HEAD,
+                },
+                {
+                    "user": {"login": "widarecu", "type": "User"},
                     "state": "CHANGES_REQUESTED",
                     "commit_id": HEAD,
                 },
@@ -202,6 +247,70 @@ class TestApproval:
     )
     def test_not_approved(self, reviews):
         assert not pp.approved_by(reviews, "widarecu", HEAD)
+
+    def test_bot_account_never_counts(self):
+        reviews = [
+            {
+                "user": {"login": "widarecu", "type": "Bot"},
+                "state": "APPROVED",
+                "commit_id": HEAD,
+            }
+        ]
+        assert not pp.approved_by(reviews, "widarecu", HEAD)
+
+    def test_review_without_a_type_does_not_count(self):
+        reviews = [
+            {"user": {"login": "widarecu"}, "state": "APPROVED", "commit_id": HEAD}
+        ]
+        assert not pp.approved_by(reviews, "widarecu", HEAD)
+
+
+class TestApproverResolution:
+    @staticmethod
+    def _owners(tmp_path, text):
+        path = tmp_path / "CODEOWNERS"
+        path.write_text(text)
+        return path
+
+    def test_repo_codeowners_names_the_default(self):
+        assert pp.codeowners_approver() == pp.DEFAULT_APPROVER
+
+    def test_owner_from_codeowners(self, tmp_path):
+        path = self._owners(tmp_path, "/scripts/pr_policy.py   @someone  # note\n")
+        assert pp.resolve_approver(None, path) == "someone"
+
+    def test_override_wins(self, tmp_path):
+        path = self._owners(tmp_path, "/scripts/pr_policy.py @someone\n")
+        assert pp.resolve_approver("other", path) == "other"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            None,
+            "",
+            "/scripts/afx.py @someone\n",
+            "/scripts/pr_policy.py\n",
+            "/scripts/pr_policy.py @a @b\n",
+            "/scripts/pr_policy.py @org/team\n",
+            "/scripts/pr_policy.py someone\n",
+            "\x00\xff not text",
+        ],
+        ids=[
+            "missing",
+            "empty",
+            "no-entry",
+            "no-owner",
+            "two-owners",
+            "team",
+            "no-at-sign",
+            "garbage",
+        ],
+    )
+    def test_falls_back_to_default(self, tmp_path, text):
+        path = tmp_path / "CODEOWNERS"
+        if text is not None:
+            path.write_bytes(text.encode("latin-1"))
+        assert pp.resolve_approver(None, path) == pp.DEFAULT_APPROVER
 
 
 class TestPolicy:
@@ -314,6 +423,36 @@ class TestMoneyPath:
     def test_red_with_invalid_approval(self, gh, lin, login, state, sha):
         gh.review(7, login, state, sha)
         assert _run(gh, lin, "--pr", "7") == pp.EXIT_FAILED
+
+    def test_bot_approval_does_not_count(self, gh, lin):
+        gh.review(7, "widarecu", "APPROVED", kind="Bot")
+        assert _run(gh, lin, "--pr", "7") == pp.EXIT_FAILED
+
+    def test_agent_authored_pr_approved_by_the_approver_passes(self, gh, lin, tmp_path):
+        gh.pulls[7]["user"] = {"login": "devin-ai-integration[bot]", "type": "Bot"}
+        gh.review(7, "widarecu", "APPROVED")
+        out = tmp_path / "out"
+        assert _run(gh, lin, "--pr", "7", output=out) == pp.EXIT_OK
+        assert _outputs(out)["eligible"] == "true"
+
+    @pytest.mark.parametrize("author", ["widarecu", "Widarecu"])
+    def test_author_is_approver_must_merge_by_hand(self, gh, lin, tmp_path, author):
+        gh.pulls[7]["user"] = {"login": author, "type": "User"}
+        gh.review(7, "widarecu", "APPROVED")
+        out = tmp_path / "out"
+        assert _run(gh, lin, "--pr", "7", output=out) == pp.EXIT_FAILED
+        assert gh.last["state"] == "failure"
+        assert "by hand" in gh.last["description"]
+        assert "authored" in gh.last["description"]
+        assert len(gh.last["description"]) <= 140
+        assert _outputs(out)["eligible"] == "false"
+
+    def test_failing_decision_is_never_auto_merge_eligible(self, gh):
+        pr = gh.add_pr(user={"login": "widarecu", "type": "User"})
+        decision = pp.Decision(False, "by hand", "AFX-1", money_path=True)
+        assert not pp.auto_merge_eligible(pr, decision, REPO)
+        action = pp.merge_action(pr, decision, REPO, ci_passed=True)
+        assert not action.enable
 
     def test_approver_is_configurable(self, gh, lin):
         gh.review(7, "someone", "APPROVED")

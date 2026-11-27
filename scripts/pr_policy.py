@@ -58,6 +58,8 @@ MONEY_PATH_LABEL = "Money-path"
 AUTO_MERGE_LABEL = "agent-authored"
 DEFAULT_APPROVER = "widarecu"
 GITHUB_API = "https://api.github.com"
+CODEOWNERS_PATH = Path(__file__).resolve().parents[1] / ".github" / "CODEOWNERS"
+CODEOWNERS_ENTRY = "/scripts/pr_policy.py"
 
 _TICKET = re.compile(r"(?<![A-Za-z0-9])AFX-(\d+)(?![0-9])", re.IGNORECASE)
 _REVIEW_VERDICTS = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
@@ -83,6 +85,33 @@ def ticket_ids(*texts: str | None) -> list[str]:
     return sorted(found, key=lambda ident: int(ident.split("-")[1]))
 
 
+def codeowners_approver(path: Path = CODEOWNERS_PATH) -> str | None:
+    """The single owner CODEOWNERS lists for this script, without the `@`.
+
+    None when the file is missing or unreadable, or the entry is absent or
+    names no owner, a team, or more than one owner."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+    owners: list[str] = []
+    for line in lines:
+        parts = line.split("#", 1)[0].split()
+        if parts and parts[0] == CODEOWNERS_ENTRY:
+            owners = parts[1:]  # the last matching line wins, as on GitHub
+    if len(owners) != 1:
+        return None
+    owner = owners[0].removeprefix("@")
+    if not owner or "/" in owner or "@" in owner or owners[0] == owner:
+        return None
+    return owner
+
+
+def resolve_approver(override: str | None, path: Path = CODEOWNERS_PATH) -> str:
+    """Flag or env override, else the CODEOWNERS owner, else the default."""
+    return (override or "").strip() or codeowners_approver(path) or DEFAULT_APPROVER
+
+
 def approved_by(reviews: Iterable[dict], approver: str, head_sha: str) -> bool:
     """True when `approver`'s latest verdict approves `head_sha` itself.
 
@@ -91,6 +120,8 @@ def approved_by(reviews: Iterable[dict], approver: str, head_sha: str) -> bool:
     older commit is stale once new commits are pushed."""
     latest: dict | None = None
     for review in reviews:
+        if (review.get("user") or {}).get("type") != "User":
+            continue  # only a person's review counts, never a GitHub App's
         login = ((review.get("user") or {}).get("login") or "").lower()
         if login == approver.lower() and review.get("state") in _REVIEW_VERDICTS:
             latest = review
@@ -123,6 +154,15 @@ def evaluate(
             ident,
         )
     money = MONEY_PATH_LABEL in issue.labels
+    author = ((pr.get("user") or {}).get("login") or "").lower()
+    if money and author == approver.lower():
+        return Decision(
+            False,
+            f"{ident} is Money-path and @{approver} authored it: GitHub won't let "
+            "an author approve their own PR, so merge it by hand",
+            ident,
+            money_path=True,
+        )
     if money and not approved_by(reviews, approver, pr["head"]["sha"]):
         return Decision(
             False,
@@ -296,10 +336,12 @@ def main(
     target.add_argument("--head-sha")
     parser.add_argument(
         "--approver",
-        default=os.environ.get("PR_POLICY_APPROVER") or DEFAULT_APPROVER,
+        default=os.environ.get("PR_POLICY_APPROVER"),
+        help="overrides the CODEOWNERS owner of scripts/pr_policy.py",
     )
     parser.add_argument("--output", default=os.environ.get("GITHUB_OUTPUT"))
     args = parser.parse_args(argv)
+    args.approver = resolve_approver(args.approver)
 
     try:
         if not args.repo:
