@@ -183,7 +183,7 @@ class TestGetAppToken:
         window (60s) is treated as stale — re-fetched on next call.
         This prevents sending a token that expires mid-request."""
         # Seed the cache with a token that expires in 10 seconds.
-        linear_agent_api._token_cache = linear_agent_api._CachedToken(
+        linear_agent_api._token_cache[_CLIENT_ID] = linear_agent_api._CachedToken(
             token="stale_token",
             expires_at=datetime.now(UTC) + timedelta(seconds=10),
         )
@@ -388,3 +388,94 @@ class TestWrappers:
         ) as mock_emit:
             linear_agent_api.emit_response(_SESSION_ID, "shipped PR #99")
         assert mock_emit.call_args.kwargs["content_type"] == "response"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Per-application tokens (AFX-174)
+# ─────────────────────────────────────────────────────────────────────
+
+_QA_ID = "qa-client-id"
+_QA_SECRET = "qa-client-secret-fake"
+
+
+def _token_body(token: str) -> dict:
+    return {"access_token": token, "token_type": "Bearer", "expires_in": 2_591_999}
+
+
+def _by_app_post(_url, data=None, **_kw):
+    tok = "qa-tok" if data["client_id"] == _QA_ID else "pe-tok"
+    return _mock_response(200, _token_body(tok))
+
+
+class TestPerApplicationTokens:
+    @pytest.fixture(autouse=True)
+    def _qa_creds(self, monkeypatch):
+        monkeypatch.setattr(settings, "LINEAR_QA_CLIENT_ID", _QA_ID)
+        monkeypatch.setattr(settings, "LINEAR_QA_CLIENT_SECRET", _QA_SECRET)
+
+    def test_qa_token_requests_qa_pair_with_read_write_scope(self):
+        with patch.object(
+            linear_agent_api.requests,
+            "post",
+            return_value=_mock_response(200, _token_body("qa-tok")),
+        ) as mock_post:
+            token, err = linear_agent_api.get_qa_token()
+        assert (token, err) == ("qa-tok", "")
+        data = mock_post.call_args.kwargs["data"]
+        assert data["client_id"] == _QA_ID
+        assert data["client_secret"] == _QA_SECRET
+        assert data["scope"] == "read,write"
+        assert data["grant_type"] == "client_credentials"
+
+    def test_qa_missing_never_falls_back_to_pe_pair(self, monkeypatch):
+        monkeypatch.setattr(settings, "LINEAR_QA_CLIENT_ID", "")
+        monkeypatch.setattr(settings, "LINEAR_QA_CLIENT_SECRET", "")
+        with patch.object(linear_agent_api.requests, "post") as mock_post:
+            token, err = linear_agent_api.get_qa_token()
+        assert token is None
+        assert err == "no_credentials"
+        mock_post.assert_not_called()
+
+    def test_pe_missing_never_falls_back_to_qa_pair(self, monkeypatch):
+        monkeypatch.setattr(settings, "LINEAR_AGENT_CLIENT_ID", "")
+        monkeypatch.setattr(settings, "LINEAR_AGENT_CLIENT_SECRET", "")
+        with patch.object(linear_agent_api.requests, "post") as mock_post:
+            token, err = linear_agent_api.get_app_token()
+        assert token is None
+        assert err == "no_credentials"
+        mock_post.assert_not_called()
+
+    def test_tokens_are_cached_independently(self):
+        with patch.object(
+            linear_agent_api.requests, "post", side_effect=_by_app_post
+        ) as mock_post:
+            assert linear_agent_api.get_qa_token() == ("qa-tok", "")
+            assert linear_agent_api.get_app_token() == ("pe-tok", "")
+            assert mock_post.call_count == 2
+            # Second round: both served from their own cache entry.
+            assert linear_agent_api.get_qa_token() == ("qa-tok", "")
+            assert linear_agent_api.get_app_token() == ("pe-tok", "")
+            assert mock_post.call_count == 2
+
+    def test_force_refresh_hits_endpoint_for_that_app_only(self):
+        with patch.object(
+            linear_agent_api.requests, "post", side_effect=_by_app_post
+        ) as mock_post:
+            linear_agent_api.get_qa_token()
+            linear_agent_api.get_app_token()
+            assert mock_post.call_count == 2
+            linear_agent_api.get_qa_token(force_refresh=True)
+            assert mock_post.call_count == 3
+            assert mock_post.call_args.kwargs["data"]["client_id"] == _QA_ID
+            # PE entry untouched.
+            assert linear_agent_api.get_app_token() == ("pe-tok", "")
+            assert mock_post.call_count == 3
+
+    def test_endpoint_failure_does_not_leak_secret_or_token(self, caplog):
+        caplog.set_level("DEBUG")
+        boom = requests.ConnectionError(f"failed secret={_QA_SECRET}")
+        with patch.object(linear_agent_api.requests, "post", side_effect=boom):
+            token, err = linear_agent_api.get_qa_token()
+        assert token is None
+        assert _QA_SECRET not in err
+        assert _QA_SECRET not in caplog.text

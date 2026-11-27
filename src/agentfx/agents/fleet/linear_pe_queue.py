@@ -47,7 +47,7 @@ from typing import Any
 import requests
 
 from agentfx.api.core.config import settings
-from agentfx.integrations import linear_delivery
+from agentfx.integrations import linear_agent_api, linear_delivery
 from agentfx.integrations.claim_store import GitHubClaims, Taker
 from agentfx.integrations.linear_client import _build_client, _gql
 
@@ -105,9 +105,28 @@ def _linear_enabled() -> tuple[bool, str]:
     spam logs."""
     if not settings.AGENT_LINEAR_ENABLED:
         return False, "AGENT_LINEAR_ENABLED is False"
-    if not settings.LINEAR_API_KEY:
-        return False, "LINEAR_API_KEY is empty"
+    if not settings.LINEAR_AGENT_CLIENT_ID or not settings.LINEAR_AGENT_CLIENT_SECRET:
+        return False, "LINEAR_AGENT_CLIENT_ID / LINEAR_AGENT_CLIENT_SECRET not set"
     return True, ""
+
+
+def _refresh_pe_token() -> str | None:
+    token, _ = linear_agent_api.get_app_token(force_refresh=True)
+    return token
+
+
+def _pe_client() -> requests.Session | None:
+    """GraphQL session authenticated as the "AgentFX Platform Engineer"
+    app. Returns None (and logs the reason) when no token can be had;
+    callers then take their normal Linear-failure path. Only the PE
+    credentials are ever used here."""
+    token, err = linear_agent_api.get_app_token()
+    if token is None:
+        logger.warning(
+            "linear_pe_queue: could not get AgentFX Platform Engineer token (%s)", err
+        )
+        return None
+    return _build_client(token, refresh=_refresh_pe_token)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -138,7 +157,9 @@ def list_ready_dispatch_candidates(limit: int) -> list[ReadyIssue]:
         logger.info("linear_pe_queue: list skipped — %s", reason)
         return []
 
-    client = _build_client(settings.LINEAR_API_KEY)
+    client = _pe_client()
+    if client is None:
+        return []
     # 2026-11-08 — needs-wilson exclusion moved from the GraphQL filter
     # to a Python post-filter. Linear's `labels: { id: { nin: [...] } }`
     # on a nested collection matches issues where AT LEAST ONE label
@@ -297,7 +318,10 @@ def find_merged_pr(identifier: str, pr_urls: list[str]) -> str | None:
 
 
 def _delivery_client() -> linear_delivery.LinearClient:
-    return linear_delivery.LinearClient(settings.LINEAR_API_KEY)
+    return linear_delivery.LinearClient(
+        client_id=settings.LINEAR_AGENT_CLIENT_ID,
+        client_secret=settings.LINEAR_AGENT_CLIENT_SECRET,
+    )
 
 
 FLEET_TAKER = "AgentFX fleet PE"
@@ -406,7 +430,9 @@ def file_for_attention(
         logger.info("linear_pe_queue: file_for_attention skipped — %s", reason)
         return False
 
-    client = _build_client(settings.LINEAR_API_KEY)
+    client = _pe_client()
+    if client is None:
+        return False
 
     if _has_file_for_attention_marker(client, issue_id=issue_id):
         logger.info(
@@ -481,7 +507,9 @@ def flag_needs_design(issue_id_or_identifier: str, *, pr_url: str) -> bool:
         logger.info("linear_pe_queue: flag_needs_design skipped — %s", reason)
         return False
 
-    client = _build_client(settings.LINEAR_API_KEY)
+    client = _pe_client()
+    if client is None:
+        return False
     issue_uuid = _resolve_issue_uuid(client, issue_id_or_identifier)
     if issue_uuid is None:
         logger.warning(
@@ -618,7 +646,9 @@ def handle_stuck_session_failure(
         return False
 
     try:
-        client = _build_client(settings.LINEAR_API_KEY)
+        client = _pe_client()
+        if client is None:
+            return False
         issue_uuid = _resolve_issue_uuid(client, issue_identifier)
         if issue_uuid is None:
             logger.warning(

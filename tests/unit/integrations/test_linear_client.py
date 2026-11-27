@@ -34,7 +34,11 @@ def _spec(**overrides) -> linear_client.FindingSpec:
 
 def _enable(monkeypatch):
     monkeypatch.setattr(linear_client.settings, "AGENT_LINEAR_ENABLED", True)
-    monkeypatch.setattr(linear_client.settings, "LINEAR_API_KEY", "lk_test_token")
+    monkeypatch.setattr(linear_client.settings, "LINEAR_QA_CLIENT_ID", "qa-id")
+    monkeypatch.setattr(linear_client.settings, "LINEAR_QA_CLIENT_SECRET", "qa-secret")
+    monkeypatch.setattr(
+        linear_client.linear_agent_api, "get_qa_token", lambda **_kw: ("qa-token", "")
+    )
     monkeypatch.setattr(linear_client.settings, "AGENT_LINEAR_TEAM_KEY", "AFX")
     monkeypatch.setattr(linear_client.settings, "AGENT_LINEAR_DAILY_CAP_PER_AGENT", 5)
 
@@ -53,13 +57,14 @@ class TestShortCircuits:
         assert result.action == "skipped:flag_off"
         build.assert_not_called()
 
-    def test_no_api_key_skips(self, monkeypatch):
+    def test_no_qa_credentials_skips(self, monkeypatch):
         monkeypatch.setattr(linear_client.settings, "AGENT_LINEAR_ENABLED", True)
-        monkeypatch.setattr(linear_client.settings, "LINEAR_API_KEY", "")
+        monkeypatch.setattr(linear_client.settings, "LINEAR_QA_CLIENT_ID", "")
+        monkeypatch.setattr(linear_client.settings, "LINEAR_QA_CLIENT_SECRET", "")
         with patch.object(linear_client, "_build_client") as build:
             result = linear_client.file_finding(_spec())
         assert result.filed is False
-        assert result.action == "skipped:no_key"
+        assert result.action == "skipped:no_credentials"
         build.assert_not_called()
 
 
@@ -687,3 +692,133 @@ class TestReopenClosedIssues:
         assert result.filed is False
         assert result.action == "skipped:reopen_failed"
         create.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Identity: file as the AgentFX QA app (AFX-174)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _resp(status, body=None):
+    r = MagicMock()
+    r.status_code = status
+    r.json.return_value = body if body is not None else {}
+    r.raise_for_status.return_value = None
+    return r
+
+
+class TestQaIdentity:
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        linear_client.linear_agent_api._reset_token_cache_for_tests()
+        yield
+        linear_client.linear_agent_api._reset_token_cache_for_tests()
+
+    def _flags(self, monkeypatch, *, qa=True, pe=True):
+        s = linear_client.settings
+        monkeypatch.setattr(s, "AGENT_LINEAR_ENABLED", True)
+        monkeypatch.setattr(s, "LINEAR_QA_CLIENT_ID", "qa-id" if qa else "")
+        monkeypatch.setattr(s, "LINEAR_QA_CLIENT_SECRET", "qa-secret" if qa else "")
+        monkeypatch.setattr(s, "LINEAR_AGENT_CLIENT_ID", "pe-id" if pe else "")
+        monkeypatch.setattr(s, "LINEAR_AGENT_CLIENT_SECRET", "pe-secret" if pe else "")
+
+    def test_filing_uses_qa_token_as_bearer(self, monkeypatch):
+        self._flags(monkeypatch)
+        token_calls = []
+
+        def fake_token_post(url, data=None, **_kw):
+            token_calls.append(data)
+            return _resp(200, {"access_token": "qa-tok", "expires_in": 3600})
+
+        sent = []
+
+        def fake_session_post(self, url, **kw):
+            sent.append(dict(self.headers))
+            return _resp(200, {"data": {}})
+
+        def fake_create(client, **_k):
+            client.post("https://api.linear.app/graphql")
+            return {"id": "i", "identifier": "AFX-1"}
+
+        with (
+            patch.object(
+                linear_client.linear_agent_api.requests, "post", fake_token_post
+            ),
+            patch("requests.Session.post", fake_session_post),
+            patch.object(
+                linear_client, "_search_open_by_fingerprint", return_value=None
+            ),
+            patch.object(
+                linear_client, "_search_closed_by_fingerprint", return_value=[]
+            ),
+            patch.object(linear_client, "_count_files_today", return_value=0),
+            patch.object(linear_client, "_create_triage_issue", fake_create),
+        ):
+            result = linear_client.file_finding(_spec())
+        assert result.filed is True
+        assert [c["client_id"] for c in token_calls] == ["qa-id"]
+        assert token_calls[0]["scope"] == "read,write"
+        assert sent[0]["Authorization"] == "Bearer qa-tok"
+
+    def test_missing_qa_pair_files_nothing_and_never_uses_pe(self, monkeypatch):
+        self._flags(monkeypatch, qa=False, pe=True)
+        with (
+            patch.object(linear_client.linear_agent_api.requests, "post") as tok,
+            patch("requests.Session.post") as gql,
+        ):
+            result = linear_client.file_finding(_spec())
+        assert result.filed is False
+        assert result.action == "skipped:no_credentials"
+        tok.assert_not_called()
+        gql.assert_not_called()
+
+    def test_token_endpoint_failure_files_nothing_and_leaks_nothing(
+        self, monkeypatch, caplog
+    ):
+        self._flags(monkeypatch)
+        caplog.set_level("DEBUG")
+        with (
+            patch.object(
+                linear_client.linear_agent_api.requests,
+                "post",
+                return_value=_resp(500),
+            ),
+            patch("requests.Session.post") as gql,
+        ):
+            result = linear_client.file_finding(_spec())
+        assert result.filed is False
+        assert result.action == "skipped:token_error"
+        gql.assert_not_called()
+        blob = caplog.text + result.reason + result.action
+        assert "qa-secret" not in blob
+
+    def test_401_forces_one_refresh_and_one_retry(self, monkeypatch):
+        self._flags(monkeypatch)
+        minted = iter(["tok-1", "tok-2"])
+        token_calls = []
+
+        def fake_token_post(url, data=None, **_kw):
+            token_calls.append(data["client_id"])
+            return _resp(200, {"access_token": next(minted), "expires_in": 3600})
+
+        auth_seen = []
+        statuses = iter([401, 200])
+
+        def fake_session_post(self, url, **kw):
+            auth_seen.append(self.headers["Authorization"])
+            return _resp(next(statuses), {"data": {"ok": 1}})
+
+        with (
+            patch.object(
+                linear_client.linear_agent_api.requests, "post", fake_token_post
+            ),
+            patch("requests.Session.post", fake_session_post),
+        ):
+            token, _ = linear_client.linear_agent_api.get_qa_token()
+            client = linear_client._build_client(
+                token, refresh=linear_client._refresh_qa_token
+            )
+            data = linear_client._gql(client, "query {}", {})
+        assert data == {"ok": 1}
+        assert auth_seen == ["Bearer tok-1", "Bearer tok-2"]
+        assert token_calls == ["qa-id", "qa-id"]
