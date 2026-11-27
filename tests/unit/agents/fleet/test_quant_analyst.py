@@ -1247,7 +1247,11 @@ class TestTechHealthLinearFiling:
 
         # Simulate stateful Linear store across the two consecutive days.
         monkeypatch.setattr(linear_client.settings, "AGENT_LINEAR_ENABLED", True)
-        monkeypatch.setattr(linear_client.settings, "LINEAR_API_KEY", "lk_test")
+        monkeypatch.setattr(
+            linear_client.linear_agent_api,
+            "get_qa_token",
+            lambda **_kw: ("qa-token", ""),
+        )
         monkeypatch.setattr(linear_client.settings, "AGENT_LINEAR_TEAM_KEY", "AFX")
         stored_open: dict[str, dict] = {}
         created_count = 0

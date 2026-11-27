@@ -682,20 +682,28 @@ class Settings(BaseSettings):
         default=False,
         env="AGENT_LINEAR_ENABLED",
         description=(
-            "If true, QA/PE/PM findings are also filed into Linear "
-            "Triage via `agentfx.integrations.linear_client`. Email "
+            "If true, QA findings are also filed into Linear Triage "
+            "via `agentfx.integrations.linear_client` (as the "
+            "'AgentFX QA' app), and the PE queue reads Ready work "
+            "(as the 'AgentFX Platform Engineer' app). Email "
             "notifications continue regardless."
         ),
     )
-    LINEAR_API_KEY: str = Field(
+    LINEAR_QA_CLIENT_ID: str = Field(
         default="",
-        env="LINEAR_API_KEY",
+        env="LINEAR_QA_CLIENT_ID",
         description=(
-            "Linear API key the fleet uses to file Triage issues + "
-            "comment on open ones. Should belong to the fleet's "
-            "dedicated Linear user (not Wilson's personal key) so "
-            "`Source` labels + attribution are correct. Empty "
-            "disables filing even if the flag is on."
+            "OAuth 2.0 client ID of the 'AgentFX QA' Linear application "
+            "(client-credentials grant). The QA agent files Triage issues "
+            "as this app user. Empty disables filing even if the flag is "
+            "on. Never falls back to the Platform Engineer credentials."
+        ),
+    )
+    LINEAR_QA_CLIENT_SECRET: str = Field(
+        default="",
+        env="LINEAR_QA_CLIENT_SECRET",
+        description=(
+            "OAuth 2.0 client secret pair for LINEAR_QA_CLIENT_ID. Never logged."
         ),
     )
     AGENT_LINEAR_TEAM_KEY: str = Field(
@@ -789,10 +797,10 @@ class Settings(BaseSettings):
         default="",
         env="LINEAR_AGENT_CLIENT_ID",
         description=(
-            "OAuth 2.0 client ID of the Linear Application the fleet "
-            "is registered as. Used in Phase 2 to obtain actor=app "
-            "tokens for outbound agentActivityCreate mutations. "
-            "Phase 1 does not read this."
+            "OAuth 2.0 client ID of the 'AgentFX Platform Engineer' Linear "
+            "application. Used to obtain actor=app tokens for agent "
+            "activity and for the PE queue (reading Ready, claiming, "
+            "commenting)."
         ),
     )
     LINEAR_AGENT_CLIENT_SECRET: str = Field(

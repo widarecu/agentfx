@@ -1,12 +1,13 @@
 """Linear Agent API client — outbound mutations from the AgentFX fleet.
 
-Where `integrations/linear_client.py` is for the fleet's `file_finding`
-Triage path (API-key auth, Wilson's identity), this module is for the
+Where `integrations/linear_client.py` is for the QA agent's `file_finding`
+Triage path (as the "AgentFX QA" application), this module is for the
 **agent-user** actions we take as the "AgentFX Platform Engineer" app:
 
-- `get_app_token()` — OAuth 2.0 `client_credentials` grant, returns
-  an `actor=app` access token (~30-day TTL per Linear's docs).
-  Cached in-process; re-requested on 401 or expiry.
+- `get_app_token()` / `get_qa_token()` — OAuth 2.0 `client_credentials`
+  grant per application (PE and QA), each returning its own
+  `actor=app` access token (~30-day TTL per Linear's docs). Cached
+  in-process per application; re-requested on 401 or expiry.
 - `emit_agent_activity()` — GraphQL `agentActivityCreate` mutation,
   posts a message inside a specific agent session. Linear mirrors
   certain activity types (`response`, `elicitation`, `error`) as
@@ -18,9 +19,10 @@ Design rules:
 - Never raise. Every function returns `(ok: bool, detail: str)` so
   callers can keep orchestrating even when Linear is down.
 - No external deps beyond `requests` (already in the project).
-- No globals Wilson has to configure. Credentials come from
-  `LINEAR_AGENT_CLIENT_ID` + `LINEAR_AGENT_CLIENT_SECRET` set by
-  the AFX-66 Phase 1 PR.
+- No globals Wilson has to configure. PE credentials come from
+  `LINEAR_AGENT_CLIENT_ID` + `LINEAR_AGENT_CLIENT_SECRET`; QA's from
+  `LINEAR_QA_CLIENT_ID` + `LINEAR_QA_CLIENT_SECRET`. A role never
+  uses the other's pair.
 - Secrets never logged (client_secret, access_token).
 """
 
@@ -59,43 +61,50 @@ class _CachedToken:
     expires_at: datetime
 
 
-# Module-level cache. Agent-wide process-local singleton; a Lock
-# prevents two concurrent webhook handlers from both racing a fetch
-# when the token expires. Simple and sufficient for staging load.
-_token_cache: _CachedToken | None = None
+# Per-application token cache, keyed by OAuth client ID. Each Linear
+# application (the Platform Engineer, QA) has its own entry, so minting
+# for one never returns or replaces the other's token. Process-local;
+# one Lock prevents concurrent handlers racing a fetch at expiry.
+_token_cache: dict[str, _CachedToken] = {}
 _token_lock = threading.Lock()
 
+# Scopes per application. PE needs the agent-user scopes; QA only files
+# and comments on issues.
+_PE_SCOPE = "read,write,app:assignable,app:mentionable"
+_QA_SCOPE = "read,write"
 
-def get_app_token(*, force_refresh: bool = False) -> tuple[str | None, str]:
-    """Return a valid `actor=app` access token, caching across calls.
 
-    `force_refresh=True` discards the cached token and requests a new
-    one — used by callers that got a 401 on a previous call.
+def get_client_token(
+    client_id: str,
+    client_secret: str,
+    scope: str,
+    *,
+    force_refresh: bool = False,
+) -> tuple[str | None, str]:
+    """Mint (or return the cached) client-credentials token for ONE
+    Linear application, identified by its client ID.
 
-    Returns `(token, "")` on success or `(None, reason)` on failure.
-    Failure reasons are human-readable:
-    - `"no_credentials"` — LINEAR_AGENT_CLIENT_ID / _SECRET not set
-    - `"token_endpoint:HTTP <code>"` — Linear's /oauth/token returned
-      non-200; the status code is in the reason
-    - `"token_endpoint:<exception>"` — network / parse failure
-    - `"malformed_response"` — 200 but no `access_token` in the body
+    `force_refresh=True` discards that application's cached token and
+    requests a new one. Other applications' cache entries are untouched.
+
+    Returns `(token, "")` on success or `(None, reason)` on failure
+    (`no_credentials`, `token_endpoint:HTTP <code>`,
+    `token_endpoint:<exception name>`, `malformed_response`). Never
+    raises; never logs the secret or a token.
     """
-    global _token_cache
-
-    client_id = settings.LINEAR_AGENT_CLIENT_ID
-    client_secret = settings.LINEAR_AGENT_CLIENT_SECRET
     if not client_id or not client_secret:
         return None, "no_credentials"
 
     now = datetime.now(UTC)
     with _token_lock:
+        cached = _token_cache.get(client_id)
         if (
             not force_refresh
-            and _token_cache is not None
-            and _token_cache.expires_at
+            and cached is not None
+            and cached.expires_at
             > now + timedelta(seconds=_TOKEN_REFRESH_BUFFER_SECONDS)
         ):
-            return _token_cache.token, ""
+            return cached.token, ""
 
         try:
             resp = requests.post(
@@ -105,19 +114,22 @@ def get_app_token(*, force_refresh: bool = False) -> tuple[str | None, str]:
                     "client_id": client_id,
                     "client_secret": client_secret,
                     # Scope must be a subset of what the app is
-                    # installed with. `write` is required to call
-                    # `agentActivityCreate` (surfaced on 2026-11-06
-                    # staging as `Invalid scope: write required`).
-                    # Individual `comments:create` / `issues:create`
-                    # scopes are NOT sufficient for agent mutations.
+                    # installed with. For PE, `write` is required for
+                    # `agentActivityCreate` (surfaced 2026-11-06 as
+                    # `Invalid scope: write required`) and
                     # `app:assignable` + `app:mentionable` are the
                     # agent-user-shape scopes per Linear's docs.
-                    "scope": "read,write,app:assignable,app:mentionable",
+                    "scope": scope,
                 },
                 timeout=_HTTP_TIMEOUT_SECONDS,
             )
         except requests.RequestException as exc:
-            logger.exception("linear_agent_api: token endpoint request failed")
+            # Log the exception class only: a traceback or message can
+            # echo the request, which carries the client secret.
+            logger.warning(
+                "linear_agent_api: token endpoint request failed (%s)",
+                type(exc).__name__,
+            )
             return None, f"token_endpoint:{type(exc).__name__}"
 
         if resp.status_code != 200:
@@ -134,7 +146,7 @@ def get_app_token(*, force_refresh: bool = False) -> tuple[str | None, str]:
         except ValueError:
             return None, "malformed_response"
 
-        token = data.get("access_token")
+        token = data.get("access_token") if isinstance(data, dict) else None
         if not token or not isinstance(token, str):
             return None, "malformed_response"
 
@@ -147,11 +159,41 @@ def get_app_token(*, force_refresh: bool = False) -> tuple[str | None, str]:
         except (TypeError, ValueError):
             expires_seconds = 3600
 
-        _token_cache = _CachedToken(
+        _token_cache[client_id] = _CachedToken(
             token=token,
             expires_at=now + timedelta(seconds=expires_seconds),
         )
         return token, ""
+
+
+def get_app_token(*, force_refresh: bool = False) -> tuple[str | None, str]:
+    """Token for the "AgentFX Platform Engineer" application (the PE
+    queue and agent-session mutations). Uses ONLY the
+    `LINEAR_AGENT_CLIENT_ID` / `LINEAR_AGENT_CLIENT_SECRET` pair.
+
+    Returns `(token, "")` or `(None, reason)`; see `get_client_token`.
+    """
+    return get_client_token(
+        settings.LINEAR_AGENT_CLIENT_ID,
+        settings.LINEAR_AGENT_CLIENT_SECRET,
+        _PE_SCOPE,
+        force_refresh=force_refresh,
+    )
+
+
+def get_qa_token(*, force_refresh: bool = False) -> tuple[str | None, str]:
+    """Token for the "AgentFX QA" application (QA agent filing into
+    Triage). Uses ONLY the `LINEAR_QA_CLIENT_ID` /
+    `LINEAR_QA_CLIENT_SECRET` pair; never falls back to the PE pair.
+
+    Returns `(token, "")` or `(None, reason)`; see `get_client_token`.
+    """
+    return get_client_token(
+        settings.LINEAR_QA_CLIENT_ID,
+        settings.LINEAR_QA_CLIENT_SECRET,
+        _QA_SCOPE,
+        force_refresh=force_refresh,
+    )
 
 
 _AGENT_ACTIVITY_MUTATION = """
@@ -310,13 +352,14 @@ def emit_response(agent_session_id: str, body: str) -> tuple[bool, str]:
 def _reset_token_cache_for_tests() -> None:
     """Flush the module-level token cache. Pytest-only helper so
     test cases don't bleed into each other via the singleton."""
-    global _token_cache
     with _token_lock:
-        _token_cache = None
+        _token_cache.clear()
 
 
 __all__ = [
     "get_app_token",
+    "get_qa_token",
+    "get_client_token",
     "emit_agent_activity",
     "emit_thought",
     "emit_error",

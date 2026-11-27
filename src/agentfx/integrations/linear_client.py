@@ -12,14 +12,13 @@ module:
 - Files every new issue into **Triage** with the right Type / Area /
   Source / `agent-filed` labels. Never sets priority — Wilson owns
   that when he approves out of Triage.
-- Never raises. Any error (flag off, no key, network, GraphQL) is
+- Authenticates as the "AgentFX QA" Linear application (OAuth
+  client-credentials token from `linear_agent_api.get_qa_token`).
+- Never raises. Any error (flag off, no credentials, network, GraphQL) is
   swallowed and logged; the agent code calling it keeps working.
 
 Not in scope here (follow-ups):
 
-- Distinct OAuth app identity (`actor=app`) for the fleet. Right now
-  the client uses a plain `LINEAR_API_KEY` which must belong to the
-  fleet's dedicated Linear user, not Wilson's personal key.
 - Daily email digest for cap-exceeded findings. Today a cap miss is
   logged WARNING and the agent falls back to its own email path.
 """
@@ -27,6 +26,7 @@ Not in scope here (follow-ups):
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -34,6 +34,7 @@ from typing import Any
 import requests
 
 from agentfx.api.core.config import settings
+from agentfx.integrations import linear_agent_api
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,9 @@ def file_finding(spec: FindingSpec, *, now: datetime | None = None) -> FilingRes
     """Agents call this. Dedupes, caps, and files. Never raises.
 
     - If `AGENT_LINEAR_ENABLED=False` → returns `filed=False, action="skipped:flag_off"`.
-    - If `LINEAR_API_KEY` empty → returns `filed=False, action="skipped:no_key"`.
+    - If the QA client ID / secret are missing → `filed=False,
+      action="skipped:no_credentials"`; if no token can be minted →
+      `action="skipped:token_error"`. The PE credentials are never used.
     - If an open issue carries the same `Fingerprint:` → comments on
       it with the new evidence; returns `filed=True, action="commented"`.
     - If the per-agent daily cap is already hit → returns
@@ -110,16 +113,28 @@ def file_finding(spec: FindingSpec, *, now: datetime | None = None) -> FilingRes
     if not bool(getattr(settings, "AGENT_LINEAR_ENABLED", False)):
         return FilingResult(filed=False, action="skipped:flag_off")
 
-    api_key = (getattr(settings, "LINEAR_API_KEY", "") or "").strip()
-    if not api_key:
+    token, token_err = linear_agent_api.get_qa_token()
+    if token is None:
+        if token_err == "no_credentials":
+            logger.warning(
+                "linear_client: AGENT_LINEAR_ENABLED=true but LINEAR_QA_CLIENT_ID / "
+                "LINEAR_QA_CLIENT_SECRET not set; skipping finding %r",
+                spec.fingerprint,
+            )
+            return FilingResult(
+                filed=False,
+                action="skipped:no_credentials",
+                reason="LINEAR_QA_CLIENT_ID / LINEAR_QA_CLIENT_SECRET not set",
+            )
         logger.warning(
-            "linear_client: AGENT_LINEAR_ENABLED=true but LINEAR_API_KEY empty; "
+            "linear_client: could not get an AgentFX QA token (%s); "
             "skipping finding %r",
+            token_err,
             spec.fingerprint,
         )
-        return FilingResult(filed=False, action="skipped:no_key")
+        return FilingResult(filed=False, action="skipped:token_error", reason=token_err)
 
-    client = _build_client(api_key)
+    client = _build_client(token, refresh=_refresh_qa_token)
     team_key = getattr(settings, "AGENT_LINEAR_TEAM_KEY", "AFX") or "AFX"
 
     # 1. Dedupe search — if an open issue already carries this
@@ -228,18 +243,46 @@ def file_finding(spec: FindingSpec, *, now: datetime | None = None) -> FilingRes
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _build_client(api_key: str) -> requests.Session:
-    """Session with the Linear auth header. Linear uses the raw key,
-    not `Bearer`. Keep-alive is fine; a stale token causes a 401 which
-    callers handle (never raised to agent code)."""
-    sess = requests.Session()
-    sess.headers.update(
-        {
-            "Authorization": api_key,
-            "Content-Type": "application/json",
-        }
-    )
-    return sess
+def _refresh_qa_token() -> str | None:
+    """Force-refresh the AgentFX QA token (used after a 401)."""
+    token, _ = linear_agent_api.get_qa_token(force_refresh=True)
+    return token
+
+
+class _BearerSession(requests.Session):
+    """Session that sends `Authorization: Bearer <token>` and, on a 401,
+    force-refreshes the token once and retries that request once.
+
+    `refresh` is the owning application's own refresh function, so a
+    session never refreshes (or uses) another application's token.
+    """
+
+    def __init__(self, token: str, refresh: Callable[[], str | None] | None) -> None:
+        super().__init__()
+        self._refresh = refresh
+        self.headers.update(
+            {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        )
+
+    def post(self, url, data=None, json=None, **kwargs):  # type: ignore[override]
+        resp = super().post(url, data=data, json=json, **kwargs)
+        if resp.status_code == 401 and self._refresh is not None:
+            logger.info("linear_client: 401 from Linear; refreshing token once")
+            new_token = self._refresh()
+            if new_token:
+                self.headers["Authorization"] = f"Bearer {new_token}"
+                resp = super().post(url, data=data, json=json, **kwargs)
+        return resp
+
+
+def _build_client(
+    token: str, *, refresh: Callable[[], str | None] | None = None
+) -> requests.Session:
+    """Session carrying an OAuth app token as `Authorization: Bearer`.
+    One forced refresh and retry on a 401 when `refresh` is given;
+    anything still failing goes through the callers' normal failure
+    path (never raised to agent code)."""
+    return _BearerSession(token, refresh)
 
 
 def _gql(client: requests.Session, query: str, variables: dict[str, Any]) -> dict:

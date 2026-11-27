@@ -33,10 +33,24 @@ from agentfx.agents.fleet.linear_pe_queue import (
     should_file_for_attention,
     transition_to_in_progress,
 )
-from agentfx.integrations import linear_delivery
+from agentfx.integrations import linear_agent_api, linear_delivery
 from agentfx.integrations.claim_store import GitHubClaims, Taker
 
 pytestmark = pytest.mark.unit
+
+
+def _set_pe_creds(monkeypatch, client_id="pe-client-id", secret="pe-client-secret"):
+    """The PE queue authenticates as the AgentFX Platform Engineer app."""
+    monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_AGENT_CLIENT_ID", client_id)
+    monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_AGENT_CLIENT_SECRET", secret)
+
+
+@pytest.fixture(autouse=True)
+def _fake_pe_token(monkeypatch):
+    """No real token endpoint: the PE token getter returns a fixed token."""
+    monkeypatch.setattr(
+        linear_agent_api, "get_app_token", lambda **_kw: ("pe-token", "")
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -121,14 +135,14 @@ class TestListReadyDispatchCandidates:
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", False)
         assert list_ready_dispatch_candidates(limit=5) == []
 
-    def test_empty_api_key_returns_empty(self, monkeypatch):
+    def test_missing_pe_credentials_returns_empty(self, monkeypatch):
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
-        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "")
+        _set_pe_creds(monkeypatch, "", "")
         assert list_ready_dispatch_candidates(limit=5) == []
 
     def test_maps_nodes_to_ready_issues(self, monkeypatch):
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
-        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
+        _set_pe_creds(monkeypatch)
         fake_response = {
             "issues": {
                 "nodes": [
@@ -166,7 +180,7 @@ class TestListReadyDispatchCandidates:
         """AFX-142: Wilson stays assignee on Ready work; the shared claim,
         not an empty assignee, keeps a second taker off a ticket."""
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
-        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
+        _set_pe_creds(monkeypatch)
         node = {
             "id": "uuid-afx-9",
             "identifier": "AFX-9",
@@ -191,7 +205,7 @@ class TestListReadyDispatchCandidates:
         regardless of createdAt. Within the same priority, older
         issue first."""
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
-        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
+        _set_pe_creds(monkeypatch)
         fake_response = {
             "issues": {
                 "nodes": [
@@ -239,7 +253,7 @@ class TestListReadyDispatchCandidates:
         """priority=0 means 'no priority' in Linear — those should
         come after any issue with an actual priority set."""
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
-        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
+        _set_pe_creds(monkeypatch)
         fake_response = {
             "issues": {
                 "nodes": [
@@ -280,7 +294,7 @@ class TestListReadyDispatchCandidates:
         the opposite of what we wanted). Fix is a Python post-filter
         that compares label ids. This test pins that behaviour."""
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
-        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
+        _set_pe_creds(monkeypatch)
         monkeypatch.setattr(
             linear_pe_queue.settings,
             "PE_LINEAR_NEEDS_WILSON_LABEL_ID",
@@ -334,7 +348,7 @@ class TestListReadyDispatchCandidates:
     def test_gql_failure_returns_empty(self, monkeypatch):
         """Linear outage must never raise into the orchestrator loop."""
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
-        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
+        _set_pe_creds(monkeypatch)
         with patch(
             "agentfx.agents.fleet.linear_pe_queue._gql",
             side_effect=RuntimeError("linear 500"),
@@ -356,7 +370,7 @@ class TestFileForAttentionIdempotency:
 
     def _enable(self, monkeypatch):
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
-        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
+        _set_pe_creds(monkeypatch)
         monkeypatch.setattr(
             linear_pe_queue.settings,
             "PE_LINEAR_NEEDS_WILSON_LABEL_ID",
@@ -524,7 +538,7 @@ class TestTransitionToInProgress:
     @pytest.fixture(autouse=True)
     def _enable(self, monkeypatch):
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
-        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
+        _set_pe_creds(monkeypatch)
 
     def test_success_uses_shared_start(self, monkeypatch):
         seen = {}
@@ -565,7 +579,7 @@ class TestRollbackToReady:
     @pytest.fixture(autouse=True)
     def _enable(self, monkeypatch):
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
-        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
+        _set_pe_creds(monkeypatch)
         self.client = _FakeDeliveryClient()
         monkeypatch.setattr(linear_pe_queue, "_delivery_client", lambda: self.client)
 
@@ -648,11 +662,13 @@ class TestHandleStuckSessionFailure:
     @pytest.fixture(autouse=True)
     def _enable(self, monkeypatch):
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
-        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "lin_test")
+        _set_pe_creds(monkeypatch)
 
     def _record(self, monkeypatch):
         calls: list[tuple[str, dict]] = []
-        monkeypatch.setattr(linear_pe_queue, "_build_client", lambda _k: object())
+        monkeypatch.setattr(
+            linear_pe_queue, "_build_client", lambda _t, **_kw: object()
+        )
         monkeypatch.setattr(
             linear_pe_queue, "_resolve_issue_uuid", lambda _c, ident: f"uuid-{ident}"
         )
@@ -725,7 +741,7 @@ class TestHandleStuckSessionFailure:
         assert [k for k, _ in calls] == ["label", "comment"]
 
     def test_never_raises(self, monkeypatch):
-        def _boom(_k):
+        def _boom(_t, **_kw):
             raise RuntimeError("down")
 
         monkeypatch.setattr(linear_pe_queue, "_build_client", _boom)
@@ -836,7 +852,7 @@ class TestFindMergedPr:
 
     def test_candidates_carry_linked_urls(self, monkeypatch):
         monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
-        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_API_KEY", "test-key")
+        _set_pe_creds(monkeypatch)
         node = {
             "id": "u",
             "identifier": "AFX-121",
@@ -856,3 +872,71 @@ class TestFindMergedPr:
         ):
             (issue,) = list_ready_dispatch_candidates(limit=5)
         assert issue.pr_urls == ["https://github.com/widarecu/agentfx/pull/161"]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Identity: the PE queue acts as the AgentFX Platform Engineer (AFX-174)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestPeIdentity:
+    def test_queue_client_carries_pe_bearer_token(self, monkeypatch):
+        monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
+        _set_pe_creds(monkeypatch)
+        client = linear_pe_queue._pe_client()
+        assert client is not None
+        assert client.headers["Authorization"] == "Bearer pe-token"
+
+    def test_missing_pe_pair_returns_empty_and_logs_reason(self, monkeypatch, caplog):
+        monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
+        _set_pe_creds(monkeypatch, "", "")
+        # QA credentials present must not rescue the queue.
+        monkeypatch.setattr(linear_pe_queue.settings, "LINEAR_QA_CLIENT_ID", "qa-id")
+        monkeypatch.setattr(
+            linear_pe_queue.settings, "LINEAR_QA_CLIENT_SECRET", "qa-secret"
+        )
+        caplog.set_level("INFO")
+        with patch("agentfx.agents.fleet.linear_pe_queue._gql") as gql:
+            assert list_ready_dispatch_candidates(limit=5) == []
+        gql.assert_not_called()
+        assert "LINEAR_AGENT_CLIENT_ID" in caplog.text
+
+    def test_token_failure_returns_empty_without_raising(self, monkeypatch):
+        monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
+        _set_pe_creds(monkeypatch)
+        monkeypatch.setattr(
+            linear_agent_api,
+            "get_app_token",
+            lambda **_kw: (None, "token_endpoint:HTTP 401"),
+        )
+        with patch("agentfx.agents.fleet.linear_pe_queue._gql") as gql:
+            assert list_ready_dispatch_candidates(limit=5) == []
+            assert file_for_attention("u", signatures=["a", "b"]) is False
+        gql.assert_not_called()
+
+    def test_queue_never_asks_for_the_qa_token(self, monkeypatch):
+        monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
+        _set_pe_creds(monkeypatch)
+
+        def _no_qa(**_kw):
+            raise AssertionError("PE queue must not use the QA token")
+
+        monkeypatch.setattr(linear_agent_api, "get_qa_token", _no_qa)
+        assert linear_pe_queue._pe_client() is not None
+
+    def test_refresh_callback_force_refreshes_pe_token(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(
+            linear_agent_api,
+            "get_app_token",
+            lambda **kw: seen.append(kw) or ("pe-token-2", ""),
+        )
+        assert linear_pe_queue._refresh_pe_token() == "pe-token-2"
+        assert seen == [{"force_refresh": True}]
+
+    def test_delivery_client_is_built_with_the_pe_pair(self, monkeypatch):
+        _set_pe_creds(monkeypatch, "pe-id", "pe-secret")
+        client = linear_pe_queue._delivery_client()
+        assert isinstance(client, linear_delivery.LinearClient)
+        assert client._client_id == "pe-id"
+        assert client._client_secret == "pe-secret"

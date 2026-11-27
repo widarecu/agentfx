@@ -72,7 +72,7 @@ def test_env_example_loads_as_safe_settings(monkeypatch):
         "FERNET_KEY",
         "SMTP_PASSWORD",
         "GITHUB_TOKEN",
-        "LINEAR_API_KEY",
+        "LINEAR_QA_CLIENT_SECRET",
         "LINEAR_AGENT_WEBHOOK_SECRET",
         "LINEAR_AGENT_CLIENT_SECRET",
     ):

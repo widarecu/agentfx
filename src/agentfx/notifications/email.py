@@ -817,8 +817,10 @@ def _not_filed_reason(action: str) -> str:
         return "daily ticket limit reached"
     if action == "skipped:flag_off":
         return "Linear filing is switched off"
-    if action == "skipped:no_key":
-        return "Linear filing is switched off (no API key)"
+    if action == "skipped:no_credentials":
+        return "Linear filing is switched off (QA credentials not set)"
+    if action == "skipped:token_error":
+        return "Linear filing failed (could not get a QA token)"
     return "Linear error"
 
 

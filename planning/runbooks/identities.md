@@ -41,8 +41,8 @@ Also checked: the repo has one collaborator (`widarecu`, admin), no deploy keys 
 | L1 | `LINEAR_PIPELINE_CLIENT_ID` / `LINEAR_PIPELINE_CLIENT_SECRET` (the old personal `LINEAR_API_KEY` secret stays only until Wilson deletes it after live verification) | GitHub Actions secrets | The pipeline: claims (`afx-request.yml`), `pr-policy`, deploy sync, daily reconcile | **AgentFX Pipeline** (app user). Before AFX-169 it was Wilson Reyes: the claim comment on AFX-163 of 2026-11-27 is recorded as authored by Wilson | "AgentFX Pipeline" OAuth application, client-credentials grant | Read and write | Token about 30 days, minted per run. Client secret: none | Yes. Live since 2026-11-27: the Done comment on AFX-169 and the claim on AFX-166 are recorded as AgentFX Pipeline |
 | L2 | Linear connector in Claude Code on the laptop | Claude's Linear connector (OAuth, signed in as Wilson) | Wilson by hand; Claude Code on the laptop | Wilson Reyes | Personal OAuth | Everything Wilson can do (admin) | Managed by Linear | Yes |
 | L3 | Cloud Claude Code | None | Not in use (see G6) | Nothing | None exists (the two personal keys on the workspace are both pipeline keys) | Nothing | n/a | Yes |
-| L4 | `LINEAR_API_KEY` on the backend | Railway variable | In-platform fleet (QA, PE, PM, Research) filing findings and reading the Ready queue | **AgentFX Fleet** (app user). One identity for all roles | A token of the "AgentFX Fleet" application, pasted in by hand. Confirmed not a personal key; the token's kind and lifetime are not confirmed | Not verified | Rejected by Linear (401) since 2026-11-27 00:10 UTC, most likely expired (AFX-177) | Partly |
-| L5 | `LINEAR_AGENT_CLIENT_ID` + `LINEAR_AGENT_CLIENT_SECRET` | Railway variables | The PE's Linear agent (delegation webhook, session replies) | **AgentFX Platform Engineer** (app user, installed 2026-11-05) | OAuth application, `actor=app` | Scopes requested in code: read, write, assignable, mentionable | Token about 30 days, renewed automatically. Client secret: none | Yes (presence and application; scopes from the code) |
+| L4 | `LINEAR_QA_CLIENT_ID` + `LINEAR_QA_CLIENT_SECRET` | Railway variables | The QA agent filing findings into Triage (AFX-174). The old backend `LINEAR_API_KEY` variable is no longer read; deleting it is Wilson's | **AgentFX QA** (app user) | OAuth application, client-credentials grant. The "AgentFX Fleet" application it replaces is Wilson's to revoke | Read and write | Token about 30 days, fetched by the backend when needed. Client secret: none | Not yet live |
+| L5 | `LINEAR_AGENT_CLIENT_ID` + `LINEAR_AGENT_CLIENT_SECRET` | Railway variables | The PE's Linear agent (delegation webhook, session replies) and, since AFX-174, the PE queue (reading Ready, claiming, commenting) | **AgentFX Platform Engineer** (app user, installed 2026-11-05) | OAuth application, `actor=app` | Scopes requested in code: read, write, assignable, mentionable | Token about 30 days, renewed automatically. Client secret: none | Yes (presence and application; scopes from the code) |
 | L6 | `LINEAR_AGENT_WEBHOOK_SECRET` | Railway variable | Checks that webhook calls really come from Linear | Nobody (it cannot write) | Signing secret | Nothing | None | Yes (present) |
 | L7 | Devin's Linear integration | Devin (Cognition) | Devin sessions: tickets, comments | **Devin** (app user) | OAuth application owned by Cognition | Not verified | Managed by Devin | Identity yes, scopes no |
 | L8 | Linear connector of the hosted PE (`mcp.linear.app/mcp`) | Vault `agentfx-fleet-pe-vault` in the Claude Console | Hosted PE | **Wilson Reyes** (an OAuth sign-in Wilson made; "MCP" on Linear's Applications page) | OAuth sign-in | Every connector tool is enabled; everything Wilson's sign-in allows | Managed by the connector (credential updated 2026-11-19) | Yes |
@@ -68,7 +68,7 @@ Users in the Linear workspace: Wilson Reyes (admin), and the app users Devin, Ag
 3. **Wilson cannot approve a PR authored as Wilson.** GitHub does not let an author approve their own PR. This blocked PR #199 and PR #207, and PRs #207 to #209 were merged by hand.
 4. **Any holder of the laptop token can merge past the `main` ruleset**, because the ruleset lets the admin role bypass on a pull request and the token is Wilson's. Today that is prevented only by instruction.
 5. **Fixed 2026-11-27 (AFX-167):** a code-owner approval used to survive later pushes, so on a Normal-risk ticket touching a code-owned file Wilson's approval of an early commit still counted after the agent pushed more. The `main` ruleset now dismisses approvals on every new push.
-6. **All in-platform roles share one Linear identity** (L4); the role is only a label any actor can set.
+6. **Fixed 2026-11-27 (AFX-174):** all in-platform roles used to share one Linear identity (L4). Now the QA agent files as "AgentFX QA" (L4) and the PE queue acts as "AgentFX Platform Engineer" (L5). The PM and Research agents do not write to Linear, so they have no identity.
 7. **Fixed 2026-11-27 (AFX-167):** the leftover `fleet-fast-gate` ruleset for the deleted `feat/agent-fleet` branch is deleted.
 
 ## 3. Target model
@@ -82,12 +82,12 @@ One row per actor. Each has exactly one GitHub identity and one Linear identity.
 | Devin | `devin-ai-integration[bot]` (exists) | Contents and Pull requests write on this repo. No personal token of Wilson's in any session | Devin (exists) | Read, create issues, create comments |
 | Cloud Claude Code sessions | `agentfx-claude[bot]` (new GitHub App) | Contents write, Pull requests write, Metadata read, this repo only | AgentFX Claude (new app user) | Read, create issues, create comments |
 | Hosted PE (Managed Agents) and the in-platform PE role | `agentfx-pe[bot]` (new GitHub App) | Contents write, Pull requests write, Metadata read, this repo only | AgentFX Platform Engineer (exists) | Read, write (it replies in agent sessions), assignable, mentionable |
-| In-platform QA agent | None. It does not write to GitHub | None | AgentFX QA (new app user) | Read, create issues, create comments |
-| In-platform PM agent | None | None | AgentFX PM (new app user) | Read, create issues, create comments |
-| In-platform Research agent | None | None | AgentFX Research (new app user), or retire the role if unused | Read, create issues, create comments |
+| In-platform QA agent | None. It does not write to GitHub | None | AgentFX QA (app user, AFX-174) | Read, create issues, create comments |
+| In-platform PM agent | None | None | None. It does not write to Linear | None |
+| In-platform Research agent | None | None | None. It does not write to Linear | None |
 | Pipeline automation (merge, claim, deploy sync, reconcile) | `agentfx-fleet-bot[bot]` (exists) for merges. Commit statuses and tags keep using the built-in workflow token, which shows as `github-actions[bot]`, lasts one run and cannot be held by anyone else | Contents write, Pull requests write | AgentFX Pipeline (new app user) | Read, write. The only machine identity that changes ticket status |
 
-"AgentFX Fleet" is retired once QA, PM and Research have their own app users.
+"AgentFX Fleet" is retired once QA and the PE queue are seen acting under their own app users on staging; Wilson then revokes it.
 
 ### How the practices are met
 
@@ -149,7 +149,7 @@ After any rotation, update the "Expires" and "Verified" columns in section 1. Ro
 
 Wilson read the settings pages on 2026-11-27 (AFX-166) and section 1 carries the results. What remains:
 
-- **L4:** what kind of token the backend's `LINEAR_API_KEY` is and how long it was meant to last. It stops mattering once each role fetches its own token (AFX-174).
+- **L4:** QA filing and the PE queue acting under their own app users on staging, after AFX-174 deploys.
 - **L7:** the permissions of Devin's Linear integration. Cognition sets them.
 - **G5:** a PR from a Devin session Wilson starts himself, under today's "Open PRs as: Devin" setting (AFX-171).
 - A test in Linear: can an app user with only "create issues" and "create comments" set labels when it files a ticket (AFX-175)?
