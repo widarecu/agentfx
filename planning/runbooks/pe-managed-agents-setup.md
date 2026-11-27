@@ -25,8 +25,8 @@ this bootstrap exactly once (idempotent — safe to re-run):
 
   echo "$GITHUB_TOKEN" | gh auth login --with-token
   gh auth setup-git
-  git config --global user.email "wilson@plusfx.net"
-  git config --global user.name  "AgentFX Fleet PE"
+  git config --global user.email "<APP_USER_ID>+agentfx-pe[bot]@users.noreply.github.com"
+  git config --global user.name  "agentfx-pe[bot]"
   mkdir -p /workspace && cd /workspace
   if [ ! -d agentfx ]; then
     git clone --depth 50 https://github.com/widarecu/agentfx.git
@@ -66,7 +66,7 @@ HARD RULES:
    names, plus their tests. No drive-by refactors.
 
 6. cwd is /workspace/agentfx. Use the pre-installed `gh`, `git`,
-   and `make`. `GITHUB_TOKEN` is injected from the vault.
+   and `make`. `GITHUB_TOKEN` is injected from the vault (see "Where the GitHub token comes from").
 
 7. The PR title and branch name exactly one `AFX-<n>`: the issue
    this PR closes. Linear also acts on IDs in the body after
@@ -85,7 +85,35 @@ HARD RULES:
    only through the deploy pipeline on `main`.
 ```
 
+## Where the GitHub and Linear tokens come from (AFX-172, not yet live)
+
+With `AGENT_PE_GITHUB_APP_CLIENT_ID` and `AGENT_PE_GITHUB_APP_PRIVATE_KEY` set on Railway, each dispatch does this, in order, immediately before `sessions.create`:
+
+1. Mint **one** installation token for the `agentfx-pe` GitHub App (restricted to `widarecu/agentfx`; Contents write, Pull requests write, Metadata read; no Workflows).
+2. Write that token into the vault's `GITHUB_TOKEN` environment-variable credential (`AGENT_PE_GITHUB_VAULT_CREDENTIAL_ID`) with `client.beta.vaults.credentials.update(credential_id, vault_id=..., auth={"type": "environment_variable", "secret_value": token})`. This is what `gh` uses, so PRs are authored by `agentfx-pe[bot]`.
+3. Pass the same token as the mounted repository's `authorization_token`. This is what `git clone` and `git push` use.
+4. If `AGENT_PE_LINEAR_VAULT_CREDENTIAL_ID` is set: write the "AgentFX Platform Engineer" Linear application's token (`linear_agent_api.get_app_token()`, about 30 days, cached) into that vault credential with `auth={"type": "static_bearer", "token": token}`, so the Linear connector acts as the app instead of as Wilson. If it is empty, the connector keeps whatever sign-in the vault holds (today Wilson's).
+
+Refusals (the dispatch is marked failed with the reason; no session is created; the personal token is never used): the App is configured but `AGENT_PE_GITHUB_VAULT_CREDENTIAL_ID` is empty; only one of the two App settings is set; minting fails; either vault update fails; the Linear credential ID is set but the Linear token cannot be obtained. With neither App setting set, nothing changes: the personal `GITHUB_TOKEN` is used and no vault call is made.
+
+**Overlap.** The vault credential is shared, so a later dispatch replaces the GitHub token seen by a session that is still running. That is safe because every token is valid for one hour from its own minting, and it is why the kickoff tells the agent to publish within about 40 minutes and to stop and report on an auth error.
+
+**Lifetime.** An App token lasts one hour; a session can run up to 4 hours before the sweeper reclaims it. There is no refresh service.
+
+**By design.** The App has no Workflows permission, so a PE change touching `.github/workflows/` cannot be pushed.
+
+**Not verified without a live session:** that the Console accepts the `environment_variable` update on the installed SDK's endpoint (the SDK type hint only exists from anthropic 2.14.0; the code sends a plain dict), that the sandbox's `gh` picks up the updated value in a new session, and that the Linear connector accepts a static bearer credential in place of the sign-in.
+
 ## Change log
+
+**AFX-172 (the PE's own GitHub and Linear identities), for Wilson to apply in order after merge. Not yet live:**
+
+| Step | Change | Why |
+|---|---|---|
+| a | Railway: set `AGENT_PE_GITHUB_VAULT_CREDENTIAL_ID` to the ID (`vcrd_...`) of the existing `GITHUB_TOKEN` credential in the vault `agentfx-fleet-pe-vault`. (`AGENT_PE_GITHUB_APP_CLIENT_ID` and `AGENT_PE_GITHUB_APP_PRIVATE_KEY` are already set.) | Without it, dispatch is refused: `gh` would keep using the personal token |
+| b | Console prompt: bootstrap lines become `git config --global user.email "<APP_USER_ID>+agentfx-pe[bot]@users.noreply.github.com"` and `git config --global user.name "agentfx-pe[bot]"`. Replace `<APP_USER_ID>` with the `id` from `https://api.github.com/users/agentfx-pe%5Bbot%5D` | Commits are attributed to the App, not to Wilson's address |
+| c | After one PE PR shows `agentfx-pe[bot]` as author: delete the personal token `agentfx-fleet-pe` in GitHub and remove `GITHUB_TOKEN` from Railway. The vault credential stays; the backend now owns its value | Removes the last personal token from the hosted PE |
+| d | Linear (optional): in the Console vault, replace the OAuth credential for `https://mcp.linear.app/mcp` with a `static_bearer` credential (any placeholder value), then set `AGENT_PE_LINEAR_VAULT_CREDENTIAL_ID` on Railway to its ID | The PE's Linear writes are recorded as "AgentFX Platform Engineer", not Wilson |
 
 **AFX-126 (single-branch cutover), for Wilson to apply in the Console before `feat/agent-fleet` is deleted:**
 

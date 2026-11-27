@@ -572,6 +572,48 @@ class Settings(BaseSettings):
             "through). Never logged; redacted from run summaries."
         ),
     )
+    AGENT_PE_GITHUB_APP_CLIENT_ID: str = Field(
+        default="",
+        env="AGENT_PE_GITHUB_APP_CLIENT_ID",
+        description=(
+            "Client ID of the `agentfx-pe` GitHub App (AFX-172). With the "
+            "private key, lets each PE dispatch mint a one-hour token "
+            "restricted to this repository, so the hosted PE pushes as "
+            "`agentfx-pe[bot]` instead of Wilson. Both settings empty = "
+            "the personal GITHUB_TOKEN is used as before; only one set = "
+            "dispatch refused as a configuration error."
+        ),
+    )
+    AGENT_PE_GITHUB_APP_PRIVATE_KEY: str = Field(
+        default="",
+        env="AGENT_PE_GITHUB_APP_PRIVATE_KEY",
+        description=(
+            "Full PEM text of the `agentfx-pe` App's private key (literal "
+            "backslash-n sequences are accepted for newlines). Secret; "
+            "never logged."
+        ),
+    )
+    AGENT_PE_GITHUB_VAULT_CREDENTIAL_ID: str = Field(
+        default="",
+        env="AGENT_PE_GITHUB_VAULT_CREDENTIAL_ID",
+        description=(
+            "ID (`vcrd_...`, not a secret) of the vault's `GITHUB_TOKEN` "
+            "environment-variable credential. With the GitHub App "
+            "configured, each dispatch writes the minted token into it so "
+            "the sandbox's `gh` acts as the App. Required when the App is "
+            "configured (dispatch refused otherwise)."
+        ),
+    )
+    AGENT_PE_LINEAR_VAULT_CREDENTIAL_ID: str = Field(
+        default="",
+        env="AGENT_PE_LINEAR_VAULT_CREDENTIAL_ID",
+        description=(
+            "ID of a `static_bearer` vault credential for "
+            "`https://mcp.linear.app/mcp`. When set, each dispatch writes "
+            "the PE Linear application's token into it so the connector "
+            "acts as that app. Empty = the connector keeps its sign-in."
+        ),
+    )
     # Managed Agents (Beta) resource IDs — created once by the operator
     # via console or a setup script, then referenced per-dispatch. All
     # three must be set for ManagedAgentsAdapter to actually dispatch;
