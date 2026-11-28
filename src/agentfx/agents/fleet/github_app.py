@@ -179,3 +179,25 @@ def mint_installation_token(*, owner: str, repo: str) -> MintResult:
         expires_at or "unknown",
     )
     return MintResult(token=token, expires_at=expires_at)
+
+
+def fleet_token(*, owner: str, repo: str, fallback: str = "") -> tuple[str | None, str]:
+    """The token the fleet's own GitHub calls use (claims, PR lookups).
+
+    App set up -> a freshly minted installation token. No App setting at
+    all -> `fallback` (the legacy `GITHUB_TOKEN`, possibly empty). App half
+    set up, or the mint fails -> `(None, reason)`: callers fail closed and
+    never fall back to the personal token once the App is configured.
+    """
+    state = app_state()
+    if state == "off":
+        return fallback, ""
+    if state != "on":
+        return None, (
+            "the PE GitHub App is only half configured (client id or private "
+            "key missing); not falling back to GITHUB_TOKEN"
+        )
+    minted = mint_installation_token(owner=owner, repo=repo)
+    if not minted.ok:
+        return None, f"the PE GitHub App token could not be minted: {minted.reason}"
+    return minted.token, ""

@@ -286,7 +286,7 @@ def find_merged_pr(identifier: str, pr_urls: list[str]) -> str | None:
     doesn't (AFX-135). Raises on a GitHub API failure so the caller skips
     rather than guesses.
     """
-    token = (getattr(settings, "GITHUB_TOKEN", "") or "").strip()
+    token = _fleet_github_token()
     headers = {"Accept": "application/vnd.github+json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -376,30 +376,27 @@ def transition_to_in_progress(issue_id: str, *, link: str = "") -> bool:
     return claim_for_dispatch(issue_id, link=link).ok
 
 
-def _claim_store() -> GitHubClaims:
-    """The claim store, signed in as the `agentfx-pe` App when it is set
-    up (AFX-180), else with `GITHUB_TOKEN`. A half-set or unmintable App
-    raises: the claim fails closed and never falls back to the personal
-    token."""
+def _fleet_github_token() -> str:
+    """Token for the fleet's own GitHub calls: the `agentfx-pe` App's when
+    it is set up (AFX-180), else `GITHUB_TOKEN`. Raises when the App is
+    half set up or its token cannot be minted, so callers fail closed and
+    never fall back to the personal token."""
     from agentfx.agents.fleet import github_app
-    from agentfx.agents.fleet.pe_workspace import _TARGET_REPO_URL
 
-    state = github_app.app_state()
-    if state == "off":
-        return GitHubClaims((getattr(settings, "GITHUB_TOKEN", "") or "").strip())
-    if state != "on":
-        raise ClaimStoreError(
-            "the PE GitHub App is only half configured (client id or private "
-            "key missing); not falling back to GITHUB_TOKEN"
-        )
-    path = _TARGET_REPO_URL.removeprefix("https://github.com/")
-    owner, _, repo = path.partition("/")
-    minted = github_app.mint_installation_token(owner=owner, repo=repo)
-    if not minted.ok:
-        raise ClaimStoreError(
-            f"the PE GitHub App token could not be minted: {minted.reason}"
-        )
-    return GitHubClaims(minted.token, repo=path)
+    owner, _, repo = _DELIVERY_REPO.partition("/")
+    token, reason = github_app.fleet_token(
+        owner=owner,
+        repo=repo,
+        fallback=(getattr(settings, "GITHUB_TOKEN", "") or "").strip(),
+    )
+    if token is None:
+        raise ClaimStoreError(reason)
+    return token
+
+
+def _claim_store() -> GitHubClaims:
+    """The claim store, signed in as the fleet (see `_fleet_github_token`)."""
+    return GitHubClaims(_fleet_github_token(), repo=_DELIVERY_REPO)
 
 
 def rollback_to_ready(issue_id: str, *, reason_summary: str) -> bool:

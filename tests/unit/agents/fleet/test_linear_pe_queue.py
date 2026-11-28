@@ -1019,3 +1019,73 @@ class TestPeIdentity:
         assert isinstance(client, linear_delivery.LinearClient)
         assert client._client_id == "pe-id"
         assert client._client_secret == "pe-secret"
+
+
+class TestFleetGithubToken:
+    """AFX-180: every GitHub call the fleet makes itself uses the PE App's
+    token once the App is set up, so the personal token can be deleted."""
+
+    def _app(self, monkeypatch, state, minted=None):
+        from agentfx.agents.fleet import github_app
+
+        monkeypatch.setattr(github_app, "app_state", lambda: state)
+        monkeypatch.setattr(
+            github_app, "mint_installation_token", lambda *, owner, repo: minted
+        )
+
+    def _capture_get(self, monkeypatch):
+        seen: list[dict] = []
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "merged_at": "2026-11-23T00:00:00Z",
+                    "base": {"ref": "main"},
+                    "head": {"ref": "agent/AFX-9-x"},
+                    "title": "AFX-9: x",
+                }
+
+        def _fake(url, **kw):
+            seen.append(kw.get("headers") or {})
+            return _Resp()
+
+        monkeypatch.setattr(linear_pe_queue.requests, "get", _fake)
+        return seen
+
+    _URL = "https://github.com/widarecu/agentfx/pull/7"
+
+    def test_merged_pr_check_uses_the_app_token(self, monkeypatch):
+        from agentfx.agents.fleet import github_app
+
+        monkeypatch.setattr(linear_pe_queue.settings, "GITHUB_TOKEN", "personal-pat")
+        self._app(
+            monkeypatch, "on", github_app.MintResult(token="ghs_app", expires_at="")
+        )
+        seen = self._capture_get(monkeypatch)
+
+        assert linear_pe_queue.find_merged_pr("AFX-9", [self._URL]) == self._URL
+        assert seen[0]["Authorization"] == "Bearer ghs_app"
+
+    def test_merged_pr_check_fails_closed_when_the_app_token_cannot_be_minted(
+        self, monkeypatch
+    ):
+        from agentfx.agents.fleet import github_app
+
+        monkeypatch.setattr(linear_pe_queue.settings, "GITHUB_TOKEN", "personal-pat")
+        self._app(monkeypatch, "on", github_app.MintResult(reason="HTTP 401"))
+        seen = self._capture_get(monkeypatch)
+
+        with pytest.raises(Exception, match="could not be minted"):
+            linear_pe_queue.find_merged_pr("AFX-9", [self._URL])
+        assert seen == []
+
+    def test_without_the_app_the_personal_token_is_still_used(self, monkeypatch):
+        monkeypatch.setattr(linear_pe_queue.settings, "GITHUB_TOKEN", "personal-pat")
+        self._app(monkeypatch, "off")
+        seen = self._capture_get(monkeypatch)
+
+        linear_pe_queue.find_merged_pr("AFX-9", [self._URL])
+        assert seen[0]["Authorization"] == "Bearer personal-pat"
