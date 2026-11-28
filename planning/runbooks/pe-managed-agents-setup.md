@@ -104,6 +104,25 @@ Refusals (the dispatch is marked failed with the reason; no session is created; 
 
 **Not verified without a live session:** that the Console accepts the `environment_variable` update on the installed SDK's endpoint (the SDK type hint only exists from anthropic 2.14.0; the code sends a plain dict), that the sandbox's `gh` picks up the updated value in a new session, and that the Linear connector accepts a static bearer credential in place of the sign-in.
 
+## How a session's outcome is decided (AFX-182)
+
+Every 10 minutes the backend reads each running session's status and its newest 100 events and decides the outcome from what Anthropic reports, not from text patterns or a timer. The last status event wins, so a session that went idle and was then sent another message is working again.
+
+| What the session reports | Outcome | What the backend does |
+|---|---|---|
+| The session has settled (idle, or terminated) and GitHub has a pull request whose head is the run's branch (`agent_branch`) | PR opened | Row `pr_open` with GitHub's link, session archived |
+| `session.status_idle`, stop reason `end_turn`, no PR | Completed without a PR | Row `completed_no_pr` (not a failure; `tests_failed` if the final message says tests still fail), summary starting `[session-outcome] completed_without_pr`; session archived; one comment on the ticket with the session's final message (trimmed, secrets removed); ticket stays In Progress with `needs-wilson` |
+| `session.error` with retry status `terminal` or `exhausted`, or idle with `retries_exhausted` | Failed | Row `workspace_failed` with summary starting `[session-outcome] failed <error type>`; session archived; one comment with the reason in plain words; In Progress with `needs-wilson` |
+| Idle with `requires_action` | Waiting | Row stays `running` (nothing surfaces it yet; AFX-183) |
+| Running, rescheduled, an error still `retrying`, or anything the backend does not recognise | Still working | Row stays `running`; the 4-hour sweeper reclaims it if it never settles |
+| Status `terminated` with no error | Ended without saying why | Classified from the final text, as before AFX-182 |
+
+Whether a PR was opened is asked of GitHub (`GET /repos/widarecu/agentfx/pulls?head=widarecu:<agent_branch>&state=all`), only once the session has settled, never read from the session's text: a session that cites an old PR is still "completed without a PR". If GitHub cannot be asked (network error, non-200, no token), the run stays open and is retried next poll. If the agent pushed a branch other than `agent_branch`, the run closes as completed without a PR, with the final message on the ticket. The run closes on the first poll that sees a final outcome. No number of idle polls is counted. The "exceeded 4h" wording is only for the sweeper. A failed or no-PR session still counts against `AGENT_PE_WORKSPACE_MAX_PER_DAY`, because the cap counts every dispatched row.
+
+**Billing pause.** After a session fails with `billing_error` (the Anthropic account is out of credit or at its spend limit), the scheduled scan and Linear delegation both refuse new Anthropic sessions (`anthropic_billing_paused` in the log and in Linear) until the next UTC midnight. A later session that succeeds (`pr_open`, `merged` or `completed_no_pr`) ends the pause early. Nothing is stored separately: the pause is read from the finished runs, so it survives a deploy. Devin dispatches are not held by it. To lift it by hand, top up the account and retry the ticket; the pause then ends at midnight UTC.
+
+**Not verified without a live session:** the exact order and content of a real session's events (the code follows the installed SDK types, `anthropic` 0.100.0, and reads fields defensively), and that a message sent to an idle session emits `session.status_running`.
+
 ## Change log
 
 **AFX-172 (the PE's own GitHub and Linear identities), for Wilson to apply in order after merge. Not yet live:**

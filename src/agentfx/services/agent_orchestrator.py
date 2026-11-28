@@ -234,11 +234,12 @@ def _pe_workspace_poll_tick() -> None:
         if counts.get("checked"):
             logger.info(
                 "agent_orchestrator: PE workspace poll "
-                "checked=%d pr_open=%d tests_failed=%d failed=%d",
+                "checked=%d pr_open=%d tests_failed=%d failed=%d completed_no_pr=%d",
                 counts.get("checked", 0),
                 counts.get("pr_open", 0),
                 counts.get("tests_failed", 0),
                 counts.get("failed", 0),
+                counts.get("completed_no_pr", 0),
             )
 
 

@@ -52,10 +52,12 @@ import json
 import logging
 import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from threading import Lock
-from typing import Protocol
+from typing import Any, Protocol
 
 import requests
 from sqlalchemy import and_, or_
@@ -480,8 +482,69 @@ def _max_usd_per_day() -> float:
     return float(val if val is not None else 3.00)
 
 
+# Row-summary prefixes for outcomes decided from a Managed Agents
+# session's own events (AFX-182). They sit at the START of the summary so
+# a consumer can recognise them with `startswith`, and so a final message
+# that happens to quote a stuck-session tag is never mistaken for one.
+SESSION_OUTCOME_PREFIX = "[session-outcome]"
+OUTCOME_COMPLETED_NO_PR = f"{SESSION_OUTCOME_PREFIX} completed_without_pr"
+OUTCOME_FAILED = f"{SESSION_OUTCOME_PREFIX} failed"
+OUTCOME_FAILED_BILLING = f"{SESSION_OUTCOME_PREFIX} failed billing_error"
+BILLING_ERROR_TYPE = "billing_error"
+_BILLING_LOOKBACK = timedelta(days=2)
+
+
+def _next_utc_midnight(value: datetime) -> datetime:
+    """The first UTC midnight after `value` (naive values are read as UTC)."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    value = value.astimezone(UTC)
+    return datetime.combine(
+        value.date() + timedelta(days=1), datetime.min.time(), tzinfo=UTC
+    )
+
+
+def billing_pause_until(db: Session, *, now: datetime | None = None) -> datetime | None:
+    """When new Anthropic sessions are paused until, or None when they are not.
+
+    Derived from existing rows (no table of its own, so it survives the
+    restart every deploy causes): walk the finished Managed Agents runs
+    newest first. The first one that succeeded (PR opened, merged, or
+    completed without a PR) ends any pause. The first one that failed on
+    a billing error pauses dispatch until the next UTC midnight after it
+    ended. Other failures are skipped: only a billing error pauses.
+    """
+    now = now or datetime.now(UTC)
+    rows = (
+        db.query(AgentWorkspaceRun)
+        .filter(AgentWorkspaceRun.adapter == "managed_agents")
+        .filter(AgentWorkspaceRun.ended_at.isnot(None))
+        .filter(AgentWorkspaceRun.ended_at >= now - _BILLING_LOOKBACK)
+        .order_by(AgentWorkspaceRun.ended_at.desc())
+        .all()
+    )
+    for r in rows:
+        summary = r.summary or ""
+        if r.status in (
+            AgentWorkspaceRunStatus.PR_OPEN,
+            AgentWorkspaceRunStatus.MERGED,
+            AgentWorkspaceRunStatus.COMPLETED_NO_PR,
+        ):
+            return None
+        if r.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED and summary.startswith(
+            OUTCOME_FAILED_BILLING
+        ):
+            until = _next_utc_midnight(r.ended_at)
+            return until if now < until else None
+    return None
+
+
 def check_budget_before_dispatch(
-    db: Session, *, now: datetime | None = None, trigger: str = "scan"
+    db: Session,
+    *,
+    now: datetime | None = None,
+    trigger: str = "scan",
+    anthropic_billing_pause: bool = True,
 ) -> tuple[bool, str]:
     """Returns `(ok, reason)` — reason is empty when ok=True.
 
@@ -496,7 +559,22 @@ def check_budget_before_dispatch(
       count cap is skipped (a human just asked for this; blocking on
       a 2/day budget designed for autonomous dispatches is wrong),
       but the USD cap is kept as the real $ guardrail.
+
+    A billing failure on an Anthropic session pauses new dispatches for
+    BOTH triggers until the next UTC day (see `billing_pause_until`).
+    The Devin adapter passes `anthropic_billing_pause=False`: Anthropic's
+    billing says nothing about Devin.
     """
+    if anthropic_billing_pause:
+        until = billing_pause_until(db, now=now)
+        if until is not None:
+            return False, (
+                "anthropic_billing_paused: the Anthropic account is out of "
+                "credit or has hit its spend limit; new PE sessions resume "
+                f"after {until.strftime('%Y-%m-%d %H:%M UTC')} or once a "
+                "session succeeds"
+            )
+
     if trigger != "webhook":
         count = dispatches_today(db, now=now)
         cap = _max_dispatches_per_day()
@@ -1019,7 +1097,9 @@ class DevinWorkspaceAdapter:
             logger.warning("pe_workspace[devin]: dispatch refused — %s", pause_reason)
             return WorkspaceDispatchResult(accepted=False, reason=pause_reason)
         trigger = spec.trigger
-        ok, reason = check_budget_before_dispatch(db, now=now, trigger=trigger)
+        ok, reason = check_budget_before_dispatch(
+            db, now=now, trigger=trigger, anthropic_billing_pause=False
+        )
         if not ok:
             return WorkspaceDispatchResult(accepted=False, reason=reason)
 
@@ -1657,10 +1737,10 @@ def _session_token_usage(session: object) -> tuple[int, int]:
 # ─────────────────────────────────────────────────────────────────────
 
 
-# Managed Agents status strings per the SDK (see sessions.list
-# `statuses` literal). Not all are terminal — `rescheduling` + `idle`
-# are transient. We transition on `terminated` only; the stuck-row
-# sweeper handles the pathological "never terminates" case.
+# Managed Agents status strings per the SDK (`rescheduling`, `running`,
+# `idle`, `terminated`). `terminated` is final. `idle` is final too when
+# the session's own events say so (`decide_session_outcome`, AFX-182);
+# the stuck-row sweeper handles a session that never settles.
 _SESSION_TERMINAL_STATUS = "terminated"
 
 
@@ -1757,44 +1837,433 @@ def _classify_session_outcome(
     return AgentWorkspaceRunStatus.WORKSPACE_FAILED, None
 
 
-def _fetch_events_text(client: object, session_id: str) -> str:
-    """Pull the recent event tail from a session for outcome parsing.
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    """Read `name` from an SDK model object or a plain dict. Events and
+    their nested `error` / `stop_reason` can be either, depending on the
+    SDK version the production image runs."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
 
-    Best-effort — any SDK failure just returns the empty string so
-    the caller still transitions the row (status defaults to
-    WORKSPACE_FAILED on an empty tail, which is correct: we can't
-    see what happened).
+
+def _type_of(obj: Any) -> str:
+    value = _field(obj, "type", "")
+    return value if isinstance(value, str) else ""
+
+
+def _text_parts(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    parts: list[str] = []
+    if isinstance(value, (list, tuple)):
+        for p in value:
+            t = _field(p, "text")
+            if isinstance(t, str) and t:
+                parts.append(t)
+    return parts
+
+
+def _events_to_text(events: Sequence[Any]) -> str:
+    """Flatten events (chronological) to text for PR-link and
+    publish/tests-failed detection. Anything we can see as text counts:
+    matching is substring-based, so recall matters more than structure."""
+    parts: list[str] = []
+    for ev in events:
+        for attr in ("content", "output", "result", "stdout"):
+            parts.extend(_text_parts(_field(ev, attr)))
+    return "\n".join(parts)
+
+
+def _last_agent_message(events: Sequence[Any]) -> str:
+    for ev in reversed(list(events)):
+        if _type_of(ev) == "agent.message":
+            text = "\n".join(_text_parts(_field(ev, "content"))).strip()
+            if text:
+                return text
+    return ""
+
+
+class SessionOutcomeKind(str, Enum):
+    PR_OPENED = "pr_opened"
+    COMPLETED_NO_PR = "completed_without_pr"
+    FAILED = "failed"
+    WAITING = "waiting"
+    WORKING = "working"
+    # The session ended (`terminated`) without saying why. The caller
+    # classifies from the event text, exactly as before AFX-182.
+    TERMINATED = "terminated"
+
+
+@dataclass(frozen=True)
+class SessionOutcome:
+    kind: SessionOutcomeKind
+    pr_url: str | None = None
+    # FAILED only: the `session.error` type (e.g. "billing_error"),
+    # "retries_exhausted" for an idle stop, or "" when unknown.
+    error_type: str = ""
+    reason: str = ""
+    final_message: str = ""
+
+
+_FINAL_RETRY_STATUSES = ("terminal", "exhausted")
+_WORKING_SESSION_STATUSES = ("running", "rescheduling")
+
+
+def decide_session_outcome(
+    events: Sequence[Any], session_status: str = "", pr_url: str | None = None
+) -> SessionOutcome:
+    """How a Managed Agents session ended, from what the service reports.
+
+    Pure: no I/O. `events` are in chronological order (oldest first);
+    `session_status` is `sessions.retrieve(...).status`.
+
+    The LAST relevant status event wins, so a session that went idle and
+    was then sent another message (`session.status_running`) is working
+    again. Rules:
+
+    - `session.error` with `retry_status` terminal or exhausted, not
+      followed by the session running again -> FAILED (type + message).
+      Errors still retrying leave the session working.
+    - `session.status_idle` + `stop_reason` end_turn -> COMPLETED_NO_PR;
+      requires_action -> WAITING; retries_exhausted -> FAILED.
+    - `session.status_terminated` (or session status `terminated`) with
+      no error -> TERMINATED (caller classifies from text, as before).
+    - Anything else, including event, error or stop types this code does
+      not know, is WORKING: never success, never a crash. The 4h sweeper
+      catches a session that never settles.
+
+    `pr_url` is what GitHub says about the run's branch (the caller asks,
+    only once the session has settled): a pull request whose head is the
+    branch the session was told to push. When given, it wins over every
+    settled outcome (the PR is the deliverable). A link in the session's
+    text decides nothing.
     """
+    status = (session_status or "").lower()
+    if status in _WORKING_SESSION_STATUSES:
+        return SessionOutcome(SessionOutcomeKind.WORKING)
+
+    state = ""  # "", "working", "idle", "terminated"
+    stop = ""
+    error: dict[str, str] | None = None
+    for ev in events:
+        et = _type_of(ev)
+        if et in ("session.status_running", "session.status_rescheduled"):
+            state, stop, error = "working", "", None
+        elif et == "session.status_idle":
+            state, stop = "idle", _type_of(_field(ev, "stop_reason"))
+        elif et == "session.status_terminated":
+            state = "terminated"
+        elif et == "session.error":
+            err = _field(ev, "error")
+            retry = _type_of(_field(err, "retry_status"))
+            if retry in _FINAL_RETRY_STATUSES:
+                message = _field(err, "message")
+                error = {
+                    "type": _type_of(err) or "unknown_error",
+                    "message": message if isinstance(message, str) else "",
+                }
+
+    if status == "terminated":
+        state = "terminated"
+    if error is None and state not in ("idle", "terminated"):
+        return SessionOutcome(SessionOutcomeKind.WORKING)
+
+    final_message = _last_agent_message(events)
+
+    if pr_url:
+        return SessionOutcome(
+            SessionOutcomeKind.PR_OPENED, pr_url=pr_url, final_message=final_message
+        )
+    if error is not None:
+        return SessionOutcome(
+            SessionOutcomeKind.FAILED,
+            error_type=error["type"],
+            reason=f"{error['type']}: {error['message']}".strip(": "),
+            final_message=final_message,
+        )
+    if state == "terminated":
+        return SessionOutcome(
+            SessionOutcomeKind.TERMINATED, final_message=final_message
+        )
+    if stop == "end_turn":
+        return SessionOutcome(
+            SessionOutcomeKind.COMPLETED_NO_PR, final_message=final_message
+        )
+    if stop == "requires_action":
+        return SessionOutcome(SessionOutcomeKind.WAITING, final_message=final_message)
+    if stop == "retries_exhausted":
+        return SessionOutcome(
+            SessionOutcomeKind.FAILED,
+            error_type="retries_exhausted",
+            reason="retries_exhausted: the session used up its retry budget",
+            final_message=final_message,
+        )
+    # Idle with a stop reason we do not know: not success, keep watching.
+    return SessionOutcome(SessionOutcomeKind.WORKING)
+
+
+def _fetch_session_events(client: object, session_id: str) -> list[Any] | None:
+    """The session's most recent events, oldest first, or None when the
+    list call fails (the caller leaves the row for the next poll).
+
+    Asks for the newest events first: the default order is oldest first,
+    so a plain `limit=` returns the START of the session and misses the
+    status events that decide the outcome."""
     try:
         resp = client.beta.sessions.events.list(  # type: ignore[attr-defined]
-            session_id=session_id, limit=50
+            session_id=session_id, limit=100, order="desc"
         )
+        items = list(_field(resp, "data") or [])
     except Exception:
         logger.exception(
             "pe_workspace[poll]: events.list failed session=%s", session_id
         )
-        return ""
+        return None
+    items.reverse()
+    return items
 
-    parts: list[str] = []
-    items = getattr(resp, "data", None) or []
-    for ev in items:
-        # Different event shapes: a user_message/assistant_message
-        # has `content` as a list of parts; tool-use events have a
-        # `tool_name` + `input`/`output`. Flatten anything we can
-        # see as text — matching is substring-based so recall
-        # matters more than structure.
-        for attr in ("content", "output", "result", "stdout"):
-            v = getattr(ev, attr, None)
-            if isinstance(v, str):
-                parts.append(v)
-            elif isinstance(v, list):
-                for p in v:
-                    t = getattr(p, "text", None) or (
-                        p.get("text") if isinstance(p, dict) else None
-                    )
-                    if t:
-                        parts.append(t)
-    return "\n".join(parts)
+
+_TARGET_OWNER, _, _TARGET_REPO = _TARGET_REPO_URL.removeprefix(
+    "https://github.com/"
+).partition("/")
+_GITHUB_API_ROOT = "https://api.github.com"
+_GITHUB_HTTP_TIMEOUT_SECONDS = 15.0
+
+
+@dataclass(frozen=True)
+class BranchPr:
+    """What GitHub says about a run's branch. `ok=False` means the lookup
+    could not be made; `url=None` with `ok=True` means no PR exists."""
+
+    ok: bool
+    url: str | None = None
+    reason: str = ""
+
+
+class BranchPrFinder:
+    """Asks GitHub whether a session opened a PR from its branch.
+
+    A PR was opened by a session if and only if the repo has a pull
+    request whose head is the run's `agent_branch`. One finder serves one
+    poll: the token is obtained once (a minted App token costs a GitHub
+    call) and a failure to get one is remembered, so it is reported once.
+    Never raises; never falls back to guessing from text.
+    """
+
+    def __init__(self) -> None:
+        self._token: str | None = None
+        self._token_error: str = ""
+        self._have_token = False
+
+    def _get_token(self) -> str | None:
+        if not self._have_token:
+            self._have_token = True
+            token, reason = github_app.fleet_token(
+                owner=_TARGET_OWNER,
+                repo=_TARGET_REPO,
+                fallback=getattr(settings, "GITHUB_TOKEN", "") or "",
+            )
+            if not token:
+                reason = reason or "no GitHub token is configured"
+                logger.warning(
+                    "pe_workspace[poll]: cannot ask GitHub about PRs (%s); "
+                    "settled runs stay open until the next poll",
+                    reason,
+                )
+                self._token_error = reason
+            else:
+                self._token = token
+        return self._token
+
+    def find(self, branch: str | None) -> BranchPr:
+        if not branch:
+            return BranchPr(ok=True)  # No branch recorded: nothing to find.
+        token = self._get_token()
+        if not token:
+            return BranchPr(ok=False, reason=self._token_error)
+        try:
+            resp = requests.get(
+                f"{_GITHUB_API_ROOT}/repos/{_TARGET_OWNER}/{_TARGET_REPO}/pulls",
+                params={
+                    "head": f"{_TARGET_OWNER}:{branch}",
+                    "state": "all",
+                    "per_page": 5,
+                },
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                timeout=_GITHUB_HTTP_TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as exc:
+            reason = f"GitHub PR lookup failed: network error ({type(exc).__name__})"
+            logger.warning("pe_workspace[poll]: %s branch=%s", reason, branch)
+            return BranchPr(ok=False, reason=reason)
+        if resp.status_code != 200:
+            reason = f"GitHub PR lookup failed: HTTP {resp.status_code}"
+            logger.warning("pe_workspace[poll]: %s branch=%s", reason, branch)
+            return BranchPr(ok=False, reason=reason)
+        try:
+            pulls = [p for p in resp.json() if isinstance(p, dict)]
+        except ValueError:
+            reason = "GitHub PR lookup failed: response was not JSON"
+            logger.warning("pe_workspace[poll]: %s branch=%s", reason, branch)
+            return BranchPr(ok=False, reason=reason)
+        pulls = [p for p in pulls if isinstance(p.get("html_url"), str)]
+        if not pulls:
+            return BranchPr(ok=True)
+        newest = max(pulls, key=lambda p: p.get("number") or 0)
+        return BranchPr(ok=True, url=newest["html_url"])
+
+
+def _archive_managed_session(client: object, session_id: str) -> bool:
+    """Archive a finished session (never delete: the event log keeps the
+    agent's final message). A finished session needs no interrupt. Never
+    raises."""
+    try:
+        client.beta.sessions.archive(session_id=session_id)  # type: ignore[attr-defined]
+        return True
+    except Exception:
+        logger.warning(
+            "pe_workspace[poll]: sessions.archive failed session=%s",
+            session_id,
+            exc_info=True,
+        )
+        return False
+
+
+_COMMENT_MESSAGE_LIMIT = 1500
+
+
+def _plain_failure_reason(outcome: SessionOutcome) -> str:
+    if outcome.error_type == BILLING_ERROR_TYPE:
+        return "the Anthropic account is out of credit or has hit its spend limit" + (
+            f" (Anthropic said: {outcome.reason})" if outcome.reason else ""
+        )
+    if outcome.error_type == "retries_exhausted":
+        return "the session used up its retry budget without finishing"
+    return f"the session hit an error and could not continue ({outcome.reason})"
+
+
+def _render_outcome_comment(
+    row: AgentWorkspaceRun,
+    outcome: SessionOutcome,
+    *,
+    tests_failed: bool = False,
+    pause_until: datetime | None = None,
+) -> str:
+    """The one ticket comment for a run closed from its session's events."""
+    session_id = row.provider_run_id or "(none)"
+    if outcome.kind == SessionOutcomeKind.COMPLETED_NO_PR:
+        lines = [
+            "**PE session finished without opening a PR.**",
+            "",
+            "The session ended its turn normally, so this is not a failure to "
+            "start or a timeout. It did not open a PR."
+            + (" It reported failing tests." if tests_failed else ""),
+        ]
+        message = outcome.final_message.strip()
+        if message:
+            if len(message) > _COMMENT_MESSAGE_LIMIT:
+                message = message[:_COMMENT_MESSAGE_LIMIT].rstrip() + " [trimmed]"
+            lines += ["", "Its final message:", ""]
+            lines += [f"> {ln}" if ln else ">" for ln in message.splitlines()]
+        else:
+            lines += ["", "It left no final message."]
+        next_step = (
+            "Left In Progress and labelled `needs-wilson`: decide whether the "
+            "ticket is already done or needs another attempt. To retry, remove "
+            "the label and move it to Ready."
+        )
+    else:
+        lines = [
+            "**PE session failed.**",
+            "",
+            f"Reason: {_plain_failure_reason(outcome)}.",
+        ]
+        if outcome.error_type == BILLING_ERROR_TYPE and pause_until is not None:
+            lines += [
+                "",
+                "New PE sessions are paused until "
+                f"{pause_until.strftime('%Y-%m-%d %H:%M UTC')}, or until a "
+                "session succeeds.",
+            ]
+        next_step = (
+            "Left In Progress and labelled `needs-wilson`. Once the cause is "
+            "fixed, remove the label and move the ticket to Ready to retry."
+        )
+    lines += ["", f"Session: `{session_id}` ({row.adapter})", "", next_step]
+    return _redact_secrets("\n".join(lines))
+
+
+def _close_run_from_outcome(
+    row: AgentWorkspaceRun,
+    outcome: SessionOutcome,
+    events_text: str,
+    *,
+    now: datetime,
+) -> str:
+    """Close a run whose session reported COMPLETED_NO_PR or FAILED:
+    record it on the row, post the one ticket comment and add
+    `needs-wilson` (the same Linear hygiene the reclaim path uses, so the
+    ticket stays In Progress). Returns "completed_no_pr" or "failed".
+    Never raises; caller commits."""
+    from agentfx.agents.fleet.linear_pe_queue import handle_stuck_session_failure
+
+    tests_failed = False
+    if outcome.kind == SessionOutcomeKind.COMPLETED_NO_PR:
+        lower = events_text.lower()
+        tests_failed = any(pat in lower for pat in _TESTS_FAILED_PATTERNS)
+        row.status = (
+            AgentWorkspaceRunStatus.TESTS_FAILED
+            if tests_failed
+            else AgentWorkspaceRunStatus.COMPLETED_NO_PR
+        )
+        row.summary = _redact_secrets(
+            f"{OUTCOME_COMPLETED_NO_PR}\n"
+            f"{outcome.final_message or '(no final message)'}"
+        )[:4000]
+        result = "completed_no_pr"
+    else:
+        row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        prefix = (
+            OUTCOME_FAILED_BILLING
+            if outcome.error_type == BILLING_ERROR_TYPE
+            else f"{OUTCOME_FAILED} {outcome.error_type or 'unknown_error'}"
+        )
+        row.summary = _redact_secrets(f"{prefix}: {outcome.reason}")[:4000]
+        result = "failed"
+    row.ended_at = now
+
+    pause_until = None
+    if outcome.error_type == BILLING_ERROR_TYPE:
+        pause_until = _next_utc_midnight(now)
+        logger.warning(
+            "pe_workspace[poll]: Anthropic billing error on session=%s: new "
+            "PE sessions paused until %s",
+            row.provider_run_id,
+            pause_until,
+        )
+    if not row.linear_issue_identifier:
+        return result
+    try:
+        handle_stuck_session_failure(
+            row.linear_issue_identifier,
+            comment_body=_render_outcome_comment(
+                row, outcome, tests_failed=tests_failed, pause_until=pause_until
+            ),
+            escalate=False,
+        )
+    except Exception:
+        logger.exception(
+            "pe_workspace: Linear hygiene failed for row=%s issue=%s",
+            row.id,
+            row.linear_issue_identifier,
+        )
+    return result
 
 
 def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict:
@@ -1809,7 +2278,13 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
     rows use the row's `provider_run_id` and `DEVIN_API_KEY`/`DEVIN_ORG_ID`.
     """
     now = now or datetime.now(UTC)
-    counts = {"checked": 0, "pr_open": 0, "tests_failed": 0, "failed": 0}
+    counts = {
+        "checked": 0,
+        "pr_open": 0,
+        "tests_failed": 0,
+        "failed": 0,
+        "completed_no_pr": 0,
+    }
 
     # Managed Agents rows need the anthropic SDK; Devin rows don't.
     # If the SDK isn't installed we skip managed_agents rows but still
@@ -1889,6 +2364,7 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
 
     client = anth.Anthropic(max_retries=2)
 
+    pr_finder = BranchPrFinder()  # one token per poll, not per session
     for row in managed_rows:
         counts["checked"] += 1
         session_id = row.provider_run_id or ""
@@ -1903,7 +2379,23 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
             # the dispatch.
             continue
         status = getattr(session, "status", "") or ""
-        if status != _SESSION_TERMINAL_STATUS:
+        # The outcome comes from what the service reports (AFX-182): the
+        # session's status and its status/error events, never from text or
+        # a count of polls. A session whose status is running needs no
+        # event read at all.
+        if status in _WORKING_SESSION_STATUSES:
+            events: list = []
+            outcome = SessionOutcome(SessionOutcomeKind.WORKING)
+        else:
+            fetched = _fetch_session_events(client, session_id)
+            if fetched is None and status != _SESSION_TERMINAL_STATUS:
+                continue  # Can't see the events; decide on the next poll.
+            events = fetched or []
+            outcome = decide_session_outcome(events, status)
+
+        if outcome.kind in (SessionOutcomeKind.WORKING, SessionOutcomeKind.WAITING):
+            # Still working, or waiting on input: leave the row open. The
+            # per-session cost cap and the 4h sweeper still apply.
             cap = _max_tokens_per_session()
             in_tok, out_tok = _session_token_usage(session)
             if cap > 0 and (in_tok > cap or out_tok > cap):
@@ -1930,10 +2422,46 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
                     client=client,
                 )
                 counts["failed"] += 1
-            continue  # Still running — leave the row alone.
+            continue
 
-        events_text = _fetch_events_text(client, session_id)
-        target_status, pr_url = _classify_session_outcome(events_text)
+        # The session has settled. Whether it opened a PR is a question for
+        # GitHub (a PR from the run's branch), not for the session's text.
+        # If GitHub can't be asked, leave the run open for the next poll.
+        found = pr_finder.find(row.agent_branch)
+        if not found.ok:
+            continue
+        if found.url:
+            outcome = decide_session_outcome(events, status, pr_url=found.url)
+
+        events_text = _events_to_text(events)
+        if status != _SESSION_TERMINAL_STATUS or outcome.kind in (
+            SessionOutcomeKind.COMPLETED_NO_PR,
+            SessionOutcomeKind.FAILED,
+        ):
+            _archive_managed_session(client, session_id)
+
+        if outcome.kind == SessionOutcomeKind.FAILED or (
+            outcome.kind == SessionOutcomeKind.COMPLETED_NO_PR
+            and not _detect_publish_failed(events_text)
+        ):
+            closed = _close_run_from_outcome(row, outcome, events_text, now=now)
+            if closed == "completed_no_pr":
+                counts["completed_no_pr"] += 1
+            else:
+                counts["failed"] += 1
+            continue
+
+        if outcome.kind == SessionOutcomeKind.PR_OPENED:
+            target_status, pr_url = AgentWorkspaceRunStatus.PR_OPEN, outcome.pr_url
+        else:
+            # GitHub says no PR: a link in the text does not make one.
+            lower = events_text.lower()
+            target_status = (
+                AgentWorkspaceRunStatus.TESTS_FAILED
+                if any(pat in lower for pat in _TESTS_FAILED_PATTERNS)
+                else AgentWorkspaceRunStatus.WORKSPACE_FAILED
+            )
+            pr_url = None
         if (
             target_status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
             and _detect_publish_failed(events_text)
@@ -2189,6 +2717,10 @@ __all__ = [
     "dispatches_today",
     "spent_usd_today",
     "check_budget_before_dispatch",
+    "billing_pause_until",
+    "decide_session_outcome",
+    "SessionOutcome",
+    "SessionOutcomeKind",
     "devin_dispatch_pause_reason",
     "reset_devin_auth_state",
     "resolve_adapter",
