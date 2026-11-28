@@ -317,11 +317,21 @@ def find_merged_pr(identifier: str, pr_urls: list[str]) -> str | None:
     return None
 
 
+def _pe_token_for_delivery(force_refresh: bool) -> str:
+    """Token source for the delivery client: the one `get_app_token` hands
+    out. The client must not mint its own: Linear cancels the PE
+    application's earlier tokens when it sees a different scope set
+    (AFX-184). The error carries the reason only, never a token."""
+    token, reason = linear_agent_api.get_app_token(force_refresh=force_refresh)
+    if token is None:
+        raise linear_delivery.LinearError(
+            f"could not get AgentFX Platform Engineer token ({reason})"
+        )
+    return token
+
+
 def _delivery_client() -> linear_delivery.LinearClient:
-    return linear_delivery.LinearClient(
-        client_id=settings.LINEAR_AGENT_CLIENT_ID,
-        client_secret=settings.LINEAR_AGENT_CLIENT_SECRET,
-    )
+    return linear_delivery.LinearClient(token_provider=_pe_token_for_delivery)
 
 
 FLEET_TAKER = "AgentFX fleet PE"
