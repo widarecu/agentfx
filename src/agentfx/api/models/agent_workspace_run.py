@@ -54,6 +54,9 @@ class AgentWorkspaceRunStatus(str, Enum):
     - TESTS_FAILED: workspace ran but internal `make test-unit`
       failed after N retries. No PR opened. `summary` carries the
       failing test output tail.
+    - COMPLETED_NO_PR: the session ended its turn normally and GitHub has
+      no PR from its branch (for example the work was already done).
+      Not a failure. `summary` carries the session's final message.
     - WORKSPACE_FAILED: workspace couldn't start / crashed / hit
       TTL. `summary` carries the provider error.
     - MERGED: Wilson merged the PR → `feat/agent-fleet`. Set by a
@@ -67,6 +70,7 @@ class AgentWorkspaceRunStatus(str, Enum):
     PR_OPEN = "pr_open"
     TESTS_FAILED = "tests_failed"
     WORKSPACE_FAILED = "workspace_failed"
+    COMPLETED_NO_PR = "completed_no_pr"
     MERGED = "merged"
     ABANDONED = "abandoned"
 

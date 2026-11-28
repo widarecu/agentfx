@@ -75,12 +75,23 @@ class TestDecideSessionOutcome:
         assert out.kind == K.COMPLETED_NO_PR
         assert out.final_message == "Already fixed on main."
 
-    def test_pr_link_is_pr_opened_even_when_idle(self):
+    def test_pr_from_github_is_pr_opened_even_when_idle(self):
         out = pe_workspace.decide_session_outcome(
-            [running(), said(f"Opened {PR}"), idle("end_turn")], "idle"
+            [running(), idle("end_turn")], "idle", pr_url=PR
         )
         assert out.kind == K.PR_OPENED
         assert out.pr_url == PR
+
+    def test_link_in_text_decides_nothing(self):
+        out = pe_workspace.decide_session_outcome(
+            [running(), said(f"Already fixed in {PR}"), idle("end_turn")], "idle"
+        )
+        assert out.kind == K.COMPLETED_NO_PR
+        assert out.pr_url is None
+
+    def test_pr_url_does_not_make_a_working_session_settled(self):
+        out = pe_workspace.decide_session_outcome([running()], "running", pr_url=PR)
+        assert out.kind == K.WORKING
 
     @pytest.mark.parametrize("retry", ["terminal", "exhausted"])
     def test_billing_error_final_is_failed(self, retry):
@@ -234,6 +245,60 @@ def _isolate(monkeypatch):
     pe_workspace.reset_devin_auth_state()
 
 
+BRANCH = "agent/2026-11-28-afx-111-qa-work-order"
+
+
+class FakeGitHub:
+    """Stands in for `requests.get` on the pulls endpoint and for
+    `github_app.fleet_token`."""
+
+    def __init__(self):
+        self.prs: dict[str, list[dict]] = {}
+        self.fail: str | None = None  # "network" | "http500" | "badjson"
+        self.token_error: str = ""
+        self.mints = 0
+        self.gets: list[dict] = []
+
+    def fleet_token(self, *, owner, repo, fallback=""):
+        self.mints += 1
+        if self.token_error:
+            return None, self.token_error
+        return "tok_test", ""
+
+    def get(self, url, *, params=None, headers=None, timeout=None):
+        import requests
+
+        self.gets.append({"url": url, "params": params, "headers": headers})
+        if self.fail == "network":
+            raise requests.ConnectionError("down")
+        resp = MagicMock()
+        if self.fail == "http500":
+            resp.status_code = 500
+            return resp
+        resp.status_code = 200
+        if self.fail == "badjson":
+            resp.json.side_effect = ValueError("nope")
+            return resp
+        branch = params["head"].split(":", 1)[1]
+        resp.json.return_value = self.prs.get(branch, [])
+        return resp
+
+
+def _pull(number: int) -> dict:
+    return {
+        "number": number,
+        "html_url": f"https://github.com/widarecu/agentfx/pull/{number}",
+    }
+
+
+@pytest.fixture(autouse=True)
+def gh(monkeypatch):
+    fake = FakeGitHub()
+    monkeypatch.setattr(pe_workspace.github_app, "fleet_token", fake.fleet_token)
+    monkeypatch.setattr(pe_workspace.requests, "get", fake.get)
+    return fake
+
+
 def _seed(db, *, row_id="r1", started=None, adapter="managed_agents", **kw):
     started = started or datetime.now(UTC) - timedelta(minutes=7)
     row = AgentWorkspaceRun(
@@ -243,6 +308,7 @@ def _seed(db, *, row_id="r1", started=None, adapter="managed_agents", **kw):
         adapter=adapter,
         status=AgentWorkspaceRunStatus.RUNNING,
         provider_run_id=f"sesn_{row_id}",
+        agent_branch=kw.pop("agent_branch", BRANCH),
         started_at=started,
         created_at=started,
         **kw,
@@ -280,7 +346,7 @@ def _linear(monkeypatch):
 
 
 class TestPollClosesOnFinalOutcome:
-    def test_end_turn_without_pr_closes_on_first_poll(self, db, monkeypatch):
+    def test_end_turn_without_pr_closes_on_first_poll(self, db, monkeypatch, gh):
         _seed(db)
         calls = _linear(monkeypatch)
         client = _client(
@@ -296,7 +362,9 @@ class TestPollClosesOnFinalOutcome:
 
         assert counts["completed_no_pr"] == 1 and counts["failed"] == 0
         row = db.query(AgentWorkspaceRun).one()
-        assert row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
+        assert row.status == AgentWorkspaceRunStatus.COMPLETED_NO_PR
+        assert gh.gets[0]["params"]["head"] == f"widarecu:{BRANCH}"
+        assert gh.gets[0]["params"]["state"] == "all"
         assert row.ended_at is not None
         assert row.summary.startswith(pe_workspace.OUTCOME_COMPLETED_NO_PR)
         assert linear_pe_queue.stuck_session_signature(row.summary) == ""
@@ -381,21 +449,113 @@ class TestPollClosesOnFinalOutcome:
         assert row.ended_at is None and calls == []
         client.beta.sessions.archive.assert_not_called()
 
-    def test_idle_session_that_opened_a_pr_is_pr_open(self, db, monkeypatch):
+    def test_settled_session_with_github_pr_is_pr_open_without_any_link(
+        self, db, monkeypatch, gh
+    ):
         _seed(db)
         calls = _linear(monkeypatch)
+        gh.prs[BRANCH] = [_pull(300), _pull(321)]
         client = _client(
             monkeypatch,
             status="idle",
-            events=[running(), said(f"PR opened: {PR}"), idle("end_turn")],
+            events=[running(), said("Done, see the PR."), idle("end_turn")],
         )
         counts = pe_workspace.poll_running_dispatches(db)
         assert counts["pr_open"] == 1
         row = db.query(AgentWorkspaceRun).one()
         assert row.status == AgentWorkspaceRunStatus.PR_OPEN
-        assert row.pr_url == PR and row.pr_number == 321
+        assert row.pr_url == PR and row.pr_number == 321  # newest
         assert calls == []  # the PR is the report; no needs-wilson comment
         client.beta.sessions.archive.assert_called_once()
+
+    def test_cited_pr_in_final_message_is_not_a_pr_opened(self, db, monkeypatch, gh):
+        _seed(db)
+        calls = _linear(monkeypatch)
+        gh.prs = {"agent/other": [_pull(143)]}  # nothing from this run's branch
+        _client(
+            monkeypatch,
+            status="idle",
+            events=[
+                said(
+                    "Already fixed on main, see "
+                    "https://github.com/widarecu/agentfx/pull/143. No change."
+                ),
+                idle("end_turn"),
+            ],
+        )
+        counts = pe_workspace.poll_running_dispatches(db)
+        assert counts["completed_no_pr"] == 1 and counts["pr_open"] == 0
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.COMPLETED_NO_PR
+        assert row.pr_url is None
+        assert "Already fixed on main" in calls[0]["body"]
+
+    @pytest.mark.parametrize("failure", ["network", "http500", "badjson"])
+    def test_lookup_failure_leaves_run_open_then_next_poll_closes_it(
+        self, db, monkeypatch, gh, caplog, failure
+    ):
+        _seed(db)
+        calls = _linear(monkeypatch)
+        client = _client(monkeypatch, status="idle", events=[said("Nothing."), idle()])
+        gh.fail = failure
+        with caplog.at_level("WARNING"):
+            counts = pe_workspace.poll_running_dispatches(db)
+        assert counts["completed_no_pr"] == 0
+        row = db.query(AgentWorkspaceRun).one()
+        assert row.status == AgentWorkspaceRunStatus.RUNNING and row.ended_at is None
+        assert calls == []
+        client.beta.sessions.archive.assert_not_called()
+        warnings = [r for r in caplog.records if "PR lookup failed" in r.getMessage()]
+        assert len(warnings) == 1
+
+        gh.fail = None
+        counts = pe_workspace.poll_running_dispatches(db)
+        assert counts["completed_no_pr"] == 1
+        assert len(calls) == 1
+
+    def test_no_token_leaves_run_open_with_one_warning(
+        self, db, monkeypatch, gh, caplog
+    ):
+        _seed(db, row_id="a")
+        _seed(db, row_id="b")
+        calls = _linear(monkeypatch)
+        _client(monkeypatch, status="idle", events=[said("Nothing."), idle()])
+        gh.token_error = "the PE GitHub App token could not be minted: boom"
+        with caplog.at_level("WARNING"):
+            pe_workspace.poll_running_dispatches(db)
+        assert {r.status for r in db.query(AgentWorkspaceRun)} == {
+            AgentWorkspaceRunStatus.RUNNING
+        }
+        assert calls == [] and gh.gets == []
+        assert gh.mints == 1  # the failure is remembered for the whole poll
+        warnings = [r for r in caplog.records if "cannot ask GitHub" in r.getMessage()]
+        assert len(warnings) == 1
+
+    def test_running_session_makes_no_github_call(self, db, monkeypatch, gh):
+        _seed(db)
+        _linear(monkeypatch)
+        _client(monkeypatch, status="running", events=[running()])
+        pe_workspace.poll_running_dispatches(db)
+        assert gh.gets == [] and gh.mints == 0
+
+    def test_waiting_or_working_idle_session_makes_no_github_call(
+        self, db, monkeypatch, gh
+    ):
+        _seed(db)
+        _linear(monkeypatch)
+        _client(monkeypatch, status="idle", events=[running(), idle("requires_action")])
+        pe_workspace.poll_running_dispatches(db)
+        assert gh.gets == [] and gh.mints == 0
+
+    def test_several_settled_sessions_mint_one_token(self, db, monkeypatch, gh):
+        for rid in ("a", "b", "c"):
+            _seed(db, row_id=rid, agent_branch=f"agent/{rid}")
+        _linear(monkeypatch)
+        _client(monkeypatch, status="idle", events=[said("Nothing."), idle()])
+        counts = pe_workspace.poll_running_dispatches(db)
+        assert counts["completed_no_pr"] == 3
+        assert gh.mints == 1 and len(gh.gets) == 3
+        assert all(g["headers"]["Authorization"] == "Bearer tok_test" for g in gh.gets)
 
     def test_events_are_requested_newest_first(self, db, monkeypatch):
         _seed(db)
@@ -534,10 +694,7 @@ class TestBillingPause:
         "status,summary",
         [
             (AgentWorkspaceRunStatus.PR_OPEN, "[poll] PR opened"),
-            (
-                AgentWorkspaceRunStatus.WORKSPACE_FAILED,
-                f"{pe_workspace.OUTCOME_COMPLETED_NO_PR}\nnothing to change",
-            ),
+            (AgentWorkspaceRunStatus.COMPLETED_NO_PR, "nothing to change"),
         ],
     )
     def test_a_later_success_ends_the_pause(self, db, monkeypatch, status, summary):
@@ -657,3 +814,74 @@ class TestRetryGateUnaffected:
     def test_completed_without_pr_summary_has_no_stuck_signature(self):
         s = f"{pe_workspace.OUTCOME_COMPLETED_NO_PR}\n[cost-cap] exceeded 5 tokens"
         assert linear_pe_queue.stuck_session_signature(s) == ""
+
+
+class TestCompletedNoPrStatus:
+    def _row(self, db, **kw):
+        return _finished(
+            db,
+            row_id="c1",
+            ended=datetime.now(UTC),
+            status=AgentWorkspaceRunStatus.COMPLETED_NO_PR,
+            summary=f"{pe_workspace.OUTCOME_COMPLETED_NO_PR}\nAlready fixed.",
+        )
+
+    def test_sweeper_never_touches_it(self, db, monkeypatch):
+        row = self._row(db)
+        row.started_at = datetime.now(UTC) - timedelta(hours=9)
+        db.commit()
+        assert pe_workspace.sweep_stuck_runs(db) == 0
+        assert db.query(AgentWorkspaceRun).one().status == (
+            AgentWorkspaceRunStatus.COMPLETED_NO_PR
+        )
+
+    def test_retry_gate_does_not_count_it_as_a_failure(self, db, monkeypatch):
+        from agentfx.agents.fleet import platform_engineer as pe
+
+        for i in range(3):
+            _finished(
+                db,
+                row_id=f"c{i}",
+                ended=datetime.now(UTC) - timedelta(minutes=i),
+                status=AgentWorkspaceRunStatus.COMPLETED_NO_PR,
+                summary=f"{pe_workspace.OUTCOME_COMPLETED_NO_PR}\nAlready fixed.",
+            )
+        filed = []
+        monkeypatch.setattr(pe, "file_for_attention", lambda *a, **k: filed.append(1))
+        issue = SimpleNamespace(identifier="AFX-115", id="uuid-1")
+        assert pe._should_skip_due_to_retry_gate(db, issue) is False
+        assert filed == []
+
+    def test_it_is_not_a_repeat_stuck_failure(self, db):
+        prior = self._row(db)
+        row = _finished(
+            db,
+            row_id="n1",
+            ended=datetime.now(UTC) + timedelta(minutes=1),
+            status=AgentWorkspaceRunStatus.WORKSPACE_FAILED,
+            summary="x",
+        )
+        assert prior.status != row.status
+        assert pe_workspace._is_repeat_stuck_failure(db, row) is False
+
+    def test_it_counts_toward_the_daily_cap(self, db):
+        self._row(db)
+        assert pe_workspace.dispatches_today(db) == 1
+
+    def test_status_value_fits_the_column_and_needs_no_migration(self):
+        """`agent_workspace_runs.status` was created as VARCHAR(24) (not a
+        native Postgres enum), so a new value needs no `ALTER TYPE`."""
+        from pathlib import Path
+
+        assert AgentWorkspaceRunStatus.COMPLETED_NO_PR.value == "completed_no_pr"
+        assert all(len(e.value) <= 24 for e in AgentWorkspaceRunStatus)
+        versions = Path(__file__).resolve().parents[4] / "migrations" / "versions"
+        creator = (versions / "2026_10_15_1900_add_agent_workspace_runs.py").read_text()
+        assert (
+            'sa.Column(\n            "status",\n            sa.String(length=24)'
+            in creator
+        )
+        assert not any(
+            "agentworkspacerunstatus" in f.read_text().lower()
+            for f in versions.glob("*.py")
+        )

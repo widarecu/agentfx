@@ -528,9 +528,8 @@ def billing_pause_until(db: Session, *, now: datetime | None = None) -> datetime
         if r.status in (
             AgentWorkspaceRunStatus.PR_OPEN,
             AgentWorkspaceRunStatus.MERGED,
+            AgentWorkspaceRunStatus.COMPLETED_NO_PR,
         ):
-            return None
-        if summary.startswith(OUTCOME_COMPLETED_NO_PR):
             return None
         if r.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED and summary.startswith(
             OUTCOME_FAILED_BILLING
@@ -1913,7 +1912,7 @@ _WORKING_SESSION_STATUSES = ("running", "rescheduling")
 
 
 def decide_session_outcome(
-    events: Sequence[Any], session_status: str = ""
+    events: Sequence[Any], session_status: str = "", pr_url: str | None = None
 ) -> SessionOutcome:
     """How a Managed Agents session ended, from what the service reports.
 
@@ -1935,8 +1934,11 @@ def decide_session_outcome(
       not know, is WORKING: never success, never a crash. The 4h sweeper
       catches a session that never settles.
 
-    A PR link in the session's text wins over every settled outcome (the
-    PR is the deliverable); finding the URL itself is unchanged.
+    `pr_url` is what GitHub says about the run's branch (the caller asks,
+    only once the session has settled): a pull request whose head is the
+    branch the session was told to push. When given, it wins over every
+    settled outcome (the PR is the deliverable). A link in the session's
+    text decides nothing.
     """
     status = (session_status or "").lower()
     if status in _WORKING_SESSION_STATUSES:
@@ -1968,8 +1970,6 @@ def decide_session_outcome(
     if error is None and state not in ("idle", "terminated"):
         return SessionOutcome(SessionOutcomeKind.WORKING)
 
-    m = re.findall(r"https://github\.com/\S+/pull/\d+", _events_to_text(events))
-    pr_url = m[-1] if m else None
     final_message = _last_agent_message(events)
 
     if pr_url:
@@ -2023,6 +2023,100 @@ def _fetch_session_events(client: object, session_id: str) -> list[Any] | None:
         return None
     items.reverse()
     return items
+
+
+_TARGET_OWNER, _, _TARGET_REPO = _TARGET_REPO_URL.removeprefix(
+    "https://github.com/"
+).partition("/")
+_GITHUB_API_ROOT = "https://api.github.com"
+_GITHUB_HTTP_TIMEOUT_SECONDS = 15.0
+
+
+@dataclass(frozen=True)
+class BranchPr:
+    """What GitHub says about a run's branch. `ok=False` means the lookup
+    could not be made; `url=None` with `ok=True` means no PR exists."""
+
+    ok: bool
+    url: str | None = None
+    reason: str = ""
+
+
+class BranchPrFinder:
+    """Asks GitHub whether a session opened a PR from its branch.
+
+    A PR was opened by a session if and only if the repo has a pull
+    request whose head is the run's `agent_branch`. One finder serves one
+    poll: the token is obtained once (a minted App token costs a GitHub
+    call) and a failure to get one is remembered, so it is reported once.
+    Never raises; never falls back to guessing from text.
+    """
+
+    def __init__(self) -> None:
+        self._token: str | None = None
+        self._token_error: str = ""
+        self._have_token = False
+
+    def _get_token(self) -> str | None:
+        if not self._have_token:
+            self._have_token = True
+            token, reason = github_app.fleet_token(
+                owner=_TARGET_OWNER,
+                repo=_TARGET_REPO,
+                fallback=getattr(settings, "GITHUB_TOKEN", "") or "",
+            )
+            if not token:
+                reason = reason or "no GitHub token is configured"
+                logger.warning(
+                    "pe_workspace[poll]: cannot ask GitHub about PRs (%s); "
+                    "settled runs stay open until the next poll",
+                    reason,
+                )
+                self._token_error = reason
+            else:
+                self._token = token
+        return self._token
+
+    def find(self, branch: str | None) -> BranchPr:
+        if not branch:
+            return BranchPr(ok=True)  # No branch recorded: nothing to find.
+        token = self._get_token()
+        if not token:
+            return BranchPr(ok=False, reason=self._token_error)
+        try:
+            resp = requests.get(
+                f"{_GITHUB_API_ROOT}/repos/{_TARGET_OWNER}/{_TARGET_REPO}/pulls",
+                params={
+                    "head": f"{_TARGET_OWNER}:{branch}",
+                    "state": "all",
+                    "per_page": 5,
+                },
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                timeout=_GITHUB_HTTP_TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as exc:
+            reason = f"GitHub PR lookup failed: network error ({type(exc).__name__})"
+            logger.warning("pe_workspace[poll]: %s branch=%s", reason, branch)
+            return BranchPr(ok=False, reason=reason)
+        if resp.status_code != 200:
+            reason = f"GitHub PR lookup failed: HTTP {resp.status_code}"
+            logger.warning("pe_workspace[poll]: %s branch=%s", reason, branch)
+            return BranchPr(ok=False, reason=reason)
+        try:
+            pulls = [p for p in resp.json() if isinstance(p, dict)]
+        except ValueError:
+            reason = "GitHub PR lookup failed: response was not JSON"
+            logger.warning("pe_workspace[poll]: %s branch=%s", reason, branch)
+            return BranchPr(ok=False, reason=reason)
+        pulls = [p for p in pulls if isinstance(p.get("html_url"), str)]
+        if not pulls:
+            return BranchPr(ok=True)
+        newest = max(pulls, key=lambda p: p.get("number") or 0)
+        return BranchPr(ok=True, url=newest["html_url"])
 
 
 def _archive_managed_session(client: object, session_id: str) -> bool:
@@ -2126,7 +2220,7 @@ def _close_run_from_outcome(
         row.status = (
             AgentWorkspaceRunStatus.TESTS_FAILED
             if tests_failed
-            else AgentWorkspaceRunStatus.WORKSPACE_FAILED
+            else AgentWorkspaceRunStatus.COMPLETED_NO_PR
         )
         row.summary = _redact_secrets(
             f"{OUTCOME_COMPLETED_NO_PR}\n"
@@ -2270,6 +2364,7 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
 
     client = anth.Anthropic(max_retries=2)
 
+    pr_finder = BranchPrFinder()  # one token per poll, not per session
     for row in managed_rows:
         counts["checked"] += 1
         session_id = row.provider_run_id or ""
@@ -2329,6 +2424,15 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
                 counts["failed"] += 1
             continue
 
+        # The session has settled. Whether it opened a PR is a question for
+        # GitHub (a PR from the run's branch), not for the session's text.
+        # If GitHub can't be asked, leave the run open for the next poll.
+        found = pr_finder.find(row.agent_branch)
+        if not found.ok:
+            continue
+        if found.url:
+            outcome = decide_session_outcome(events, status, pr_url=found.url)
+
         events_text = _events_to_text(events)
         if status != _SESSION_TERMINAL_STATUS or outcome.kind in (
             SessionOutcomeKind.COMPLETED_NO_PR,
@@ -2347,7 +2451,17 @@ def poll_running_dispatches(db: Session, *, now: datetime | None = None) -> dict
                 counts["failed"] += 1
             continue
 
-        target_status, pr_url = _classify_session_outcome(events_text)
+        if outcome.kind == SessionOutcomeKind.PR_OPENED:
+            target_status, pr_url = AgentWorkspaceRunStatus.PR_OPEN, outcome.pr_url
+        else:
+            # GitHub says no PR: a link in the text does not make one.
+            lower = events_text.lower()
+            target_status = (
+                AgentWorkspaceRunStatus.TESTS_FAILED
+                if any(pat in lower for pat in _TESTS_FAILED_PATTERNS)
+                else AgentWorkspaceRunStatus.WORKSPACE_FAILED
+            )
+            pr_url = None
         if (
             target_status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
             and _detect_publish_failed(events_text)

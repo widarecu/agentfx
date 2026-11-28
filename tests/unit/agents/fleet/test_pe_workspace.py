@@ -985,6 +985,13 @@ class TestPollRunningDispatches:
         from types import SimpleNamespace
         from unittest.mock import MagicMock
 
+        monkeypatch.setattr(
+            pe_workspace.BranchPrFinder,
+            "find",
+            lambda self, branch: pe_workspace.BranchPr(
+                ok=True, url="https://github.com/widarecu/agentfx/pull/42"
+            ),
+        )
         self._seed_running(db)
 
         session_resp = SimpleNamespace(status="terminated")
@@ -1111,6 +1118,13 @@ class TestPollRunningDispatches:
         from types import SimpleNamespace
         from unittest.mock import MagicMock
 
+        monkeypatch.setattr(
+            pe_workspace.BranchPrFinder,
+            "find",
+            lambda self, branch: pe_workspace.BranchPr(
+                ok=True, url="https://github.com/widarecu/agentfx/pull/99"
+            ),
+        )
         row = self._seed_running(db, session_id="sess_design")
         row.linear_issue_identifier = "AFX-888"
         db.commit()
@@ -1169,6 +1183,13 @@ class TestPollRunningDispatches:
         from types import SimpleNamespace
         from unittest.mock import MagicMock
 
+        monkeypatch.setattr(
+            pe_workspace.BranchPrFinder,
+            "find",
+            lambda self, branch: pe_workspace.BranchPr(
+                ok=True, url="https://github.com/widarecu/agentfx/pull/100"
+            ),
+        )
         row = self._seed_running(db, session_id="sess_normal")
         row.linear_issue_identifier = "AFX-889"
         db.commit()
