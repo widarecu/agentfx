@@ -349,6 +349,12 @@ def test_components_deploy_only_when_needed_and_independently():
         assert f'guard --sha "$TARGET_SHA" --component {component}' in _deploy_runs(job)
     assert "railway_deploy.py" in _deploy_runs("deploy-backend")
     assert "vercel deploy --prod" in _deploy_runs("deploy-frontend")
+    # AFX-129: the build must be told its commit, and the guard must read the
+    # live portal's commit; dropping either goes unnoticed until a deploy fails.
+    assert '--build-env VITE_SOURCE_SHA="$TARGET_SHA"' in _deploy_runs(
+        "deploy-frontend"
+    )
+    assert '--frontend-url "$FRONTEND_URL"' in _deploy_runs("deploy-frontend")
 
 
 def test_guard_runs_before_the_deploy_and_backend_stamps_its_sha():
