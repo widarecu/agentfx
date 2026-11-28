@@ -42,13 +42,13 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 import requests
 
 from agentfx.api.core.config import settings
 from agentfx.integrations import linear_agent_api, linear_delivery
-from agentfx.integrations.claim_store import GitHubClaims, Taker
+from agentfx.integrations.claim_store import ClaimStoreError, GitHubClaims, Taker
 from agentfx.integrations.linear_client import _build_client, _gql
 
 logger = logging.getLogger(__name__)
@@ -286,7 +286,7 @@ def find_merged_pr(identifier: str, pr_urls: list[str]) -> str | None:
     doesn't (AFX-135). Raises on a GitHub API failure so the caller skips
     rather than guesses.
     """
-    token = (getattr(settings, "GITHUB_TOKEN", "") or "").strip()
+    token = _fleet_github_token()
     headers = {"Accept": "application/vnd.github+json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -327,20 +327,25 @@ def _delivery_client() -> linear_delivery.LinearClient:
 FLEET_TAKER = "AgentFX fleet PE"
 
 
-def transition_to_in_progress(issue_id: str, *, link: str = "") -> bool:
+class ClaimOutcome(NamedTuple):
+    """Result of a fleet claim. `refused` is True when the claim ran and
+    was turned down (another taker has it, not Ready); False with
+    `ok=False` means it could not be attempted (Linear off, no GitHub
+    credential, an error)."""
+
+    ok: bool
+    reason: str = ""
+    refused: bool = False
+
+
+def claim_for_dispatch(issue_id: str, *, link: str = "") -> ClaimOutcome:
     """Claim a Ready issue through the shared `linear_delivery.start`
     (AFX-142), serialized with every other taker by the GitHub claim
-    tags. Returns True only when the fleet won the claim; the worker it
-    then launches is told not to claim again. Any refusal (another taker
-    won, not Ready) returns False so no duplicate workspace starts.
-
-    Never raises; on failure returns False and the caller skips
-    this issue (next scan tick retries).
-    """
+    tags, and say why when it doesn't. Never raises."""
     ok, reason = _linear_enabled()
     if not ok:
         logger.info("linear_pe_queue: transition_to_in_progress skipped — %s", reason)
-        return False
+        return ClaimOutcome(False, reason)
     try:
         result = linear_delivery.start(
             _delivery_client(),
@@ -348,18 +353,50 @@ def transition_to_in_progress(issue_id: str, *, link: str = "") -> bool:
             claims=_claim_store(),
             taker=Taker(FLEET_TAKER, link),
         )
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "linear_pe_queue: transition_to_in_progress failed for %s", issue_id
         )
-        return False
+        return ClaimOutcome(False, f"{type(exc).__name__}: {exc}"[:300])
     if not result.ok:
         logger.info("linear_pe_queue: not claiming %s — %s", issue_id, result.reason)
-    return result.ok
+        return ClaimOutcome(False, result.reason, refused=True)
+    return ClaimOutcome(True)
+
+
+def transition_to_in_progress(issue_id: str, *, link: str = "") -> bool:
+    """Claim a Ready issue (see `claim_for_dispatch`). Returns True only
+    when the fleet won the claim; the worker it then launches is told not
+    to claim again. Any refusal (another taker won, not Ready) returns
+    False so no duplicate workspace starts.
+
+    Never raises; on failure returns False and the caller skips
+    this issue (next scan tick retries).
+    """
+    return claim_for_dispatch(issue_id, link=link).ok
+
+
+def _fleet_github_token() -> str:
+    """Token for the fleet's own GitHub calls: the `agentfx-pe` App's when
+    it is set up (AFX-180), else `GITHUB_TOKEN`. Raises when the App is
+    half set up or its token cannot be minted, so callers fail closed and
+    never fall back to the personal token."""
+    from agentfx.agents.fleet import github_app
+
+    owner, _, repo = _DELIVERY_REPO.partition("/")
+    token, reason = github_app.fleet_token(
+        owner=owner,
+        repo=repo,
+        fallback=(getattr(settings, "GITHUB_TOKEN", "") or "").strip(),
+    )
+    if token is None:
+        raise ClaimStoreError(reason)
+    return token
 
 
 def _claim_store() -> GitHubClaims:
-    return GitHubClaims((getattr(settings, "GITHUB_TOKEN", "") or "").strip())
+    """The claim store, signed in as the fleet (see `_fleet_github_token`)."""
+    return GitHubClaims(_fleet_github_token(), repo=_DELIVERY_REPO)
 
 
 def rollback_to_ready(issue_id: str, *, reason_summary: str) -> bool:

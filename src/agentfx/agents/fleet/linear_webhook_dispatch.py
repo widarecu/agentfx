@@ -66,6 +66,23 @@ _ERROR_ADAPTER_REFUSED_TEMPLATE = (
     "open. Check the Railway logs for `pe_agent:` entries around "
     "this timestamp for the full trace."
 )
+# Claim refused: the shared claim (AFX-142) turned this ticket down, so
+# no session starts. `reason` is the claim's own plain-words answer, for
+# example "AFX-9 is already claimed by Claude Code" or "AFX-9 is
+# 'In Review', not 'Ready'".
+_ERROR_CLAIM_REFUSED_TEMPLATE = (
+    "**Not started — I couldn't claim this ticket.** {reason}. Only a "
+    "ticket in Ready can be taken, by one taker at a time; if it is "
+    "In Progress or In Review, another taker already has it. Move it "
+    "back to Ready and delegate again if that is wrong."
+)
+# Claim could not be attempted at all (Linear off, GitHub credential
+# missing or the PE App token could not be minted, or an error).
+_ERROR_CLAIM_UNAVAILABLE_TEMPLATE = (
+    "**Not started — the claim step failed, so nothing was dispatched.** "
+    "{reason}. The ticket was left as it was. Check Railway logs for "
+    "`linear_pe_queue` entries around this timestamp."
+)
 _ERROR_UNEXPECTED_TEMPLATE = (
     "Unexpected error while dispatching: `{exc_type}`. No PR will "
     "open. Check Railway logs."
@@ -183,6 +200,7 @@ def _dispatch_workspace(
         # Lazy imports keep Phase 1-only installs (webhook receiver
         # without dispatch) from pulling the Managed Agents stack on
         # import.
+        from agentfx.agents.fleet import linear_pe_queue
         from agentfx.agents.fleet.pe_workspace import (
             build_task_slug,
             check_budget_before_dispatch,
@@ -223,7 +241,37 @@ def _dispatch_workspace(
             slug_fn=build_task_slug,
         )
 
-        # Step 5 — Dispatch via the resolved adapter.
+        # Step 4b — Claim the ticket BEFORE any session starts (AFX-180),
+        # exactly as the scheduled scan does: the worker's kickoff tells
+        # it the fleet already claimed the ticket. Refused or failed →
+        # no dispatch, one error activity saying why.
+        claim = linear_pe_queue.claim_for_dispatch(
+            identifier, link=f"branch `agent/{spec.task_slug}`"
+        )
+        if not claim.ok:
+            logger.info(
+                "linear_webhook_dispatch: claim not taken session=%s %s: %s",
+                session_id,
+                identifier,
+                claim.reason,
+            )
+            template = (
+                _ERROR_CLAIM_REFUSED_TEMPLATE
+                if claim.refused
+                else _ERROR_CLAIM_UNAVAILABLE_TEMPLATE
+            )
+            from agentfx.agents.fleet.pe_workspace import _redact_secrets
+
+            # The reason can carry an upstream error's text; scrub it before
+            # it is shown in Linear.
+            emit_error(
+                session_id, template.format(reason=_redact_secrets(claim.reason))
+            )
+            return False, f"claim_refused:{claim.reason}"
+
+        # Step 5 — Dispatch via the resolved adapter. From here the
+        # ticket is In Progress: every outcome where no session started
+        # puts it back to Ready, as the scan does.
         adapter = resolve_adapter()
         try:
             result = adapter.dispatch(db, spec=spec, now=now)
@@ -231,6 +279,9 @@ def _dispatch_workspace(
             logger.exception(
                 "linear_webhook_dispatch: adapter raised — session=%s",
                 session_id,
+            )
+            linear_pe_queue.rollback_to_ready(
+                identifier, reason_summary=f"adapter_exception: {type(exc).__name__}"
             )
             emit_error(
                 session_id,
@@ -243,6 +294,9 @@ def _dispatch_workspace(
                 "linear_webhook_dispatch: adapter refused session=%s reason=%s",
                 session_id,
                 result.reason,
+            )
+            linear_pe_queue.rollback_to_ready(
+                identifier, reason_summary=f"adapter_refused: {result.reason}"
             )
             emit_error(
                 session_id,
@@ -285,6 +339,10 @@ def _dispatch_workspace(
             row is not None and row.status == AgentWorkspaceRunStatus.WORKSPACE_FAILED
         )
         if row_failed:
+            linear_pe_queue.rollback_to_ready(
+                identifier,
+                reason_summary=((row.summary or "") if row is not None else "")[:400],
+            )
             emit_error(
                 session_id,
                 _ERROR_DISPATCH_PERSISTED_BUT_FAILED_TEMPLATE.format(
