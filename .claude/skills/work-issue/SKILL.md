@@ -21,5 +21,6 @@ Canonical flow: `planning/runbooks/delivery-pipeline.md`. Use the Linear MCP too
    - In Claude Code, pass your ticket branch explicitly: `gh pr create --base main --head agent/AFX-<n>-<slug>`.
    - Add the `agent-authored` label (`gh pr edit <number> --add-label agent-authored`) so `pr-policy` can auto-merge it. Money-path too: `pr-policy` holds it for Wilson's approval. Don't add `needs-wilson` for risk alone.
 8. **Comment on the issue**: what was tested, and the CI link. Then **stop**.
+9. **If your PR conflicts with `main`** (`pr-policy` says "has merge conflicts with main"), you raised it, so you resolve it: `git fetch origin main && git merge origin/main`, fix the conflicts, run the `pr-preflight` checks again, and push to the same branch. A Money-path PR then needs Wilson's approval again on the new commit.
 
 Everything after is automatic: PR opened → In Review; merged to `main` → Deploy to staging; verified deploy → Done (deploy sync); failed deploy → Blocked + `needs-wilson`. Never set these by hand.

@@ -46,6 +46,15 @@ class FakeGitHub:
         self.calls: list[tuple[str, str]] = []
         self.fail_on: str | None = None
         self.ci: dict[str, str] = {}
+        # Timestamps for reviews and statuses; tests move it forward.
+        self.now = "2026-11-25T12:37:48Z"
+        self.main_at = "2026-11-25T09:00:00Z"  # `main`'s latest commit
+        # GETs of a PR that still read `mergeable: null` (GitHub computing).
+        self.unsettled: dict[int, int] = {}
+        self.slept: list[float] = []
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
 
     def add_pr(self, number: int = 7, **kw) -> dict:
         pr = {
@@ -78,7 +87,12 @@ class FakeGitHub:
         kind: str = "User",
     ) -> None:
         self.reviews[number].append(
-            {"user": {"login": login, "type": kind}, "state": state, "commit_id": sha}
+            {
+                "user": {"login": login, "type": kind},
+                "state": state,
+                "commit_id": sha,
+                "submitted_at": self.now,
+            }
         )
 
     def opener(self, req, timeout=None):
@@ -91,8 +105,24 @@ class FakeGitHub:
             items = self.reviews[int(m[1])]
             page = int(m[2])
             body = items[(page - 1) * 100 : page * 100]
+        elif m := re.fullmatch(
+            r"/pulls\?state=open&base=main&per_page=100&page=(\d+)", path
+        ):
+            body = [
+                p
+                for p in self.pulls.values()
+                if p["state"] == "open" and p["base"]["ref"] == "main"
+            ][(int(m[1]) - 1) * 100 : int(m[1]) * 100]
         elif m := re.fullmatch(r"/pulls/(\d+)", path):
             body = self.pulls[int(m[1])]
+            if self.unsettled.get(int(m[1])):
+                self.unsettled[int(m[1])] -= 1
+                body = {**body, "mergeable": None, "mergeable_state": "unknown"}
+        elif path == "/branches/main":
+            body = {"commit": {"commit": {"committer": {"date": self.main_at}}}}
+        elif m := re.fullmatch(r"/commits/([^/]+)/status\?per_page=100", path):
+            latest = [b for sha, b in reversed(self.statuses) if sha == m[1]][:1]
+            body = {"statuses": latest}
         elif m := re.fullmatch(
             r"/commits/([^/]+)/check-runs\?check_name=CI%20required&filter=latest",
             path,
@@ -107,7 +137,10 @@ class FakeGitHub:
                 if m[1] == p["head"]["sha"] or m[1] in p.get("commits", ())
             ]
         elif m := re.fullmatch(r"/statuses/([^/]+)", path):
-            self.statuses.append((m[1], json.loads(req.data)))
+            status = json.loads(req.data)
+            self.statuses.append(
+                (m[1], {**status, "created_at": self.now, "updated_at": self.now})
+            )
             body = {}
         else:
             raise AssertionError(f"unexpected call {method} {path}")
@@ -115,7 +148,12 @@ class FakeGitHub:
 
     @property
     def last(self) -> dict:
-        return self.statuses[-1][1]
+        return _posted(self.statuses[-1][1])
+
+
+def _posted(status: dict) -> dict:
+    """A recorded status as the script sent it, without fake timestamps."""
+    return {k: v for k, v in status.items() if k not in ("created_at", "updated_at")}
 
 
 @pytest.fixture
@@ -134,7 +172,7 @@ def _run(gh: FakeGitHub, lin: FakeLinear, *argv: str, output: Path | None = None
         args += ["--output", str(output)]
     return pp.main(
         args,
-        github=pp.GitHub("t", REPO, opener=gh.opener),
+        github=pp.GitHub("t", REPO, opener=gh.opener, sleep=gh.sleep),
         linear=ld.LinearClient("k", opener=lin.opener),
     )
 
@@ -320,7 +358,7 @@ class TestPolicy:
         gh.add_pr()
         out = tmp_path / "out"
         assert _run(gh, lin, "--pr", "7", output=out) == pp.EXIT_OK
-        assert gh.statuses == [
+        assert [(sha, _posted(st)) for sha, st in gh.statuses] == [
             (
                 HEAD,
                 {
@@ -700,3 +738,201 @@ class TestFailsClosed:
         client = pp.GitHub("t", REPO, opener=gh.opener)
         client.set_status(HEAD, "failure", "x" * 500)
         assert len(gh.last["description"]) == 140
+
+
+NEW = "head-sha-3"
+CONFLICT = "has merge conflicts with main"
+
+
+class TestMergeConflicts:
+    """AFX-162: a PR that conflicts with `main` says so, instead of asking
+    for an approval that can't take effect."""
+
+    @pytest.fixture(autouse=True)
+    def _ticket(self, gh, lin):
+        lin.add("AFX-1", "In Review", labels=["Money-path"])
+        gh.add_pr(mergeable=False, mergeable_state="dirty")
+
+    def test_money_path_conflict_names_author_and_new_approval(self, gh, lin, tmp_path):
+        gh.review(7, "widarecu", "APPROVED")
+        out = tmp_path / "out"
+        assert _run(gh, lin, "--pr", "7", output=out) == pp.EXIT_FAILED
+        assert gh.last["state"] == "failure"
+        assert gh.last["description"] == (
+            "AFX-1 has merge conflicts with main: the PR's author merges main in "
+            "and fixes them, then @widarecu approves the new commit"
+        )
+        assert len(gh.last["description"]) <= 140
+        assert _outputs(out)["eligible"] == "false"
+
+    def test_normal_risk_conflict_asks_for_no_approval(self, gh, lin):
+        lin.issues["AFX-1"].labels = []
+        assert _run(gh, lin, "--pr", "7") == pp.EXIT_FAILED
+        assert gh.last["description"] == (
+            "AFX-1 has merge conflicts with main: the PR's author merges main in "
+            "and fixes them"
+        )
+
+    def test_conflict_wins_over_the_author_is_approver_message(self, gh, lin):
+        gh.pulls[7]["user"] = {"login": "widarecu", "type": "User"}
+        assert _run(gh, lin, "--pr", "7") == pp.EXIT_FAILED
+        assert CONFLICT in gh.last["description"]
+        assert "by hand" not in gh.last["description"]
+
+    def test_conflict_turns_off_armed_auto_merge(self, gh, lin, tmp_path):
+        gh.review(7, "widarecu", "APPROVED")
+        gh.pulls[7]["auto_merge"] = {"merge_method": "squash"}
+        out = tmp_path / "out"
+        assert _run(gh, lin, "--head-sha", HEAD, output=out) == pp.EXIT_FAILED
+        assert _outputs(out)["disable"] == "7"
+
+    def test_fixed_by_a_push_then_approved_passes_and_merges(self, gh, lin, tmp_path):
+        assert _run(gh, lin, "--pr", "7") == pp.EXIT_FAILED
+        gh.pulls[7].update(mergeable=True, mergeable_state="clean")
+        gh.pulls[7]["head"]["sha"] = NEW
+        assert _run(gh, lin, "--pr", "7") == pp.EXIT_FAILED
+        assert "needs @widarecu's approval of the latest commit" in (
+            gh.last["description"]
+        )
+        gh.review(7, "widarecu", "APPROVED", sha=NEW)
+        out = tmp_path / "out"
+        assert _run(gh, lin, "--head-sha", NEW, output=out) == pp.EXIT_OK
+        assert gh.statuses[-1][0] == NEW and gh.last["state"] == "success"
+        assert _outputs(out) == {
+            "eligible": "true",
+            "pr": "7",
+            "sha": NEW,
+            "disable": "",
+        }
+
+    def test_waits_for_github_to_work_out_mergeability(self, gh, lin):
+        gh.unsettled[7] = 2
+        assert _run(gh, lin, "--pr", "7") == pp.EXIT_FAILED
+        assert CONFLICT in gh.last["description"]
+        assert gh.slept == [2, 4]
+
+    def test_still_unknown_after_retries_is_checked_as_before(self, gh, lin):
+        gh.unsettled[7] = 10
+        assert _run(gh, lin, "--pr", "7") == pp.EXIT_FAILED
+        assert gh.slept == list(pp.MERGEABLE_RETRY_SECONDS)
+        assert "needs @widarecu's approval" in gh.last["description"]
+
+    def test_closed_pr_is_not_waited_on(self, gh, lin):
+        gh.pulls[7].update(state="closed", mergeable=None, mergeable_state="unknown")
+        assert _run(gh, lin, "--pr", "7") == pp.EXIT_OK
+        assert gh.slept == [] and gh.statuses == []
+
+
+class TestSweep:
+    """AFX-162: GitHub starts no review relay on a conflicted PR, so the
+    push and schedule sweeps re-check PRs whose status is out of date."""
+
+    @pytest.fixture(autouse=True)
+    def _ticket(self, gh, lin):
+        lin.add("AFX-1", "In Review", labels=["Money-path"])
+        gh.add_pr(mergeable=True, mergeable_state="blocked")
+
+    def _conflict(self, gh, number=7):
+        gh.pulls[number].update(mergeable=False, mergeable_state="dirty")
+
+    def test_incident_approval_on_conflicted_pr_is_seen(self, gh, lin, tmp_path):
+        """PR #197: approval asked for, `main` moves and conflicts it, then
+        Wilson approves; the relay never runs but the sweep refreshes."""
+        assert _run(gh, lin, "--pr", "7") == pp.EXIT_FAILED
+        assert "needs @widarecu's approval" in gh.last["description"]
+        self._conflict(gh)
+        gh.main_at = "2026-11-26T09:42:21Z"
+        gh.now = "2026-11-26T09:43:22Z"
+        gh.review(7, "widarecu", "APPROVED")
+        out = tmp_path / "out"
+        gh.now = "2026-11-26T09:45:00Z"
+        assert _run(gh, lin, "--sweep", output=out) == pp.EXIT_FAILED
+        assert CONFLICT in gh.last["description"]
+        assert gh.statuses[-1][1]["updated_at"] == "2026-11-26T09:45:00Z"
+        assert _outputs(out)["eligible"] == "false"
+
+    def test_approval_after_the_conflict_status_refreshes_it(self, gh, lin):
+        self._conflict(gh)
+        _run(gh, lin, "--pr", "7")
+        gh.now = "2026-11-26T09:43:58Z"
+        gh.review(7, "widarecu", "APPROVED")
+        gh.now = "2026-11-26T09:50:00Z"
+        _run(gh, lin, "--sweep")
+        assert len(gh.statuses) == 2
+        assert gh.statuses[-1][1]["updated_at"] == "2026-11-26T09:50:00Z"
+        assert CONFLICT in gh.last["description"]
+
+    def test_main_moving_into_conflict_is_reported_before_any_review(self, gh, lin):
+        assert _run(gh, lin, "--pr", "7") == pp.EXIT_FAILED
+        self._conflict(gh)
+        gh.main_at = "2026-11-26T09:42:21Z"
+        gh.now = "2026-11-26T09:42:50Z"
+        _run(gh, lin, "--sweep")
+        assert CONFLICT in gh.last["description"]
+
+    def test_conflicted_pr_failing_for_another_reason_is_not_rechecked_again(
+        self, gh, lin
+    ):
+        """No loop: a Blocked ticket's message never names the conflict."""
+        lin.issues["AFX-1"].state = "Blocked"
+        _run(gh, lin, "--pr", "7")
+        self._conflict(gh)
+        gh.main_at = "2026-11-26T09:42:21Z"
+        gh.now = "2026-11-26T09:45:00Z"
+        _run(gh, lin, "--sweep")
+        assert len(gh.statuses) == 2 and "Blocked" in gh.last["description"]
+        gh.now = "2026-11-26T09:50:00Z"
+        _run(gh, lin, "--sweep")
+        _run(gh, lin, "--sweep")
+        assert len(gh.statuses) == 2
+
+    def test_conflict_already_reported_and_no_new_review_is_left(self, gh, lin):
+        gh.review(7, "widarecu", "APPROVED")
+        self._conflict(gh)
+        gh.now = "2026-11-26T09:43:00Z"
+        _run(gh, lin, "--pr", "7")
+        lin.calls.clear()
+        assert _run(gh, lin, "--sweep") == pp.EXIT_OK
+        assert len(gh.statuses) == 1
+        assert lin.calls == []
+
+    def test_clean_pr_with_current_status_is_left(self, gh, lin):
+        _run(gh, lin, "--pr", "7")
+        before = len(gh.calls)
+        assert _run(gh, lin, "--sweep") == pp.EXIT_OK
+        assert len(gh.statuses) == 1
+        assert not any("/reviews" in path for _, path in gh.calls[before:])
+
+    def test_conflict_status_cleared_without_a_push_is_rechecked(self, gh, lin):
+        self._conflict(gh)
+        _run(gh, lin, "--pr", "7")
+        gh.pulls[7].update(mergeable=True, mergeable_state="blocked")
+        _run(gh, lin, "--sweep")
+        assert len(gh.statuses) == 2
+        assert "needs @widarecu's approval" in gh.last["description"]
+
+    def test_pr_never_checked_is_checked(self, gh, lin):
+        _run(gh, lin, "--sweep")
+        assert len(gh.statuses) == 1
+
+    def test_unknown_mergeability_is_left_for_the_next_sweep(self, gh, lin):
+        gh.unsettled[7] = 10
+        assert _run(gh, lin, "--sweep") == pp.EXIT_OK
+        assert gh.statuses == []
+
+    def test_only_open_prs_into_main_are_swept(self, gh, lin):
+        gh.add_pr(8, base={"ref": "other"}, head={"sha": "s8"})
+        gh.add_pr(9, state="closed", head={"sha": "s9"})
+        _run(gh, lin, "--sweep")
+        assert [sha for sha, _ in gh.statuses] == [HEAD]
+
+    def test_sweep_can_enable_auto_merge(self, gh, lin, tmp_path):
+        """A missed relay on a clean PR: the sweep's pass sets auto-merge."""
+        gh.review(7, "widarecu", "APPROVED")
+        out = tmp_path / "out"
+        assert _run(gh, lin, "--sweep", output=out) == pp.EXIT_OK
+        assert _outputs(out)["pr"] == "7" and _outputs(out)["sha"] == HEAD
+
+    def test_status_unreadable_exits_error(self, gh, lin):
+        gh.fail_on = "/status?"
+        assert _run(gh, lin, "--sweep") == pp.EXIT_ERROR

@@ -23,6 +23,8 @@ Only `main` exists. Every merge to `main` deploys to staging (Railway backend, V
 5. **Open one PR into `main`** whose title and branch name exactly one AFX ticket: the one it closes. Add the `agent-authored` label: `gh pr edit <number> --add-label agent-authored`.
 6. **Comment on the ticket** what was tested and the CI link. Then **stop**. Merge, deploy and Done are automatic; never set In Review, Done or any later state by hand.
 
+**Your PR conflicts with `main`?** Whoever raised the PR resolves it (Wilson's decision, AFX-162): merge `origin/main` into the PR's branch, fix the conflicts, run `make lint` and `make test-unit` again, and push to the same branch. A Money-path PR then needs Wilson's approval again on that new commit. `pr-policy` says when a PR conflicts; nobody else fixes it for you.
+
 **Blocked on a decision?** `python3 scripts/afx.py block AFX-<n> "<the question>"`. It moves the ticket to Blocked, adds `needs-wilson` and posts the question once, however often it is retried. Then stop; don't guess.
 
 ### How the claim works
@@ -60,7 +62,8 @@ Every taker uses the same `afx start` / `afx block` (AFX-142): Wilson with Claud
 `pr-policy` runs on every PR into `main` and checks:
 1. the PR names exactly one AFX ticket, in **In Progress** or **In Review**;
 2. `CI required` passed on the PR's latest commit;
-3. if the ticket has **Risk: Money-path** (order execution, sizing, kill switch, credentials, deploy gates), Wilson has approved the PR's latest commit.
+3. the PR has no merge conflict with `main`;
+4. if the ticket has **Risk: Money-path** (order execution, sizing, kill switch, credentials, deploy gates), Wilson has approved the PR's latest commit.
 
 When all pass on an `agent-authored` PR, `pr-policy` turns on auto-merge (squash) pinned to that commit. A new push re-runs everything.
 
@@ -69,6 +72,7 @@ When all pass on an `agent-authored` PR, `pr-policy` turns on auto-merge (squash
 - A Money-path PR authored by the approver (Wilson's laptop PRs) can't be approved, since GitHub bars self-approval. `pr-policy` fails it saying so, and Wilson merges it by hand. Only a person's review counts, never a GitHub App's.
 - Don't add `needs-wilson` for risk alone; it is for real blockers.
 - A review triggers the "PR review relay" workflow, which re-runs `pr-policy`, so Wilson's approval takes effect without a new push. The `main` ruleset drops an approval on every new push, so he approves again after any later commit.
+- **Merge conflicts.** A PR that conflicts with `main` fails `pr-policy` with "has merge conflicts with main: the PR's author merges main in and fixes them" (plus ", then @widarecu approves the new commit" on Money-path), never with a request for an approval that can't take effect. The PR's author (the session or agent that raised it) merges `main` in, fixes the conflicts, re-runs the checks and pushes; Wilson then approves the new commit if the ticket is Money-path. GitHub starts no review workflow on a conflicted PR, so the relay can't see an approval there; instead `pr-policy` sweeps the open PRs into `main` on every push to `main` and every 5 minutes, and re-checks any whose status no longer matches its conflict state or that was reviewed since its last conflict status. If the author's session is gone, the daily drift digest lists PRs that stay in conflict for over a day (section 7).
 
 ## 5. CI
 
@@ -94,7 +98,7 @@ Railway's service settings for the backend (Dockerfile builder, `/health` check,
 
 ## 7. Daily reconciliation
 
-`delivery-reconcile.yml` runs daily at 08:17 Sydney. It replays a missed deploy sync for the current `deployed/staging` (in `apply` mode only), then publishes one drift digest on the run summary without moving any ticket: In Progress for more than 3 days with no PR, In Review with no open PR, Done without a deploy-sync marker, Backlog/Ready moves not made by Wilson (matched by Linear user ID), PRs merged into `main` by anyone other than `agentfx-fleet-bot`, and anything it couldn't check. Wilson acts on the digest.
+`delivery-reconcile.yml` runs daily at 08:17 Sydney. It replays a missed deploy sync for the current `deployed/staging` (in `apply` mode only), then publishes one drift digest on the run summary without moving any ticket: In Progress for more than 3 days with no PR, In Review with no open PR, Done without a deploy-sync marker, Backlog/Ready moves not made by Wilson (matched by Linear user ID), PRs merged into `main` by anyone other than `agentfx-fleet-bot`, open PRs into `main` in conflict with it for more than a day (with their author, dated from `pr-policy`'s first conflict status on the PR's latest commit), and anything it couldn't check. Wilson acts on the digest.
 
 ## 8. Wilson's part
 

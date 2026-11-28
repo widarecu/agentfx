@@ -684,6 +684,38 @@ class GhCli:
             )
         return out
 
+    def open_pulls(self) -> list[dict]:
+        """Open PRs into `main`: number, title, author, head_sha and
+        mergeable (False when it conflicts with `main`, None while GitHub
+        is still working that out). Needs `pull-requests: read`."""
+        out: list[dict] = []
+        page = 1
+        while True:
+            batch = (
+                self._get(f"pulls?state=open&base=main&per_page={_PAGE}&page={page}")
+                or []
+            )
+            for pr in batch:
+                # The list endpoint omits mergeable; the single-PR read has it.
+                full = self._get(f"pulls/{pr['number']}") or {}
+                out.append(
+                    {
+                        "number": pr["number"],
+                        "title": pr.get("title"),
+                        "author": (pr.get("user") or {}).get("login"),
+                        "head_sha": (pr.get("head") or {}).get("sha"),
+                        "mergeable": full.get("mergeable"),
+                    }
+                )
+            if len(batch) < _PAGE:
+                return out
+            page += 1
+
+    def commit_statuses(self, sha: str) -> list[dict]:
+        """The latest 100 commit statuses on `sha`, newest first. Needs
+        `statuses: read`."""
+        return self._get(f"commits/{sha}/statuses?per_page={_PAGE}") or []
+
     def commit_pulls(self, sha: str) -> list[dict]:
         pulls: list[dict] = []
         page = 1

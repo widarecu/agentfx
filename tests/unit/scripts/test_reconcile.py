@@ -46,6 +46,16 @@ class FakeGitHub(SyncGitHub):
         super().__init__(**kw)
         self.pr_states: dict[int, str] = dict(pr_states or {})
         self.merged: list[dict] = []
+        self.open: list[dict] = []
+        self.statuses: dict[str, list[dict]] = {}
+
+    def open_pulls(self):
+        self._check()
+        return list(self.open)
+
+    def commit_statuses(self, sha):
+        self._check()
+        return list(self.statuses.get(sha, []))
 
     def merged_pulls(self, since):
         self._check()
@@ -293,6 +303,98 @@ class TestByHandMerges:
         assert (dr.UNCHECKED, "merges") in _kinds(result)
 
 
+def _open(n, *, mergeable=False, author="agentfx-pe[bot]", sha=None):
+    return {
+        "number": n,
+        "title": f"AFX-{n}: change",
+        "author": author,
+        "head_sha": sha or f"sha{n}",
+        "mergeable": mergeable,
+    }
+
+
+def _status(at, description, *, context="pr-policy", state="failure"):
+    return {
+        "context": context,
+        "state": state,
+        "description": description,
+        "created_at": at,
+    }
+
+
+_CONFLICT = (
+    "AFX-30 has merge conflicts with main: the PR's author merges main in "
+    "and fixes them, then @widarecu approves the new commit"
+)
+
+
+class TestConflictedPulls:
+    """AFX-162: open PRs into `main` in conflict for over a day, so a PR
+    whose author's session is gone doesn't sit there unseen."""
+
+    def test_conflict_over_a_day_is_listed_with_its_author(self, gh, lin):
+        gh.open = [_open(30)]
+        gh.statuses["sha30"] = [
+            _status("2026-11-23T09:00:00Z", _CONFLICT),
+            _status("2026-11-22T09:42:30Z", _CONFLICT),
+            _status("2026-11-21T12:37:48Z", "AFX-30 is Money-path: needs approval"),
+        ]
+        result = _run(gh, lin)
+        assert _kinds(result) == [(dr.CONFLICTED, "PR #30")]
+        detail = result.findings[0].detail
+        assert "author agentfx-pe[bot]" in detail
+        assert "AFX-30: change" in detail
+        assert "since 2026-11-22T09:42:30Z" in detail
+        assert "Open PR in conflict with main for over a day" in result.summary
+
+    def test_conflict_under_a_day_is_not_listed(self, gh, lin):
+        gh.open = [_open(30)]
+        gh.statuses["sha30"] = [_status("2026-11-22T12:30:00Z", _CONFLICT)]
+        assert _run(gh, lin).findings == []
+
+    @pytest.mark.parametrize("mergeable", [True, None], ids=["clean", "unknown"])
+    def test_clean_or_undecided_pr_is_not_listed(self, gh, lin, mergeable):
+        gh.open = [_open(30, mergeable=mergeable)]
+        gh.statuses["sha30"] = [_status("2026-11-20T09:00:00Z", _CONFLICT)]
+        assert _run(gh, lin).findings == []
+
+    def test_other_contexts_are_ignored_and_older_conflicts_do_not_count(
+        self, gh, lin
+    ):
+        gh.open = [_open(30)]
+        gh.statuses["sha30"] = [
+            _status("2026-11-23T11:00:00Z", "deploy ok", context="other"),
+            _status("2026-11-23T10:00:00Z", _CONFLICT),
+            _status("2026-11-21T10:00:00Z", "AFX-30 is In Review", state="success"),
+            _status("2026-11-20T10:00:00Z", _CONFLICT),
+        ]
+        assert _run(gh, lin).findings == []
+
+    def test_conflict_pr_policy_has_not_reported_is_unchecked(self, gh, lin):
+        gh.open = [_open(30)]
+        gh.statuses["sha30"] = [_status("2026-11-20T10:00:00Z", "AFX-30 is In Review")]
+        result = _run(gh, lin)
+        assert _kinds(result) == [(dr.UNCHECKED, "PR #30")]
+        assert "not reported" in result.findings[0].detail
+
+    def test_same_conflict_next_day_is_not_repeated(self, gh, lin):
+        gh.open = [_open(30)]
+        gh.statuses["sha30"] = [_status("2026-11-21T09:42:30Z", _CONFLICT)]
+        first = _run(gh, lin)
+        assert _kinds(first) == [(dr.CONFLICTED, "PR #30")]
+        next_day = dr.reconcile(
+            gh,
+            ld.LinearClient("k", opener=lin.opener),
+            repo=REPO,
+            now=NOW + timedelta(days=1),
+            wilson_user_id=WILSON,
+            run_url=RUN,
+            apply=False,
+            previous=first.state,
+        )
+        assert "not repeated" in next_day.summary
+
+
 class TestActors:
     def test_app_user_move_is_flagged_and_named(self, gh, lin):
         lin.add(
@@ -387,7 +489,11 @@ class TestMissedSync:
         lin.add("AFX-1", "In Progress", started_at=OLD)
         result = _run(gh, lin)
         assert result.exit_code == 1
-        assert _kinds(result) == [(dr.STALE, "AFX-1"), (dr.UNCHECKED, "merges")]
+        assert _kinds(result) == [
+            (dr.STALE, "AFX-1"),
+            (dr.UNCHECKED, "merges"),
+            (dr.UNCHECKED, "open PRs"),
+        ]
         assert "GitHub API failed" in result.summary
 
 
@@ -530,6 +636,42 @@ class TestGhCliPullState:
 
         with pytest.raises(ds.GitHubError):
             ds.GhCli(REPO, runner=runner).pull_state(9)
+
+
+class TestGhCliOpenPulls:
+    def test_lists_open_prs_into_main_with_mergeability(self):
+        calls: list[str] = []
+
+        def runner(args):
+            calls.append(args[1])
+            if "pulls?" in args[1]:
+                return json.dumps(
+                    [
+                        {
+                            "number": 30,
+                            "title": "AFX-30: change",
+                            "user": {"login": "agentfx-pe[bot]"},
+                            "head": {"sha": "sha30"},
+                        }
+                    ]
+                )
+            if args[1].endswith("/statuses?per_page=100"):
+                return json.dumps([_status("2026-11-22T09:00:00Z", _CONFLICT)])
+            return json.dumps({"mergeable": False})
+
+        cli = ds.GhCli(REPO, runner=runner)
+        assert cli.open_pulls() == [
+            {
+                "number": 30,
+                "title": "AFX-30: change",
+                "author": "agentfx-pe[bot]",
+                "head_sha": "sha30",
+                "mergeable": False,
+            }
+        ]
+        assert "state=open" in calls[0] and "base=main" in calls[0]
+        assert calls[1] == f"repos/{REPO}/pulls/30"
+        assert cli.commit_statuses("sha30")[0]["description"] == _CONFLICT
 
 
 class TestGhCliMergedPulls:

@@ -4,7 +4,8 @@
 A PR passes when:
   1. its title and head branch name exactly one distinct AFX ticket,
   2. that Linear ticket is In Progress or In Review, and
-  3. if the ticket carries the Money-path label, Wilson's latest review
+  3. it has no merge conflict with `main` (AFX-162), and
+  4. if the ticket carries the Money-path label, Wilson's latest review
      is an approval of the PR's current head commit.
 
 Anything missing, ambiguous, unknown or unreachable fails closed, and so
@@ -19,8 +20,15 @@ within seconds of the check, not on a pass from before a Linear move or
 a later push. Any other auto-merge request on the PR is turned off. Only trusted code from `main` runs this script;
 PR titles and branch names are read through the API, never executed.
 
+GitHub starts no review workflow on a PR that conflicts with `main`, so
+an approval there never reaches the review relay. `--sweep` (on every
+push to `main` and every few minutes) re-checks each open PR into `main`
+whose status no longer matches its conflict state, or that got a review
+after its last conflict status (AFX-162).
+
     python scripts/pr_policy.py --repo widarecu/agentfx --pr 123
     python scripts/pr_policy.py --repo widarecu/agentfx --head-sha <sha>
+    python scripts/pr_policy.py --repo widarecu/agentfx --sweep
 
 Exit codes: 0 pass (or nothing to check), 1 policy failed, 2 API error.
 """
@@ -32,23 +40,26 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from agentfx.integrations import delivery_reconcile as dr  # noqa: E402
 from agentfx.integrations import linear_delivery as ld  # noqa: E402
 
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_ERROR = 2
 
-CONTEXT = "pr-policy"
+CONTEXT = dr.PR_POLICY_CONTEXT
 CI_CHECK = "CI required"
 TARGET_BRANCH = "main"
 ALLOWED_STATES = (ld.IN_PROGRESS, ld.IN_REVIEW)
@@ -60,6 +71,9 @@ DEFAULT_APPROVER = "widarecu"
 GITHUB_API = "https://api.github.com"
 CODEOWNERS_PATH = Path(__file__).resolve().parents[1] / ".github" / "CODEOWNERS"
 CODEOWNERS_ENTRY = "/scripts/pr_policy.py"
+# GitHub works out `mergeable` in the background after a push to the PR
+# or to `main`; until then it reads null with mergeable_state "unknown".
+MERGEABLE_RETRY_SECONDS = (2, 4, 8)
 
 _TICKET = re.compile(r"(?<![A-Za-z0-9])AFX-(\d+)(?![0-9])", re.IGNORECASE)
 _REVIEW_VERDICTS = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
@@ -154,6 +168,15 @@ def evaluate(
             ident,
         )
     money = MONEY_PATH_LABEL in issue.labels
+    if pr.get("mergeable") is False:
+        then = f", then @{approver} approves the new commit" if money else ""
+        return Decision(
+            False,
+            f"{ident} {dr.PR_CONFLICT_PHRASE}: the PR's author merges main in "
+            f"and fixes them{then}",
+            ident,
+            money_path=money,
+        )
     author = ((pr.get("user") or {}).get("login") or "").lower()
     if money and author == approver.lower():
         return Decision(
@@ -214,6 +237,7 @@ class GitHub:
         url: str = GITHUB_API,
         timeout: float = 15.0,
         opener: Opener | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if not token:
             raise GitHubError("GH_TOKEN is empty")
@@ -221,6 +245,7 @@ class GitHub:
         self._base = f"{url}/repos/{repo}"
         self._timeout = timeout
         self._opener = opener or urllib.request.urlopen
+        self._sleep = sleep
 
     def _call(self, method: str, path: str, body: dict | None = None) -> Any:
         req = urllib.request.Request(
@@ -248,6 +273,45 @@ class GitHub:
 
     def pull(self, number: int) -> dict:
         return self._call("GET", f"/pulls/{number}")
+
+    def settled_pull(self, number: int, pr: dict | None = None) -> dict:
+        """The PR (`pr` if already read) once GitHub has worked out whether
+        it conflicts with its base; still `mergeable: null` if that takes
+        longer than the retries."""
+        pr = pr if pr is not None else self.pull(number)
+        for delay in MERGEABLE_RETRY_SECONDS:
+            if pr.get("mergeable") is not None or pr.get("mergeable_state") != "unknown":
+                break
+            self._sleep(delay)
+            pr = self.pull(number)
+        return pr
+
+    def open_pulls(self) -> list[int]:
+        out: list[int] = []
+        page = 1
+        while True:
+            batch = self._call(
+                "GET",
+                f"/pulls?state=open&base={TARGET_BRANCH}&per_page=100&page={page}",
+            )
+            out.extend(p["number"] for p in batch or [])
+            if not batch or len(batch) < 100:
+                return out
+            page += 1
+
+    def main_moved_at(self) -> str | None:
+        """When `main`'s latest commit landed (its committer date)."""
+        body = self._call("GET", f"/branches/{TARGET_BRANCH}")
+        commit = ((body or {}).get("commit") or {}).get("commit") or {}
+        return (commit.get("committer") or {}).get("date")
+
+    def policy_status(self, sha: str) -> dict | None:
+        """The latest `pr-policy` status on `sha`, if any."""
+        body = self._call("GET", f"/commits/{sha}/status?per_page=100")
+        for status in (body or {}).get("statuses") or []:
+            if status.get("context") == CONTEXT:
+                return status
+        return None
 
     def reviews(self, number: int) -> list[dict]:
         out: list[dict] = []
@@ -288,14 +352,66 @@ class GitHub:
         )
 
 
+def _in_scope(pr: dict) -> bool:
+    return (
+        pr.get("state") == "open"
+        and (pr.get("base") or {}).get("ref") == TARGET_BRANCH
+    )
+
+
+def _when(ts: str | None) -> datetime | None:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
+
+
+def _after(ts: str | None, written: datetime | None) -> bool:
+    when = _when(ts)
+    return when is not None and (written is None or when > written)
+
+
+def needs_recheck(github: GitHub, pr: dict, main_moved_at: str | None) -> bool:
+    """Sweep: True when the PR's `pr-policy` status may be out of date with
+    its conflict state: never checked; says conflicted but no longer is;
+    conflicted, the status doesn't say so and `main` moved since it was
+    written; or conflicted and reviewed since (the relay never ran). Each
+    re-check writes a newer status, so none of these repeats by itself."""
+    mergeable = pr.get("mergeable")
+    if mergeable is None:
+        return False  # GitHub hasn't decided yet; the next sweep looks again
+    status = github.policy_status(pr["head"]["sha"])
+    if status is None:
+        return True
+    says_conflict = dr.PR_CONFLICT_PHRASE in (status.get("description") or "")
+    if mergeable is True:
+        return says_conflict
+    written = _when(status.get("updated_at") or status.get("created_at"))
+    if not says_conflict and _after(main_moved_at, written):
+        return True
+    return any(
+        _after(r.get("submitted_at"), written) for r in github.reviews(pr["number"])
+    )
+
+
+def sweep(github: GitHub) -> list[int]:
+    """Open PRs into `main` whose `pr-policy` status needs a re-check."""
+    numbers = github.open_pulls()
+    main_moved_at = github.main_moved_at() if numbers else None
+    due = []
+    for number in numbers:
+        pr = github.settled_pull(number)
+        if _in_scope(pr) and needs_recheck(github, pr, main_moved_at):
+            due.append(number)
+    return due
+
+
 def check(
     number: int, github: GitHub, linear: ld.LinearClient, approver: str, repo: str
 ) -> tuple[int, MergeAction]:
     """Check one PR and record the status. Returns (exit code, merge action)."""
     pr = github.pull(number)
-    if pr.get("state") != "open" or (pr.get("base") or {}).get("ref") != TARGET_BRANCH:
+    if not _in_scope(pr):
         print(f"#{number}: not an open PR into {TARGET_BRANCH}, nothing to check")
         return EXIT_OK, MergeAction()
+    pr = github.settled_pull(number, pr)
     sha = pr["head"]["sha"]
     try:
         sharing = sorted(set(github.pulls_for_sha(sha)) - {number})
@@ -334,6 +450,11 @@ def main(
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--pr", type=int)
     target.add_argument("--head-sha")
+    target.add_argument(
+        "--sweep",
+        action="store_true",
+        help="re-check open PRs whose status is out of date with their conflict state",
+    )
     parser.add_argument(
         "--approver",
         default=os.environ.get("PR_POLICY_APPROVER"),
@@ -348,7 +469,13 @@ def main(
             raise GitHubError("--repo or GITHUB_REPOSITORY is required")
         github = github or GitHub(os.environ.get("GH_TOKEN", "").strip(), args.repo)
         linear = linear or ld.LinearClient.from_env()
-        numbers = [args.pr] if args.pr else github.pulls_for_sha(args.head_sha)
+        if args.sweep:
+            numbers = sweep(github)
+            print(f"sweep: re-checking {', '.join(map(str, numbers)) or 'none'}")
+        elif args.pr:
+            numbers = [args.pr]
+        else:
+            numbers = github.pulls_for_sha(args.head_sha)
         code, enable, sha, disable = EXIT_OK, "", "", []
         for number in numbers:
             result, action = check(number, github, linear, args.approver, args.repo)
@@ -361,7 +488,7 @@ def main(
         print(f"pr-policy error: {err}", file=sys.stderr)
         _write_outputs(args.output, eligible="false", pr="", sha="", disable="")
         return EXIT_ERROR
-    if not numbers:
+    if not numbers and not args.sweep:
         print(f"no open PR has head {args.head_sha}, nothing to check")
     _write_outputs(
         args.output,
