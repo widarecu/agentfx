@@ -11,6 +11,8 @@
    * Done in the window without a deploy-sync (or legacy promote) marker,
    * Backlog/Ready moves in the window by anyone other than Wilson,
    * PRs merged into `main` in the window by anyone other than the fleet bot,
+   * open PRs into `main` in conflict with it for over a day (AFX-162),
+     dated from the oldest `pr-policy` conflict status on the PR head,
    * anything that could not be checked (history or PR state unavailable).
 3. Publishes one digest: the GitHub Actions job summary. `digest.json`
    (uploaded as an artifact) carries the window and a fingerprint of the
@@ -33,6 +35,11 @@ DONE = "Done"
 WATCHED_STATES = [ld.IN_PROGRESS, ld.IN_REVIEW]
 HUMAN_OWNED_STATES = ("Backlog", ld.READY)
 STALE_AFTER = timedelta(days=3)
+CONFLICT_AFTER = timedelta(days=1)
+# `scripts/pr_policy.py` puts this in the `pr-policy` status of a PR that
+# conflicts with `main`; the digest dates the conflict from it.
+PR_POLICY_CONTEXT = "pr-policy"
+PR_CONFLICT_PHRASE = "has merge conflicts with main"
 DEFAULT_WINDOW_DAYS = 7
 DEFAULT_WILSON_USER_ID = "4c000ffe-cccc-4d3c-bd74-04a3a009032c"
 FLEET_BOT_LOGIN = "agentfx-fleet-bot"
@@ -45,6 +52,7 @@ REVIEW = "in-review-no-open-pr"
 UNMARKED = "done-without-deploy"
 TRANSITION = "status-set-by-other"
 BY_HAND = "merged-by-hand"
+CONFLICTED = "conflicted-pr"
 UNCHECKED = "unchecked"
 
 _TITLES = {
@@ -53,6 +61,7 @@ _TITLES = {
     UNMARKED: "Done without a deploy marker",
     TRANSITION: "Backlog/Ready set by someone other than Wilson",
     BY_HAND: "PR merged into main by someone other than the fleet bot",
+    CONFLICTED: "Open PR in conflict with main for over a day",
     UNCHECKED: "Could not be checked",
 }
 
@@ -155,6 +164,7 @@ def find_drift(
         if (_parse(issue.get("updatedAt")) or now) >= since:
             out.extend(_transition_drift(client, issue, since, wilson_user_id))
     out.extend(_by_hand_merges(gh, since))
+    out.extend(_stale_conflicts(gh, now))
     return out
 
 
@@ -243,6 +253,67 @@ def _by_hand_merges(gh, since: datetime) -> list[Finding]:
                 key=f"#{n}|{pr.get('merged_at')}",
             )
         )
+    return out
+
+
+def conflict_since(statuses: list[dict]) -> datetime | None:
+    """When `pr-policy` first reported the current conflict: the oldest
+    of the unbroken run of conflict statuses at the top of `statuses`
+    (newest first). None when the latest `pr-policy` status isn't one."""
+    since = None
+    for status in statuses:
+        if status.get("context") != PR_POLICY_CONTEXT:
+            continue
+        if PR_CONFLICT_PHRASE not in (status.get("description") or ""):
+            break
+        since = _parse(status.get("created_at")) or since
+    return since
+
+
+def _stale_conflicts(gh, now: datetime) -> list[Finding]:
+    try:
+        pulls = gh.open_pulls()
+    except ds.GitHubError as exc:
+        return [
+            Finding(UNCHECKED, "open PRs", f"open PRs unavailable: {exc}", "open-pulls")
+        ]
+    out = []
+    for pr in sorted(pulls, key=lambda p: p["number"]):
+        if pr.get("mergeable") is not False:
+            continue  # clean, or GitHub hasn't decided: tomorrow's run looks again
+        n = pr["number"]
+        try:
+            since = conflict_since(gh.commit_statuses(pr["head_sha"]))
+        except ds.GitHubError as exc:
+            out.append(
+                Finding(
+                    UNCHECKED,
+                    f"PR #{n}",
+                    f"statuses unavailable: {exc}",
+                    f"status #{n}",
+                )
+            )
+            continue
+        if since is None:
+            out.append(
+                Finding(
+                    UNCHECKED,
+                    f"PR #{n}",
+                    "conflicts with main, but pr-policy has not reported it yet",
+                    f"conflict #{n}",
+                )
+            )
+        elif now - since > CONFLICT_AFTER:
+            out.append(
+                Finding(
+                    CONFLICTED,
+                    f"PR #{n}",
+                    f"{pr.get('title')} (author {pr.get('author') or 'unknown'}): "
+                    f"in conflict since {_iso(since)}; its author merges main in "
+                    "and fixes it",
+                    key=f"#{n}|{_iso(since)}",
+                )
+            )
     return out
 
 
