@@ -29,12 +29,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agentfx.agents.fleet import linear_webhook_dispatch as lwd
-from agentfx.agents.fleet import pe_workspace
+from agentfx.agents.fleet import linear_pe_queue, pe_workspace
+from agentfx.agents.fleet.linear_pe_queue import ClaimOutcome
 from agentfx.agents.fleet.pe_workspace import (
     WorkspaceDispatchResult,
     WorkspaceTaskSpec,
 )
-from agentfx.api.models.agent_workspace_run import AgentWorkspaceRun
+from agentfx.api.models.agent_workspace_run import (
+    AgentWorkspaceRun,
+    AgentWorkspaceRunStatus,
+)
 from agentfx.services import agent_orchestrator
 
 pytestmark = pytest.mark.unit
@@ -82,6 +86,7 @@ def _patch_bg(
     adapter_raises=None,
     existing_row=None,
     linked_row=None,
+    claim_result=None,
 ):
     """Wire up every external dependency as a MagicMock so the test
     only exercises the orchestrator's branching. Returns the mocks
@@ -106,6 +111,10 @@ def _patch_bg(
             )
         )
     mock_resolve = MagicMock(return_value=mock_adapter)
+    mock_claim = MagicMock(return_value=claim_result or ClaimOutcome(True))
+    mock_rollback = MagicMock(return_value=True)
+    monkeypatch.setattr(linear_pe_queue, "claim_for_dispatch", mock_claim)
+    monkeypatch.setattr(linear_pe_queue, "rollback_to_ready", mock_rollback)
 
     # DB session: query().filter().first() returns existing_row for
     # the idempotency lookup; the second query (for the row-link step)
@@ -138,6 +147,8 @@ def _patch_bg(
         "budget": mock_budget,
         "adapter": mock_adapter,
         "resolve": mock_resolve,
+        "claim": mock_claim,
+        "rollback": mock_rollback,
         "build_slug": mock_build_slug,
     }
 
@@ -542,3 +553,113 @@ class TestLinearOutageTolerance:
         assert dispatched is True
         assert reason == "ok"
         mocks["adapter"].dispatch.assert_called_once()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# AFX-180: delegation claims the ticket before a session starts
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _run(**kwargs):
+    return lwd.dispatch_from_linear_webhook(
+        delivery_id=_DELIVERY_ID, payload=_real_payload(), now=_NOW, **kwargs
+    )
+
+
+def test_claim_happens_before_the_adapter_is_called(monkeypatch):
+    mocks = _patch_bg(monkeypatch)
+    order = MagicMock()
+    order.attach_mock(mocks["claim"], "claim")
+    order.attach_mock(mocks["adapter"].dispatch, "dispatch")
+
+    assert _run() == (True, "ok")
+
+    assert [c[0] for c in order.mock_calls] == ["claim", "dispatch"]
+    mocks["claim"].assert_called_once_with(
+        "AFX-8", link="branch `agent/2026-11-06-afx-8-qa-tech-health`"
+    )
+    mocks["rollback"].assert_not_called()
+
+
+def test_claim_refused_means_no_dispatch_and_one_error_activity(monkeypatch):
+    mocks = _patch_bg(
+        monkeypatch,
+        claim_result=ClaimOutcome(
+            False, "AFX-8 is 'In Progress', not 'Ready'", refused=True
+        ),
+    )
+
+    dispatched, reason = _run()
+
+    assert dispatched is False and reason.startswith("claim_refused:")
+    mocks["resolve"].assert_not_called()
+    mocks["adapter"].dispatch.assert_not_called()
+    mocks["rollback"].assert_not_called()
+    mocks["error"].assert_called_once()
+    text = mocks["error"].call_args.args[1]
+    assert "couldn't claim" in text and "'In Progress', not 'Ready'" in text
+    assert "another taker" in text
+
+
+def test_claim_unavailable_says_nothing_was_dispatched(monkeypatch):
+    mocks = _patch_bg(
+        monkeypatch,
+        claim_result=ClaimOutcome(False, "ClaimStoreError: app token not minted"),
+    )
+
+    assert _run()[0] is False
+    mocks["adapter"].dispatch.assert_not_called()
+    mocks["error"].assert_called_once()
+    assert "claim step failed" in mocks["error"].call_args.args[1]
+
+
+def test_claim_then_adapter_refusal_rolls_back_once(monkeypatch):
+    mocks = _patch_bg(
+        monkeypatch,
+        adapter_result=WorkspaceDispatchResult(accepted=False, reason="no config"),
+    )
+
+    assert _run() == (False, "adapter_refused:no config")
+
+    mocks["claim"].assert_called_once()
+    mocks["rollback"].assert_called_once()
+    assert mocks["rollback"].call_args.args == ("AFX-8",)
+
+
+def test_claim_then_adapter_exception_rolls_back_once(monkeypatch):
+    mocks = _patch_bg(monkeypatch, adapter_raises=RuntimeError("boom"))
+
+    assert _run()[0] is False
+    mocks["rollback"].assert_called_once()
+
+
+def test_claim_then_workspace_failed_rolls_back_once(monkeypatch):
+    row = MagicMock()
+    row.id = "run_wsp_abc123" + ("0" * 20)
+    row.status = AgentWorkspaceRunStatus.WORKSPACE_FAILED
+    row.summary = "sessions.create 400"
+    mocks = _patch_bg(monkeypatch, linked_row=row)
+
+    assert _run() == (False, "adapter_persisted_but_failed")
+
+    mocks["rollback"].assert_called_once()
+    assert mocks["rollback"].call_args.kwargs["reason_summary"] == "sessions.create 400"
+
+
+def test_duplicate_delivery_does_not_claim_or_roll_back(monkeypatch):
+    existing = MagicMock()
+    existing.id = "run_existing_1234"
+    mocks = _patch_bg(monkeypatch, existing_row=existing)
+
+    assert _run()[0] is False
+
+    mocks["claim"].assert_not_called()
+    mocks["rollback"].assert_not_called()
+    mocks["adapter"].dispatch.assert_not_called()
+
+
+def test_budget_denied_does_not_claim(monkeypatch):
+    mocks = _patch_bg(monkeypatch, budget_result=(False, "cap"))
+
+    assert _run() == (False, "budget:cap")
+    mocks["claim"].assert_not_called()
