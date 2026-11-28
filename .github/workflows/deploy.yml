@@ -8,9 +8,11 @@ name: Deploy
 # * Every push to main runs, docs-only included: `plan` compares the commit
 #   with the `deployed/staging` tag and deploys only the components whose
 #   source changed. Nothing to deploy is an explicit success after verify.
-# * `verify` checks backend /health reports the deployed source SHA (or, for
-#   an unchanged backend, a SHA with the same backend source) and that the
-#   frontend URL serves.
+# * `verify` checks backend /health and the frontend's /source-sha.txt
+#   report the deployed source SHA (or, for an unchanged component, a SHA
+#   with the same component source) and that the frontend URL serves.
+# * Each deploy job's guard refuses a commit older than the tag or than the
+#   SHA its live component reports (AFX-129).
 # * `record` moves `deployed/staging` only after a verified deploy, keeping
 #   the previous SHA in `deployed/staging-previous`. It never moves the tag
 #   backwards, so stale retries cannot regress it.
@@ -179,7 +181,7 @@ jobs:
           fetch-depth: 0
 
       - name: Refuse to deploy an older commit than staging runs
-        run: python3 scripts/deploy_staging.py guard --sha "$TARGET_SHA" --component frontend
+        run: python3 scripts/deploy_staging.py guard --sha "$TARGET_SHA" --component frontend --frontend-url "$FRONTEND_URL"
 
       - name: Check out the commit to deploy
         run: git checkout --detach "$TARGET_SHA"
@@ -212,8 +214,10 @@ jobs:
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
 
       # `vercel deploy` waits for the build and exits non-zero if it fails.
+      # VITE_SOURCE_SHA makes the build write /source-sha.txt
+      # (portal/web/vite-plugins/sourceSha.ts), which guard and verify read.
       - name: Deploy to Vercel (production)
-        run: vercel deploy --prod --token=${{ secrets.VERCEL_TOKEN }}
+        run: vercel deploy --prod --build-env VITE_SOURCE_SHA="$TARGET_SHA" --token=${{ secrets.VERCEL_TOKEN }}
         env:
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
@@ -237,13 +241,14 @@ jobs:
       backend_detail: ${{ steps.verify.outputs.backend_detail }}
       backend_live_sha: ${{ steps.verify.outputs.backend_live_sha }}
       frontend_detail: ${{ steps.verify.outputs.frontend_detail }}
+      frontend_live_sha: ${{ steps.verify.outputs.frontend_live_sha }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Verify backend /health SHA and frontend URL
+      - name: Verify backend /health SHA and frontend source-sha.txt
         id: verify
         run: >-
           python3 scripts/deploy_staging.py verify --sha "$TARGET_SHA"

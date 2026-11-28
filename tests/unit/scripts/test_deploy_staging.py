@@ -103,6 +103,11 @@ def _health(sha: str | None) -> tuple[int, str]:
 _BACKEND = "https://backend.test"
 _FRONTEND = "https://frontend.test"
 _HEALTH = f"{_BACKEND}/health"
+_SHA_FILE = f"{_FRONTEND}/source-sha.txt"
+
+
+def _sha_file(sha: str) -> tuple[int, str]:
+    return 200, f"{sha}\n"
 
 
 class FakeGh:
@@ -393,6 +398,74 @@ def test_guard_allows_backend_when_health_is_unreachable(repo):
     )
 
 
+def test_guard_refuses_a_rerun_of_an_older_frontend_than_the_live_one(repo):
+    """AFX-129: A is tagged; B's frontend failed; C's frontend went live but
+    C's backend failed, so A stays tagged. Re-running B's frontend must not
+    replace C's: the live frontend's source-sha.txt says C."""
+    a = repo.initial
+    b = repo.commit({"portal/web/src/App.tsx": "b\n"}, "B")
+    c = repo.commit(
+        {"portal/web/src/App.tsx": "c\n", "src/agentfx/api/main.py": "c\n"}, "C"
+    )
+    assert ds.relation(repo.g, b, a) == "newer"
+    http = FakeHttp({_SHA_FILE: [_sha_file(c)]})
+    problem = ds.guard(repo.g, b, "frontend", a, fetch=http, frontend_url=_FRONTEND)
+    assert "the staging frontend already runs" in problem
+    assert c in problem
+    assert http.calls == [_SHA_FILE]
+
+
+def test_guard_allows_frontend_newer_than_the_live_one(repo):
+    old = repo.commit({"portal/web/src/App.tsx": "1\n"})
+    new = repo.commit({"portal/web/src/App.tsx": "2\n"})
+    http = FakeHttp({_SHA_FILE: [_sha_file(old)]})
+    assert (
+        ds.guard(repo.g, new, "frontend", old, fetch=http, frontend_url=_FRONTEND) == ""
+    )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [(404, ""), (0, "timeout"), (200, "<!doctype html><html></html>")],
+    ids=["missing", "unreachable", "spa-fallback"],
+)
+def test_guard_allows_frontend_without_a_reported_sha(repo, response):
+    """Before the first build that writes source-sha.txt, only the tag guards.
+    Vercel's SPA rewrite answers a missing file with index.html and a 200."""
+    sha = repo.commit({"portal/web/src/App.tsx": "1\n"})
+    http = FakeHttp({_SHA_FILE: [response]})
+    assert (
+        ds.guard(
+            repo.g, sha, "frontend", repo.initial, fetch=http, frontend_url=_FRONTEND
+        )
+        == ""
+    )
+
+
+def test_guard_cli_refuses_the_frontend_rerun_scenario(repo, capsys):
+    b = repo.commit({"portal/web/src/App.tsx": "b\n"}, "B")
+    c = repo.commit({"portal/web/src/App.tsx": "c\n"}, "C")
+    repo.tag(repo.initial)
+    code = ds.main(
+        [
+            "--repo-dir",
+            str(repo.path),
+            "guard",
+            "--sha",
+            b,
+            "--component",
+            "frontend",
+            "--frontend-url",
+            _FRONTEND,
+        ],
+        fetch=FakeHttp({_SHA_FILE: [_sha_file(c)]}),
+    )
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "::error::Not deploying the frontend" in out
+    assert f"already runs {c}" in out
+
+
 def test_guard_cli_exits_non_zero_for_stale(repo, capsys):
     old = repo.commit({"src/agentfx/api/main.py": "app = 2\n"})
     new = repo.commit({"src/agentfx/api/main.py": "app = 3\n"})
@@ -510,26 +583,73 @@ def _verify_frontend(repo, sha, deployed, http):
     )
 
 
-def test_verify_frontend_url_serves(repo):
+def test_verify_deployed_frontend_reports_the_target(repo):
     sha = repo.commit({"portal/web/src/App.tsx": "1\n"})
-    check = _verify_frontend(repo, sha, True, FakeHttp({_FRONTEND: [(200, "<html>")]}))
-    assert check.ok and check.expected == sha
+    http = FakeHttp({_SHA_FILE: [_sha_file(sha)], _FRONTEND: [(200, "<html>")]})
+    check = _verify_frontend(repo, sha, True, http)
+    assert check.ok and check.expected == sha and check.live_sha == sha
+    assert f"source-sha.txt reports {sha[:12]} (deployed)" in check.detail
 
 
-def test_verify_unchanged_frontend_names_its_last_applicable_sha(repo):
+def test_verify_frontend_waits_for_the_new_build_to_go_live(repo):
+    sha = repo.commit({"portal/web/src/App.tsx": "1\n"})
+    http = FakeHttp(
+        {
+            _SHA_FILE: [_sha_file(repo.initial), _sha_file(sha)],
+            _FRONTEND: [(200, "<html>")],
+        }
+    )
+    assert _verify_frontend(repo, sha, True, http).ok
+    assert http.calls.count(_SHA_FILE) == 2
+
+
+def test_verify_frontend_sha_mismatch_fails_even_when_the_page_serves(repo):
+    """AFX-129: a 200 is not proof; an older live build must fail verify."""
+    sha = repo.commit({"portal/web/src/App.tsx": "1\n"})
+    http = FakeHttp(
+        {_SHA_FILE: [_sha_file(repo.initial)], _FRONTEND: [(200, "<html>")]}
+    )
+    check = _verify_frontend(repo, sha, True, http)
+    assert not check.ok
+    assert check.live_sha == repo.initial
+    assert f"source-sha.txt reports {repo.initial[:12]}, expected {sha[:12]}" in (
+        check.detail
+    )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [(404, ""), (0, "timeout"), (200, "<!doctype html>"), (200, "abc123\n")],
+)
+def test_verify_frontend_fails_without_a_reported_sha(repo, response):
+    sha = repo.commit({"portal/web/src/App.tsx": "1\n"})
+    http = FakeHttp({_SHA_FILE: [response], _FRONTEND: [(200, "<html>")]})
+    check = _verify_frontend(repo, sha, True, http)
+    assert not check.ok and "source-sha.txt" in check.detail
+
+
+def test_verify_unchanged_frontend_accepts_its_last_applicable_sha(repo):
     fe_sha = repo.commit({"portal/web/src/App.tsx": "1\n"})
     be_sha = repo.commit({"src/agentfx/api/main.py": "app = 2\n"})
-    check = _verify_frontend(
-        repo, be_sha, False, FakeHttp({_FRONTEND: [(200, "<html>")]})
-    )
+    http = FakeHttp({_SHA_FILE: [_sha_file(fe_sha)], _FRONTEND: [(200, "<html>")]})
+    check = _verify_frontend(repo, be_sha, False, http)
     assert check.ok and check.expected == fe_sha
     assert f"unchanged since {fe_sha[:12]}" in check.detail
 
 
-def test_verify_frontend_failure(repo):
-    check = _verify_frontend(
-        repo, repo.initial, True, FakeHttp({_FRONTEND: [(404, "")]})
-    )
+def test_verify_unchanged_frontend_rejects_a_different_frontend_source(repo):
+    stale_build = repo.initial
+    repo.commit({"portal/web/src/App.tsx": "1\n"})
+    be_sha = repo.commit({"src/agentfx/api/main.py": "app = 2\n"})
+    http = FakeHttp({_SHA_FILE: [_sha_file(stale_build)], _FRONTEND: [(200, "<html>")]})
+    check = _verify_frontend(repo, be_sha, False, http)
+    assert not check.ok
+    assert "frontend source differs" in check.detail
+
+
+def test_verify_frontend_fails_when_the_page_does_not_serve(repo):
+    http = FakeHttp({_SHA_FILE: [_sha_file(repo.initial)], _FRONTEND: [(404, "")]})
+    check = _verify_frontend(repo, repo.initial, True, http)
     assert not check.ok and "HTTP 404" in check.detail
 
 
@@ -537,7 +657,13 @@ def test_verify_cli_writes_outcomes_and_fails_on_mismatch(repo, tmp_path, monkey
     sha = repo.commit({"src/agentfx/api/main.py": "app = 2\n"})
     out = tmp_path / "out"
     monkeypatch.setenv("GITHUB_OUTPUT", str(out))
-    http = FakeHttp({_HEALTH: [_health(repo.initial)], _FRONTEND: [(200, "<html>")]})
+    http = FakeHttp(
+        {
+            _HEALTH: [_health(repo.initial)],
+            _SHA_FILE: [_sha_file(repo.initial)],
+            _FRONTEND: [(200, "<html>")],
+        }
+    )
     clock = Clock()
     argv = [
         "--repo-dir",
@@ -559,6 +685,7 @@ def test_verify_cli_writes_outcomes_and_fails_on_mismatch(repo, tmp_path, monkey
     assert outputs["backend_check"] == "failed"
     assert outputs["frontend_check"] == "passed"
     assert outputs["backend_live_sha"] == repo.initial
+    assert outputs["frontend_live_sha"] == repo.initial
 
 
 # ─────────────────────────────────────────────────────────────────────
