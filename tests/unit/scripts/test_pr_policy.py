@@ -791,8 +791,9 @@ class TestMergeConflicts:
         gh.pulls[7].update(mergeable=True, mergeable_state="clean")
         gh.pulls[7]["head"]["sha"] = NEW
         assert _run(gh, lin, "--pr", "7") == pp.EXIT_FAILED
-        assert "needs @widarecu's approval of the latest commit" in (
-            gh.last["description"]
+        assert (
+            "needs @widarecu's approval of the latest commit"
+            in (gh.last["description"])
         )
         gh.review(7, "widarecu", "APPROVED", sha=NEW)
         out = tmp_path / "out"

@@ -358,9 +358,7 @@ class TestConflictedPulls:
         gh.statuses["sha30"] = [_status("2026-11-20T09:00:00Z", _CONFLICT)]
         assert _run(gh, lin).findings == []
 
-    def test_other_contexts_are_ignored_and_older_conflicts_do_not_count(
-        self, gh, lin
-    ):
+    def test_other_contexts_are_ignored_and_older_conflicts_do_not_count(self, gh, lin):
         gh.open = [_open(30)]
         gh.statuses["sha30"] = [
             _status("2026-11-23T11:00:00Z", "deploy ok", context="other"),
