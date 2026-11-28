@@ -8,11 +8,12 @@ tag, the record of the last commit fully running on staging:
 * `plan`    — compare the target SHA with `deployed/staging` and decide which
   components (backend on Railway, frontend on Vercel) need deploying.
   Docs-only (or tests-only) changes need nothing and are an explicit success.
-* `guard`   — refuse to deploy a commit older than what staging already runs,
-  so a stale "Re-run failed jobs" or manual retry cannot regress staging.
-* `verify`  — backend `/health` must report the target SHA when the backend
-  was deployed, or a SHA with the same backend source when it was not; the
-  frontend URL must serve.
+* `guard`   — refuse to deploy a commit older than what staging already runs
+  (the tag, and the SHA the live component reports), so a stale "Re-run
+  failed jobs" or manual retry cannot regress staging.
+* `verify`  — backend `/health` and the frontend's `/source-sha.txt` must
+  report the target SHA when the component was deployed, or a SHA with the
+  same component source when it was not; the frontend URL must also serve.
 * `record`  — after a verified deploy, keep the previous SHA in
   `deployed/staging-previous`, then fast-forward `deployed/staging`.
 * `summary` — always runs: one backend / frontend / verify / tag outcome,
@@ -53,6 +54,10 @@ PREVIOUS_TAG_REF = f"refs/tags/{PREVIOUS_TAG}"
 DEFAULT_BACKEND_URL = "https://agentfx-staging.up.railway.app"
 DEFAULT_FRONTEND_URL = "https://agentfx-liart.vercel.app"
 DEFAULT_REPO = "widarecu/agentfx"
+
+# Written into the frontend build by portal/web/vite-plugins/sourceSha.ts
+# (AFX-129); Vercel serves it as a static file at the site root.
+FRONTEND_SHA_FILE = "source-sha.txt"
 
 BACKEND = "backend"
 FRONTEND = "frontend"
@@ -327,7 +332,7 @@ def make_plan(git: Git, target: str, tag_sha: str | None) -> Plan:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Backend source SHA
+# Live source SHAs
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -346,6 +351,34 @@ def read_backend_sha(
     if not _SHA_RE.match(sha):
         return None, "/health does not report a source_sha"
     return sha, ""
+
+
+def read_frontend_sha(
+    fetch: Fetch, frontend_url: str, timeout: float = 15
+) -> tuple[str | None, str]:
+    """Return (source_sha, problem) from the frontend's `source-sha.txt`.
+
+    A build without the file still answers 200 with `index.html` (the SPA
+    rewrite), so only a body that is exactly a SHA counts.
+    """
+    status, body = fetch(f"{frontend_url.rstrip('/')}/{FRONTEND_SHA_FILE}", timeout)
+    if status != 200:
+        return (
+            None,
+            f"{FRONTEND_SHA_FILE} returned HTTP {status or 'error'} {body[:200]}".strip(),
+        )
+    sha = body.strip().lower()
+    if not _SHA_RE.match(sha):
+        return None, f"{FRONTEND_SHA_FILE} does not report a source SHA"
+    return sha, ""
+
+
+def read_live_sha(
+    fetch: Fetch, component: str, *, backend_url: str, frontend_url: str
+) -> tuple[str | None, str]:
+    if component == BACKEND:
+        return read_backend_sha(fetch, backend_url)
+    return read_frontend_sha(fetch, frontend_url)
 
 
 def same_component_source(git: Git, component: str, live: str, target: str) -> bool:
@@ -370,8 +403,14 @@ def guard(
     *,
     fetch: Fetch = http_get,
     backend_url: str = DEFAULT_BACKEND_URL,
+    frontend_url: str = DEFAULT_FRONTEND_URL,
 ) -> str:
-    """Return "" when deploying `target` is safe, else why it is not."""
+    """Return "" when deploying `target` is safe, else why it is not.
+
+    The tag can lag behind what is live: a newer commit's component may have
+    deployed while its run failed elsewhere. So the SHA the live component
+    reports also counts; unreachable or unreported, only the tag is checked.
+    """
     rel = relation(git, target, tag_sha)
     if rel == "diverged":
         return diverged_problem(target, tag_sha)
@@ -380,18 +419,14 @@ def guard(
             f"{TAG} is already at {tag_sha}, which contains {target}; "
             "deploying the older commit would regress staging"
         )
-    if component == BACKEND:
-        live, _ = read_backend_sha(fetch, backend_url)
-        if (
-            live
-            and live != target
-            and git.resolve(live)
-            and git.is_ancestor(target, live)
-        ):
-            return (
-                f"the staging backend already runs {live}, which contains {target}; "
-                "deploying the older commit would regress it"
-            )
+    live, _ = read_live_sha(
+        fetch, component, backend_url=backend_url, frontend_url=frontend_url
+    )
+    if live and live != target and git.resolve(live) and git.is_ancestor(target, live):
+        return (
+            f"the staging {component} already runs {live}, which contains {target}; "
+            "deploying the older commit would regress it"
+        )
     return ""
 
 
@@ -409,6 +444,58 @@ class Check:
     live_sha: str = ""
 
 
+def _verify_component(
+    git: Git,
+    component: str,
+    target: str,
+    deployed: bool,
+    *,
+    read: Callable[[], tuple[str | None, str]],
+    label: str,
+    timeout: float,
+    interval: float,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+    serves: Callable[[], str] | None = None,
+) -> Check:
+    """Poll until the live `component` reports the expected source SHA.
+
+    `read` returns (live_sha, problem); `serves`, if given, returns "" when the
+    component also answers normally, else the problem.
+    """
+    if deployed:
+        expected = target
+    else:
+        expected = git.last_commit(target, component_paths(component)) or target
+    how = "deployed" if deployed else f"unchanged since {expected[:12]}"
+    deadline = clock() + timeout
+    while True:
+        live, problem = read()
+        if live and (
+            live == target
+            if deployed
+            else same_component_source(git, component, live, target)
+        ):
+            problem = serves() if serves else ""
+            if not problem:
+                return Check(
+                    component,
+                    True,
+                    expected,
+                    f"{label} reports {live[:12]} ({how})",
+                    live,
+                )
+        elif live:
+            problem = (
+                f"{label} reports {live[:12]}, expected {target[:12]}"
+                if deployed
+                else f"{label} reports {live[:12]}, whose {component} source differs from {target[:12]}"
+            )
+        if clock() >= deadline:
+            return Check(component, False, expected, problem, live or "")
+        sleep(interval)
+
+
 def verify_backend(
     git: Git,
     target: str,
@@ -421,31 +508,18 @@ def verify_backend(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Check:
-    if deployed:
-        expected = target
-    else:
-        expected = git.last_commit(target, component_paths(BACKEND)) or target
-    deadline = clock() + timeout
-    while True:
-        live, problem = read_backend_sha(fetch, backend_url)
-        if live and (
-            live == target
-            if deployed
-            else same_component_source(git, BACKEND, live, target)
-        ):
-            how = "deployed" if deployed else f"unchanged since {expected[:12]}"
-            return Check(
-                BACKEND, True, expected, f"/health reports {live[:12]} ({how})", live
-            )
-        if live:
-            problem = (
-                f"/health reports {live[:12]}, expected {target[:12]}"
-                if deployed
-                else f"/health reports {live[:12]}, whose backend source differs from {target[:12]}"
-            )
-        if clock() >= deadline:
-            return Check(BACKEND, False, expected, problem, live or "")
-        sleep(interval)
+    return _verify_component(
+        git,
+        BACKEND,
+        target,
+        deployed,
+        read=lambda: read_backend_sha(fetch, backend_url),
+        label="/health",
+        timeout=timeout,
+        interval=interval,
+        clock=clock,
+        sleep=sleep,
+    )
 
 
 def verify_frontend(
@@ -460,24 +534,25 @@ def verify_frontend(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Check:
-    if deployed:
-        expected = target
-    else:
-        expected = git.last_commit(target, component_paths(FRONTEND)) or target
-    how = "deployed" if deployed else f"unchanged since {expected[:12]}"
-    deadline = clock() + timeout
-    while True:
+    def serves() -> str:
         status, _ = fetch(frontend_url, 15)
-        if status == 200:
-            return Check(FRONTEND, True, expected, f"{frontend_url} serves ({how})")
-        if clock() >= deadline:
-            return Check(
-                FRONTEND,
-                False,
-                expected,
-                f"{frontend_url} returned HTTP {status or 'error'}",
-            )
-        sleep(interval)
+        return (
+            "" if status == 200 else f"{frontend_url} returned HTTP {status or 'error'}"
+        )
+
+    return _verify_component(
+        git,
+        FRONTEND,
+        target,
+        deployed,
+        read=lambda: read_frontend_sha(fetch, frontend_url),
+        label=FRONTEND_SHA_FILE,
+        timeout=timeout,
+        interval=interval,
+        clock=clock,
+        sleep=sleep,
+        serves=serves,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -710,6 +785,7 @@ def main(
     p_guard.add_argument("--sha", required=True)
     p_guard.add_argument("--component", choices=COMPONENTS, required=True)
     p_guard.add_argument("--backend-url", default=DEFAULT_BACKEND_URL)
+    p_guard.add_argument("--frontend-url", default=DEFAULT_FRONTEND_URL)
 
     p_verify = sub.add_parser("verify")
     p_verify.add_argument("--sha", required=True)
@@ -775,6 +851,7 @@ def main(
                 git.remote_ref(TAG_REF),
                 fetch=fetch,
                 backend_url=args.backend_url,
+                frontend_url=args.frontend_url,
             )
             if problem:
                 print(f"::error::Not deploying the {args.component}: {problem}.")
@@ -816,6 +893,7 @@ def main(
                     "backend_expected_sha": backend.expected,
                     "frontend_check": "passed" if frontend.ok else "failed",
                     "frontend_detail": frontend.detail,
+                    "frontend_live_sha": frontend.live_sha,
                     "frontend_expected_sha": frontend.expected,
                 }
             )
