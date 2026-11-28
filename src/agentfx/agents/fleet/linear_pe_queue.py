@@ -615,6 +615,10 @@ def stuck_session_signature(summary: str | None) -> str:
     per-session cost cap, or publish failed after all fallbacks), or
     "" when the summary isn't one. Token counts and event tails are
     dropped so two consecutive stuck sessions compare equal."""
+    # A run closed from its session's own events (AFX-182) is not a stuck
+    # session, even if its final message quotes one of the tags below.
+    if (summary or "").startswith("[session-outcome]"):
+        return ""
     lower = (summary or "").lower()
     for tag, signature in _STUCK_SESSION_SIGNATURES:
         if tag in lower:
