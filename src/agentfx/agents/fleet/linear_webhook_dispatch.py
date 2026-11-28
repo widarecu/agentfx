@@ -260,7 +260,13 @@ def _dispatch_workspace(
                 if claim.refused
                 else _ERROR_CLAIM_UNAVAILABLE_TEMPLATE
             )
-            emit_error(session_id, template.format(reason=claim.reason))
+            from agentfx.agents.fleet.pe_workspace import _redact_secrets
+
+            # The reason can carry an upstream error's text; scrub it before
+            # it is shown in Linear.
+            emit_error(
+                session_id, template.format(reason=_redact_secrets(claim.reason))
+            )
             return False, f"claim_refused:{claim.reason}"
 
         # Step 5 — Dispatch via the resolved adapter. From here the
