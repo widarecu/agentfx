@@ -128,6 +128,10 @@ The limit that remains: while Claude Code on the laptop uses Wilson's own `gh` l
 4. Store each credential in exactly one place, the one the actor runs in. Add it to the inventory in section 1 with its expiry.
 5. Check: the actor opens a test PR and files a test Triage issue; GitHub and Linear both show the new name, and an approval attempt by the actor has no effect on `pr-policy`.
 
+### One permission set per Linear application
+
+Linear cancels an application's earlier tokens when a new token is requested with a different set of permissions (scopes). So each application is only ever asked for one set, and one piece of code hands out its tokens: `get_app_token()` for the Platform Engineer, `get_qa_token()` for QA, read and write for the Pipeline. Anything else that talks to Linear as that application takes its token from there and never requests its own. Changing an application's permission set in Linear also cancels its live tokens. `tests/unit/agents/fleet/test_linear_token_scopes.py` fails if the rule is broken.
+
 ### Rotating or revoking a credential
 
 | Credential type | Rotate | Revoke at once |

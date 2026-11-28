@@ -55,9 +55,32 @@ BLOCKABLE_STATES = frozenset({IN_PROGRESS, IN_REVIEW, BLOCKED})
 
 Opener = Callable[..., Any]
 
+# A source of bearer tokens: `provider(force_refresh)` returns a token, or
+# raises `LinearError` when none can be had. `force_refresh=True` asks for a
+# new one because the last was rejected.
+TokenProvider = Callable[[bool], str]
+
 
 class LinearError(RuntimeError):
     """Linear API call failed (HTTP, GraphQL errors or bad payload)."""
+
+
+class _AuthRejected(LinearError):
+    """Linear rejected the credential (HTTP 401, or a GraphQL
+    authentication error). Still a `LinearError` for every caller."""
+
+
+def _is_auth_errors(errors: Any) -> bool:
+    """True when GraphQL `errors` say the credential was rejected."""
+    if not isinstance(errors, list):
+        return False
+    for err in errors:
+        ext = err.get("extensions") if isinstance(err, dict) else None
+        if isinstance(ext, dict):
+            kind = f"{ext.get('type', '')} {ext.get('code', '')}".lower()
+            if "authentication" in kind:
+                return True
+    return False
 
 
 class NotFoundError(LinearError):
@@ -108,7 +131,21 @@ class LinearClient:
     Authenticates as the "AgentFX Pipeline" app user when given a client ID
     and secret (client-credentials grant, `Authorization: Bearer <token>`),
     else with a personal API key (sent bare). The app token is minted once,
-    on the first request, and lasts about 30 days, so there is no refresh."""
+    on the first request, and lasts about 30 days, so there is no refresh.
+
+    Or takes its token from a `token_provider` (the fleet, AFX-184): a
+    callable `provider(force_refresh: bool) -> str` that returns a bearer
+    token (raising `LinearError` when it cannot). The client calls
+    `provider(False)` for every request and never contacts the token
+    endpoint itself. If Linear rejects the token (HTTP 401 or a GraphQL
+    authentication error) it calls `provider(True)` once and retries that
+    one request once; a second rejection is raised. A provider cannot be
+    combined with an API key or a client ID/secret.
+
+    One application, one scope set: Linear cancels an application's
+    earlier tokens when a token is requested with a different scope set,
+    so whoever already holds tokens for an application must be the only
+    source of its tokens (the provider)."""
 
     def __init__(
         self,
@@ -120,20 +157,26 @@ class LinearClient:
         token_url: str = LINEAR_TOKEN_URL,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         opener: Opener | None = None,
+        token_provider: TokenProvider | None = None,
     ) -> None:
+        if token_provider is not None and (api_key or client_id or client_secret):
+            raise LinearError(
+                "token_provider cannot be combined with an API key or a client ID/secret"
+            )
         if bool(client_id) != bool(client_secret):
             missing = CLIENT_SECRET_ENV if client_id else CLIENT_ID_ENV
             raise LinearError(
                 f"{missing} is not set: the pipeline app needs both "
                 f"{CLIENT_ID_ENV} and {CLIENT_SECRET_ENV}"
             )
-        if not api_key and not client_id:
+        if not api_key and not client_id and token_provider is None:
             raise LinearError(
                 f"{API_KEY_ENV} is empty (or set {CLIENT_ID_ENV} and {CLIENT_SECRET_ENV})"
             )
         self._api_key = api_key
         self._client_id = client_id
         self._client_secret = client_secret
+        self._token_provider = token_provider
         self._token: str | None = None
         self._token_url = token_url
         self._url = url
@@ -157,6 +200,8 @@ class LinearClient:
         """The Authorization header value. With the pipeline pair the app
         token is minted on first use and cached for this client; there is
         no fallback to the API key if minting fails."""
+        if self._token_provider is not None:
+            return f"Bearer {self._token_provider(False)}"
         if not self._client_id:
             return self._api_key
         if self._token is None:
@@ -164,6 +209,9 @@ class LinearClient:
         return f"Bearer {self._token}"
 
     def _mint_token(self) -> str:
+        # The pipeline application is only ever asked for "read,write".
+        # Never request another scope set for one application: Linear
+        # cancels its earlier tokens when the scope set changes (AFX-184).
         # Error text never includes the client secret or any token.
         form = urllib.parse.urlencode(
             {
@@ -202,12 +250,24 @@ class LinearClient:
 
     def gql(self, query: str, variables: dict[str, Any] | None = None) -> dict:
         """Run one request and return `data`. Linear puts the real error
-        in the body of HTTP 400s, so the body is parsed on errors too."""
+        in the body of HTTP 400s, so the body is parsed on errors too.
+        With a token provider, a rejected token is refreshed through it
+        and the request retried once."""
+        try:
+            return self._gql_once(query, variables, self._authorization())
+        except _AuthRejected:
+            if self._token_provider is None:
+                raise
+        return self._gql_once(query, variables, f"Bearer {self._token_provider(True)}")
+
+    def _gql_once(
+        self, query: str, variables: dict[str, Any] | None, authorization: str
+    ) -> dict:
         req = urllib.request.Request(
             self._url,
             data=json.dumps({"query": query, "variables": variables or {}}).encode(),
             headers={
-                "Authorization": self._authorization(),
+                "Authorization": authorization,
                 "Content-Type": "application/json",
             },
         )
@@ -220,6 +280,8 @@ class LinearClient:
                 detail = json.loads(raw).get("errors") or raw.decode("utf-8", "replace")
             except ValueError:
                 detail = raw.decode("utf-8", "replace")
+            if err.code == 401 or _is_auth_errors(detail):
+                raise _AuthRejected(f"linear http {err.code}: {detail}") from err
             raise LinearError(f"linear http {err.code}: {detail}") from err
         except (urllib.error.URLError, TimeoutError, OSError) as err:
             raise LinearError(f"linear unreachable: {err}") from err
@@ -228,6 +290,8 @@ class LinearClient:
         except ValueError as err:
             raise LinearError(f"linear non-json response: {body[:200]!r}") from err
         if payload.get("errors"):
+            if _is_auth_errors(payload["errors"]):
+                raise _AuthRejected(f"linear graphql errors: {payload['errors']}")
             raise LinearError(f"linear graphql errors: {payload['errors']}")
         return payload.get("data") or {}
 

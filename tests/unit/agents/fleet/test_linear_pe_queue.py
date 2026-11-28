@@ -1013,12 +1013,35 @@ class TestPeIdentity:
         assert linear_pe_queue._refresh_pe_token() == "pe-token-2"
         assert seen == [{"force_refresh": True}]
 
-    def test_delivery_client_is_built_with_the_pe_pair(self, monkeypatch):
-        _set_pe_creds(monkeypatch, "pe-id", "pe-secret")
+    def test_delivery_client_takes_its_token_from_get_app_token(self, monkeypatch):
+        seen = []
+
+        def fake(**kw):
+            seen.append(kw)
+            return ("pe-token-2" if kw.get("force_refresh") else "pe-token", "")
+
+        monkeypatch.setattr(linear_agent_api, "get_app_token", fake)
         client = linear_pe_queue._delivery_client()
         assert isinstance(client, linear_delivery.LinearClient)
-        assert client._client_id == "pe-id"
-        assert client._client_secret == "pe-secret"
+        # It never holds the PE pair: it cannot mint a token of its own.
+        assert client._client_id == "" and client._client_secret == ""
+        assert client._authorization() == "Bearer pe-token"
+        assert client._token_provider(True) == "pe-token-2"
+        assert seen == [{"force_refresh": False}, {"force_refresh": True}]
+
+    def test_claim_fails_closed_without_a_token_and_names_no_token(self, monkeypatch):
+        monkeypatch.setattr(linear_pe_queue.settings, "AGENT_LINEAR_ENABLED", True)
+        _set_pe_creds(monkeypatch)
+        monkeypatch.setattr(
+            linear_agent_api,
+            "get_app_token",
+            lambda **_kw: (None, "token_endpoint:HTTP 401"),
+        )
+        monkeypatch.setattr(linear_pe_queue, "_claim_store", lambda: object())
+        outcome = linear_pe_queue.claim_for_dispatch("AFX-1")
+        assert outcome.ok is False and outcome.refused is False
+        assert "token_endpoint:HTTP 401" in outcome.reason
+        assert linear_pe_queue.rollback_to_ready("AFX-1", reason_summary="x") is False
 
 
 class TestFleetGithubToken:

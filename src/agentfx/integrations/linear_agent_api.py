@@ -68,6 +68,10 @@ class _CachedToken:
 _token_cache: dict[str, _CachedToken] = {}
 _token_lock = threading.Lock()
 
+# ONE application, ONE scope set. Linear cancels an application's earlier
+# tokens when a token is requested with a different scope set (AFX-184), so
+# nothing may request a token for these client IDs with any other scope, and
+# every consumer takes its token from here rather than minting its own.
 # Scopes per application. PE needs the agent-user scopes; QA only files
 # and comments on issues.
 _PE_SCOPE = "read,write,app:assignable,app:mentionable"
